@@ -1,0 +1,58 @@
+{
+  "name": "@yawlabs/mcp-compliance",
+  "version": "0.1.1",
+  "description": "CLI tool and MCP server that tests MCP servers for spec compliance",
+  "license": "MIT",
+  "author": "Yaw Labs (https://yaw.sh)",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/runner.js",
+      "types": "./dist/runner.d.ts"
+    }
+  },
+  "main": "./dist/runner.js",
+  "types": "./dist/runner.d.ts",
+  "bin": {
+    "mcp-compliance": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "chalk": "^5.4.1",
+    "commander": "^13.1.0",
+    "undici": "^7.8.0",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "compliance",
+    "testing",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yawlabs/mcp-compliance.git"
+  },
+  "homepage": "https://mcp.hosting"
+}
