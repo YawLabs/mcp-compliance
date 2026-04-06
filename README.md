@@ -27,7 +27,22 @@ mcp-compliance test https://my-server.com/mcp --format json
 
 # Strict mode — exits with code 1 on required test failure (for CI)
 mcp-compliance test https://my-server.com/mcp --strict
+
+# With authentication
+mcp-compliance test https://my-server.com/mcp --auth "Bearer tok123"
+
+# Custom headers (repeatable)
+mcp-compliance test https://my-server.com/mcp -H "Authorization: Bearer tok123" -H "X-Api-Key: abc"
 ```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--format <format>` | Output format: `terminal` or `json` (default: `terminal`) |
+| `--strict` | Exit with code 1 on any required test failure (for CI) |
+| `-H, --header <header>` | Add header to all requests, format `"Key: Value"` (repeatable) |
+| `--auth <token>` | Shorthand for `-H "Authorization: <token>"` |
 
 ### Get badge markdown
 
@@ -119,13 +134,15 @@ Add to your Claude Code MCP config:
   "mcpServers": {
     "mcp-compliance": {
       "command": "npx",
-      "args": ["@yawlabs/mcp-compliance-server"]
+      "args": ["-y", "@yawlabs/mcp-compliance"],
+      "env": {},
+      "args_extra": ["mcp"]
     }
   }
 }
 ```
 
-Or if installed globally:
+Or run the MCP server directly:
 
 ```json
 {

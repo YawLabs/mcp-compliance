@@ -1,13 +1,17 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { createRequire } from 'node:module';
 import { runComplianceSuite } from '../runner.js';
 import { generateBadge } from '../badge.js';
 import { TEST_DEFINITIONS } from '../types.js';
 
+const require = createRequire(import.meta.url);
+const { version } = require('../../package.json');
+
 const server = new McpServer({
   name: 'mcp-compliance',
-  version: '0.1.0',
+  version,
 });
 
 server.tool(

@@ -16,6 +16,33 @@ function createIdCounter() {
   return () => ++id;
 }
 
+/**
+ * Parse SSE (text/event-stream) response body.
+ * Extracts the last complete JSON-RPC response from "data: " lines.
+ */
+function parseSSEResponse(text: string): any {
+  const lines = text.split('\n');
+  let lastJsonRpcResponse: any = null;
+
+  for (const line of lines) {
+    if (line.startsWith('data: ')) {
+      const data = line.slice(6).trim();
+      if (!data) continue;
+      try {
+        const parsed = JSON.parse(data);
+        // Keep the last complete JSON-RPC response (has id + result/error)
+        if (parsed.jsonrpc === '2.0' && parsed.id !== undefined) {
+          lastJsonRpcResponse = parsed;
+        }
+      } catch {
+        // Not valid JSON, skip
+      }
+    }
+  }
+
+  return lastJsonRpcResponse;
+}
+
 const _defaultNextId = createIdCounter();
 
 async function mcpRequest(
@@ -23,6 +50,7 @@ async function mcpRequest(
   method: string,
   params?: unknown,
   nextId: () => number = _defaultNextId,
+  extraHeaders?: Record<string, string>,
 ): Promise<{
   statusCode: number;
   body: any;
@@ -36,12 +64,15 @@ async function mcpRequest(
     params: params || {},
   });
 
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json, text/event-stream',
+    ...extraHeaders,
+  };
+
   const res = await request(backendUrl, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json, text/event-stream',
-    },
+    headers,
     body,
     signal: AbortSignal.timeout(15000),
   });
@@ -52,6 +83,22 @@ async function mcpRequest(
     if (typeof v === 'string') responseHeaders[k] = v;
   }
 
+  // Check Content-Type to decide how to parse the response
+  const contentType = (responseHeaders['content-type'] || '').toLowerCase();
+
+  if (contentType.includes('text/event-stream')) {
+    const parsed = parseSSEResponse(text);
+    if (parsed) {
+      return { statusCode: res.statusCode, body: parsed, headers: responseHeaders };
+    }
+    // Fallback: try plain JSON parse
+    try {
+      return { statusCode: res.statusCode, body: JSON.parse(text), headers: responseHeaders };
+    } catch {
+      return { statusCode: res.statusCode, body: { _raw: text }, headers: responseHeaders };
+    }
+  }
+
   try {
     return { statusCode: res.statusCode, body: JSON.parse(text), headers: responseHeaders };
   } catch {
@@ -59,10 +106,19 @@ async function mcpRequest(
   }
 }
 
-async function mcpNotification(backendUrl: string, method: string, params?: unknown): Promise<void> {
+async function mcpNotification(
+  backendUrl: string,
+  method: string,
+  params?: unknown,
+  extraHeaders?: Record<string, string>,
+): Promise<void> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...extraHeaders,
+  };
   await request(backendUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ jsonrpc: '2.0', method, ...(params ? { params } : {}) }),
     signal: AbortSignal.timeout(5000),
   }).then(r => r.body.text()).catch(() => {});
@@ -71,6 +127,8 @@ async function mcpNotification(backendUrl: string, method: string, params?: unkn
 export interface RunOptions {
   /** Optional callback for progress updates */
   onProgress?: (testId: string, passed: boolean, details: string) => void;
+  /** Extra headers to include on all requests */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -92,7 +150,21 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   const backendUrl = url;
   const tests: TestResult[] = [];
   const nextId = createIdCounter();
-  const rpc = (method: string, params?: unknown) => mcpRequest(backendUrl, method, params, nextId);
+
+  // Session state: MCP-Session-Id and negotiated protocol version
+  let sessionId: string | null = null;
+  let negotiatedProtocolVersion: string | null = null;
+  const userHeaders = options.headers || {};
+
+  function buildHeaders(): Record<string, string> {
+    const h: Record<string, string> = { ...userHeaders };
+    if (sessionId) h['mcp-session-id'] = sessionId;
+    if (negotiatedProtocolVersion) h['mcp-protocol-version'] = negotiatedProtocolVersion;
+    return h;
+  }
+
+  const rpc = (method: string, params?: unknown) =>
+    mcpRequest(backendUrl, method, params, nextId, buildHeaders());
 
   let serverInfo = {
     protocolVersion: null as string | null,
@@ -141,7 +213,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   await test('transport-post', 'HTTP POST accepted', 'transport', true, 'basic/transports#streamable-http', async () => {
     const res = await request(backendUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' },
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', ...userHeaders },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
       signal: AbortSignal.timeout(10000),
     });
@@ -154,7 +226,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   await test('transport-content-type', 'Responds with JSON or SSE', 'transport', true, 'basic/transports#streamable-http', async () => {
     const res = await request(backendUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' },
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', ...userHeaders },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
       signal: AbortSignal.timeout(10000),
     });
@@ -181,6 +253,14 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     serverInfo.name = result.serverInfo?.name || null;
     serverInfo.version = result.serverInfo?.version || null;
     serverInfo.capabilities = result.capabilities || {};
+
+    // Capture MCP-Session-Id from response headers (spec: clients MUST include on subsequent requests)
+    const sid = initRes.headers['mcp-session-id'];
+    if (sid) sessionId = sid;
+
+    // Capture negotiated protocol version (spec: clients MUST send MCP-Protocol-Version on subsequent requests)
+    if (result.protocolVersion) negotiatedProtocolVersion = result.protocolVersion;
+
     return { passed: !!result.protocolVersion, details: `Protocol: ${result.protocolVersion || 'missing'}` };
   });
 
@@ -209,8 +289,8 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     return { passed: valid, details: valid ? 'Valid JSON-RPC 2.0 response' : `Missing fields: jsonrpc=${body?.jsonrpc}, id=${body?.id}` };
   });
 
-  // Send initialized notification
-  await mcpNotification(backendUrl, 'notifications/initialized');
+  // Send initialized notification (include session headers)
+  await mcpNotification(backendUrl, 'notifications/initialized', undefined, buildHeaders());
 
   // ── 2b. LIFECYCLE: Ping ───────────────────────────────────────────
 
@@ -226,18 +306,21 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
 
   const hasTools = !!serverInfo.capabilities.tools;
 
+  // Cache for list results to avoid duplicate rpc calls
+  let cachedToolsList: any[] | null = null;
+
   await test('tools-list', 'tools/list returns valid response', 'tools', hasTools, 'server/tools#listing-tools', async () => {
     const res = await rpc('tools/list');
     const tools = res.body?.result?.tools;
     if (!Array.isArray(tools)) return { passed: false, details: 'No tools array in result' };
+    cachedToolsList = tools;
     toolCount = tools.length;
     toolNames = tools.map((t: any) => t.name).filter(Boolean);
     return { passed: true, details: `${toolCount} tool(s): ${toolNames.slice(0, 5).join(', ')}${toolCount > 5 ? '...' : ''}` };
   });
 
   await test('tools-schema', 'All tools have name and inputSchema', 'schema', hasTools, 'server/tools#data-types', async () => {
-    const res = await rpc('tools/list');
-    const tools = res.body?.result?.tools || [];
+    const tools = cachedToolsList ?? (await rpc('tools/list')).body?.result?.tools ?? [];
     const issues: string[] = [];
     const warnings: string[] = [];
     for (const tool of tools) {
@@ -298,17 +381,19 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   const hasResources = !!serverInfo.capabilities.resources;
 
   if (hasResources) {
+    let cachedResourcesList: any[] | null = null;
+
     await test('resources-list', 'resources/list returns valid response', 'resources', true, 'server/resources#listing-resources', async () => {
       const res = await rpc('resources/list');
       const resources = res.body?.result?.resources;
       if (!Array.isArray(resources)) return { passed: false, details: 'No resources array' };
+      cachedResourcesList = resources;
       resourceCount = resources.length;
       return { passed: true, details: `${resourceCount} resource(s)` };
     });
 
     await test('resources-schema', 'Resources have uri and name', 'schema', true, 'server/resources#data-types', async () => {
-      const res = await rpc('resources/list');
-      const resources = res.body?.result?.resources || [];
+      const resources = cachedResourcesList ?? (await rpc('resources/list')).body?.result?.resources ?? [];
       const issues: string[] = [];
       for (const r of resources) {
         if (!r.uri) issues.push('Resource missing uri');
@@ -363,19 +448,20 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
 
   if (hasPrompts) {
     let promptNames: string[] = [];
+    let cachedPromptsList: any[] | null = null;
 
     await test('prompts-list', 'prompts/list returns valid response', 'prompts', true, 'server/prompts#listing-prompts', async () => {
       const res = await rpc('prompts/list');
       const prompts = res.body?.result?.prompts;
       if (!Array.isArray(prompts)) return { passed: false, details: 'No prompts array' };
+      cachedPromptsList = prompts;
       promptCount = prompts.length;
       promptNames = prompts.map((p: any) => p.name).filter(Boolean);
       return { passed: true, details: `${promptCount} prompt(s): ${promptNames.slice(0, 5).join(', ')}${promptCount > 5 ? '...' : ''}` };
     });
 
     await test('prompts-schema', 'Prompts have name field', 'schema', true, 'server/prompts#data-types', async () => {
-      const res = await rpc('prompts/list');
-      const prompts = res.body?.result?.prompts || [];
+      const prompts = cachedPromptsList ?? (await rpc('prompts/list')).body?.result?.prompts ?? [];
       const issues: string[] = [];
       for (const p of prompts) {
         if (!p.name) issues.push('Prompt missing name');
@@ -430,7 +516,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   await test('error-invalid-jsonrpc', 'Handles malformed JSON-RPC', 'errors', true, 'basic', async () => {
     const res = await request(backendUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...buildHeaders() },
       body: JSON.stringify({ not: 'a valid jsonrpc message' }),
       signal: AbortSignal.timeout(10000),
     });
@@ -449,7 +535,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   await test('error-invalid-json', 'Handles invalid JSON body', 'errors', false, 'basic', async () => {
     const res = await request(backendUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...buildHeaders() },
       body: '{this is not valid json!!!',
       signal: AbortSignal.timeout(10000),
     });

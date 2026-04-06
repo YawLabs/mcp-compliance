@@ -16,9 +16,8 @@ export function generateBadge(url: string): {
     parsed = new URL('https://unknown');
   }
 
-  const hostname = parsed.hostname;
-  // Use full hostname encoded for the badge path
-  const encoded = encodeURIComponent(hostname);
+  // Use full URL (encoded) for the badge path, not just hostname
+  const encoded = encodeURIComponent(parsed.href);
 
   const imageUrl = `https://mcp.hosting/api/compliance/${encoded}/badge`;
   const reportUrl = `https://mcp.hosting/compliance/${encoded}`;
