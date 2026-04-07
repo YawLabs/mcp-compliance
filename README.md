@@ -1,22 +1,32 @@
 # @yawlabs/mcp-compliance
 
-CLI tool and MCP server that tests MCP servers for spec compliance. Runs a 43-test suite covering transport, lifecycle, tools, resources, prompts, error handling, and schema validation against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25).
+[![npm version](https://img.shields.io/npm/v/@yawlabs/mcp-compliance)](https://www.npmjs.com/package/@yawlabs/mcp-compliance)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![GitHub stars](https://img.shields.io/github/stars/YawLabs/mcp-compliance)](https://github.com/YawLabs/mcp-compliance/stargazers)
+[![CI](https://github.com/YawLabs/mcp-compliance/actions/workflows/ci.yml/badge.svg)](https://github.com/YawLabs/mcp-compliance/actions/workflows/ci.yml)
 
-## Install
+**Test any MCP server for spec compliance.** 43-test suite covering transport, lifecycle, tools, resources, prompts, error handling, and schema validation against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). CLI, MCP server, and programmatic API.
 
-```bash
-npm install -g @yawlabs/mcp-compliance
-```
+Built and maintained by [YawLabs](https://yaw.sh).
 
-Or run directly with npx:
+## Quick Start
+
+**1. Run against any MCP server**
 
 ```bash
 npx @yawlabs/mcp-compliance test https://my-server.com/mcp
 ```
 
-## CLI Usage
+**2. Or install globally**
 
-### Run compliance tests
+```bash
+npm install -g @yawlabs/mcp-compliance
+mcp-compliance test https://my-server.com/mcp
+```
+
+That's it. You'll get a colored terminal report with a letter grade (A-F), per-test pass/fail, and a compliance score.
+
+## CLI Usage
 
 ```bash
 # Terminal output with colors and grade
@@ -75,7 +85,9 @@ Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https:
 
 ## What the 43 tests check
 
-### Transport (7 tests)
+<details>
+<summary><strong>Transport (7 tests)</strong></summary>
+
 - **transport-post** — Server accepts HTTP POST requests (required)
 - **transport-content-type** — Responds with application/json or text/event-stream (required)
 - **transport-notification-202** — Notifications return 202 Accepted
@@ -84,7 +96,11 @@ Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https:
 - **transport-delete** — DELETE accepted or returns 405
 - **transport-batch-reject** — Rejects JSON-RPC batch requests (required)
 
-### Lifecycle (10 tests)
+</details>
+
+<details>
+<summary><strong>Lifecycle (10 tests)</strong></summary>
+
 - **lifecycle-init** — Initialize handshake succeeds (required)
 - **lifecycle-proto-version** — Returns valid YYYY-MM-DD protocol version (required)
 - **lifecycle-server-info** — Includes serverInfo with name
@@ -96,25 +112,41 @@ Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https:
 - **lifecycle-logging** — logging/setLevel accepted (required if logging capability declared)
 - **lifecycle-completions** — completion/complete accepted (required if completions capability declared)
 
-### Tools (4 tests)
+</details>
+
+<details>
+<summary><strong>Tools (4 tests)</strong></summary>
+
 - **tools-list** — tools/list returns valid array (required if tools capability declared)
 - **tools-call** — tools/call responds with correct format
 - **tools-pagination** — tools/list supports cursor-based pagination
 - **tools-content-types** — Tool content items have valid types
 
-### Resources (5 tests)
+</details>
+
+<details>
+<summary><strong>Resources (5 tests)</strong></summary>
+
 - **resources-list** — resources/list returns valid array (required if resources capability declared)
 - **resources-read** — resources/read returns content items
 - **resources-templates** — resources/templates/list works or returns method-not-found
 - **resources-pagination** — resources/list supports cursor-based pagination
 - **resources-subscribe** — Resource subscribe/unsubscribe (required if subscribe capability declared)
 
-### Prompts (3 tests)
+</details>
+
+<details>
+<summary><strong>Prompts (3 tests)</strong></summary>
+
 - **prompts-list** — prompts/list returns valid array (required if prompts capability declared)
 - **prompts-get** — prompts/get returns valid messages
 - **prompts-pagination** — prompts/list supports cursor-based pagination
 
-### Error Handling (8 tests)
+</details>
+
+<details>
+<summary><strong>Error Handling (8 tests)</strong></summary>
+
 - **error-unknown-method** — Returns JSON-RPC error for unknown method (required)
 - **error-method-code** — Uses correct -32601 error code
 - **error-invalid-jsonrpc** — Handles malformed JSON-RPC (required)
@@ -124,13 +156,19 @@ Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https:
 - **error-invalid-request-code** — Returns -32600 for invalid request
 - **tools-call-unknown** — Returns error for nonexistent tool name
 
-### Schema Validation (6 tests)
+</details>
+
+<details>
+<summary><strong>Schema Validation (6 tests)</strong></summary>
+
 - **tools-schema** — All tools have valid name and inputSchema (required if tools capability declared)
 - **tools-annotations** — Tool annotations are valid if present
 - **tools-title-field** — Tools include title field (2025-11-25)
 - **tools-output-schema** — Tools with outputSchema are valid (2025-11-25)
 - **prompts-schema** — Prompts have valid name field (required if prompts capability declared)
 - **resources-schema** — Resources have valid uri and name (required if resources capability declared)
+
+</details>
 
 ## Grading
 
@@ -166,13 +204,15 @@ Required tests are worth 70% of the score, optional tests 30%.
   run: npx @yawlabs/mcp-compliance test ${{ env.MCP_SERVER_URL }} --strict --retries 2 --timeout 30000
 ```
 
-## MCP Server (for Claude Code)
+## MCP Server (for Claude Code, Cursor, etc.)
 
-This package also exposes an MCP server with 3 tools that can be used from Claude Code or any MCP client.
+This package also exposes an MCP server with 3 tools that can be used from Claude Code, Cursor, or any MCP client.
 
 ### Setup
 
-Add to your Claude Code MCP config:
+Create `.mcp.json` in your project root:
+
+macOS / Linux / WSL:
 
 ```json
 {
@@ -185,11 +225,30 @@ Add to your Claude Code MCP config:
 }
 ```
 
+Windows:
+
+```json
+{
+  "mcpServers": {
+    "mcp-compliance": {
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "@yawlabs/mcp-compliance", "mcp"]
+    }
+  }
+}
+```
+
+> **Tip:** This file is safe to commit — it contains no secrets.
+
+Restart your MCP client and approve the server when prompted.
+
 ### Tools
 
-- **mcp_compliance_test** — Run the full 43-test suite against a URL. Returns grade, score, and detailed results.
-- **mcp_compliance_badge** — Get the badge markdown/HTML for a server.
+- **mcp_compliance_test** — Run the full 43-test suite against a URL. Supports auth, custom headers, timeout, retries, and category/test filtering. Returns grade, score, and detailed results.
+- **mcp_compliance_badge** — Get the badge markdown/HTML for a server. Supports auth and custom headers.
 - **mcp_compliance_explain** — Explain what a specific test ID checks and why it matters.
+
+All tools have [MCP tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#annotations) (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP clients can skip confirmation dialogs for safe operations.
 
 ## Programmatic Usage
 
@@ -207,6 +266,10 @@ const report2 = await runComplianceSuite('https://my-server.com/mcp', {
   only: ['transport', 'lifecycle'],
 });
 ```
+
+## Requirements
+
+- Node.js 18+
 
 ## Links
 

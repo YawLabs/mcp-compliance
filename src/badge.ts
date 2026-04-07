@@ -13,7 +13,7 @@ export function generateBadge(url: string): {
   try {
     parsed = new URL(url);
   } catch {
-    parsed = new URL('https://unknown');
+    parsed = new URL("https://unknown");
   }
 
   // Use full URL (encoded) for the badge path, not just hostname

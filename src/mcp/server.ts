@@ -1,12 +1,12 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { createRequire } from 'node:module';
-import { registerTools } from './tools.js';
+import { createRequire } from "node:module";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { registerTools } from "./tools.js";
 
 const require = createRequire(import.meta.url);
-const { version } = require('../../package.json');
+const { version } = require("../../package.json");
 
-const server = new McpServer({ name: 'mcp-compliance', version });
+const server = new McpServer({ name: "mcp-compliance", version });
 registerTools(server);
 
 async function main() {
@@ -15,6 +15,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('MCP server error:', err);
+  console.error("MCP server error:", err);
   process.exit(1);
 });
