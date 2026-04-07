@@ -44,7 +44,7 @@ export function formatTerminal(report: ComplianceReport): string {
 
   lines.push('');
   lines.push(chalk.bold('MCP Compliance Report'));
-  lines.push(chalk.dim(`Spec: ${report.specVersion}  |  ${report.timestamp}`));
+  lines.push(chalk.dim(`Spec: ${report.specVersion}  |  Tool: v${report.toolVersion}  |  ${report.timestamp}`));
   lines.push(chalk.dim(`URL: ${report.url}`));
 
   if (report.serverInfo.name) {
@@ -78,15 +78,31 @@ export function formatTerminal(report: ComplianceReport): string {
     }
   }
 
-  if (report.toolCount > 0) {
+  // Capabilities summary
+  const caps = report.serverInfo.capabilities;
+  const declared = Object.keys(caps).filter(k => caps[k] !== undefined);
+  if (declared.length > 0) {
     lines.push('');
+    lines.push(chalk.dim(`  Capabilities: ${declared.join(', ')}`));
+  }
+
+  if (report.toolCount > 0) {
     lines.push(chalk.dim(`  Tools (${report.toolCount}): ${report.toolNames.slice(0, 10).join(', ')}${report.toolCount > 10 ? '...' : ''}`));
   }
   if (report.resourceCount > 0) {
-    lines.push(chalk.dim(`  Resources: ${report.resourceCount}`));
+    lines.push(chalk.dim(`  Resources (${report.resourceCount}): ${report.resourceNames.slice(0, 10).join(', ')}${report.resourceCount > 10 ? '...' : ''}`));
   }
   if (report.promptCount > 0) {
-    lines.push(chalk.dim(`  Prompts: ${report.promptCount}`));
+    lines.push(chalk.dim(`  Prompts (${report.promptCount}): ${report.promptNames.slice(0, 10).join(', ')}${report.promptCount > 10 ? '...' : ''}`));
+  }
+
+  // Warnings
+  if (report.warnings.length > 0) {
+    lines.push('');
+    lines.push(chalk.yellow(`  Warnings (${report.warnings.length}):`));
+    for (const w of report.warnings) {
+      lines.push(chalk.yellow(`    - ${w}`));
+    }
   }
 
   lines.push('');

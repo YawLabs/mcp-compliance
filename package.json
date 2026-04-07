@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/mcp-compliance",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "CLI tool and MCP server that tests MCP servers for spec compliance",
   "license": "MIT",
   "author": "Yaw Labs (https://yaw.sh)",
@@ -28,7 +28,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "chalk": "^5.4.1",
     "commander": "^13.1.0",
     "undici": "^7.8.0",

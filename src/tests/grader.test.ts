@@ -78,4 +78,46 @@ describe('computeScore', () => {
     expect(result.categories.transport).toEqual({ passed: 1, total: 2 });
     expect(result.categories.lifecycle).toEqual({ passed: 1, total: 1 });
   });
+
+  it('handles all required tests failing', () => {
+    const tests = [
+      makeTest(false, true),
+      makeTest(false, true),
+      makeTest(false, false),
+    ];
+    const result = computeScore(tests);
+    expect(result.score).toBe(0);
+    expect(result.grade).toBe('F');
+    expect(result.overall).toBe('fail');
+    expect(result.summary.requiredPassed).toBe(0);
+  });
+
+  it('handles no optional tests', () => {
+    const tests = [
+      makeTest(true, true),
+      makeTest(true, true),
+    ];
+    const result = computeScore(tests);
+    expect(result.score).toBe(100);
+    expect(result.overall).toBe('pass');
+  });
+
+  it('handles no required tests', () => {
+    const tests = [
+      makeTest(true, false),
+      makeTest(false, false),
+    ];
+    const result = computeScore(tests);
+    // Required score = 70 (no required tests = full credit), optional = 50% of 30 = 15
+    expect(result.score).toBe(85);
+    expect(result.overall).toBe('partial');
+  });
+
+  it('handles empty test array', () => {
+    const result = computeScore([]);
+    expect(result.score).toBe(100);
+    expect(result.grade).toBe('A');
+    expect(result.overall).toBe('pass');
+    expect(result.summary.total).toBe(0);
+  });
 });

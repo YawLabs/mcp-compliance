@@ -3,6 +3,11 @@ import chalk from 'chalk';
 import { createRequire } from 'node:module';
 import { runComplianceSuite } from './runner.js';
 import { formatTerminal, formatJson } from './reporter.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+import { generateBadge } from './badge.js';
+import { TEST_DEFINITIONS } from './types.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
@@ -16,6 +21,10 @@ function parseHeaderArg(value: string, prev: Record<string, string>): Record<str
   const val = value.slice(idx + 1).trim();
   prev[key] = val;
   return prev;
+}
+
+function parseList(value: string): string[] {
+  return value.split(',').map(s => s.trim()).filter(Boolean);
 }
 
 const program = new Command();
@@ -33,7 +42,22 @@ program
   .option('--strict', 'Exit with code 1 on any required test failure (for CI)')
   .option('-H, --header <header>', 'Add header to all requests (format: "Key: Value", repeatable)', parseHeaderArg, {})
   .option('--auth <token>', 'Shorthand for -H "Authorization: <token>"')
-  .action(async (url: string, opts: { format: string; strict?: boolean; header: Record<string, string>; auth?: string }) => {
+  .option('--timeout <ms>', 'Request timeout in milliseconds', '15000')
+  .option('--retries <n>', 'Number of retries for failed tests', '0')
+  .option('--only <items>', 'Only run tests matching these categories or test IDs (comma-separated)', parseList)
+  .option('--skip <items>', 'Skip tests matching these categories or test IDs (comma-separated)', parseList)
+  .option('--verbose', 'Print each test result as it runs')
+  .action(async (url: string, opts: {
+    format: string;
+    strict?: boolean;
+    header: Record<string, string>;
+    auth?: string;
+    timeout: string;
+    retries: string;
+    only?: string[];
+    skip?: string[];
+    verbose?: boolean;
+  }) => {
     try {
       const headers = { ...opts.header };
       if (opts.auth) headers['Authorization'] = opts.auth;
@@ -42,7 +66,21 @@ program
         console.log(chalk.dim(`\nTesting ${url}...\n`));
       }
 
-      const report = await runComplianceSuite(url, { headers });
+      const report = await runComplianceSuite(url, {
+        headers,
+        timeout: parseInt(opts.timeout, 10) || 15000,
+        retries: parseInt(opts.retries, 10) || 0,
+        only: opts.only,
+        skip: opts.skip,
+        onProgress: opts.verbose ? (testId, passed, details) => {
+          const icon = passed ? chalk.green('PASS') : chalk.red('FAIL');
+          console.log(`  ${icon} ${testId} — ${details}`);
+        } : undefined,
+      });
+
+      if (opts.verbose && opts.format === 'terminal') {
+        console.log(''); // blank line after verbose output
+      }
 
       if (opts.format === 'json') {
         console.log(formatJson(report));
@@ -69,14 +107,18 @@ program
   .argument('<url>', 'MCP server URL to test')
   .option('-H, --header <header>', 'Add header to all requests (format: "Key: Value", repeatable)', parseHeaderArg, {})
   .option('--auth <token>', 'Shorthand for -H "Authorization: <token>"')
-  .action(async (url: string, opts: { header: Record<string, string>; auth?: string }) => {
+  .option('--timeout <ms>', 'Request timeout in milliseconds', '15000')
+  .action(async (url: string, opts: { header: Record<string, string>; auth?: string; timeout: string }) => {
     try {
       const headers = { ...opts.header };
       if (opts.auth) headers['Authorization'] = opts.auth;
 
       console.log(chalk.dim(`\nTesting ${url}...\n`));
 
-      const report = await runComplianceSuite(url, { headers });
+      const report = await runComplianceSuite(url, {
+        headers,
+        timeout: parseInt(opts.timeout, 10) || 15000,
+      });
 
       console.log(`Grade: ${report.grade} (${report.score}%)\n`);
       console.log(report.badge.markdown);
@@ -85,6 +127,92 @@ program
       console.error(chalk.red(`\nError: ${err.message}\n`));
       process.exit(1);
     }
+  });
+
+program
+  .command('mcp')
+  .description('Start the MCP compliance server (stdio transport)')
+  .action(async () => {
+    const server = new McpServer({ name: 'mcp-compliance', version });
+
+    server.tool(
+      'mcp_compliance_test',
+      'Run the full MCP compliance test suite against a server URL. Returns grade (A-F), score, and detailed results for all 43 tests covering transport, lifecycle, tools, resources, prompts, errors, and schema validation.',
+      { url: z.string().url().describe('The MCP server URL to test (must be HTTP or HTTPS)') },
+      async ({ url }) => {
+        try {
+          const report = await runComplianceSuite(url);
+          const summary = [
+            `Grade: ${report.grade} (${report.score}%)`,
+            `Overall: ${report.overall}`,
+            `Tests: ${report.summary.passed}/${report.summary.total} passed (${report.summary.requiredPassed}/${report.summary.required} required)`,
+            '',
+            ...report.tests.map(t =>
+              `${t.passed ? 'PASS' : 'FAIL'} ${t.name}${t.required ? ' (required)' : ''} — ${t.details}`
+            ),
+          ];
+          if (report.serverInfo.name) {
+            summary.unshift(`Server: ${report.serverInfo.name} v${report.serverInfo.version || '?'}`);
+          }
+          if (report.warnings.length > 0) {
+            summary.push('', `Warnings (${report.warnings.length}):`);
+            for (const w of report.warnings) summary.push(`  - ${w}`);
+          }
+          return {
+            content: [
+              { type: 'text' as const, text: summary.join('\n') },
+              { type: 'text' as const, text: `\n\nFull report:\n${JSON.stringify(report, null, 2)}` },
+            ],
+          };
+        } catch (err: any) {
+          return { content: [{ type: 'text' as const, text: `Error running compliance test: ${err.message}` }], isError: true };
+        }
+      },
+    );
+
+    server.tool(
+      'mcp_compliance_badge',
+      'Get the badge markdown embed code for an MCP server. Runs the compliance test suite first to determine the grade.',
+      { url: z.string().url().describe('The MCP server URL to test') },
+      async ({ url }) => {
+        try {
+          const report = await runComplianceSuite(url);
+          const badge = report.badge;
+          return {
+            content: [{
+              type: 'text' as const,
+              text: [`Grade: ${report.grade} (${report.score}%)`, '', 'Markdown:', badge.markdown, '', 'HTML:', badge.html].join('\n'),
+            }],
+          };
+        } catch (err: any) {
+          return { content: [{ type: 'text' as const, text: `Error: ${err.message}` }], isError: true };
+        }
+      },
+    );
+
+    server.tool(
+      'mcp_compliance_explain',
+      'Explain what a specific compliance test ID checks and why it matters.',
+      { testId: z.string().describe('The test ID to explain (e.g., "transport-post", "lifecycle-init", "tools-schema")') },
+      async ({ testId }) => {
+        const def = TEST_DEFINITIONS.find(t => t.id === testId);
+        if (!def) {
+          return {
+            content: [{ type: 'text' as const, text: `Unknown test ID: "${testId}"\n\nValid test IDs:\n${TEST_DEFINITIONS.map(t => t.id).join(', ')}` }],
+            isError: true,
+          };
+        }
+        return {
+          content: [{
+            type: 'text' as const,
+            text: [`Test: ${def.id}`, `Name: ${def.name}`, `Category: ${def.category}`, `Required: ${def.required ? 'Yes' : 'No'}`, `Spec reference: https://modelcontextprotocol.io/specification/2025-11-25/${def.specRef}`, '', def.description].join('\n'),
+          }],
+        };
+      },
+    );
+
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
   });
 
 program.parse();

@@ -1,4 +1,5 @@
 import { request } from 'undici';
+import { createRequire } from 'node:module';
 import type { TestResult, ComplianceReport } from './types.js';
 import { computeScore } from './grader.js';
 import { generateBadge } from './badge.js';
@@ -8,53 +9,73 @@ export { TEST_DEFINITIONS } from './types.js';
 export { computeGrade, computeScore } from './grader.js';
 export { generateBadge } from './badge.js';
 
+const _require = createRequire(import.meta.url);
+const { version: TOOL_VERSION } = _require('../package.json');
+
 const SPEC_VERSION = '2025-11-25';
 const SPEC_BASE = `https://modelcontextprotocol.io/specification/${SPEC_VERSION}`;
 
-function createIdCounter() {
-  let id = 0;
+const VALID_CONTENT_TYPES = ['text', 'image', 'audio', 'resource', 'resource_link'];
+
+function createIdCounter(start = 0) {
+  let id = start;
   return () => ++id;
 }
 
 /**
  * Parse SSE (text/event-stream) response body.
- * Extracts the last complete JSON-RPC response from "data: " lines.
+ * Handles multi-line data fields per the SSE specification:
+ * consecutive "data:" lines are concatenated with "\n".
+ * An empty line marks the end of an event.
  */
 function parseSSEResponse(text: string): any {
   const lines = text.split('\n');
   let lastJsonRpcResponse: any = null;
+  let currentData: string[] = [];
 
-  for (const line of lines) {
-    if (line.startsWith('data: ')) {
-      const data = line.slice(6).trim();
-      if (!data) continue;
-      try {
-        const parsed = JSON.parse(data);
-        // Keep the last complete JSON-RPC response (has id + result/error)
-        if (parsed.jsonrpc === '2.0' && parsed.id !== undefined) {
-          lastJsonRpcResponse = parsed;
-        }
-      } catch {
-        // Not valid JSON, skip
+  function flushEvent() {
+    if (currentData.length === 0) return;
+    const data = currentData.join('\n');
+    currentData = [];
+    if (!data.trim()) return;
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed.jsonrpc === '2.0' && parsed.id !== undefined) {
+        lastJsonRpcResponse = parsed;
       }
+    } catch {
+      // Not valid JSON, skip
     }
   }
+
+  for (const line of lines) {
+    if (line.startsWith('data:')) {
+      const content = line.slice(5);
+      currentData.push(content.startsWith(' ') ? content.slice(1) : content);
+    } else if (line.trim() === '') {
+      flushEvent();
+    }
+    // Ignore other fields: event:, id:, retry:, and comments starting with ":"
+  }
+
+  // Handle trailing data without final empty line
+  flushEvent();
 
   return lastJsonRpcResponse;
 }
 
-const _defaultNextId = createIdCounter();
-
 async function mcpRequest(
   backendUrl: string,
   method: string,
-  params?: unknown,
-  nextId: () => number = _defaultNextId,
-  extraHeaders?: Record<string, string>,
+  params: unknown | undefined,
+  nextId: () => number,
+  extraHeaders: Record<string, string> | undefined,
+  timeout: number,
 ): Promise<{
   statusCode: number;
   body: any;
   headers: Record<string, string>;
+  requestId: number;
 }> {
   const id = nextId();
   const body = JSON.stringify({
@@ -74,7 +95,7 @@ async function mcpRequest(
     method: 'POST',
     headers,
     body,
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(timeout),
   });
 
   const text = await res.body.text();
@@ -83,45 +104,51 @@ async function mcpRequest(
     if (typeof v === 'string') responseHeaders[k] = v;
   }
 
-  // Check Content-Type to decide how to parse the response
   const contentType = (responseHeaders['content-type'] || '').toLowerCase();
 
   if (contentType.includes('text/event-stream')) {
     const parsed = parseSSEResponse(text);
     if (parsed) {
-      return { statusCode: res.statusCode, body: parsed, headers: responseHeaders };
+      return { statusCode: res.statusCode, body: parsed, headers: responseHeaders, requestId: id };
     }
-    // Fallback: try plain JSON parse
     try {
-      return { statusCode: res.statusCode, body: JSON.parse(text), headers: responseHeaders };
+      return { statusCode: res.statusCode, body: JSON.parse(text), headers: responseHeaders, requestId: id };
     } catch {
-      return { statusCode: res.statusCode, body: { _raw: text }, headers: responseHeaders };
+      return { statusCode: res.statusCode, body: { _raw: text }, headers: responseHeaders, requestId: id };
     }
   }
 
   try {
-    return { statusCode: res.statusCode, body: JSON.parse(text), headers: responseHeaders };
+    return { statusCode: res.statusCode, body: JSON.parse(text), headers: responseHeaders, requestId: id };
   } catch {
-    return { statusCode: res.statusCode, body: { _raw: text }, headers: responseHeaders };
+    return { statusCode: res.statusCode, body: { _raw: text }, headers: responseHeaders, requestId: id };
   }
 }
 
 async function mcpNotification(
   backendUrl: string,
   method: string,
-  params?: unknown,
-  extraHeaders?: Record<string, string>,
-): Promise<void> {
+  params: unknown | undefined,
+  extraHeaders: Record<string, string> | undefined,
+  timeout: number,
+): Promise<{ statusCode: number; headers: Record<string, string> }> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    'Accept': 'application/json, text/event-stream',
     ...extraHeaders,
   };
-  await request(backendUrl, {
+  const res = await request(backendUrl, {
     method: 'POST',
     headers,
     body: JSON.stringify({ jsonrpc: '2.0', method, ...(params ? { params } : {}) }),
-    signal: AbortSignal.timeout(5000),
-  }).then(r => r.body.text()).catch(() => {});
+    signal: AbortSignal.timeout(timeout),
+  });
+  await res.body.text();
+  const responseHeaders: Record<string, string> = {};
+  for (const [k, v] of Object.entries(res.headers)) {
+    if (typeof v === 'string') responseHeaders[k] = v;
+  }
+  return { statusCode: res.statusCode, headers: responseHeaders };
 }
 
 export interface RunOptions {
@@ -129,13 +156,20 @@ export interface RunOptions {
   onProgress?: (testId: string, passed: boolean, details: string) => void;
   /** Extra headers to include on all requests */
   headers?: Record<string, string>;
+  /** Request timeout in milliseconds (default: 15000) */
+  timeout?: number;
+  /** Number of retries for failed tests (default: 0) */
+  retries?: number;
+  /** Only run tests matching these category names or test IDs */
+  only?: string[];
+  /** Skip tests matching these category names or test IDs */
+  skip?: string[];
 }
 
 /**
  * Run the full MCP compliance test suite against a URL.
  */
 export async function runComplianceSuite(url: string, options: RunOptions = {}): Promise<ComplianceReport> {
-  // Validate URL
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -149,9 +183,13 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
 
   const backendUrl = url;
   const tests: TestResult[] = [];
-  const nextId = createIdCounter();
+  const warnings: string[] = [];
+  // Use high start offset for the main ID counter to avoid collision with transport test hardcoded IDs
+  const nextId = createIdCounter(1000);
+  const timeout = options.timeout || 15000;
+  const retries = options.retries || 0;
 
-  // Session state: MCP-Session-Id and negotiated protocol version
+  // Session state
   let sessionId: string | null = null;
   let negotiatedProtocolVersion: string | null = null;
   const userHeaders = options.headers || {};
@@ -164,7 +202,17 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   }
 
   const rpc = (method: string, params?: unknown) =>
-    mcpRequest(backendUrl, method, params, nextId, buildHeaders());
+    mcpRequest(backendUrl, method, params, nextId, buildHeaders(), timeout);
+
+  function shouldRun(id: string, category: string): boolean {
+    if (options.only && options.only.length > 0) {
+      return options.only.includes(category) || options.only.includes(id);
+    }
+    if (options.skip && options.skip.length > 0) {
+      return !options.skip.includes(category) && !options.skip.includes(id);
+    }
+    return true;
+  }
 
   let serverInfo = {
     protocolVersion: null as string | null,
@@ -175,7 +223,9 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   let toolCount = 0;
   let toolNames: string[] = [];
   let resourceCount = 0;
+  let resourceNames: string[] = [];
   let promptCount = 0;
+  let promptNames: string[] = [];
 
   async function test(
     id: string,
@@ -185,37 +235,40 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     specRef: string,
     fn: () => Promise<{ passed: boolean; details: string }>,
   ): Promise<void> {
+    if (!shouldRun(id, category)) return;
+
     const start = Date.now();
-    try {
-      const result = await fn();
-      tests.push({
-        id, name, category, required,
-        passed: result.passed,
-        details: result.details,
-        durationMs: Date.now() - start,
-        specRef: `${SPEC_BASE}/${specRef}`,
-      });
-      options.onProgress?.(id, result.passed, result.details);
-    } catch (err: any) {
-      tests.push({
-        id, name, category, required,
-        passed: false,
-        details: `Error: ${err.message}`,
-        durationMs: Date.now() - start,
-        specRef: `${SPEC_BASE}/${specRef}`,
-      });
-      options.onProgress?.(id, false, `Error: ${err.message}`);
+    let lastResult = { passed: false, details: '' };
+
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        lastResult = await fn();
+        if (lastResult.passed) break;
+        if (attempt < retries) await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      } catch (err: any) {
+        lastResult = { passed: false, details: `Error: ${err.message}` };
+        if (attempt < retries) await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      }
     }
+
+    tests.push({
+      id, name, category, required,
+      passed: lastResult.passed,
+      details: lastResult.details,
+      durationMs: Date.now() - start,
+      specRef: `${SPEC_BASE}/${specRef}`,
+    });
+    options.onProgress?.(id, lastResult.passed, lastResult.details);
   }
 
-  // ── 1. TRANSPORT ──────────────────────────────────────────────────
+  // ── 1. TRANSPORT (basic, pre-init) ───────────────────────────────
 
   await test('transport-post', 'HTTP POST accepted', 'transport', true, 'basic/transports#streamable-http', async () => {
     const res = await request(backendUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', ...userHeaders },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
-      signal: AbortSignal.timeout(10000),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 99901, method: 'ping' }),
+      signal: AbortSignal.timeout(timeout),
     });
     await res.body.text();
     const passed = res.statusCode >= 200 && res.statusCode < 300;
@@ -227,8 +280,8 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     const res = await request(backendUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', ...userHeaders },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
-      signal: AbortSignal.timeout(10000),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 99902, method: 'ping' }),
+      signal: AbortSignal.timeout(timeout),
     });
     await res.body.text();
     const rawCt = res.headers['content-type'];
@@ -237,30 +290,108 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     return { passed: valid, details: `Content-Type: ${ct}` };
   });
 
-  // ── 2. LIFECYCLE: Initialize ──────────────────────────────────────
+  await test('transport-get', 'GET returns SSE stream or 405', 'transport', false, 'basic/transports#streamable-http', async () => {
+    const res = await request(backendUrl, {
+      method: 'GET',
+      headers: { 'Accept': 'text/event-stream', ...userHeaders },
+      signal: AbortSignal.timeout(timeout),
+    });
+    await res.body.text();
+    const ct = ((res.headers['content-type'] as string) || '').toLowerCase();
+    if (res.statusCode === 405) {
+      return { passed: true, details: 'HTTP 405 Method Not Allowed (acceptable)' };
+    }
+    if (ct.includes('text/event-stream')) {
+      return { passed: true, details: 'Returns text/event-stream for SSE' };
+    }
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      return { passed: true, details: `HTTP ${res.statusCode} (accepted)` };
+    }
+    return { passed: false, details: `HTTP ${res.statusCode}, Content-Type: ${ct}` };
+  });
+
+  await test('transport-delete', 'DELETE accepted or returns 405', 'transport', false, 'basic/transports#streamable-http', async () => {
+    const res = await request(backendUrl, {
+      method: 'DELETE',
+      headers: { ...userHeaders },
+      signal: AbortSignal.timeout(timeout),
+    });
+    await res.body.text();
+    if (res.statusCode === 405) {
+      return { passed: true, details: 'HTTP 405 Method Not Allowed (acceptable)' };
+    }
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      return { passed: true, details: `HTTP ${res.statusCode} (session termination supported)` };
+    }
+    // 400/404 are also acceptable (no active session)
+    if (res.statusCode === 400 || res.statusCode === 404) {
+      return { passed: true, details: `HTTP ${res.statusCode} (no active session, acceptable)` };
+    }
+    return { passed: false, details: `HTTP ${res.statusCode}` };
+  });
+
+  await test('transport-batch-reject', 'Rejects JSON-RPC batch requests', 'transport', true, 'basic/transports#streamable-http', async () => {
+    const res = await request(backendUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', ...userHeaders },
+      body: JSON.stringify([
+        { jsonrpc: '2.0', id: 99903, method: 'ping' },
+        { jsonrpc: '2.0', id: 99904, method: 'ping' },
+      ]),
+      signal: AbortSignal.timeout(timeout),
+    });
+    const text = await res.body.text();
+    // Server should reject batch with error or 4xx
+    if (res.statusCode >= 400 && res.statusCode < 500) {
+      return { passed: true, details: `HTTP ${res.statusCode} (batch rejected)` };
+    }
+    try {
+      const body = JSON.parse(text);
+      if (body?.error) {
+        return { passed: true, details: `JSON-RPC error: ${body.error.code} — ${body.error.message}` };
+      }
+      // If server returned a batch response (array), that's a failure
+      if (Array.isArray(body)) {
+        return { passed: false, details: 'Server processed batch request (MCP forbids batch)' };
+      }
+    } catch {}
+    return { passed: false, details: `HTTP ${res.statusCode} — expected error or 4xx for batch request` };
+  });
+
+  // ── 2. LIFECYCLE SETUP (always runs) ─────────────────────────────
 
   let initRes: any = null;
-
-  await test('lifecycle-init', 'Initialize handshake', 'lifecycle', true, 'basic/lifecycle#initialization', async () => {
+  try {
     initRes = await rpc('initialize', {
       protocolVersion: SPEC_VERSION,
       capabilities: { roots: { listChanged: true }, sampling: {} },
-      clientInfo: { name: 'mcp-compliance', version: '1.0.0' },
+      clientInfo: { name: 'mcp-compliance', version: TOOL_VERSION },
     });
+    const result = initRes?.body?.result;
+    if (result) {
+      serverInfo.protocolVersion = result.protocolVersion || null;
+      serverInfo.name = result.serverInfo?.name || null;
+      serverInfo.version = result.serverInfo?.version || null;
+      serverInfo.capabilities = result.capabilities || {};
+      const sid = initRes.headers['mcp-session-id'];
+      if (sid) sessionId = sid;
+      if (result.protocolVersion) negotiatedProtocolVersion = result.protocolVersion;
+    }
+  } catch (err: any) {
+    // Init failed — lifecycle tests will report the failure
+  }
+
+  // Send initialized notification (always, for session setup)
+  try {
+    await mcpNotification(backendUrl, 'notifications/initialized', undefined, buildHeaders(), timeout);
+  } catch {}
+
+  // ── 3. LIFECYCLE TESTS ───────────────────────────────────────────
+
+  await test('lifecycle-init', 'Initialize handshake', 'lifecycle', true, 'basic/lifecycle#initialization', async () => {
+    if (!initRes) return { passed: false, details: 'Initialize request failed' };
     const result = initRes.body?.result;
     if (!result) return { passed: false, details: 'No result in response' };
-    serverInfo.protocolVersion = result.protocolVersion || null;
-    serverInfo.name = result.serverInfo?.name || null;
-    serverInfo.version = result.serverInfo?.version || null;
-    serverInfo.capabilities = result.capabilities || {};
-
-    // Capture MCP-Session-Id from response headers (spec: clients MUST include on subsequent requests)
-    const sid = initRes.headers['mcp-session-id'];
-    if (sid) sessionId = sid;
-
-    // Capture negotiated protocol version (spec: clients MUST send MCP-Protocol-Version on subsequent requests)
-    if (result.protocolVersion) negotiatedProtocolVersion = result.protocolVersion;
-
     return { passed: !!result.protocolVersion, details: `Protocol: ${result.protocolVersion || 'missing'}` };
   });
 
@@ -268,6 +399,9 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     const version = initRes?.body?.result?.protocolVersion;
     if (!version) return { passed: false, details: 'No protocolVersion' };
     const valid = /^\d{4}-\d{2}-\d{2}$/.test(version);
+    if (valid && version !== SPEC_VERSION) {
+      warnings.push(`Server negotiated protocol version ${version} (latest is ${SPEC_VERSION})`);
+    }
     return { passed: valid, details: `Version: ${version}` };
   });
 
@@ -289,11 +423,6 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     return { passed: valid, details: valid ? 'Valid JSON-RPC 2.0 response' : `Missing fields: jsonrpc=${body?.jsonrpc}, id=${body?.id}` };
   });
 
-  // Send initialized notification (include session headers)
-  await mcpNotification(backendUrl, 'notifications/initialized', undefined, buildHeaders());
-
-  // ── 2b. LIFECYCLE: Ping ───────────────────────────────────────────
-
   await test('lifecycle-ping', 'Responds to ping', 'lifecycle', true, 'basic/utilities#ping', async () => {
     const res = await rpc('ping');
     const body = res.body;
@@ -302,11 +431,107 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     return { passed: false, details: 'No result in ping response' };
   });
 
-  // ── 3. TOOLS ──────────────────────────────────────────────────────
+  await test('lifecycle-instructions', 'Instructions field is valid', 'lifecycle', false, 'basic/lifecycle#initialization', async () => {
+    const result = initRes?.body?.result;
+    if (!result) return { passed: false, details: 'No init result' };
+    if (result.instructions === undefined) {
+      return { passed: true, details: 'No instructions field (optional)' };
+    }
+    if (typeof result.instructions === 'string') {
+      const preview = result.instructions.length > 80 ? result.instructions.slice(0, 80) + '...' : result.instructions;
+      return { passed: true, details: `Instructions: "${preview}"` };
+    }
+    return { passed: false, details: `instructions should be a string, got ${typeof result.instructions}` };
+  });
+
+  await test('lifecycle-id-match', 'Response ID matches request ID', 'lifecycle', true, 'basic', async () => {
+    const res = await rpc('ping');
+    const body = res.body;
+    if (body?.id === undefined) return { passed: false, details: 'No id in response' };
+    const match = body.id === res.requestId;
+    return { passed: match, details: match ? `Request id=${res.requestId}, response id=${body.id} (match)` : `Request id=${res.requestId}, response id=${body.id} (MISMATCH)` };
+  });
+
+  // Logging capability test
+  const hasLogging = !!serverInfo.capabilities.logging;
+  await test('lifecycle-logging', 'logging/setLevel accepted', 'lifecycle', hasLogging, 'server/utilities#logging', async () => {
+    if (!hasLogging) return { passed: true, details: 'Server does not declare logging capability (skipped)' };
+    const res = await rpc('logging/setLevel', { level: 'info' });
+    if (res.body?.error) {
+      return { passed: false, details: `Error: ${res.body.error.code} — ${res.body.error.message}` };
+    }
+    return { passed: true, details: 'logging/setLevel accepted' };
+  });
+
+  // Completions capability test
+  const hasCompletions = !!serverInfo.capabilities.completions;
+  await test('lifecycle-completions', 'completion/complete accepted', 'lifecycle', hasCompletions, 'server/utilities#completion', async () => {
+    if (!hasCompletions) return { passed: true, details: 'Server does not declare completions capability (skipped)' };
+    const res = await rpc('completion/complete', {
+      ref: { type: 'ref/prompt', name: '__test__' },
+      argument: { name: 'test', value: '' },
+    });
+    if (res.body?.error) {
+      // -32602 (invalid params) is acceptable — the prompt doesn't exist
+      if (res.body.error.code === -32602) {
+        return { passed: true, details: 'InvalidParams for test ref (acceptable)' };
+      }
+      return { passed: false, details: `Error: ${res.body.error.code} — ${res.body.error.message}` };
+    }
+    const values = res.body?.result?.completion?.values;
+    if (Array.isArray(values)) {
+      return { passed: true, details: `Returned ${values.length} completion(s)` };
+    }
+    return { passed: true, details: 'completion/complete accepted' };
+  });
+
+  // ── 4. TRANSPORT (session-dependent, post-init) ──────────────────
+
+  await test('transport-notification-202', 'Notification returns 202 Accepted', 'transport', false, 'basic/transports#streamable-http', async () => {
+    const res = await request(backendUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        ...buildHeaders(),
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'nonexistent', reason: 'compliance test' } }),
+      signal: AbortSignal.timeout(timeout),
+    });
+    await res.body.text();
+    if (res.statusCode === 202) {
+      return { passed: true, details: 'HTTP 202 Accepted (correct)' };
+    }
+    // Some servers return 200 or 204 for notifications — acceptable but not ideal
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      return { passed: true, details: `HTTP ${res.statusCode} (accepted, but 202 is preferred)` };
+    }
+    return { passed: false, details: `HTTP ${res.statusCode} — expected 202 Accepted for notifications` };
+  });
+
+  await test('transport-session-id', 'Enforces MCP-Session-Id after init', 'transport', false, 'basic/transports#streamable-http', async () => {
+    if (!sessionId) {
+      warnings.push('Server did not issue MCP-Session-Id header');
+      return { passed: true, details: 'Server did not issue session ID (test not applicable)' };
+    }
+    // Send a request WITHOUT the session ID
+    const headersWithout: Record<string, string> = { ...userHeaders };
+    if (negotiatedProtocolVersion) headersWithout['mcp-protocol-version'] = negotiatedProtocolVersion;
+    // Explicitly do NOT include mcp-session-id
+    const res = await mcpRequest(backendUrl, 'ping', undefined, createIdCounter(99910), headersWithout, timeout);
+    if (res.statusCode === 400) {
+      return { passed: true, details: 'HTTP 400 for missing session ID (correct)' };
+    }
+    // Some servers may accept the request anyway (lenient)
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      return { passed: false, details: `HTTP ${res.statusCode} — server should return 400 when session ID is missing` };
+    }
+    return { passed: false, details: `HTTP ${res.statusCode}` };
+  });
+
+  // ── 5. TOOLS ─────────────────────────────────────────────────────
 
   const hasTools = !!serverInfo.capabilities.tools;
-
-  // Cache for list results to avoid duplicate rpc calls
   let cachedToolsList: any[] | null = null;
 
   await test('tools-list', 'tools/list returns valid response', 'tools', hasTools, 'server/tools#listing-tools', async () => {
@@ -319,16 +544,16 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     return { passed: true, details: `${toolCount} tool(s): ${toolNames.slice(0, 5).join(', ')}${toolCount > 5 ? '...' : ''}` };
   });
 
+  // Schema tests for tools
   await test('tools-schema', 'All tools have name and inputSchema', 'schema', hasTools, 'server/tools#data-types', async () => {
     const tools = cachedToolsList ?? (await rpc('tools/list')).body?.result?.tools ?? [];
     const issues: string[] = [];
-    const warnings: string[] = [];
     for (const tool of tools) {
       if (!tool.name) { issues.push('Tool missing name'); continue; }
       if (tool.name.length > 128 || !/^[A-Za-z0-9_.\-]+$/.test(tool.name)) {
         issues.push(`${tool.name}: name format invalid`);
       }
-      if (!tool.description) warnings.push(`${tool.name}: missing description`);
+      if (!tool.description) warnings.push(`Tool "${tool.name}" missing description`);
       if (!tool.inputSchema) {
         issues.push(`${tool.name}: missing inputSchema (required)`);
       } else if (typeof tool.inputSchema !== 'object' || tool.inputSchema === null) {
@@ -338,9 +563,71 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       }
     }
     const detail = issues.length === 0
-      ? (warnings.length > 0 ? `Schemas valid. Warnings: ${warnings.join('; ')}` : 'All tools have valid schemas')
+      ? 'All tools have valid schemas'
       : issues.join('; ');
     return { passed: issues.length === 0, details: detail };
+  });
+
+  await test('tools-annotations', 'Tool annotations are valid', 'schema', false, 'server/tools#annotations', async () => {
+    const tools = cachedToolsList ?? (await rpc('tools/list')).body?.result?.tools ?? [];
+    if (tools.length === 0) return { passed: true, details: 'No tools to validate' };
+    const issues: string[] = [];
+    let annotatedCount = 0;
+    for (const tool of tools) {
+      const ann = tool.annotations;
+      if (!ann) continue;
+      annotatedCount++;
+      if (typeof ann !== 'object' || ann === null) {
+        issues.push(`${tool.name}: annotations must be an object`);
+        continue;
+      }
+      const boolFields = ['readOnlyHint', 'destructiveHint', 'idempotentHint', 'openWorldHint'];
+      for (const field of boolFields) {
+        if (ann[field] !== undefined && typeof ann[field] !== 'boolean') {
+          issues.push(`${tool.name}: annotations.${field} should be boolean, got ${typeof ann[field]}`);
+        }
+      }
+      if (ann.title !== undefined && typeof ann.title !== 'string') {
+        issues.push(`${tool.name}: annotations.title should be string`);
+      }
+    }
+    if (issues.length > 0) return { passed: false, details: issues.join('; ') };
+    return { passed: true, details: annotatedCount > 0 ? `${annotatedCount} tool(s) with valid annotations` : 'No tools have annotations (optional)' };
+  });
+
+  await test('tools-title-field', 'Tools include title field', 'schema', false, 'server/tools#data-types', async () => {
+    const tools = cachedToolsList ?? (await rpc('tools/list')).body?.result?.tools ?? [];
+    if (tools.length === 0) return { passed: true, details: 'No tools to validate' };
+    const withTitle = tools.filter((t: any) => typeof t.title === 'string');
+    const issues: string[] = [];
+    for (const tool of tools) {
+      if (tool.title !== undefined && typeof tool.title !== 'string') {
+        issues.push(`${tool.name}: title should be a string`);
+      }
+    }
+    if (issues.length > 0) return { passed: false, details: issues.join('; ') };
+    if (withTitle.length === 0) {
+      return { passed: true, details: 'No tools have title field (optional, added in 2025-11-25)' };
+    }
+    return { passed: true, details: `${withTitle.length}/${tools.length} tool(s) have title field` };
+  });
+
+  await test('tools-output-schema', 'Tools with outputSchema are valid', 'schema', false, 'server/tools#structured-content', async () => {
+    const tools = cachedToolsList ?? (await rpc('tools/list')).body?.result?.tools ?? [];
+    if (tools.length === 0) return { passed: true, details: 'No tools to validate' };
+    const issues: string[] = [];
+    let withSchema = 0;
+    for (const tool of tools) {
+      if (tool.outputSchema === undefined) continue;
+      withSchema++;
+      if (typeof tool.outputSchema !== 'object' || tool.outputSchema === null) {
+        issues.push(`${tool.name}: outputSchema must be a JSON Schema object`);
+      } else if (tool.outputSchema.type !== 'object') {
+        issues.push(`${tool.name}: outputSchema.type must be "object" (got "${tool.outputSchema.type || 'undefined'}")`);
+      }
+    }
+    if (issues.length > 0) return { passed: false, details: issues.join('; ') };
+    return { passed: true, details: withSchema > 0 ? `${withSchema} tool(s) with valid outputSchema` : 'No tools have outputSchema (optional)' };
   });
 
   if (toolNames.length > 0) {
@@ -366,6 +653,56 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       return { passed: false, details: 'Response missing content array' };
     });
 
+    await test('tools-content-types', 'Tool content items have valid types', 'tools', false, 'server/tools#calling-tools', async () => {
+      const res = await rpc('tools/call', { name: toolNames[0], arguments: {} });
+      const result = res.body?.result;
+      const error = res.body?.error;
+      if (error) {
+        return { passed: true, details: `Tool returned error (content types not applicable): code ${error.code}` };
+      }
+      const content = result?.content;
+      if (!Array.isArray(content) || content.length === 0) {
+        return { passed: true, details: 'No content items to validate' };
+      }
+      const issues: string[] = [];
+      const types = new Set<string>();
+      for (const item of content) {
+        if (!item.type) {
+          issues.push('Content item missing type field');
+        } else if (!VALID_CONTENT_TYPES.includes(item.type)) {
+          issues.push(`Unknown content type: "${item.type}"`);
+        } else {
+          types.add(item.type);
+        }
+      }
+      if (issues.length > 0) return { passed: false, details: issues.join('; ') };
+      return { passed: true, details: `Content types: ${[...types].join(', ')}` };
+    });
+  }
+
+  // Pagination test for tools
+  if (hasTools) {
+    await test('tools-pagination', 'tools/list supports pagination', 'tools', false, 'server/tools#listing-tools', async () => {
+      const res = await rpc('tools/list');
+      const result = res.body?.result;
+      if (!result) return { passed: false, details: 'No result from tools/list' };
+      if (!Array.isArray(result.tools)) return { passed: false, details: 'No tools array' };
+      if (result.nextCursor !== undefined) {
+        if (typeof result.nextCursor !== 'string') {
+          return { passed: false, details: `nextCursor should be string, got ${typeof result.nextCursor}` };
+        }
+        // Try fetching next page
+        const nextRes = await rpc('tools/list', { cursor: result.nextCursor });
+        const nextResult = nextRes.body?.result;
+        if (!nextResult || !Array.isArray(nextResult.tools)) {
+          return { passed: false, details: 'Next page failed to return tools array' };
+        }
+        return { passed: true, details: `Pagination works: page 1 had ${result.tools.length} tools, page 2 had ${nextResult.tools.length} tools` };
+      }
+      return { passed: true, details: `${result.tools.length} tool(s), no nextCursor (single page)` };
+    });
+
+    // tools-call-unknown moved outside toolNames guard so it runs for all tools-capable servers
     await test('tools-call-unknown', 'Returns error for unknown tool name', 'errors', false, 'server/tools#error-handling', async () => {
       const res = await rpc('tools/call', { name: '__nonexistent_tool_compliance_test__', arguments: {} });
       const error = res.body?.error;
@@ -376,9 +713,10 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     });
   }
 
-  // ── 4. RESOURCES ──────────────────────────────────────────────────
+  // ── 6. RESOURCES ─────────────────────────────────────────────────
 
   const hasResources = !!serverInfo.capabilities.resources;
+  const hasSubscribe = !!(serverInfo.capabilities.resources as any)?.subscribe;
 
   if (hasResources) {
     let cachedResourcesList: any[] | null = null;
@@ -389,6 +727,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       if (!Array.isArray(resources)) return { passed: false, details: 'No resources array' };
       cachedResourcesList = resources;
       resourceCount = resources.length;
+      resourceNames = resources.map((r: any) => r.name).filter(Boolean);
       return { passed: true, details: `${resourceCount} resource(s)` };
     });
 
@@ -401,14 +740,17 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
           try { new URL(r.uri); } catch { issues.push(`${r.uri}: invalid URI format`); }
         }
         if (!r.name) issues.push(`${r.uri || '?'}: missing name`);
+        if (!r.description) warnings.push(`Resource "${r.name || r.uri}" missing description`);
+        if (!r.mimeType) warnings.push(`Resource "${r.name || r.uri}" missing mimeType`);
       }
       return { passed: issues.length === 0, details: issues.length === 0 ? 'All resources valid' : issues.join('; ') };
     });
 
     if (resourceCount > 0) {
       await test('resources-read', 'resources/read returns content', 'resources', false, 'server/resources#reading-resources', async () => {
-        const listRes = await rpc('resources/list');
-        const firstUri = listRes.body?.result?.resources?.[0]?.uri;
+        // Use cached list instead of re-fetching
+        const resources = cachedResourcesList ?? (await rpc('resources/list')).body?.result?.resources ?? [];
+        const firstUri = resources[0]?.uri;
         if (!firstUri) return { passed: false, details: 'No resource URI to test' };
         const readRes = await rpc('resources/read', { uri: firstUri });
         const contents = readRes.body?.result?.contents;
@@ -440,14 +782,54 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       if (issues.length > 0) return { passed: false, details: issues.join('; ') };
       return { passed: true, details: `${templates.length} resource template(s)` };
     });
+
+    await test('resources-pagination', 'resources/list supports pagination', 'resources', false, 'server/resources#listing-resources', async () => {
+      const res = await rpc('resources/list');
+      const result = res.body?.result;
+      if (!result) return { passed: false, details: 'No result from resources/list' };
+      if (!Array.isArray(result.resources)) return { passed: false, details: 'No resources array' };
+      if (result.nextCursor !== undefined) {
+        if (typeof result.nextCursor !== 'string') {
+          return { passed: false, details: `nextCursor should be string, got ${typeof result.nextCursor}` };
+        }
+        const nextRes = await rpc('resources/list', { cursor: result.nextCursor });
+        const nextResult = nextRes.body?.result;
+        if (!nextResult || !Array.isArray(nextResult.resources)) {
+          return { passed: false, details: 'Next page failed to return resources array' };
+        }
+        return { passed: true, details: `Pagination works: page 1 had ${result.resources.length}, page 2 had ${nextResult.resources.length}` };
+      }
+      return { passed: true, details: `${result.resources.length} resource(s), no nextCursor (single page)` };
+    });
+
+    if (hasSubscribe && resourceCount > 0) {
+      await test('resources-subscribe', 'Resource subscribe/unsubscribe', 'resources', true, 'server/resources#subscriptions', async () => {
+        const resources = cachedResourcesList ?? (await rpc('resources/list')).body?.result?.resources ?? [];
+        const firstUri = resources[0]?.uri;
+        if (!firstUri) return { passed: false, details: 'No resource URI for subscribe test' };
+
+        // Subscribe
+        const subRes = await rpc('resources/subscribe', { uri: firstUri });
+        if (subRes.body?.error) {
+          return { passed: false, details: `Subscribe error: ${subRes.body.error.code} — ${subRes.body.error.message}` };
+        }
+
+        // Unsubscribe
+        const unsubRes = await rpc('resources/unsubscribe', { uri: firstUri });
+        if (unsubRes.body?.error) {
+          return { passed: false, details: `Unsubscribe error: ${unsubRes.body.error.code} — ${unsubRes.body.error.message}` };
+        }
+
+        return { passed: true, details: `Subscribe/unsubscribe for ${firstUri} succeeded` };
+      });
+    }
   }
 
-  // ── 5. PROMPTS ────────────────────────────────────────────────────
+  // ── 7. PROMPTS ───────────────────────────────────────────────────
 
   const hasPrompts = !!serverInfo.capabilities.prompts;
 
   if (hasPrompts) {
-    let promptNames: string[] = [];
     let cachedPromptsList: any[] | null = null;
 
     await test('prompts-list', 'prompts/list returns valid response', 'prompts', true, 'server/prompts#listing-prompts', async () => {
@@ -465,6 +847,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       const issues: string[] = [];
       for (const p of prompts) {
         if (!p.name) issues.push('Prompt missing name');
+        if (!p.description) warnings.push(`Prompt "${p.name || '?'}" missing description`);
         if (p.arguments && !Array.isArray(p.arguments)) issues.push(`${p.name || '?'}: arguments must be an array`);
         if (Array.isArray(p.arguments)) {
           for (const arg of p.arguments) {
@@ -491,9 +874,28 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         return { passed: true, details: `${messages.length} message(s) from ${promptNames[0]}` };
       });
     }
+
+    await test('prompts-pagination', 'prompts/list supports pagination', 'prompts', false, 'server/prompts#listing-prompts', async () => {
+      const res = await rpc('prompts/list');
+      const result = res.body?.result;
+      if (!result) return { passed: false, details: 'No result from prompts/list' };
+      if (!Array.isArray(result.prompts)) return { passed: false, details: 'No prompts array' };
+      if (result.nextCursor !== undefined) {
+        if (typeof result.nextCursor !== 'string') {
+          return { passed: false, details: `nextCursor should be string, got ${typeof result.nextCursor}` };
+        }
+        const nextRes = await rpc('prompts/list', { cursor: result.nextCursor });
+        const nextResult = nextRes.body?.result;
+        if (!nextResult || !Array.isArray(nextResult.prompts)) {
+          return { passed: false, details: 'Next page failed to return prompts array' };
+        }
+        return { passed: true, details: `Pagination works: page 1 had ${result.prompts.length}, page 2 had ${nextResult.prompts.length}` };
+      }
+      return { passed: true, details: `${result.prompts.length} prompt(s), no nextCursor (single page)` };
+    });
   }
 
-  // ── 6. ERROR HANDLING ─────────────────────────────────────────────
+  // ── 8. ERROR HANDLING ────────────────────────────────────────────
 
   await test('error-unknown-method', 'Returns JSON-RPC error for unknown method', 'errors', true, 'basic', async () => {
     const res = await rpc('nonexistent/method');
@@ -516,9 +918,9 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   await test('error-invalid-jsonrpc', 'Handles malformed JSON-RPC', 'errors', true, 'basic', async () => {
     const res = await request(backendUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...buildHeaders() },
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', ...buildHeaders() },
       body: JSON.stringify({ not: 'a valid jsonrpc message' }),
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(timeout),
     });
     const text = await res.body.text();
     try {
@@ -535,9 +937,9 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   await test('error-invalid-json', 'Handles invalid JSON body', 'errors', false, 'basic', async () => {
     const res = await request(backendUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...buildHeaders() },
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', ...buildHeaders() },
       body: '{this is not valid json!!!',
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(timeout),
     });
     const text = await res.body.text();
     try {
@@ -560,13 +962,60 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     return { passed: false, details: 'No error for tools/call without name' };
   });
 
-  // ── Compute score ─────────────────────────────────────────────────
+  await test('error-parse-code', 'Returns -32700 for invalid JSON', 'errors', false, 'basic', async () => {
+    const res = await request(backendUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', ...buildHeaders() },
+      body: '<<<not json>>>',
+      signal: AbortSignal.timeout(timeout),
+    });
+    const text = await res.body.text();
+    try {
+      const body = JSON.parse(text);
+      if (body?.error?.code === -32700) {
+        return { passed: true, details: `Error code: -32700 (Parse error) — ${body.error.message}` };
+      }
+      if (body?.error) {
+        return { passed: false, details: `Expected -32700, got ${body.error.code} — ${body.error.message}` };
+      }
+    } catch {}
+    if (res.statusCode >= 400 && res.statusCode < 500) {
+      return { passed: false, details: `HTTP ${res.statusCode} — server should return JSON-RPC error code -32700` };
+    }
+    return { passed: false, details: `HTTP ${res.statusCode} — expected error code -32700` };
+  });
+
+  await test('error-invalid-request-code', 'Returns -32600 for invalid request', 'errors', false, 'basic', async () => {
+    const res = await request(backendUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', ...buildHeaders() },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 99999 }),
+      signal: AbortSignal.timeout(timeout),
+    });
+    const text = await res.body.text();
+    try {
+      const body = JSON.parse(text);
+      if (body?.error?.code === -32600) {
+        return { passed: true, details: `Error code: -32600 (Invalid Request) — ${body.error.message}` };
+      }
+      if (body?.error) {
+        return { passed: false, details: `Expected -32600, got ${body.error.code} — ${body.error.message}` };
+      }
+    } catch {}
+    if (res.statusCode >= 400 && res.statusCode < 500) {
+      return { passed: false, details: `HTTP ${res.statusCode} — server should return JSON-RPC error code -32600` };
+    }
+    return { passed: false, details: `HTTP ${res.statusCode} — expected error code -32600` };
+  });
+
+  // ── Compute score ────────────────────────────────────────────────
 
   const { score, grade, overall, summary, categories } = computeScore(tests);
   const badge = generateBadge(url);
 
   return {
     specVersion: SPEC_VERSION,
+    toolVersion: TOOL_VERSION,
     url,
     timestamp: new Date().toISOString(),
     score,
@@ -575,11 +1024,14 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     summary,
     categories,
     tests,
+    warnings,
     serverInfo,
     toolCount,
     toolNames,
     resourceCount,
+    resourceNames,
     promptCount,
+    promptNames,
     badge,
   };
 }
