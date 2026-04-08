@@ -1,3 +1,13 @@
+import { createHash } from "node:crypto";
+
+/**
+ * Generate a short, deterministic hash of a URL for badge paths.
+ * Uses SHA-256 truncated to 12 hex chars (48 bits of entropy).
+ */
+function urlHash(url: string): string {
+  return createHash("sha256").update(url).digest("hex").slice(0, 12);
+}
+
 /**
  * Generate badge URLs and markdown for a compliance report.
  * Badge images are served by mcp.hosting.
@@ -8,19 +18,10 @@ export function generateBadge(url: string): {
   markdown: string;
   html: string;
 } {
-  // Extract a subdomain-like identifier from the URL
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    parsed = new URL("https://unknown");
-  }
+  const hash = urlHash(url);
 
-  // Use full URL (encoded) for the badge path, not just hostname
-  const encoded = encodeURIComponent(parsed.href);
-
-  const imageUrl = `https://mcp.hosting/api/compliance/${encoded}/badge`;
-  const reportUrl = `https://mcp.hosting/compliance/${encoded}`;
+  const imageUrl = `https://mcp.hosting/api/compliance/${hash}/badge`;
+  const reportUrl = `https://mcp.hosting/compliance/${hash}`;
 
   return {
     imageUrl,

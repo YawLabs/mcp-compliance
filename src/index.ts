@@ -19,6 +19,14 @@ function parseHeaderArg(value: string, prev: Record<string, string>): Record<str
   return prev;
 }
 
+function parsePositiveInt(value: string, name: string, min = 0): number {
+  const n = Number.parseInt(value, 10);
+  if (Number.isNaN(n) || n < min) {
+    throw new Error(`${name} must be an integer >= ${min}, got "${value}"`);
+  }
+  return n;
+}
+
 function parseList(value: string): string[] {
   return value
     .split(",")
@@ -40,8 +48,16 @@ program
   .option("--auth <token>", 'Shorthand for -H "Authorization: <token>"')
   .option("--timeout <ms>", "Request timeout in milliseconds", "15000")
   .option("--retries <n>", "Number of retries for failed tests", "0")
-  .option("--only <items>", "Only run tests matching these categories or test IDs (comma-separated)", parseList)
-  .option("--skip <items>", "Skip tests matching these categories or test IDs (comma-separated)", parseList)
+  .option(
+    "--only <items>",
+    'Only run matching categories or test IDs, comma-separated (e.g., "transport,lifecycle" or "transport-post,lifecycle-init")',
+    parseList,
+  )
+  .option(
+    "--skip <items>",
+    'Skip matching categories or test IDs, comma-separated (e.g., "schema" or "tools-pagination")',
+    parseList,
+  )
   .option("--verbose", "Print each test result as it runs")
   .action(
     async (
@@ -68,8 +84,8 @@ program
 
         const report = await runComplianceSuite(url, {
           headers,
-          timeout: Number.parseInt(opts.timeout, 10) || 15000,
-          retries: Number.parseInt(opts.retries, 10) || 0,
+          timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
+          retries: parsePositiveInt(opts.retries, "--retries"),
           only: opts.only,
           skip: opts.skip,
           onProgress: opts.verbose
@@ -95,11 +111,12 @@ program
         if (opts.strict && report.overall === "fail") {
           process.exit(1);
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
         if (opts.format === "json" || opts.format === "sarif") {
-          console.error(JSON.stringify({ error: err.message }));
+          console.error(JSON.stringify({ error: message }));
         } else {
-          console.error(chalk.red(`\nError: ${err.message}\n`));
+          console.error(chalk.red(`\nError: ${message}\n`));
         }
         process.exit(1);
       }
@@ -122,14 +139,15 @@ program
 
       const report = await runComplianceSuite(url, {
         headers,
-        timeout: Number.parseInt(opts.timeout, 10) || 15000,
+        timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
       });
 
       console.log(`Grade: ${report.grade} (${report.score}%)\n`);
       console.log(report.badge.markdown);
       console.log("");
-    } catch (err: any) {
-      console.error(chalk.red(`\nError: ${err.message}\n`));
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(chalk.red(`\nError: ${message}\n`));
       process.exit(1);
     }
   });

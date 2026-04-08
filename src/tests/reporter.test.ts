@@ -310,6 +310,18 @@ describe("formatSarif", () => {
     expect(inv.properties.score).toBe(85);
   });
 
+  it("includes server context in invocation properties", () => {
+    const output = formatSarif(makeReport());
+    const parsed = JSON.parse(output);
+    const props = parsed.runs[0].invocations[0].properties;
+    expect(props.serverUrl).toBe("https://example.com/mcp");
+    expect(props.serverName).toBe("test-server");
+    expect(props.serverVersion).toBe("1.0.0");
+    expect(props.protocolVersion).toBe("2025-11-25");
+    expect(props.testsPassed).toBe(8);
+    expect(props.testsTotal).toBe(10);
+  });
+
   it("includes fix recommendations in result messages", () => {
     const output = formatSarif(
       makeReport({

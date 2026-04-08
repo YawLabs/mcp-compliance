@@ -1,4 +1,5 @@
 import chalk from "chalk";
+import { SPEC_BASE } from "./runner.js";
 import { TEST_DEFINITIONS } from "./types.js";
 import type { ComplianceReport, Grade, TestResult } from "./types.js";
 
@@ -159,8 +160,6 @@ export function formatJson(report: ComplianceReport): string {
  * Compatible with GitHub Code Scanning and other SARIF viewers.
  */
 export function formatSarif(report: ComplianceReport): string {
-  const SPEC_BASE = `https://modelcontextprotocol.io/specification/${report.specVersion}`;
-
   const rules = report.tests.map((t) => {
     const def = TEST_DEFINITIONS.find((d) => d.id === t.id);
     return {
@@ -225,6 +224,12 @@ export function formatSarif(report: ComplianceReport): string {
               score: report.score,
               overall: report.overall,
               specVersion: report.specVersion,
+              serverUrl: report.url,
+              serverName: report.serverInfo.name,
+              serverVersion: report.serverInfo.version,
+              protocolVersion: report.serverInfo.protocolVersion,
+              testsPassed: report.summary.passed,
+              testsTotal: report.summary.total,
             },
           },
         ],

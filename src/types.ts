@@ -62,9 +62,9 @@ export interface TestDefinition {
   recommendation: string;
 }
 
-/** All 43 test IDs with descriptions for the explain command */
+/** All 45 test IDs with descriptions for the explain command */
 export const TEST_DEFINITIONS: TestDefinition[] = [
-  // ── Transport (7 tests) ──────────────────────────────────────────
+  // ── Transport (8 tests) ──────────────────────────────────────────
   {
     id: "transport-post",
     name: "HTTP POST accepted",
@@ -143,7 +143,19 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Check if the parsed JSON body is an array. If so, return a JSON-RPC error or HTTP 400. Do not process batch requests — MCP explicitly forbids them.",
   },
 
-  // ── Lifecycle (10 tests) ─────────────────────────────────────────
+  {
+    id: "transport-content-type-init",
+    name: "Initialize response has valid content type",
+    category: "transport",
+    required: false,
+    specRef: "basic/transports#streamable-http",
+    description:
+      "Validates that the initialize response uses application/json or text/event-stream content type. Some servers return other types for the handshake.",
+    recommendation:
+      'Ensure the initialize response uses Content-Type "application/json" or "text/event-stream". Do not return text/html or other types for JSON-RPC responses.',
+  },
+
+  // ── Lifecycle (11 tests) ─────────────────────────────────────────
   {
     id: "lifecycle-init",
     name: "Initialize handshake",
@@ -253,6 +265,18 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "If the server declares completions capability, tests that the completion/complete method is accepted.",
     recommendation:
       'If you declare completions in capabilities, implement the "completion/complete" handler. Return a completion object with a values array, even if empty.',
+  },
+
+  {
+    id: "lifecycle-cancellation",
+    name: "Handles cancellation notifications",
+    category: "lifecycle",
+    required: false,
+    specRef: "basic/utilities#cancellation",
+    description:
+      "Tests that the server accepts notifications/cancelled without error. Servers should gracefully handle cancellation of unknown or completed requests.",
+    recommendation:
+      "Accept notifications/cancelled and stop any in-progress work for the referenced requestId. If the request is unknown or already complete, silently ignore the cancellation.",
   },
 
   // ── Tools (4 tests) ──────────────────────────────────────────────

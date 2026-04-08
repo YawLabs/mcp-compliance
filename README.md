@@ -15,7 +15,7 @@ MCP servers are multiplying fast — but most ship without compliance testing. B
 
 This tool solves that:
 
-- **43 tests across 7 categories** — transport, lifecycle, tools, resources, prompts, error handling, and schema validation. No gaps.
+- **45 tests across 7 categories** — transport, lifecycle, tools, resources, prompts, error handling, and schema validation. No gaps.
 - **Capability-driven** — tests adapt to what the server declares. If it says it supports tools, tool tests become required. No false failures for features the server doesn't claim.
 - **Graded scoring** — A-F letter grade with a weighted score (required tests 70%, optional 30%). One number to communicate compliance.
 - **CI-ready** — `--strict` mode exits with code 1 on required test failures. Drop it into any pipeline.
@@ -100,7 +100,7 @@ mcp-compliance badge https://my-server.com/mcp
 
 Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https://mcp.hosting).
 
-## What the 43 tests check
+## What the 45 tests check
 
 <details>
 <summary><strong>Transport (7 tests)</strong></summary>

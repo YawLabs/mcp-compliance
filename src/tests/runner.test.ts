@@ -43,6 +43,14 @@ describe("runComplianceSuite — connection failures", () => {
       expect(t.passed).toBe(false);
     }
   }, 15000);
+
+  it("includes preflight warning for unreachable host", async () => {
+    const report = await runComplianceSuite(DEAD_URL, {
+      timeout: 2000,
+      only: ["transport-post"],
+    });
+    expect(report.warnings.some((w) => w.includes("unreachable"))).toBe(true);
+  }, 15000);
 });
 
 describe("runComplianceSuite — filtering", () => {
@@ -157,7 +165,7 @@ describe("runComplianceSuite — exports", () => {
   it("exports TEST_DEFINITIONS", async () => {
     const { TEST_DEFINITIONS } = await import("../runner.js");
     expect(Array.isArray(TEST_DEFINITIONS)).toBe(true);
-    expect(TEST_DEFINITIONS.length).toBe(43);
+    expect(TEST_DEFINITIONS.length).toBe(45);
     for (const def of TEST_DEFINITIONS) {
       expect(def.id).toBeDefined();
       expect(def.name).toBeDefined();

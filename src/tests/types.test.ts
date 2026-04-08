@@ -13,8 +13,8 @@ const VALID_CATEGORIES: TestCategory[] = [
 ];
 
 describe("TEST_DEFINITIONS", () => {
-  it("contains exactly 43 test definitions", () => {
-    expect(TEST_DEFINITIONS).toHaveLength(43);
+  it("contains exactly 45 test definitions", () => {
+    expect(TEST_DEFINITIONS).toHaveLength(45);
   });
 
   it("all IDs are unique", () => {
@@ -58,8 +58,8 @@ describe("TEST_DEFINITIONS", () => {
     for (const def of TEST_DEFINITIONS) {
       counts[def.category] = (counts[def.category] || 0) + 1;
     }
-    expect(counts.transport).toBe(7);
-    expect(counts.lifecycle).toBe(10);
+    expect(counts.transport).toBe(8);
+    expect(counts.lifecycle).toBe(11);
     expect(counts.tools).toBe(4);
     expect(counts.resources).toBe(5);
     expect(counts.prompts).toBe(3);
@@ -100,5 +100,19 @@ describe("TEST_DEFINITIONS", () => {
     expect(comp).toBeDefined();
     expect(comp!.specRef).toContain("completion");
     expect(comp!.required).toBe(false);
+  });
+
+  it("lifecycle-cancellation has correct specRef", () => {
+    const cancel = TEST_DEFINITIONS.find((t) => t.id === "lifecycle-cancellation");
+    expect(cancel).toBeDefined();
+    expect(cancel!.specRef).toContain("cancellation");
+    expect(cancel!.required).toBe(false);
+  });
+
+  it("transport-content-type-init exists", () => {
+    const ct = TEST_DEFINITIONS.find((t) => t.id === "transport-content-type-init");
+    expect(ct).toBeDefined();
+    expect(ct!.category).toBe("transport");
+    expect(ct!.required).toBe(false);
   });
 });

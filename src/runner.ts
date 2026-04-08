@@ -12,8 +12,8 @@ export { generateBadge } from "./badge.js";
 const _require = createRequire(import.meta.url);
 const { version: TOOL_VERSION } = _require("../package.json");
 
-const SPEC_VERSION = "2025-11-25";
-const SPEC_BASE = `https://modelcontextprotocol.io/specification/${SPEC_VERSION}`;
+export const SPEC_VERSION = "2025-11-25";
+export const SPEC_BASE = `https://modelcontextprotocol.io/specification/${SPEC_VERSION}`;
 
 const VALID_CONTENT_TYPES = ["text", "image", "audio", "resource", "resource_link"];
 
@@ -27,8 +27,9 @@ function createIdCounter(start = 0) {
  * Handles multi-line data fields per the SSE specification:
  * consecutive "data:" lines are concatenated with "\n".
  * An empty line marks the end of an event.
+ * @internal Exported for testing.
  */
-function parseSSEResponse(text: string): any {
+export function parseSSEResponse(text: string): any {
   const lines = text.split("\n");
   let lastJsonRpcResponse: any = null;
   let currentData: string[] = [];
@@ -170,20 +171,43 @@ export interface RunOptions {
  * Run the full MCP compliance test suite against a URL.
  */
 export async function runComplianceSuite(url: string, options: RunOptions = {}): Promise<ComplianceReport> {
-  let parsed: URL;
   try {
-    parsed = new URL(url);
+    const parsed = new URL(url);
     if (!["http:", "https:"].includes(parsed.protocol)) {
       throw new Error("Only HTTP and HTTPS URLs are supported");
     }
-  } catch (e: any) {
-    if (e.message.includes("Only HTTP")) throw e;
+  } catch (e: unknown) {
+    if (e instanceof Error && e.message.includes("Only HTTP")) throw e;
     throw new Error(`Invalid URL: ${url}`);
   }
 
   const backendUrl = url;
+
+  // Preflight connectivity check — fail fast instead of running 43 failing tests
+  let serverReachable = true;
+  try {
+    const preflight = await request(backendUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        ...options.headers,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "ping" }),
+      signal: AbortSignal.timeout(Math.min(options.timeout || 15000, 10000)),
+    });
+    await preflight.body.text();
+  } catch {
+    serverReachable = false;
+  }
+
   const tests: TestResult[] = [];
   const warnings: string[] = [];
+  if (!serverReachable) {
+    warnings.push(
+      `Server at ${url} is unreachable — all tests will fail. Check the URL and ensure the server is running.`,
+    );
+  }
   // Use high start offset for the main ID counter to avoid collision with transport test hardcoded IDs
   const nextId = createIdCounter(1000);
   const timeout = options.timeout || 15000;
@@ -245,8 +269,9 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         lastResult = await fn();
         if (lastResult.passed) break;
         if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-      } catch (err: any) {
-        lastResult = { passed: false, details: `Error: ${err.message}` };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        lastResult = { passed: false, details: `Error: ${message}` };
         if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
       }
     }
@@ -279,10 +304,24 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         body: JSON.stringify({ jsonrpc: "2.0", id: 99901, method: "ping" }),
         signal: AbortSignal.timeout(timeout),
       });
-      await res.body.text();
-      const passed = res.statusCode >= 200 && res.statusCode < 300;
-      const note = res.statusCode === 401 || res.statusCode === 403 ? " (auth required)" : "";
-      return { passed, details: `HTTP ${res.statusCode}${note}` };
+      const text = await res.body.text();
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        return { passed: true, details: `HTTP ${res.statusCode}` };
+      }
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        return { passed: false, details: `HTTP ${res.statusCode} (auth required — pass --auth)` };
+      }
+      // 400 with a JSON-RPC error body is acceptable — server processed the POST
+      // but rejected the pre-init request (e.g., session required)
+      if (res.statusCode === 400) {
+        try {
+          const body = JSON.parse(text);
+          if (body?.error || body?.jsonrpc) {
+            return { passed: true, details: "HTTP 400 with JSON-RPC response (server requires initialization first)" };
+          }
+        } catch {}
+      }
+      return { passed: false, details: `HTTP ${res.statusCode}` };
     },
   );
 
@@ -314,50 +353,35 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     false,
     "basic/transports#streamable-http",
     async () => {
+      const getHeaders: Record<string, string> = { Accept: "text/event-stream", ...buildHeaders() };
       const res = await request(backendUrl, {
         method: "GET",
-        headers: { Accept: "text/event-stream", ...userHeaders },
+        headers: getHeaders,
         signal: AbortSignal.timeout(timeout),
       });
-      await res.body.text();
+      const body = await res.body.text();
       const ct = ((res.headers["content-type"] as string) || "").toLowerCase();
       if (res.statusCode === 405) {
         return { passed: true, details: "HTTP 405 Method Not Allowed (acceptable)" };
       }
       if (ct.includes("text/event-stream")) {
-        return { passed: true, details: "Returns text/event-stream for SSE" };
+        // Validate the SSE payload has proper format if non-empty
+        if (body.trim().length > 0) {
+          const hasDataFields = body.includes("data:");
+          const hasEventFields = body.includes("event:");
+          if (!hasDataFields && !hasEventFields) {
+            return {
+              passed: false,
+              details: "Content-Type is text/event-stream but body has no SSE data: or event: fields",
+            };
+          }
+        }
+        return { passed: true, details: "Returns text/event-stream with valid SSE format" };
       }
       if (res.statusCode >= 200 && res.statusCode < 300) {
         return { passed: true, details: `HTTP ${res.statusCode} (accepted)` };
       }
       return { passed: false, details: `HTTP ${res.statusCode}, Content-Type: ${ct}` };
-    },
-  );
-
-  await test(
-    "transport-delete",
-    "DELETE accepted or returns 405",
-    "transport",
-    false,
-    "basic/transports#streamable-http",
-    async () => {
-      const res = await request(backendUrl, {
-        method: "DELETE",
-        headers: { ...userHeaders },
-        signal: AbortSignal.timeout(timeout),
-      });
-      await res.body.text();
-      if (res.statusCode === 405) {
-        return { passed: true, details: "HTTP 405 Method Not Allowed (acceptable)" };
-      }
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        return { passed: true, details: `HTTP ${res.statusCode} (session termination supported)` };
-      }
-      // 400/404 are also acceptable (no active session)
-      if (res.statusCode === 400 || res.statusCode === 404) {
-        return { passed: true, details: `HTTP ${res.statusCode} (no active session, acceptable)` };
-      }
-      return { passed: false, details: `HTTP ${res.statusCode}` };
     },
   );
 
@@ -402,7 +426,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   try {
     initRes = await rpc("initialize", {
       protocolVersion: SPEC_VERSION,
-      capabilities: { roots: { listChanged: true }, sampling: {} },
+      capabilities: {},
       clientInfo: { name: "mcp-compliance", version: TOOL_VERSION },
     });
     const result = initRes?.body?.result;
@@ -415,7 +439,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       if (sid) sessionId = sid;
       if (result.protocolVersion) negotiatedProtocolVersion = result.protocolVersion;
     }
-  } catch (err: any) {
+  } catch {
     // Init failed — lifecycle tests will report the failure
   }
 
@@ -548,11 +572,25 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     "server/utilities#logging",
     async () => {
       if (!hasLogging) return { passed: true, details: "Server does not declare logging capability (skipped)" };
+      // Test with a valid level
       const res = await rpc("logging/setLevel", { level: "info" });
       if (res.body?.error) {
         return { passed: false, details: `Error: ${res.body.error.code} — ${res.body.error.message}` };
       }
-      return { passed: true, details: "logging/setLevel accepted" };
+      // Test with an invalid level to verify the server validates input
+      const invalidRes = await rpc("logging/setLevel", { level: "__invalid_level__" });
+      const validatesInput = !!invalidRes.body?.error;
+      const validLevels = ["debug", "warning", "error"];
+      const accepted: string[] = [];
+      for (const level of validLevels) {
+        const r = await rpc("logging/setLevel", { level });
+        if (!r.body?.error) accepted.push(level);
+      }
+      const details = validatesInput
+        ? `logging/setLevel accepted (validates levels, ${accepted.length + 1} levels accepted)`
+        : "logging/setLevel accepted (warning: server does not reject invalid log levels)";
+      if (!validatesInput) warnings.push("Server accepts invalid log levels without error");
+      return { passed: true, details };
     },
   );
 
@@ -585,7 +623,45 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     },
   );
 
+  // Cancellation handling test
+  await test(
+    "lifecycle-cancellation",
+    "Handles cancellation notifications",
+    "lifecycle",
+    false,
+    "basic/utilities#cancellation",
+    async () => {
+      // Send a cancellation notification for a nonexistent request — server should accept it gracefully
+      const res = await mcpNotification(
+        backendUrl,
+        "notifications/cancelled",
+        { requestId: 99999, reason: "compliance test" },
+        buildHeaders(),
+        timeout,
+      );
+      // 202 is ideal, any 2xx is acceptable for a notification
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        return { passed: true, details: `HTTP ${res.statusCode} (cancellation accepted)` };
+      }
+      return { passed: false, details: `HTTP ${res.statusCode} — server should accept cancellation notifications` };
+    },
+  );
+
   // ── 4. TRANSPORT (session-dependent, post-init) ──────────────────
+
+  await test(
+    "transport-content-type-init",
+    "Initialize response has valid content type",
+    "transport",
+    false,
+    "basic/transports#streamable-http",
+    async () => {
+      if (!initRes) return { passed: false, details: "No init response to check" };
+      const ct = (initRes.headers["content-type"] || "").toLowerCase();
+      const valid = ct.includes("application/json") || ct.includes("text/event-stream");
+      return { passed: valid, details: `Content-Type: ${ct || "missing"}` };
+    },
+  );
 
   await test(
     "transport-notification-202",
@@ -675,7 +751,8 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     },
   );
 
-  // Schema tests for tools
+  // Schema tests for tools (depend on tools-list succeeding)
+  const toolsListOk = cachedToolsList !== null;
   await test(
     "tools-schema",
     "All tools have name and inputSchema",
@@ -683,7 +760,8 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     hasTools,
     "server/tools#data-types",
     async () => {
-      const tools = cachedToolsList ?? (await rpc("tools/list")).body?.result?.tools ?? [];
+      if (!toolsListOk) return { passed: false, details: "Skipped: tools/list failed" };
+      const tools = cachedToolsList ?? [];
       const issues: string[] = [];
       for (const tool of tools) {
         if (!tool.name) {
@@ -716,7 +794,8 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     false,
     "server/tools#annotations",
     async () => {
-      const tools = cachedToolsList ?? (await rpc("tools/list")).body?.result?.tools ?? [];
+      if (!toolsListOk) return { passed: false, details: "Skipped: tools/list failed" };
+      const tools = cachedToolsList ?? [];
       if (tools.length === 0) return { passed: true, details: "No tools to validate" };
       const issues: string[] = [];
       let annotatedCount = 0;
@@ -750,7 +829,8 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   );
 
   await test("tools-title-field", "Tools include title field", "schema", false, "server/tools#data-types", async () => {
-    const tools = cachedToolsList ?? (await rpc("tools/list")).body?.result?.tools ?? [];
+    if (!toolsListOk) return { passed: false, details: "Skipped: tools/list failed" };
+    const tools = cachedToolsList ?? [];
     if (tools.length === 0) return { passed: true, details: "No tools to validate" };
     const withTitle = tools.filter((t: any) => typeof t.title === "string");
     const issues: string[] = [];
@@ -773,7 +853,8 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     false,
     "server/tools#structured-content",
     async () => {
-      const tools = cachedToolsList ?? (await rpc("tools/list")).body?.result?.tools ?? [];
+      if (!toolsListOk) return { passed: false, details: "Skipped: tools/list failed" };
+      const tools = cachedToolsList ?? [];
       if (tools.length === 0) return { passed: true, details: "No tools to validate" };
       const issues: string[] = [];
       let withSchema = 0;
@@ -816,13 +897,13 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
           return { passed: true, details: `Protocol error: code ${code} — ${error.message}` };
         }
         if (result?.content && Array.isArray(result.content)) {
+          if (result.isError) {
+            return { passed: true, details: "Tool returned execution error with content (valid)" };
+          }
           const badItems = result.content.filter((c: any) => !c.type);
           if (badItems.length > 0)
             return { passed: false, details: `${badItems.length} content item(s) missing 'type' field` };
           return { passed: true, details: `Returned ${result.content.length} content item(s)` };
-        }
-        if (result?.isError && result?.content && Array.isArray(result.content)) {
-          return { passed: true, details: "Tool returned execution error with content (valid)" };
         }
         return { passed: false, details: "Response missing content array" };
       },
@@ -937,6 +1018,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       },
     );
 
+    const resourcesListOk = cachedResourcesList !== null;
     await test(
       "resources-schema",
       "Resources have uri and name",
@@ -944,7 +1026,8 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       true,
       "server/resources#data-types",
       async () => {
-        const resources = cachedResourcesList ?? (await rpc("resources/list")).body?.result?.resources ?? [];
+        if (!resourcesListOk) return { passed: false, details: "Skipped: resources/list failed" };
+        const resources = cachedResourcesList ?? [];
         const issues: string[] = [];
         for (const r of resources) {
           if (!r.uri) issues.push("Resource missing uri");
@@ -974,8 +1057,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         false,
         "server/resources#reading-resources",
         async () => {
-          // Use cached list instead of re-fetching
-          const resources = cachedResourcesList ?? (await rpc("resources/list")).body?.result?.resources ?? [];
+          const resources = cachedResourcesList ?? [];
           const firstUri = resources[0]?.uri;
           if (!firstUri) return { passed: false, details: "No resource URI to test" };
           const readRes = await rpc("resources/read", { uri: firstUri });
@@ -1009,8 +1091,15 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         if (!Array.isArray(templates)) return { passed: false, details: "No resourceTemplates array" };
         const issues: string[] = [];
         for (const t of templates) {
-          if (!t.uriTemplate) issues.push("Template missing uriTemplate");
+          if (!t.uriTemplate) {
+            issues.push("Template missing uriTemplate");
+          } else if (typeof t.uriTemplate !== "string") {
+            issues.push(`uriTemplate should be a string, got ${typeof t.uriTemplate}`);
+          } else if (!t.uriTemplate.includes("{") || !t.uriTemplate.includes("}")) {
+            warnings.push(`Template "${t.name || t.uriTemplate}" has no URI template parameters (e.g., {id})`);
+          }
           if (!t.name) issues.push(`${t.uriTemplate || "?"}: missing name`);
+          if (!t.description) warnings.push(`Template "${t.name || t.uriTemplate || "?"}" missing description`);
         }
         if (issues.length > 0) return { passed: false, details: issues.join("; ") };
         return { passed: true, details: `${templates.length} resource template(s)` };
@@ -1054,7 +1143,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         true,
         "server/resources#subscriptions",
         async () => {
-          const resources = cachedResourcesList ?? (await rpc("resources/list")).body?.result?.resources ?? [];
+          const resources = cachedResourcesList ?? [];
           const firstUri = resources[0]?.uri;
           if (!firstUri) return { passed: false, details: "No resource URI for subscribe test" };
 
@@ -1109,8 +1198,10 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       },
     );
 
+    const promptsListOk = cachedPromptsList !== null;
     await test("prompts-schema", "Prompts have name field", "schema", true, "server/prompts#data-types", async () => {
-      const prompts = cachedPromptsList ?? (await rpc("prompts/list")).body?.result?.prompts ?? [];
+      if (!promptsListOk) return { passed: false, details: "Skipped: prompts/list failed" };
+      const prompts = cachedPromptsList ?? [];
       const issues: string[] = [];
       for (const p of prompts) {
         if (!p.name) issues.push("Prompt missing name");
@@ -1313,6 +1404,69 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     }
     return { passed: false, details: `HTTP ${res.statusCode} — expected error code -32600` };
   });
+
+  // ── 9. SESSION CLEANUP (runs last to avoid breaking other tests) ──
+
+  await test(
+    "transport-delete",
+    "DELETE accepted or returns 405",
+    "transport",
+    false,
+    "basic/transports#streamable-http",
+    async () => {
+      const deleteHeaders: Record<string, string> = { ...buildHeaders() };
+      const res = await request(backendUrl, {
+        method: "DELETE",
+        headers: deleteHeaders,
+        signal: AbortSignal.timeout(timeout),
+      });
+      await res.body.text();
+      if (res.statusCode === 405) {
+        return { passed: true, details: "HTTP 405 Method Not Allowed (acceptable)" };
+      }
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        // Session terminated — verify subsequent request with old session ID is rejected
+        if (sessionId) {
+          try {
+            const verifyRes = await mcpRequest(
+              backendUrl,
+              "ping",
+              undefined,
+              createIdCounter(99920),
+              deleteHeaders,
+              timeout,
+            );
+            if (verifyRes.statusCode === 400 || verifyRes.statusCode === 404 || verifyRes.statusCode === 409) {
+              return {
+                passed: true,
+                details: `HTTP ${res.statusCode} (session terminated, post-delete request correctly rejected with ${verifyRes.statusCode})`,
+              };
+            }
+          } catch {
+            // Connection refused after delete is also acceptable
+            return {
+              passed: true,
+              details: `HTTP ${res.statusCode} (session terminated, post-delete request rejected)`,
+            };
+          }
+        }
+        return { passed: true, details: `HTTP ${res.statusCode} (session termination supported)` };
+      }
+      // 400/404 are also acceptable (no active session)
+      if (res.statusCode === 400 || res.statusCode === 404) {
+        return { passed: true, details: `HTTP ${res.statusCode} (no active session, acceptable)` };
+      }
+      return { passed: false, details: `HTTP ${res.statusCode}` };
+    },
+  );
+
+  // ── Cap warnings ─────────────────────────────────────────────────
+
+  const MAX_WARNINGS = 50;
+  if (warnings.length > MAX_WARNINGS) {
+    const truncated = warnings.length - MAX_WARNINGS;
+    warnings.splice(MAX_WARNINGS, truncated, `... and ${truncated} more warning(s) suppressed`);
+  }
 
   // ── Compute score ────────────────────────────────────────────────
 
