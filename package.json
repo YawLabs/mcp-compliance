@@ -1,9 +1,9 @@
 {
   "name": "@yawlabs/mcp-compliance",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "CLI tool and MCP server that tests MCP servers for spec compliance",
   "license": "MIT",
-  "author": "Yaw Labs (https://yaw.sh)",
+  "author": "Yaw Labs <contact@yaw.sh> (https://yaw.sh)",
   "type": "module",
   "exports": {
     ".": {
@@ -18,7 +18,9 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "!dist/**/*.test.*",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsup",
@@ -28,7 +30,8 @@
     "lint:fix": "biome check --write src/",
     "typecheck": "tsc --noEmit",
     "test:ci": "npm run build && npm test",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "start": "node dist/index.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -52,7 +55,12 @@
     "model-context-protocol",
     "compliance",
     "testing",
-    "cli"
+    "cli",
+    "mcp-server",
+    "spec",
+    "validation",
+    "json-rpc",
+    "ai"
   ],
   "repository": {
     "type": "git",

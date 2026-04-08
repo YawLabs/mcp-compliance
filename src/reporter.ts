@@ -1,4 +1,5 @@
 import chalk from "chalk";
+import { TEST_DEFINITIONS } from "./types.js";
 import type { ComplianceReport, Grade, TestResult } from "./types.js";
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -45,7 +46,14 @@ function testLine(t: TestResult): string {
   const icon = t.passed ? chalk.green("  PASS") : chalk.red("  FAIL");
   const req = t.required ? chalk.dim(" (required)") : "";
   const dur = chalk.dim(` ${t.durationMs}ms`);
-  return `${icon}  ${t.name}${req}${dur}\n${chalk.dim(`         ${t.details}`)}`;
+  let line = `${icon}  ${t.name}${req}${dur}\n${chalk.dim(`         ${t.details}`)}`;
+  if (!t.passed) {
+    const def = TEST_DEFINITIONS.find((d) => d.id === t.id);
+    if (def?.recommendation) {
+      line += `\n${chalk.cyan(`         Fix: ${def.recommendation}`)}`;
+    }
+  }
+  return line;
 }
 
 export function formatTerminal(report: ComplianceReport): string {
@@ -144,4 +152,85 @@ export function formatTerminal(report: ComplianceReport): string {
 
 export function formatJson(report: ComplianceReport): string {
   return JSON.stringify(report, null, 2);
+}
+
+/**
+ * Format report as SARIF (Static Analysis Results Interchange Format) v2.1.0.
+ * Compatible with GitHub Code Scanning and other SARIF viewers.
+ */
+export function formatSarif(report: ComplianceReport): string {
+  const SPEC_BASE = `https://modelcontextprotocol.io/specification/${report.specVersion}`;
+
+  const rules = report.tests.map((t) => {
+    const def = TEST_DEFINITIONS.find((d) => d.id === t.id);
+    return {
+      id: t.id,
+      name: t.name,
+      shortDescription: { text: t.name },
+      fullDescription: { text: def?.description || t.details },
+      helpUri: t.specRef || `${SPEC_BASE}/basic`,
+      properties: {
+        category: t.category,
+        required: t.required,
+      },
+    };
+  });
+
+  const results = report.tests
+    .filter((t) => !t.passed)
+    .map((t) => {
+      const def = TEST_DEFINITIONS.find((d) => d.id === t.id);
+      return {
+        ruleId: t.id,
+        level: t.required ? "error" : "warning",
+        message: {
+          text: def?.recommendation ? `${t.details}. Fix: ${def.recommendation}` : t.details,
+        },
+        locations: [
+          {
+            physicalLocation: {
+              artifactLocation: {
+                uri: report.url,
+                uriBaseId: "MCP_SERVER",
+              },
+            },
+          },
+        ],
+        properties: {
+          category: t.category,
+          durationMs: t.durationMs,
+        },
+      };
+    });
+
+  const sarif = {
+    $schema: "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+    version: "2.1.0",
+    runs: [
+      {
+        tool: {
+          driver: {
+            name: "mcp-compliance",
+            version: report.toolVersion,
+            informationUri: "https://github.com/YawLabs/mcp-compliance",
+            rules,
+          },
+        },
+        results,
+        invocations: [
+          {
+            executionSuccessful: report.overall !== "fail",
+            properties: {
+              grade: report.grade,
+              score: report.score,
+              overall: report.overall,
+              specVersion: report.specVersion,
+            },
+          },
+        ],
+      },
+    ],
+  };
+
+  return JSON.stringify(sarif, null, 2);
 }

@@ -1,10 +1,8 @@
 import { createRequire } from "node:module";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import chalk from "chalk";
 import { Command } from "commander";
-import { registerTools } from "./mcp/tools.js";
-import { formatJson, formatTerminal } from "./reporter.js";
+import { startServer } from "./mcp/server.js";
+import { formatJson, formatSarif, formatTerminal } from "./reporter.js";
 import { runComplianceSuite } from "./runner.js";
 
 const require = createRequire(import.meta.url);
@@ -36,7 +34,7 @@ program
   .command("test")
   .description("Run the full compliance test suite against an MCP server")
   .argument("<url>", "MCP server URL to test")
-  .option("--format <format>", "Output format: terminal or json", "terminal")
+  .option("--format <format>", "Output format: terminal, json, or sarif", "terminal")
   .option("--strict", "Exit with code 1 on any required test failure (for CI)")
   .option("-H, --header <header>", 'Add header to all requests (format: "Key: Value", repeatable)', parseHeaderArg, {})
   .option("--auth <token>", 'Shorthand for -H "Authorization: <token>"')
@@ -88,6 +86,8 @@ program
 
         if (opts.format === "json") {
           console.log(formatJson(report));
+        } else if (opts.format === "sarif") {
+          console.log(formatSarif(report));
         } else {
           console.log(formatTerminal(report));
         }
@@ -96,7 +96,7 @@ program
           process.exit(1);
         }
       } catch (err: any) {
-        if (opts.format === "json") {
+        if (opts.format === "json" || opts.format === "sarif") {
           console.error(JSON.stringify({ error: err.message }));
         } else {
           console.error(chalk.red(`\nError: ${err.message}\n`));
@@ -138,10 +138,7 @@ program
   .command("mcp")
   .description("Start the MCP compliance server (stdio transport)")
   .action(async () => {
-    const server = new McpServer({ name: "mcp-compliance", version });
-    registerTools(server);
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
+    await startServer();
   });
 
 program.parse();

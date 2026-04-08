@@ -169,6 +169,8 @@ export function registerTools(server: McpServer) {
               `Spec reference: https://modelcontextprotocol.io/specification/2025-11-25/${def.specRef}`,
               "",
               def.description,
+              "",
+              `Fix: ${def.recommendation}`,
             ].join("\n"),
           },
         ],

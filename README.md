@@ -7,17 +7,31 @@
 
 **Test any MCP server for spec compliance.** 43-test suite covering transport, lifecycle, tools, resources, prompts, error handling, and schema validation against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). CLI, MCP server, and programmatic API.
 
-Built and maintained by [YawLabs](https://yaw.sh).
+Built and maintained by [Yaw Labs](https://yaw.sh).
 
-## Quick Start
+## Why this tool?
 
-**1. Run against any MCP server**
+MCP servers are multiplying fast — but most ship without compliance testing. Broken transport handling, missing error codes, malformed schemas, and silent capability violations are common. Hand-rolling test scripts is tedious and incomplete.
+
+This tool solves that:
+
+- **43 tests across 7 categories** — transport, lifecycle, tools, resources, prompts, error handling, and schema validation. No gaps.
+- **Capability-driven** — tests adapt to what the server declares. If it says it supports tools, tool tests become required. No false failures for features the server doesn't claim.
+- **Graded scoring** — A-F letter grade with a weighted score (required tests 70%, optional 30%). One number to communicate compliance.
+- **CI-ready** — `--strict` mode exits with code 1 on required test failures. Drop it into any pipeline.
+- **Spec-referenced** — every test links to the exact section of the MCP specification it validates. No ambiguity about what's being tested or why.
+- **Three interfaces** — CLI for humans, MCP server for AI assistants, programmatic API for integration.
+- **Published specification** — the [testing methodology](./MCP_COMPLIANCE_SPEC.md) and [rule catalog](./mcp-compliance-rules.json) are open (CC BY 4.0) so anyone can implement compatible tooling.
+
+## Quick start
+
+**Run against any MCP server:**
 
 ```bash
 npx @yawlabs/mcp-compliance test https://my-server.com/mcp
 ```
 
-**2. Or install globally**
+**Or install globally:**
 
 ```bash
 npm install -g @yawlabs/mcp-compliance
@@ -26,7 +40,7 @@ mcp-compliance test https://my-server.com/mcp
 
 That's it. You'll get a colored terminal report with a letter grade (A-F), per-test pass/fail, and a compliance score.
 
-## CLI Usage
+## CLI usage
 
 ```bash
 # Terminal output with colors and grade
@@ -34,6 +48,9 @@ mcp-compliance test https://my-server.com/mcp
 
 # JSON output (for scripting)
 mcp-compliance test https://my-server.com/mcp --format json
+
+# SARIF output (for GitHub Code Scanning)
+mcp-compliance test https://my-server.com/mcp --format sarif > compliance.sarif
 
 # Strict mode — exits with code 1 on required test failure (for CI)
 mcp-compliance test https://my-server.com/mcp --strict
@@ -65,7 +82,7 @@ mcp-compliance test https://my-server.com/mcp --verbose
 
 | Option | Description |
 |--------|-------------|
-| `--format <format>` | Output format: `terminal` or `json` (default: `terminal`) |
+| `--format <format>` | Output format: `terminal`, `json`, or `sarif` (default: `terminal`) |
 | `--strict` | Exit with code 1 on any required test failure (for CI) |
 | `-H, --header <header>` | Add header to all requests, format `"Key: Value"` (repeatable) |
 | `--auth <token>` | Shorthand for `-H "Authorization: <token>"` |
@@ -180,9 +197,9 @@ Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https:
 | D     | 40-59  |
 | F     | 0-39   |
 
-Required tests are worth 70% of the score, optional tests 30%.
+Required tests are worth 70% of the score, optional tests 30%. See the [full scoring algorithm](./MCP_COMPLIANCE_SPEC.md#2-scoring-algorithm) in the specification.
 
-## CI Integration
+## CI integration
 
 ```yaml
 # GitHub Actions example
@@ -204,13 +221,29 @@ Required tests are worth 70% of the score, optional tests 30%.
   run: npx @yawlabs/mcp-compliance test ${{ env.MCP_SERVER_URL }} --strict --retries 2 --timeout 30000
 ```
 
-## MCP Server (for Claude Code, Cursor, etc.)
+```yaml
+# SARIF output for GitHub Code Scanning
+- name: MCP Compliance Check
+  run: npx @yawlabs/mcp-compliance test ${{ env.MCP_SERVER_URL }} --format sarif > compliance.sarif
+- name: Upload SARIF
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: compliance.sarif
+```
+
+## MCP server (for Claude Code, Cursor, etc.)
 
 This package also exposes an MCP server with 3 tools that can be used from Claude Code, Cursor, or any MCP client.
 
 ### Setup
 
-Create `.mcp.json` in your project root:
+**Claude Code (one-liner):**
+
+```bash
+claude mcp add mcp-compliance -- npx -y @yawlabs/mcp-compliance mcp
+```
+
+**Or create `.mcp.json` in your project root:**
 
 macOS / Linux / WSL:
 
@@ -250,7 +283,7 @@ Restart your MCP client and approve the server when prompted.
 
 All tools have [MCP tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#annotations) (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP clients can skip confirmation dialogs for safe operations.
 
-## Programmatic Usage
+## Programmatic usage
 
 ```typescript
 import { runComplianceSuite } from '@yawlabs/mcp-compliance';
@@ -267,16 +300,48 @@ const report2 = await runComplianceSuite('https://my-server.com/mcp', {
 });
 ```
 
+## Specification
+
+The compliance testing methodology is published as an open specification:
+
+- **[MCP Compliance Testing Specification](./MCP_COMPLIANCE_SPEC.md)** — test execution model, scoring algorithm, all 43 test rules with pass/fail criteria (CC BY 4.0)
+- **[Machine-readable rule catalog](./mcp-compliance-rules.json)** — JSON Schema-compliant catalog for programmatic consumption
+
+These are complementary to (not competing with) the [official MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). The MCP spec defines what servers must do; this spec defines how to verify compliance.
+
 ## Requirements
 
 - Node.js 18+
+
+## Contributing
+
+```bash
+git clone https://github.com/YawLabs/mcp-compliance.git
+cd mcp-compliance
+npm install
+npm run build
+npm test
+```
+
+**Development commands:**
+
+| Command | Description |
+|---------|-------------|
+| `npm run build` | Compile with tsup |
+| `npm run dev` | Watch mode |
+| `npm test` | Run tests (vitest) |
+| `npm run lint` | Check with Biome |
+| `npm run lint:fix` | Auto-fix with Biome |
+| `npm run typecheck` | TypeScript type checking |
+| `npm run test:ci` | Build + test (CI-safe) |
 
 ## Links
 
 - [mcp.hosting](https://mcp.hosting) — Hosted MCP server infrastructure
 - [MCP Specification](https://modelcontextprotocol.io/specification/2025-11-25)
+- [MCP Compliance Testing Spec](./MCP_COMPLIANCE_SPEC.md)
 - [Yaw Labs](https://yaw.sh)
 
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE).

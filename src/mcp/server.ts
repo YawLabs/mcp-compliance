@@ -6,15 +6,29 @@ import { registerTools } from "./tools.js";
 const require = createRequire(import.meta.url);
 const { version } = require("../../package.json");
 
-const server = new McpServer({ name: "mcp-compliance", version });
-registerTools(server);
+/**
+ * Create and configure the MCP compliance server instance.
+ */
+export function createComplianceServer(): McpServer {
+  const server = new McpServer({ name: "mcp-compliance", version });
+  registerTools(server);
+  return server;
+}
 
-async function main() {
+/**
+ * Start the MCP compliance server with stdio transport.
+ */
+export async function startServer(): Promise<void> {
+  const server = createComplianceServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
 
-main().catch((err) => {
-  console.error("MCP server error:", err);
-  process.exit(1);
-});
+// Direct execution support
+const isDirectRun = process.argv[1]?.endsWith("mcp/server.js") || process.argv[1]?.endsWith("mcp\\server.js");
+if (isDirectRun) {
+  startServer().catch((err) => {
+    console.error("MCP server error:", err);
+    process.exit(1);
+  });
+}
