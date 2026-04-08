@@ -62,9 +62,9 @@ export interface TestDefinition {
   recommendation: string;
 }
 
-/** All 45 test IDs with descriptions for the explain command */
+/** All 48 test IDs with descriptions for the explain command */
 export const TEST_DEFINITIONS: TestDefinition[] = [
-  // ── Transport (8 tests) ──────────────────────────────────────────
+  // ── Transport (10 tests) ─────────────────────────────────────────
   {
     id: "transport-post",
     name: "HTTP POST accepted",
@@ -155,7 +155,31 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       'Ensure the initialize response uses Content-Type "application/json" or "text/event-stream". Do not return text/html or other types for JSON-RPC responses.',
   },
 
-  // ── Lifecycle (11 tests) ─────────────────────────────────────────
+  {
+    id: "transport-get-stream",
+    name: "GET with session returns SSE or 405",
+    category: "transport",
+    required: false,
+    specRef: "basic/transports#streamable-http",
+    description:
+      "Tests the GET endpoint with an active session ID for server-initiated messages. After initialization, the server should either return an SSE stream or 405.",
+    recommendation:
+      "If your server supports server-initiated messages, return text/event-stream on GET with a valid session ID. Otherwise, return 405 Method Not Allowed.",
+  },
+
+  {
+    id: "transport-concurrent",
+    name: "Handles concurrent requests",
+    category: "transport",
+    required: false,
+    specRef: "basic/transports#streamable-http",
+    description:
+      "Sends multiple JSON-RPC requests in parallel and verifies the server responds to all with correct matching IDs. Tests that the server can handle concurrent connections.",
+    recommendation:
+      "Ensure your server can handle multiple simultaneous requests. Each response must include the correct id matching the request. Use async handlers or connection pooling.",
+  },
+
+  // ── Lifecycle (12 tests) ─────────────────────────────────────────
   {
     id: "lifecycle-init",
     name: "Initialize handshake",
@@ -277,6 +301,18 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Tests that the server accepts notifications/cancelled without error. Servers should gracefully handle cancellation of unknown or completed requests.",
     recommendation:
       "Accept notifications/cancelled and stop any in-progress work for the referenced requestId. If the request is unknown or already complete, silently ignore the cancellation.",
+  },
+
+  {
+    id: "lifecycle-progress",
+    name: "Accepts progress notifications",
+    category: "lifecycle",
+    required: false,
+    specRef: "basic/utilities#progress",
+    description:
+      "Tests that the server accepts notifications/progress without error. Servers should handle progress notifications for request tracking.",
+    recommendation:
+      "Accept notifications/progress with progressToken, progress, and optional total fields. Ignore notifications for unknown progress tokens.",
   },
 
   // ── Tools (4 tests) ──────────────────────────────────────────────

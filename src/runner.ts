@@ -647,6 +647,28 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     },
   );
 
+  // Progress notification test
+  await test(
+    "lifecycle-progress",
+    "Accepts progress notifications",
+    "lifecycle",
+    false,
+    "basic/utilities#progress",
+    async () => {
+      const res = await mcpNotification(
+        backendUrl,
+        "notifications/progress",
+        { progressToken: "compliance-test-token", progress: 50, total: 100 },
+        buildHeaders(),
+        timeout,
+      );
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        return { passed: true, details: `HTTP ${res.statusCode} (progress notification accepted)` };
+      }
+      return { passed: false, details: `HTTP ${res.statusCode} — server should accept progress notifications` };
+    },
+  );
+
   // ── 4. TRANSPORT (session-dependent, post-init) ──────────────────
 
   await test(
@@ -723,6 +745,92 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         };
       }
       return { passed: false, details: `HTTP ${res.statusCode}` };
+    },
+  );
+
+  await test(
+    "transport-get-stream",
+    "GET with session returns SSE or 405",
+    "transport",
+    false,
+    "basic/transports#streamable-http",
+    async () => {
+      // This test requires an active session to be meaningful
+      if (!sessionId) {
+        return { passed: true, details: "No session ID — server-initiated messages not applicable" };
+      }
+      const res = await request(backendUrl, {
+        method: "GET",
+        headers: { Accept: "text/event-stream", ...buildHeaders() },
+        signal: AbortSignal.timeout(Math.min(timeout, 3000)),
+      });
+      const body = await res.body.text();
+      const ct = ((res.headers["content-type"] as string) || "").toLowerCase();
+      if (res.statusCode === 405) {
+        return { passed: true, details: "HTTP 405 (server does not support server-initiated messages)" };
+      }
+      if (ct.includes("text/event-stream")) {
+        // Validate SSE format if body is non-empty
+        if (body.trim().length > 0) {
+          const hasSSEFields = body.includes("data:") || body.includes("event:");
+          if (!hasSSEFields) {
+            return { passed: false, details: "Content-Type is text/event-stream but body has no SSE fields" };
+          }
+        }
+        return { passed: true, details: "GET with session returns SSE stream for server-initiated messages" };
+      }
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        return { passed: true, details: `HTTP ${res.statusCode} (accepted)` };
+      }
+      return { passed: false, details: `HTTP ${res.statusCode}, Content-Type: ${ct}` };
+    },
+  );
+
+  await test(
+    "transport-concurrent",
+    "Handles concurrent requests",
+    "transport",
+    false,
+    "basic/transports#streamable-http",
+    async () => {
+      // Send 3 ping requests in parallel with distinct IDs
+      const ids = [createIdCounter(99930)(), createIdCounter(99931)(), createIdCounter(99932)()];
+      const promises = ids.map((id) =>
+        request(backendUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            ...buildHeaders(),
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id, method: "ping" }),
+          signal: AbortSignal.timeout(timeout),
+        }).then(async (res) => {
+          const text = await res.body.text();
+          const ct = ((res.headers["content-type"] as string) || "").toLowerCase();
+          let body: any;
+          if (ct.includes("text/event-stream")) {
+            body = parseSSEResponse(text);
+          }
+          if (!body) {
+            try {
+              body = JSON.parse(text);
+            } catch {}
+          }
+          return { statusCode: res.statusCode, body, requestId: id };
+        }),
+      );
+      const results = await Promise.all(promises);
+      const issues: string[] = [];
+      for (const r of results) {
+        if (r.statusCode < 200 || r.statusCode >= 300) {
+          issues.push(`Request id=${r.requestId}: HTTP ${r.statusCode}`);
+        } else if (r.body?.id !== r.requestId) {
+          issues.push(`Request id=${r.requestId}: response id=${r.body?.id} (mismatch)`);
+        }
+      }
+      if (issues.length > 0) return { passed: false, details: issues.join("; ") };
+      return { passed: true, details: `${results.length} concurrent requests handled correctly` };
     },
   );
 

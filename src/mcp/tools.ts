@@ -9,7 +9,7 @@ import { TEST_DEFINITIONS } from "../types.js";
 export function registerTools(server: McpServer) {
   server.tool(
     "mcp_compliance_test",
-    "Run the full MCP compliance test suite against a server URL. Returns grade (A-F), score, and detailed results for all 45 tests covering transport, lifecycle, tools, resources, prompts, errors, and schema validation.",
+    "Run the full MCP compliance test suite against a server URL. Returns grade (A-F), score, and detailed results for all 48 tests covering transport, lifecycle, tools, resources, prompts, errors, and schema validation.",
     {
       url: z.string().url().describe("The MCP server URL to test (must be HTTP or HTTPS)"),
       auth: z.string().optional().describe('Authorization header value (e.g., "Bearer tok123")'),

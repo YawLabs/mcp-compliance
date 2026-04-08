@@ -1,11 +1,11 @@
 # mcp-compliance
 
-MCP server compliance testing tool. Tests any Streamable HTTP MCP server against the MCP specification (2025-11-25) with 45 tests across 7 categories.
+MCP server compliance testing tool. Tests any Streamable HTTP MCP server against the MCP specification (2025-11-25) with 48 tests across 7 categories.
 
 ## Architecture
 
 - `src/index.ts` — CLI entry point (Commander.js). Subcommands: `test`, `badge`, `mcp`.
-- `src/runner.ts` — Core test engine. Runs all 45 tests sequentially. Exports `runComplianceSuite()`, `SPEC_VERSION`, `SPEC_BASE`, and `parseSSEResponse()`. Includes preflight connectivity check.
+- `src/runner.ts` — Core test engine. Runs all 48 tests sequentially. Exports `runComplianceSuite()`, `SPEC_VERSION`, `SPEC_BASE`, and `parseSSEResponse()`. Includes preflight connectivity check.
 - `src/types.ts` — TypeScript interfaces + `TEST_DEFINITIONS` array (all 43 test metadata).
 - `src/grader.ts` — Scoring algorithm: required tests 70%, optional 30%. Grade thresholds: A>=90, B>=75, C>=60, D>=40, F<40.
 - `src/reporter.ts` — Terminal (chalk), JSON, and SARIF formatters. SARIF includes server context in invocations.

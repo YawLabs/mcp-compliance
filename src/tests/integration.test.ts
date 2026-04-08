@@ -111,7 +111,7 @@ afterAll(async () => {
 
 describe("integration — full compliance suite against real server", () => {
   it("passes all required tests", async () => {
-    const report = await runComplianceSuite(serverUrl, { timeout: 5000 });
+    const report = await runComplianceSuite(serverUrl, { timeout: 3000 });
     // All required tests must pass
     const requiredFails = report.tests.filter((t) => t.required && !t.passed);
     if (requiredFails.length > 0) {
@@ -122,7 +122,7 @@ describe("integration — full compliance suite against real server", () => {
   }, 30000);
 
   it("returns a valid report structure", async () => {
-    const report = await runComplianceSuite(serverUrl, { timeout: 5000 });
+    const report = await runComplianceSuite(serverUrl, { timeout: 3000 });
 
     expect(report.specVersion).toBe("2025-11-25");
     expect(report.score).toBeGreaterThan(0);
@@ -135,14 +135,14 @@ describe("integration — full compliance suite against real server", () => {
     expect(report.promptCount).toBeGreaterThan(0);
   }, 30000);
 
-  it("runs all 45 tests", async () => {
-    const report = await runComplianceSuite(serverUrl, { timeout: 5000 });
-    // Should run a significant number of tests (all 45 base tests)
-    expect(report.tests.length).toBeGreaterThanOrEqual(42);
+  it("runs all 48 tests", async () => {
+    const report = await runComplianceSuite(serverUrl, { timeout: 3000 });
+    // Should run a significant number of tests (all 48 base tests)
+    expect(report.tests.length).toBeGreaterThanOrEqual(45);
   }, 30000);
 
   it("has no preflight warning for reachable server", async () => {
-    const report = await runComplianceSuite(serverUrl, { timeout: 5000 });
+    const report = await runComplianceSuite(serverUrl, { timeout: 3000 });
     expect(report.warnings.some((w) => w.includes("unreachable"))).toBe(false);
   }, 30000);
 });
