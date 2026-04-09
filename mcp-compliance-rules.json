@@ -47,6 +47,12 @@
       "name": "Schema Validation",
       "description": "Structural validation of tool, resource, and prompt definitions",
       "scope": "capability-gated"
+    },
+    {
+      "id": "security",
+      "name": "Security Validation",
+      "description": "Authentication, input validation, tool integrity, and information disclosure tests",
+      "scope": "post-init"
     }
   ],
   "rules": [
@@ -133,6 +139,42 @@
       "description": "Verifies the server enforces MCP-Session-Id header after initialization",
       "passCriteria": "Returns 400 for missing session ID, or auto-pass if no session ID was issued",
       "failCriteria": "Returns 2xx without required session ID header"
+    },
+    {
+      "id": "transport-content-type-init",
+      "name": "Initialize response has valid content type",
+      "category": "transport",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#streamable-http",
+      "description": "Validates that the initialize response uses application/json or text/event-stream content type",
+      "passCriteria": "Content-Type is application/json or text/event-stream",
+      "failCriteria": "Content-Type is neither application/json nor text/event-stream"
+    },
+    {
+      "id": "transport-get-stream",
+      "name": "GET with session returns SSE or 405",
+      "category": "transport",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#streamable-http",
+      "description": "Tests the GET endpoint with an active session ID for server-initiated messages",
+      "passCriteria": "Returns text/event-stream or 405 Method Not Allowed",
+      "failCriteria": "Returns other status or content type"
+    },
+    {
+      "id": "transport-concurrent",
+      "name": "Handles concurrent requests",
+      "category": "transport",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#streamable-http",
+      "description": "Sends multiple JSON-RPC requests in parallel and verifies correct responses",
+      "passCriteria": "All concurrent requests receive responses with correct matching IDs",
+      "failCriteria": "Any response has mismatched ID or non-2xx status"
     },
     {
       "id": "lifecycle-init",
@@ -253,6 +295,30 @@
       "description": "Verifies the server handles completion/complete requests",
       "passCriteria": "Result returned or -32602 error, or auto-pass if completions capability not advertised",
       "failCriteria": "Error other than -32602 when completions capability is advertised"
+    },
+    {
+      "id": "lifecycle-cancellation",
+      "name": "Handles cancellation notifications",
+      "category": "lifecycle",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/utilities#cancellation",
+      "description": "Verifies the server accepts notifications/cancelled without error",
+      "passCriteria": "Server accepts cancellation notification (2xx response)",
+      "failCriteria": "Server returns error for cancellation notification"
+    },
+    {
+      "id": "lifecycle-progress",
+      "name": "Accepts progress notifications",
+      "category": "lifecycle",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/utilities#progress",
+      "description": "Verifies the server accepts notifications/progress without error",
+      "passCriteria": "Server accepts progress notification (2xx response)",
+      "failCriteria": "Server returns error for progress notification"
     },
     {
       "id": "tools-list",
@@ -565,6 +631,258 @@
       "description": "Verifies all resources have a valid parseable URI and name",
       "passCriteria": "All resources have a valid parseable URI and name field",
       "failCriteria": "Any resource is missing uri, has an invalid URI, or is missing name"
+    },
+    {
+      "id": "security-auth-required",
+      "name": "Rejects unauthenticated requests",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/authorization",
+      "description": "Verifies the server rejects requests without an Authorization header",
+      "passCriteria": "HTTP 401 or 403 for unauthenticated request",
+      "failCriteria": "Server accepts unauthenticated request or no auth is configured"
+    },
+    {
+      "id": "security-auth-malformed",
+      "name": "Rejects malformed auth credentials",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/authorization",
+      "description": "Verifies the server rejects malformed Authorization header values",
+      "passCriteria": "HTTP 401 or 403 for garbage auth token",
+      "failCriteria": "Server accepts malformed auth token"
+    },
+    {
+      "id": "security-tls-required",
+      "name": "Enforces HTTPS/TLS",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/authorization",
+      "description": "Verifies the server rejects plaintext HTTP connections when HTTPS is configured",
+      "passCriteria": "HTTP connection rejected, redirected, or server URL uses HTTP (skipped)",
+      "failCriteria": "Server accepts plaintext HTTP alongside HTTPS"
+    },
+    {
+      "id": "security-session-entropy",
+      "name": "Session IDs are high-entropy",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#streamable-http",
+      "description": "Verifies MCP-Session-Id values are cryptographically random",
+      "passCriteria": "Session ID is ≥16 chars, non-sequential, with high character diversity",
+      "failCriteria": "Session ID is short, purely numeric, or low-entropy"
+    },
+    {
+      "id": "security-session-not-auth",
+      "name": "Session ID does not bypass auth",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#streamable-http",
+      "description": "Verifies that a valid session ID alone is not sufficient for authentication",
+      "passCriteria": "HTTP 401 or 403 when session ID is sent without Authorization header",
+      "failCriteria": "Server accepts request with session ID but no auth"
+    },
+    {
+      "id": "security-oauth-metadata",
+      "name": "OAuth metadata endpoint exists",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/authorization",
+      "description": "Verifies the OAuth authorization server metadata endpoint exists",
+      "passCriteria": "/.well-known/oauth-authorization-server returns valid JSON with issuer and token_endpoint",
+      "failCriteria": "Endpoint missing, non-JSON, or missing required fields"
+    },
+    {
+      "id": "security-token-in-uri",
+      "name": "Rejects auth tokens in query string",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/authorization",
+      "description": "Verifies the server does not accept auth tokens in the URL query string",
+      "passCriteria": "HTTP 401 or 403 when token is in query string instead of Authorization header",
+      "failCriteria": "Server accepts token from query string"
+    },
+    {
+      "id": "security-cors-headers",
+      "name": "CORS headers are restrictive",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#streamable-http",
+      "description": "Verifies CORS headers do not use wildcard origin",
+      "passCriteria": "No CORS headers, or Access-Control-Allow-Origin is not '*' or reflected",
+      "failCriteria": "Access-Control-Allow-Origin is '*' or reflects arbitrary origins"
+    },
+    {
+      "id": "security-command-injection",
+      "name": "Resists command injection in tool params",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": "tools",
+      "specRef": "server/tools#calling-tools",
+      "description": "Verifies tools do not execute OS command injection payloads in string parameters",
+      "passCriteria": "Injection payloads do not produce command execution output",
+      "failCriteria": "Tool output contains evidence of command execution"
+    },
+    {
+      "id": "security-sql-injection",
+      "name": "Resists SQL injection in tool params",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": "tools",
+      "specRef": "server/tools#calling-tools",
+      "description": "Verifies tools do not expose SQL injection vulnerabilities",
+      "passCriteria": "Injection payloads do not trigger database errors or data leakage",
+      "failCriteria": "Tool output contains SQL error messages or database metadata"
+    },
+    {
+      "id": "security-path-traversal",
+      "name": "Resists path traversal in tool params",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": "tools",
+      "specRef": "server/tools#calling-tools",
+      "description": "Verifies tools do not allow path traversal attacks via string parameters",
+      "passCriteria": "Traversal payloads do not return sensitive file content",
+      "failCriteria": "Tool output contains content from /etc/passwd or system files"
+    },
+    {
+      "id": "security-ssrf-internal",
+      "name": "Resists SSRF to internal networks",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": "tools",
+      "specRef": "server/tools#calling-tools",
+      "description": "Verifies tools with URL parameters do not fetch internal/cloud metadata endpoints",
+      "passCriteria": "Internal IP payloads do not return cloud metadata or internal service data",
+      "failCriteria": "Tool output contains cloud metadata or internal network responses"
+    },
+    {
+      "id": "security-oversized-input",
+      "name": "Handles oversized inputs gracefully",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "server/tools#calling-tools",
+      "description": "Verifies the server handles 1MB+ payloads without crashing",
+      "passCriteria": "HTTP 413, any 4xx error, or server handles gracefully without timeout",
+      "failCriteria": "Server times out or crashes under oversized input"
+    },
+    {
+      "id": "security-extra-params",
+      "name": "Rejects or ignores extra tool params",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": "tools",
+      "specRef": "server/tools#calling-tools",
+      "description": "Verifies the server handles unexpected additional tool parameters safely",
+      "passCriteria": "Server rejects extra params with error or silently ignores them",
+      "failCriteria": "Server crashes or processes __proto__ pollution attempts"
+    },
+    {
+      "id": "security-tool-schema-defined",
+      "name": "All tools define inputSchema",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": "tools",
+      "specRef": "server/tools#data-types",
+      "description": "Verifies all tools have an inputSchema with type 'object' for input validation",
+      "passCriteria": "All tools have inputSchema with type: 'object'",
+      "failCriteria": "Any tool is missing inputSchema or has wrong type"
+    },
+    {
+      "id": "security-tool-rug-pull",
+      "name": "Tool definitions are stable across calls",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": "tools",
+      "specRef": "server/tools#listing-tools",
+      "description": "Verifies tool definitions do not change between consecutive tools/list calls",
+      "passCriteria": "Tool count, names, and descriptions are identical across 2 calls",
+      "failCriteria": "Tool definitions changed between calls (possible rug-pull attack)"
+    },
+    {
+      "id": "security-tool-description-poisoning",
+      "name": "Tool descriptions free of injection patterns",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": "tools",
+      "specRef": "server/tools#data-types",
+      "description": "Scans tool descriptions for prompt injection patterns and hidden characters",
+      "passCriteria": "No suspicious patterns found in tool names, descriptions, or parameter descriptions",
+      "failCriteria": "Tool descriptions contain 'ignore previous', 'override', hidden Unicode, or Base64 payloads"
+    },
+    {
+      "id": "security-tool-cross-reference",
+      "name": "Tools do not reference other tools by name",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": "tools",
+      "specRef": "server/tools#data-types",
+      "description": "Checks that tool descriptions do not reference other tool names",
+      "passCriteria": "No tool description contains the name of another tool",
+      "failCriteria": "Tool description references another tool by name (manipulation risk)"
+    },
+    {
+      "id": "security-error-no-stacktrace",
+      "name": "Error responses do not leak stack traces",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic",
+      "description": "Verifies error responses do not contain stack traces, file paths, or sensitive data",
+      "passCriteria": "No stack traces, file paths, connection strings, or credentials in error responses",
+      "failCriteria": "Error response contains implementation details or sensitive information"
+    },
+    {
+      "id": "security-error-no-internal-ip",
+      "name": "Error responses do not leak internal IPs",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic",
+      "description": "Verifies error responses do not contain private IP addresses",
+      "passCriteria": "No 10.x, 172.16-31.x, 192.168.x, or 127.x addresses in error responses",
+      "failCriteria": "Error response contains internal IP addresses"
+    },
+    {
+      "id": "security-rate-limiting",
+      "name": "Rate limiting is enforced",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#streamable-http",
+      "description": "Verifies the server implements rate limiting under burst load",
+      "passCriteria": "HTTP 429 returned during 50-request burst",
+      "failCriteria": "All 50 rapid requests accepted without rate limiting"
     }
   ]
 }

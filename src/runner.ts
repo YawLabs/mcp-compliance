@@ -3,11 +3,14 @@ import { request } from "undici";
 import { generateBadge } from "./badge.js";
 import { computeScore } from "./grader.js";
 import type { ComplianceReport, TestResult } from "./types.js";
+import { TEST_DEFINITIONS } from "./types.js";
 
 export type { TestResult, ComplianceReport } from "./types.js";
 export { TEST_DEFINITIONS } from "./types.js";
 export { computeGrade, computeScore } from "./grader.js";
 export { generateBadge } from "./badge.js";
+
+const TEST_DEFINITIONS_MAP = new Map(TEST_DEFINITIONS.map((t) => [t.id, t]));
 
 const _require = createRequire(import.meta.url);
 const { version: TOOL_VERSION } = _require("../package.json");
@@ -16,6 +19,41 @@ export const SPEC_VERSION = "2025-11-25";
 export const SPEC_BASE = `https://modelcontextprotocol.io/specification/${SPEC_VERSION}`;
 
 const VALID_CONTENT_TYPES = ["text", "image", "audio", "resource", "resource_link"];
+
+const INJECTION_PAYLOADS = {
+  command: ["; cat /etc/passwd", "$(whoami)", "| ls -la", "`id`", "&& echo pwned"],
+  sql: ["' OR 1=1 --", "'; DROP TABLE users; --", "1 UNION SELECT * FROM information_schema.tables--"],
+  pathTraversal: ["../../etc/passwd", "..\\..\\windows\\system.ini", "%2e%2e%2f%2e%2e%2fetc%2fpasswd"],
+  ssrf: ["http://169.254.169.254/latest/meta-data/", "http://127.0.0.1:22", "http://[::1]/", "http://10.0.0.1/"],
+};
+
+const STACK_TRACE_PATTERNS = [
+  /at\s+\S+\s+\(.*:\d+:\d+\)/i, // Node.js: "at Function (file.js:10:5)"
+  /Traceback\s+\(most recent/i, // Python
+  /\.py",\s+line\s+\d+/i, // Python file reference
+  /\.java:\d+\)/i, // Java
+  /\.go:\d+/i, // Go
+  /from\s+\S+\.rb:\d+/i, // Ruby
+  /\.cs:line\s+\d+/i, // C#/.NET
+  /#\d+\s+\/.*\.php\(\d+\)/i, // PHP
+  /panicked\s+at\s+'/i, // Rust
+  /ENOENT|EACCES|EPERM/, // Node.js system errors
+  /node_modules\//, // Node.js module paths
+  /\/usr\/local\/|\/home\//, // Unix paths
+  /[A-Z]:\\.*\\/, // Windows paths
+  /password|passwd|secret|credential/i, // Sensitive terms
+  /jdbc:|mysql:|postgres:|mongodb:/i, // DB connection strings
+];
+
+const INTERNAL_IP_PATTERNS = [
+  /\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
+  /\b172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/,
+  /\b192\.168\.\d{1,3}\.\d{1,3}\b/,
+  /\b127\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
+  /\b::1\b/, // IPv6 loopback
+  /\bfe80:/i, // IPv6 link-local
+  /\bf[cd][0-9a-f]{2}:/i, // IPv6 unique local (fc00::/fd00::)
+];
 
 function createIdCounter(start = 0) {
   let id = start;
@@ -183,7 +221,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
 
   const backendUrl = url;
 
-  // Preflight connectivity check — fail fast instead of running 43 failing tests
+  // Preflight connectivity check — fail fast instead of running 69 failing tests
   let serverReachable = true;
   try {
     const preflight = await request(backendUrl, {
@@ -1513,7 +1551,770 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     return { passed: false, details: `HTTP ${res.statusCode} — expected error code -32600` };
   });
 
-  // ── 9. SESSION CLEANUP (runs last to avoid breaking other tests) ──
+  // ── 9. SECURITY TESTS ────────────────────────────────────────────
+
+  // Auth & Transport security tests
+  // These tests detect whether the server requires authentication.
+  // If --auth was passed and the server accepted it, we test with auth stripped.
+  const hasAuth = !!userHeaders.Authorization || !!userHeaders.authorization;
+
+  await test(
+    "security-auth-required",
+    "Rejects unauthenticated requests",
+    "security",
+    false,
+    "basic/authorization",
+    async () => {
+      if (!hasAuth) {
+        return {
+          passed: false,
+          details: "Server does not require auth (no --auth provided and server accepted unauthenticated requests)",
+        };
+      }
+      // Re-send initialize without auth header
+      const noAuthHeaders: Record<string, string> = {};
+      if (sessionId) noAuthHeaders["mcp-session-id"] = sessionId;
+      try {
+        const res = await mcpRequest(backendUrl, "ping", undefined, nextId, noAuthHeaders, timeout);
+        if (res.statusCode === 401 || res.statusCode === 403) {
+          return { passed: true, details: `HTTP ${res.statusCode} (unauthenticated request rejected)` };
+        }
+        return { passed: false, details: `HTTP ${res.statusCode} — server accepted unauthenticated request` };
+      } catch (err: unknown) {
+        return { passed: true, details: "Connection rejected (acceptable)" };
+      }
+    },
+  );
+
+  await test(
+    "security-auth-malformed",
+    "Rejects malformed auth credentials",
+    "security",
+    false,
+    "basic/authorization",
+    async () => {
+      if (!hasAuth) {
+        return { passed: false, details: "Skipped: server does not require auth" };
+      }
+      const malformedHeaders: Record<string, string> = {
+        Authorization: "Bearer INVALID_GARBAGE_TOKEN_!@#$%^&*()",
+      };
+      if (sessionId) malformedHeaders["mcp-session-id"] = sessionId;
+      try {
+        const res = await mcpRequest(backendUrl, "ping", undefined, nextId, malformedHeaders, timeout);
+        if (res.statusCode === 401 || res.statusCode === 403) {
+          return { passed: true, details: `HTTP ${res.statusCode} (malformed auth rejected)` };
+        }
+        return { passed: false, details: `HTTP ${res.statusCode} — server accepted malformed auth token` };
+      } catch (err: unknown) {
+        return { passed: true, details: "Connection rejected (acceptable)" };
+      }
+    },
+  );
+
+  await test("security-tls-required", "Enforces HTTPS/TLS", "security", false, "basic/authorization", async () => {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.protocol !== "https:") {
+      return { passed: false, details: `Server URL uses ${parsedUrl.protocol} — production servers should use HTTPS` };
+    }
+    // Try HTTP variant
+    const httpUrl = url.replace(/^https:/, "http:");
+    try {
+      const res = await request(httpUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 99950, method: "ping" }),
+        signal: AbortSignal.timeout(Math.min(timeout, 5000)),
+      });
+      await res.body.text();
+      if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 308) {
+        return { passed: true, details: `HTTP ${res.statusCode} redirect to HTTPS (good)` };
+      }
+      if (res.statusCode >= 400) {
+        return { passed: true, details: `HTTP ${res.statusCode} (plaintext rejected)` };
+      }
+      return { passed: false, details: `HTTP ${res.statusCode} — server accepts plaintext HTTP connections` };
+    } catch {
+      return { passed: true, details: "HTTP connection refused (HTTPS enforced)" };
+    }
+  });
+
+  await test(
+    "security-session-entropy",
+    "Session IDs are high-entropy",
+    "security",
+    false,
+    "basic/transports#streamable-http",
+    async () => {
+      if (!sessionId) {
+        return { passed: true, details: "Server does not issue session IDs (skipped)" };
+      }
+      // Check length (should be at least 16 chars for reasonable entropy)
+      if (sessionId.length < 16) {
+        return {
+          passed: false,
+          details: `Session ID too short (${sessionId.length} chars): "${sessionId}" — should be ≥16 chars`,
+        };
+      }
+      // Check for sequential/numeric patterns
+      if (/^\d+$/.test(sessionId)) {
+        return {
+          passed: false,
+          details: `Session ID is purely numeric: "${sessionId}" — likely sequential, not random`,
+        };
+      }
+      // Check character diversity (at least 8 unique chars)
+      const uniqueChars = new Set(sessionId.toLowerCase()).size;
+      if (uniqueChars < 8) {
+        return {
+          passed: false,
+          details: `Session ID has low character diversity (${uniqueChars} unique chars): "${sessionId}"`,
+        };
+      }
+      return {
+        passed: true,
+        details: `Session ID has good entropy (${sessionId.length} chars, ${uniqueChars} unique): "${sessionId.substring(0, 16)}..."`,
+      };
+    },
+  );
+
+  await test(
+    "security-session-not-auth",
+    "Session ID does not bypass auth",
+    "security",
+    false,
+    "basic/transports#streamable-http",
+    async () => {
+      if (!hasAuth) {
+        return { passed: true, details: "Skipped: server does not require auth" };
+      }
+      if (!sessionId) {
+        return { passed: true, details: "Skipped: server does not issue session IDs" };
+      }
+      // Send request with session ID but NO auth
+      const sessionOnlyHeaders: Record<string, string> = {
+        "mcp-session-id": sessionId,
+      };
+      try {
+        const res = await mcpRequest(backendUrl, "ping", undefined, nextId, sessionOnlyHeaders, timeout);
+        if (res.statusCode === 401 || res.statusCode === 403) {
+          return { passed: true, details: `HTTP ${res.statusCode} (session ID alone not sufficient for auth)` };
+        }
+        return {
+          passed: false,
+          details: `HTTP ${res.statusCode} — server accepted session ID without auth (spec: MUST NOT use sessions for authentication)`,
+        };
+      } catch {
+        return { passed: true, details: "Connection rejected (acceptable)" };
+      }
+    },
+  );
+
+  await test(
+    "security-oauth-metadata",
+    "OAuth metadata endpoint exists",
+    "security",
+    false,
+    "basic/authorization",
+    async () => {
+      if (!hasAuth) {
+        return { passed: true, details: "Skipped: server does not require auth" };
+      }
+      const parsedUrl = new URL(url);
+      const metadataUrl = `${parsedUrl.protocol}//${parsedUrl.host}/.well-known/oauth-authorization-server`;
+      try {
+        const res = await request(metadataUrl, {
+          method: "GET",
+          headers: { Accept: "application/json" },
+          signal: AbortSignal.timeout(Math.min(timeout, 5000)),
+        });
+        const text = await res.body.text();
+        if (res.statusCode === 200) {
+          try {
+            const meta = JSON.parse(text);
+            if (meta.issuer && meta.token_endpoint) {
+              return { passed: true, details: `OAuth metadata found: issuer=${meta.issuer}` };
+            }
+            return {
+              passed: false,
+              details: "OAuth metadata response missing required fields (issuer, token_endpoint)",
+            };
+          } catch {
+            return { passed: false, details: "OAuth metadata endpoint returned non-JSON response" };
+          }
+        }
+        return { passed: false, details: `OAuth metadata endpoint returned HTTP ${res.statusCode}` };
+      } catch {
+        return { passed: false, details: "OAuth metadata endpoint unreachable" };
+      }
+    },
+  );
+
+  await test(
+    "security-token-in-uri",
+    "Rejects auth tokens in query string",
+    "security",
+    false,
+    "basic/authorization",
+    async () => {
+      if (!hasAuth) {
+        return { passed: true, details: "Skipped: server does not require auth" };
+      }
+      const authValue = userHeaders.Authorization || userHeaders.authorization || "";
+      const token = authValue.replace(/^Bearer\s+/i, "");
+      if (!token) {
+        return { passed: true, details: "Skipped: could not extract token from auth header" };
+      }
+      const uriWithToken = `${url}${url.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(token)}`;
+      try {
+        // Send WITHOUT auth header, WITH token in URI
+        const noAuthHeaders: Record<string, string> = {};
+        if (sessionId) noAuthHeaders["mcp-session-id"] = sessionId;
+        const res = await mcpRequest(uriWithToken, "ping", undefined, nextId, noAuthHeaders, timeout);
+        if (res.statusCode === 401 || res.statusCode === 403) {
+          return { passed: true, details: `HTTP ${res.statusCode} (token in query string rejected)` };
+        }
+        // If server accepted it, that's a fail
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          return {
+            passed: false,
+            details: "Server accepted auth token in query string (spec: MUST NOT transmit credentials in URIs)",
+          };
+        }
+        return { passed: true, details: `HTTP ${res.statusCode} (token in query string not accepted)` };
+      } catch {
+        return { passed: true, details: "Connection rejected (acceptable)" };
+      }
+    },
+  );
+
+  await test(
+    "security-cors-headers",
+    "CORS headers are restrictive",
+    "security",
+    false,
+    "basic/transports#streamable-http",
+    async () => {
+      // Send an OPTIONS preflight or check CORS headers from a normal response
+      try {
+        const res = await request(backendUrl, {
+          method: "OPTIONS",
+          headers: {
+            Origin: "https://evil.example.com",
+            "Access-Control-Request-Method": "POST",
+            ...buildHeaders(),
+          },
+          signal: AbortSignal.timeout(Math.min(timeout, 5000)),
+        });
+        await res.body.text();
+        const acao = res.headers["access-control-allow-origin"];
+        if (!acao) {
+          return { passed: true, details: "No CORS headers returned (server-to-server only, acceptable)" };
+        }
+        if (acao === "*") {
+          return {
+            passed: false,
+            details: 'Access-Control-Allow-Origin is "*" (wildcard) — allows cross-origin credential theft',
+          };
+        }
+        if (acao === "https://evil.example.com") {
+          return { passed: false, details: "Server reflects arbitrary Origin in CORS — effectively wildcard" };
+        }
+        return { passed: true, details: `CORS restricted to: ${acao}` };
+      } catch {
+        return { passed: true, details: "OPTIONS request failed (no CORS, acceptable)" };
+      }
+    },
+  );
+
+  // Input validation security tests (only run if tools are available)
+  // Shared helper for injection tests: sends payloads to a tool param, checks output against a detection pattern
+  async function runInjectionTest(
+    toolName: string,
+    paramName: string,
+    payloads: string[],
+    detectPattern: RegExp,
+    label: string,
+  ): Promise<{ passed: boolean; details: string }> {
+    const issues: string[] = [];
+    for (const payload of payloads) {
+      try {
+        const res = await rpc("tools/call", { name: toolName, arguments: { [paramName]: payload } });
+        const content = res.body?.result?.content;
+        if (Array.isArray(content)) {
+          const text = content.map((c: any) => c.text || "").join(" ");
+          if (detectPattern.test(text)) {
+            issues.push(`Payload "${payload}" ${label} (output: ${text.substring(0, 100)})`);
+          }
+        }
+      } catch {
+        // Error is acceptable — server rejected the input
+      }
+    }
+    if (issues.length > 0) return { passed: false, details: issues.join("; ") };
+    return {
+      passed: true,
+      details: `Tested ${payloads.length} payloads against ${toolName}.${paramName} — no ${label.split(" ")[0]} detected`,
+    };
+  }
+
+  if (toolNames.length > 0) {
+    const allTools: any[] = cachedToolsList ?? [];
+    const toolsWithStringParams = allTools.filter((t) => {
+      const props = t.inputSchema?.properties;
+      if (!props) return false;
+      return Object.values(props).some((p: any) => p.type === "string");
+    });
+
+    const injectionTarget: any = toolsWithStringParams[0] || allTools[0];
+    const targetStringParam: string | null = injectionTarget?.inputSchema?.properties
+      ? (Object.entries(injectionTarget.inputSchema.properties).find(
+          ([_, v]: [string, any]) => v.type === "string",
+        )?.[0] ?? null)
+      : null;
+
+    await test(
+      "security-command-injection",
+      "Resists command injection in tool params",
+      "security",
+      false,
+      "server/tools#calling-tools",
+      async () => {
+        if (!injectionTarget || !targetStringParam)
+          return { passed: true, details: "No tools with string parameters to test" };
+        return runInjectionTest(
+          injectionTarget.name,
+          targetStringParam,
+          INJECTION_PAYLOADS.command,
+          /root:.*:\d+:\d+:.*:\/|uid=\d+\(\w+\)|drwxr|pwned/i,
+          "appears to have executed",
+        );
+      },
+    );
+
+    await test(
+      "security-sql-injection",
+      "Resists SQL injection in tool params",
+      "security",
+      false,
+      "server/tools#calling-tools",
+      async () => {
+        if (!injectionTarget || !targetStringParam)
+          return { passed: true, details: "No tools with string parameters to test" };
+        return runInjectionTest(
+          injectionTarget.name,
+          targetStringParam,
+          INJECTION_PAYLOADS.sql,
+          /syntax error|sql|mysql|postgres|sqlite|information_schema|table_name/i,
+          "triggered database error",
+        );
+      },
+    );
+
+    await test(
+      "security-path-traversal",
+      "Resists path traversal in tool params",
+      "security",
+      false,
+      "server/tools#calling-tools",
+      async () => {
+        if (!injectionTarget || !targetStringParam)
+          return { passed: true, details: "No tools with string parameters to test" };
+        return runInjectionTest(
+          injectionTarget.name,
+          targetStringParam,
+          INJECTION_PAYLOADS.pathTraversal,
+          /root:.*:0:0|\[boot loader\]|\[extensions\]/i,
+          "returned sensitive file content",
+        );
+      },
+    );
+
+    await test(
+      "security-ssrf-internal",
+      "Resists SSRF to internal networks",
+      "security",
+      false,
+      "server/tools#calling-tools",
+      async () => {
+        const urlParamTool = allTools.find((t: any) => {
+          const props = t.inputSchema?.properties;
+          if (!props) return false;
+          return Object.entries(props).some(
+            ([k, v]: [string, any]) => v.type === "string" && /url|uri|endpoint|link|href/i.test(k),
+          );
+        });
+        if (!urlParamTool) return { passed: true, details: "No tools with URL parameters found (skipped)" };
+        const urlParam = Object.entries(urlParamTool.inputSchema.properties).find(
+          ([k, v]: [string, any]) => v.type === "string" && /url|uri|endpoint|link|href/i.test(k),
+        )?.[0];
+        if (!urlParam) return { passed: true, details: "No URL parameter found" };
+        return runInjectionTest(
+          urlParamTool.name,
+          urlParam,
+          INJECTION_PAYLOADS.ssrf,
+          /ami-|instance-id|hostname|iam|security-credentials/i,
+          "returned internal data",
+        );
+      },
+    );
+  } else {
+    // No tools — auto-pass input validation tests
+    for (const testId of [
+      "security-command-injection",
+      "security-sql-injection",
+      "security-path-traversal",
+      "security-ssrf-internal",
+    ]) {
+      await test(
+        testId,
+        TEST_DEFINITIONS_MAP.get(testId)?.name || testId,
+        "security",
+        false,
+        "server/tools#calling-tools",
+        async () => ({ passed: true, details: "No tools available to test (skipped)" }),
+      );
+    }
+  }
+
+  await test(
+    "security-oversized-input",
+    "Handles oversized inputs gracefully",
+    "security",
+    false,
+    "server/tools#calling-tools",
+    async () => {
+      const largeValue = "A".repeat(1_048_576);
+      try {
+        const res = await request(backendUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            ...buildHeaders(),
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: nextId(),
+            method: "tools/call",
+            params: { name: toolNames[0] || "test", arguments: { data: largeValue } },
+          }),
+          signal: AbortSignal.timeout(timeout),
+        });
+        await res.body.text();
+        if (res.statusCode === 413) {
+          return { passed: true, details: "HTTP 413 Payload Too Large (good)" };
+        }
+        if (res.statusCode >= 400) {
+          return { passed: true, details: `HTTP ${res.statusCode} (oversized input rejected)` };
+        }
+        return { passed: true, details: `HTTP ${res.statusCode} — server handled 1MB payload without crashing` };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("timeout") || msg.includes("abort")) {
+          return { passed: false, details: "Request timed out — server may be struggling with oversized input" };
+        }
+        return { passed: true, details: "Connection rejected (acceptable for oversized input)" };
+      }
+    },
+  );
+
+  await test(
+    "security-extra-params",
+    "Rejects or ignores extra tool params",
+    "security",
+    false,
+    "server/tools#calling-tools",
+    async () => {
+      if (toolNames.length === 0) {
+        return { passed: true, details: "No tools available to test (skipped)" };
+      }
+      try {
+        const res = await rpc("tools/call", {
+          name: toolNames[0],
+          arguments: { __injected_param__: "malicious_value", __proto__: { admin: true } },
+        });
+        const error = res.body?.error;
+        if (error) {
+          return { passed: true, details: `Extra params rejected with error: ${error.code} — ${error.message}` };
+        }
+        // If server accepted but ignored extra params, that's acceptable
+        return { passed: true, details: "Server processed request (extra params likely ignored)" };
+      } catch {
+        return { passed: true, details: "Request rejected (acceptable)" };
+      }
+    },
+  );
+
+  // Tool integrity tests
+  await test(
+    "security-tool-schema-defined",
+    "All tools define inputSchema",
+    "security",
+    false,
+    "server/tools#data-types",
+    async () => {
+      if (!toolsListOk) return { passed: true, details: "Skipped: tools/list not available" };
+      const tools = cachedToolsList ?? [];
+      if (tools.length === 0) return { passed: true, details: "No tools to validate" };
+      const missing = tools.filter((t: any) => !t.inputSchema || t.inputSchema.type !== "object");
+      if (missing.length > 0) {
+        return {
+          passed: false,
+          details: `${missing.length} tool(s) missing inputSchema: ${missing.map((t: any) => t.name).join(", ")}`,
+        };
+      }
+      return { passed: true, details: `All ${tools.length} tool(s) have inputSchema defined` };
+    },
+  );
+
+  await test(
+    "security-tool-rug-pull",
+    "Tool definitions are stable across calls",
+    "security",
+    false,
+    "server/tools#listing-tools",
+    async () => {
+      if (!toolsListOk) return { passed: true, details: "Skipped: tools/list not available" };
+      // Fetch tools/list again and compare
+      try {
+        const res = await rpc("tools/list");
+        const tools2 = res.body?.result?.tools;
+        if (!Array.isArray(tools2)) return { passed: false, details: "Second tools/list call failed" };
+        const tools1 = cachedToolsList ?? [];
+        if (tools1.length !== tools2.length) {
+          return {
+            passed: false,
+            details: `Tool count changed: ${tools1.length} → ${tools2.length} (possible rug-pull)`,
+          };
+        }
+        const names1 = tools1
+          .map((t: any) => t.name)
+          .sort()
+          .join(",");
+        const names2 = tools2
+          .map((t: any) => t.name)
+          .sort()
+          .join(",");
+        if (names1 !== names2) {
+          return { passed: false, details: "Tool names changed between calls (possible rug-pull)" };
+        }
+        // Check descriptions haven't changed
+        for (const t1 of tools1) {
+          const t2 = tools2.find((t: any) => t.name === t1.name);
+          if (t2 && t1.description !== t2.description) {
+            return {
+              passed: false,
+              details: `Tool "${t1.name}" description changed between calls (possible rug-pull)`,
+            };
+          }
+        }
+        return { passed: true, details: `${tools1.length} tool(s) consistent across 2 calls` };
+      } catch {
+        return { passed: false, details: "Second tools/list call threw an error" };
+      }
+    },
+  );
+
+  await test(
+    "security-tool-description-poisoning",
+    "Tool descriptions free of injection patterns",
+    "security",
+    false,
+    "server/tools#data-types",
+    async () => {
+      if (!toolsListOk) return { passed: true, details: "Skipped: tools/list not available" };
+      const tools = cachedToolsList ?? [];
+      if (tools.length === 0) return { passed: true, details: "No tools to validate" };
+
+      const suspiciousPatterns = [
+        { pattern: /ignore\s+(all\s+)?previous/i, label: "ignore previous instructions" },
+        { pattern: /override\s+(system|instructions|rules)/i, label: "override instructions" },
+        { pattern: /system\s+prompt/i, label: "system prompt reference" },
+        { pattern: /you\s+must\s+(always|never)/i, label: "behavioral override" },
+        { pattern: /do\s+not\s+(tell|inform|mention)/i, label: "concealment instruction" },
+        { pattern: /\b[A-Za-z0-9+/]{40,}={0,2}\b/, label: "possible Base64-encoded payload" },
+        // Zero-width characters (U+200B, U+200C, U+200D, U+FEFF)
+        { pattern: /\u200B|\u200C|\u200D|\uFEFF/, label: "hidden Unicode characters" },
+      ];
+
+      const issues: string[] = [];
+      for (const tool of tools) {
+        const textsToCheck = [
+          tool.description || "",
+          ...(tool.inputSchema?.properties
+            ? Object.values(tool.inputSchema.properties).map((p: any) => p.description || "")
+            : []),
+        ];
+        const combined = textsToCheck.join(" ");
+        for (const { pattern, label } of suspiciousPatterns) {
+          if (pattern.test(combined)) {
+            issues.push(`Tool "${tool.name}": ${label}`);
+          }
+        }
+      }
+      if (issues.length > 0) return { passed: false, details: issues.join("; ") };
+      return { passed: true, details: `${tools.length} tool(s) scanned — no injection patterns found` };
+    },
+  );
+
+  await test(
+    "security-tool-cross-reference",
+    "Tools do not reference other tools by name",
+    "security",
+    false,
+    "server/tools#data-types",
+    async () => {
+      if (!toolsListOk) return { passed: true, details: "Skipped: tools/list not available" };
+      const tools = cachedToolsList ?? [];
+      if (tools.length < 2)
+        return { passed: true, details: "Fewer than 2 tools — cross-reference check not applicable" };
+
+      const names = tools.map((t: any) => t.name).filter(Boolean);
+      const issues: string[] = [];
+      for (const tool of tools) {
+        const desc = (tool.description || "").toLowerCase();
+        for (const otherName of names) {
+          if (otherName === tool.name) continue;
+          if (desc.includes(otherName.toLowerCase())) {
+            issues.push(`Tool "${tool.name}" description references "${otherName}"`);
+          }
+        }
+      }
+      if (issues.length > 0) {
+        warnings.push(`Cross-tool references found: ${issues.join("; ")}`);
+        return { passed: false, details: issues.join("; ") };
+      }
+      return { passed: true, details: `${tools.length} tool(s) checked — no cross-references found` };
+    },
+  );
+
+  // Information disclosure tests
+  await test(
+    "security-error-no-stacktrace",
+    "Error responses do not leak stack traces",
+    "security",
+    false,
+    "basic",
+    async () => {
+      const errorResponses: string[] = [];
+      // Trigger several error conditions and collect response text
+      const errorPayloads = [
+        "{this is not valid json!!!",
+        JSON.stringify({ jsonrpc: "2.0", id: nextId(), method: "nonexistent/___crash___test___" }),
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: nextId(),
+          method: "tools/call",
+          params: { name: "___nonexistent___tool___" },
+        }),
+      ];
+      for (const payload of errorPayloads) {
+        try {
+          const res = await request(backendUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json, text/event-stream",
+              ...buildHeaders(),
+            },
+            body: payload,
+            signal: AbortSignal.timeout(timeout),
+          });
+          const text = await res.body.text();
+          errorResponses.push(text);
+        } catch {
+          // Connection error — no response to check
+        }
+      }
+
+      const issues: string[] = [];
+      for (const text of errorResponses) {
+        for (const pattern of STACK_TRACE_PATTERNS) {
+          if (pattern.test(text)) {
+            issues.push(`Response contains: ${pattern.source} (matched in: ${text.substring(0, 80)}...)`);
+            break; // One match per response is enough
+          }
+        }
+      }
+      if (issues.length > 0) return { passed: false, details: issues.slice(0, 3).join("; ") };
+      return {
+        passed: true,
+        details: `${errorResponses.length} error responses checked — no stack traces or sensitive data found`,
+      };
+    },
+  );
+
+  await test(
+    "security-error-no-internal-ip",
+    "Error responses do not leak internal IPs",
+    "security",
+    false,
+    "basic",
+    async () => {
+      // Trigger an error and check for internal IPs
+      try {
+        const res = await request(backendUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            ...buildHeaders(),
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: nextId(), method: "___trigger_error___" }),
+          signal: AbortSignal.timeout(timeout),
+        });
+        const text = await res.body.text();
+        for (const pattern of INTERNAL_IP_PATTERNS) {
+          const match = text.match(pattern);
+          if (match) {
+            return { passed: false, details: `Error response contains internal IP: ${match[0]}` };
+          }
+        }
+        return { passed: true, details: "No internal IP addresses found in error responses" };
+      } catch {
+        return { passed: true, details: "No response to check (connection error)" };
+      }
+    },
+  );
+
+  await test(
+    "security-rate-limiting",
+    "Rate limiting is enforced",
+    "security",
+    false,
+    "basic/transports#streamable-http",
+    async () => {
+      // Send a burst of 50 rapid requests
+      const burstSize = 50;
+      let got429 = false;
+      const promises = Array.from({ length: burstSize }, () =>
+        mcpRequest(backendUrl, "ping", undefined, nextId, buildHeaders(), timeout)
+          .then((res) => {
+            if (res.statusCode === 429) got429 = true;
+            return res.statusCode;
+          })
+          .catch(() => 0),
+      );
+      const statusCodes = await Promise.all(promises);
+      if (got429) {
+        return { passed: true, details: `Rate limiting detected (429 returned after ${burstSize} rapid requests)` };
+      }
+      const errorCount = statusCodes.filter((c) => c >= 500).length;
+      if (errorCount > burstSize / 2) {
+        return {
+          passed: false,
+          details: `Server returned ${errorCount}/${burstSize} 5xx errors under load — should return 429 instead of crashing`,
+        };
+      }
+      return {
+        passed: false,
+        details: `No rate limiting detected (${burstSize} rapid requests all returned ${[...new Set(statusCodes)].join(",")})`,
+      };
+    },
+  );
+
+  // ── 10. SESSION CLEANUP (runs last to avoid breaking other tests) ──
 
   await test(
     "transport-delete",

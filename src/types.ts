@@ -1,4 +1,12 @@
-export type TestCategory = "transport" | "lifecycle" | "tools" | "resources" | "prompts" | "errors" | "schema";
+export type TestCategory =
+  | "transport"
+  | "lifecycle"
+  | "tools"
+  | "resources"
+  | "prompts"
+  | "errors"
+  | "schema"
+  | "security";
 
 export interface TestResult {
   id: string;
@@ -62,7 +70,7 @@ export interface TestDefinition {
   recommendation: string;
 }
 
-/** All 48 test IDs with descriptions for the explain command */
+/** All 69 test IDs with descriptions for the explain command */
 export const TEST_DEFINITIONS: TestDefinition[] = [
   // ── Transport (10 tests) ─────────────────────────────────────────
   {
@@ -605,5 +613,244 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     description: "Validates every resource has a valid URI (parseable as a URL) and a name field.",
     recommendation:
       "Ensure every resource has a valid, parseable URI and a name field. Add description and mimeType for better client integration.",
+  },
+
+  // ── Security: Auth & Transport (8 tests) ─────────────────────────
+  {
+    id: "security-auth-required",
+    name: "Rejects unauthenticated requests",
+    category: "security",
+    required: false,
+    specRef: "basic/authorization",
+    description:
+      "Sends a request without an Authorization header and verifies the server returns HTTP 401. Servers exposed over the network should require authentication.",
+    recommendation:
+      "Implement authentication on your MCP endpoint. Return HTTP 401 Unauthorized for requests without valid credentials. Use OAuth 2.1 or Bearer tokens as recommended by the MCP spec.",
+  },
+  {
+    id: "security-auth-malformed",
+    name: "Rejects malformed auth credentials",
+    category: "security",
+    required: false,
+    specRef: "basic/authorization",
+    description:
+      "Sends a request with a malformed Authorization header (garbage value) and verifies the server returns HTTP 401 or 403. Servers must validate auth tokens, not just check for presence.",
+    recommendation:
+      "Validate the format and signature of Authorization header values. Reject malformed or invalid tokens with HTTP 401. Do not treat any non-empty Authorization header as valid.",
+  },
+  {
+    id: "security-tls-required",
+    name: "Enforces HTTPS/TLS",
+    category: "security",
+    required: false,
+    specRef: "basic/authorization",
+    description:
+      "If the server URL uses HTTPS, attempts an HTTP (plaintext) connection and verifies it is rejected or redirected. Production MCP servers should not accept plaintext connections.",
+    recommendation:
+      "Configure your server to reject HTTP connections or redirect to HTTPS. Use TLS 1.2 or higher. The MCP spec requires HTTPS for production deployments.",
+  },
+  {
+    id: "security-session-entropy",
+    name: "Session IDs are high-entropy",
+    category: "security",
+    required: false,
+    specRef: "basic/transports#streamable-http",
+    description:
+      "Analyzes the MCP-Session-Id returned by the server. Session IDs should be cryptographically random and not sequential or predictable.",
+    recommendation:
+      "Generate session IDs using a cryptographically secure random source (e.g., crypto.randomUUID()). Session IDs should be at least 128 bits of entropy. Do not use sequential counters or timestamps.",
+  },
+  {
+    id: "security-session-not-auth",
+    name: "Session ID does not bypass auth",
+    category: "security",
+    required: false,
+    specRef: "basic/transports#streamable-http",
+    description:
+      "Verifies that presenting a valid MCP-Session-Id without an Authorization header is still rejected. Per spec, servers MUST NOT use sessions for authentication.",
+    recommendation:
+      "Always validate the Authorization header independently of the MCP-Session-Id. Sessions are for request routing, not authentication. Reject requests that lack valid auth even if they have a valid session ID.",
+  },
+  {
+    id: "security-oauth-metadata",
+    name: "OAuth metadata endpoint exists",
+    category: "security",
+    required: false,
+    specRef: "basic/authorization",
+    description:
+      "Checks for a well-known OAuth authorization server metadata endpoint at /.well-known/oauth-authorization-server. If the server requires auth, it should advertise how to obtain tokens.",
+    recommendation:
+      "Publish an OAuth 2.0 Authorization Server Metadata document at /.well-known/oauth-authorization-server on your server's origin. Include issuer, token_endpoint, and supported grant types.",
+  },
+  {
+    id: "security-token-in-uri",
+    name: "Rejects auth tokens in query string",
+    category: "security",
+    required: false,
+    specRef: "basic/authorization",
+    description:
+      "Sends a request with the auth token in the URL query string instead of the Authorization header. The MCP spec forbids transmitting credentials in URIs.",
+    recommendation:
+      "Never accept authentication tokens from URL query parameters. Tokens in URIs are logged by proxies, appear in browser history, and leak via the Referer header. Only accept tokens in the Authorization header.",
+  },
+  {
+    id: "security-cors-headers",
+    name: "CORS headers are restrictive",
+    category: "security",
+    required: false,
+    specRef: "basic/transports#streamable-http",
+    description:
+      "If the server returns CORS headers, verifies that Access-Control-Allow-Origin is not set to wildcard (*). Wildcard CORS on an authenticated API allows cross-origin credential theft.",
+    recommendation:
+      'Set Access-Control-Allow-Origin to specific trusted origins, not "*". If CORS is not needed (server-to-server only), do not send CORS headers at all.',
+  },
+
+  // ── Security: Input Validation (6 tests) ─────────────────────────
+  {
+    id: "security-command-injection",
+    name: "Resists command injection in tool params",
+    category: "security",
+    required: false,
+    specRef: "server/tools#calling-tools",
+    description:
+      "Calls each tool with OS command injection payloads in string parameters (e.g., '; cat /etc/passwd', '$(whoami)'). Verifies the server does not execute injected commands.",
+    recommendation:
+      "Never pass tool argument values directly to shell commands. Use parameterized APIs, execFile() instead of exec(), or allowlists. Sanitize all user-provided input before use in system calls.",
+  },
+  {
+    id: "security-sql-injection",
+    name: "Resists SQL injection in tool params",
+    category: "security",
+    required: false,
+    specRef: "server/tools#calling-tools",
+    description:
+      'Calls each tool with SQL injection payloads in string parameters (e.g., "\' OR 1=1 --"). Verifies the server does not return database errors or unexpected data.',
+    recommendation:
+      "Use parameterized queries or prepared statements for all database operations. Never concatenate user input into SQL strings. Return generic error messages that do not reveal database structure.",
+  },
+  {
+    id: "security-path-traversal",
+    name: "Resists path traversal in tool params",
+    category: "security",
+    required: false,
+    specRef: "server/tools#calling-tools",
+    description:
+      "Calls each tool with path traversal payloads in string parameters (e.g., '../../etc/passwd', '..\\\\..\\\\windows\\\\system.ini'). Verifies the server does not expose files outside its intended scope.",
+    recommendation:
+      "Validate and sanitize file paths. Use path.resolve() and verify the result is within the allowed directory. Reject paths containing '..' segments. Use a chroot or sandboxed filesystem for file operations.",
+  },
+  {
+    id: "security-ssrf-internal",
+    name: "Resists SSRF to internal networks",
+    category: "security",
+    required: false,
+    specRef: "server/tools#calling-tools",
+    description:
+      "For tools that accept URL parameters, submits internal IP addresses (169.254.169.254, 127.0.0.1, 10.0.0.0/8) and cloud metadata endpoints. Verifies the server blocks requests to internal networks.",
+    recommendation:
+      "Validate and restrict URLs in tool parameters. Block requests to private IP ranges (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x), link-local addresses, and cloud metadata endpoints. Use an allowlist of permitted domains.",
+  },
+  {
+    id: "security-oversized-input",
+    name: "Handles oversized inputs gracefully",
+    category: "security",
+    required: false,
+    specRef: "server/tools#calling-tools",
+    description:
+      "Sends a tools/call request with an extremely large argument value (1MB+ string). Verifies the server rejects it with an error instead of crashing or consuming excessive resources.",
+    recommendation:
+      "Implement request body size limits. Return HTTP 413 or JSON-RPC error for oversized payloads. Set explicit maxBodyLength in your HTTP server configuration.",
+  },
+  {
+    id: "security-extra-params",
+    name: "Rejects or ignores extra tool params",
+    category: "security",
+    required: false,
+    specRef: "server/tools#calling-tools",
+    description:
+      "Calls a tool with unexpected additional parameters beyond what the schema defines. Verifies the server either rejects them (strict) or silently ignores them (permissive) without errors.",
+    recommendation:
+      "Use JSON Schema validation with additionalProperties: false to reject unexpected parameters, or strip unknown properties before processing. Do not pass unvalidated properties to internal functions.",
+  },
+
+  // ── Security: Tool Integrity (4 tests) ───────────────────────────
+  {
+    id: "security-tool-schema-defined",
+    name: "All tools define inputSchema",
+    category: "security",
+    required: false,
+    specRef: "server/tools#data-types",
+    description:
+      "Verifies all tools have an inputSchema with type 'object'. Tools without schemas cannot have their inputs validated, creating an injection risk.",
+    recommendation:
+      "Define a complete JSON Schema (inputSchema with type: 'object') for every tool. Specify all expected properties, their types, and constraints. This enables input validation and prevents parameter injection.",
+  },
+  {
+    id: "security-tool-rug-pull",
+    name: "Tool definitions are stable across calls",
+    category: "security",
+    required: false,
+    specRef: "server/tools#listing-tools",
+    description:
+      "Calls tools/list twice and compares the results. Tool definitions should not change between calls within the same session, which could indicate a rug-pull attack.",
+    recommendation:
+      "Ensure tools/list returns consistent results within a session. If tools change dynamically, send a tools/list_changed notification. Never silently alter tool definitions — this is a known MCP attack vector (tool poisoning).",
+  },
+  {
+    id: "security-tool-description-poisoning",
+    name: "Tool descriptions free of injection patterns",
+    category: "security",
+    required: false,
+    specRef: "server/tools#data-types",
+    description:
+      "Scans all tool names, descriptions, and parameter descriptions for prompt injection patterns: 'ignore previous', 'override', 'system prompt', hidden Unicode characters, and Base64-encoded strings.",
+    recommendation:
+      "Review all tool descriptions for prompt injection patterns. Remove any text that attempts to override LLM instructions, references system prompts, or contains hidden characters. Tool descriptions are rendered to LLMs and can be used for prompt injection.",
+  },
+  {
+    id: "security-tool-cross-reference",
+    name: "Tools do not reference other tools by name",
+    category: "security",
+    required: false,
+    specRef: "server/tools#data-types",
+    description:
+      "Checks that tool descriptions do not reference other tool names. Cross-references between tools can be used to manipulate LLM tool selection and create implicit execution chains.",
+    recommendation:
+      "Avoid referencing other tool names in tool descriptions. Each tool should be self-contained. If tools have dependencies, document them in server instructions, not in individual tool descriptions.",
+  },
+
+  // ── Security: Information Disclosure (3 tests) ───────────────────
+  {
+    id: "security-error-no-stacktrace",
+    name: "Error responses do not leak stack traces",
+    category: "security",
+    required: false,
+    specRef: "basic",
+    description:
+      "Triggers various error conditions and inspects responses for stack traces, file paths, and internal implementation details. Error responses should not reveal server internals.",
+    recommendation:
+      "Sanitize error responses before returning them to clients. Remove stack traces, file paths, database connection strings, and internal IP addresses. Use generic error messages for unexpected failures.",
+  },
+  {
+    id: "security-error-no-internal-ip",
+    name: "Error responses do not leak internal IPs",
+    category: "security",
+    required: false,
+    specRef: "basic",
+    description:
+      "Inspects error response bodies for private IP addresses (10.x, 172.16-31.x, 192.168.x, 127.x) that would reveal internal network topology.",
+    recommendation:
+      "Strip internal IP addresses from error responses. Configure your reverse proxy to not forward X-Real-IP or internal addressing. Use a centralized error handler that sanitizes responses.",
+  },
+  {
+    id: "security-rate-limiting",
+    name: "Rate limiting is enforced",
+    category: "security",
+    required: false,
+    specRef: "basic/transports#streamable-http",
+    description:
+      "Sends a burst of rapid requests and checks if the server eventually returns HTTP 429 Too Many Requests. Production servers should implement rate limiting to prevent abuse.",
+    recommendation:
+      "Implement rate limiting on your MCP endpoint. Return HTTP 429 with a Retry-After header when limits are exceeded. Consider per-IP, per-token, and per-session rate limits.",
   },
 ];

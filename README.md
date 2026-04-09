@@ -5,7 +5,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/YawLabs/mcp-compliance)](https://github.com/YawLabs/mcp-compliance/stargazers)
 [![CI](https://github.com/YawLabs/mcp-compliance/actions/workflows/ci.yml/badge.svg)](https://github.com/YawLabs/mcp-compliance/actions/workflows/ci.yml)
 
-**Test any MCP server for spec compliance.** 43-test suite covering transport, lifecycle, tools, resources, prompts, error handling, and schema validation against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). CLI, MCP server, and programmatic API.
+**Test any MCP server for spec compliance.** 69-test suite covering transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). CLI, MCP server, and programmatic API.
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
@@ -15,7 +15,7 @@ MCP servers are multiplying fast — but most ship without compliance testing. B
 
 This tool solves that:
 
-- **48 tests across 7 categories** — transport, lifecycle, tools, resources, prompts, error handling, and schema validation. No gaps.
+- **69 tests across 8 categories** — transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security. No gaps.
 - **Capability-driven** — tests adapt to what the server declares. If it says it supports tools, tool tests become required. No false failures for features the server doesn't claim.
 - **Graded scoring** — A-F letter grade with a weighted score (required tests 70%, optional 30%). One number to communicate compliance.
 - **CI-ready** — `--strict` mode exits with code 1 on required test failures. Drop it into any pipeline.
@@ -100,10 +100,10 @@ mcp-compliance badge https://my-server.com/mcp
 
 Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https://mcp.hosting).
 
-## What the 48 tests check
+## What the 69 tests check
 
 <details>
-<summary><strong>Transport (7 tests)</strong></summary>
+<summary><strong>Transport (10 tests)</strong></summary>
 
 - **transport-post** — Server accepts HTTP POST requests (required)
 - **transport-content-type** — Responds with application/json or text/event-stream (required)
@@ -112,11 +112,14 @@ Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https:
 - **transport-get** — GET returns SSE stream or 405
 - **transport-delete** — DELETE accepted or returns 405
 - **transport-batch-reject** — Rejects JSON-RPC batch requests (required)
+- **transport-content-type-init** — Initialize response has valid content type
+- **transport-get-stream** — GET with session returns SSE or 405
+- **transport-concurrent** — Handles concurrent requests
 
 </details>
 
 <details>
-<summary><strong>Lifecycle (10 tests)</strong></summary>
+<summary><strong>Lifecycle (12 tests)</strong></summary>
 
 - **lifecycle-init** — Initialize handshake succeeds (required)
 - **lifecycle-proto-version** — Returns valid YYYY-MM-DD protocol version (required)
@@ -128,6 +131,8 @@ Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https:
 - **lifecycle-id-match** — Response ID matches request ID (required)
 - **lifecycle-logging** — logging/setLevel accepted (required if logging capability declared)
 - **lifecycle-completions** — completion/complete accepted (required if completions capability declared)
+- **lifecycle-cancellation** — Handles cancellation notifications
+- **lifecycle-progress** — Accepts progress notifications
 
 </details>
 
@@ -184,6 +189,33 @@ Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https:
 - **tools-output-schema** — Tools with outputSchema are valid (2025-11-25)
 - **prompts-schema** — Prompts have valid name field (required if prompts capability declared)
 - **resources-schema** — Resources have valid uri and name (required if resources capability declared)
+
+</details>
+
+<details>
+<summary><strong>Security (21 tests)</strong></summary>
+
+- **security-auth-required** — Rejects unauthenticated requests
+- **security-auth-malformed** — Rejects malformed auth credentials
+- **security-tls-required** — Enforces HTTPS/TLS
+- **security-session-entropy** — Session IDs are high-entropy
+- **security-session-not-auth** — Session ID does not bypass auth
+- **security-oauth-metadata** — OAuth metadata endpoint exists
+- **security-token-in-uri** — Rejects auth tokens in query string
+- **security-cors-headers** — CORS headers are restrictive
+- **security-command-injection** — Resists command injection in tool params
+- **security-sql-injection** — Resists SQL injection in tool params
+- **security-path-traversal** — Resists path traversal in tool params
+- **security-ssrf-internal** — Resists SSRF to internal networks
+- **security-oversized-input** — Handles oversized inputs gracefully
+- **security-extra-params** — Rejects or ignores extra tool params
+- **security-tool-schema-defined** — All tools define inputSchema
+- **security-tool-rug-pull** — Tool definitions are stable across calls
+- **security-tool-description-poisoning** — Tool descriptions free of injection patterns
+- **security-tool-cross-reference** — Tools do not reference other tools by name
+- **security-error-no-stacktrace** — Error responses do not leak stack traces
+- **security-error-no-internal-ip** — Error responses do not leak internal IPs
+- **security-rate-limiting** — Rate limiting is enforced
 
 </details>
 
@@ -277,7 +309,7 @@ Restart your MCP client and approve the server when prompted.
 
 ### Tools
 
-- **mcp_compliance_test** — Run the full 43-test suite against a URL. Supports auth, custom headers, timeout, retries, and category/test filtering. Returns grade, score, and detailed results.
+- **mcp_compliance_test** — Run the full 69-test suite against a URL. Supports auth, custom headers, timeout, retries, and category/test filtering. Returns grade, score, and detailed results.
 - **mcp_compliance_badge** — Get the badge markdown/HTML for a server. Supports auth and custom headers.
 - **mcp_compliance_explain** — Explain what a specific test ID checks and why it matters.
 
@@ -304,7 +336,7 @@ const report2 = await runComplianceSuite('https://my-server.com/mcp', {
 
 The compliance testing methodology is published as an open specification:
 
-- **[MCP Compliance Testing Specification](./MCP_COMPLIANCE_SPEC.md)** — test execution model, scoring algorithm, all 43 test rules with pass/fail criteria (CC BY 4.0)
+- **[MCP Compliance Testing Specification](./MCP_COMPLIANCE_SPEC.md)** — test execution model, scoring algorithm, all 69 test rules with pass/fail criteria (CC BY 4.0)
 - **[Machine-readable rule catalog](./mcp-compliance-rules.json)** — JSON Schema-compliant catalog for programmatic consumption
 
 These are complementary to (not competing with) the [official MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). The MCP spec defines what servers must do; this spec defines how to verify compliance.

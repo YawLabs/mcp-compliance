@@ -11,9 +11,10 @@ const CATEGORY_LABELS: Record<string, string> = {
   prompts: "Prompts",
   errors: "Error Handling",
   schema: "Schema Validation",
+  security: "Security",
 };
 
-const CATEGORY_ORDER = ["transport", "lifecycle", "tools", "resources", "prompts", "errors", "schema"];
+const CATEGORY_ORDER = ["transport", "lifecycle", "tools", "resources", "prompts", "errors", "schema", "security"];
 
 function gradeColor(grade: Grade): string {
   switch (grade) {

@@ -17,7 +17,7 @@ This specification is tool-agnostic. Any compliance testing tool can implement t
 
 **Scope:**
 
-- **43 compliance test rules** across 7 categories, each with a defined severity (required or optional)
+- **69 compliance test rules** across 8 categories, each with a defined severity (required or optional)
 - **Scoring algorithm** that weights required vs. optional tests and produces a numerical score
 - **Grading methodology** that maps scores to letter grades (A through F)
 - **Capability-driven test execution model** that dynamically adjusts test requirements based on server-declared capabilities
@@ -39,13 +39,14 @@ This specification is tool-agnostic. Any compliance testing tool can implement t
   - [2.2 Grade Thresholds](#22-grade-thresholds)
   - [2.3 Overall Status](#23-overall-status)
 - [3. Test Rules](#3-test-rules)
-  - [3.1 transport -- HTTP Transport Validation (7 tests)](#31-transport----http-transport-validation-7-tests)
-  - [3.2 lifecycle -- Protocol Lifecycle (10 tests)](#32-lifecycle----protocol-lifecycle-10-tests)
+  - [3.1 transport -- HTTP Transport Validation (10 tests)](#31-transport----http-transport-validation-7-tests)
+  - [3.2 lifecycle -- Protocol Lifecycle (12 tests)](#32-lifecycle----protocol-lifecycle-10-tests)
   - [3.3 tools -- Tool Operations (4 tests)](#33-tools----tool-operations-4-tests)
   - [3.4 resources -- Resource Operations (5 tests)](#34-resources----resource-operations-5-tests)
   - [3.5 prompts -- Prompt Operations (3 tests)](#35-prompts----prompt-operations-3-tests)
   - [3.6 errors -- Error Handling (8 tests)](#36-errors----error-handling-8-tests)
   - [3.7 schema -- Schema Validation (6 tests)](#37-schema----schema-validation-6-tests)
+  - [3.8 security -- Security Validation (21 tests)](#38-security----security-validation-21-tests)
 - [4. Rule Catalog (Machine-Readable)](#4-rule-catalog-machine-readable)
 - [5. Implementing This Specification](#5-implementing-this-specification)
 - [6. Contributing](#6-contributing)
@@ -73,6 +74,8 @@ Tests execute sequentially in a defined order. The ordering is significant becau
 6. **Errors** -- Sends deliberately malformed or invalid requests to verify error handling. Always runs (error handling is a baseline requirement).
 
 7. **Schema** -- Validates the structural correctness of tool, resource, and prompt definitions returned by list operations. Runs after the corresponding list operations.
+
+8. **Security** -- Tests authentication enforcement, input validation (command injection, SQL injection, path traversal, SSRF), tool integrity (rug-pull detection, description poisoning), information disclosure, and rate limiting. Runs after all functional tests. Input validation tests are capability-gated on `tools`.
 
 **Session state** is tracked across tests. After the `initialize` handshake:
 - `MCP-Session-Id` (if issued by the server) is included on all subsequent requests.
@@ -169,7 +172,7 @@ Each test rule is documented with the following fields:
 
 ---
 
-### 3.1 transport -- HTTP Transport Validation (7 tests)
+### 3.1 transport -- HTTP Transport Validation (10 tests)
 
 Transport tests run **before** the MCP initialization handshake. They validate that the server's HTTP endpoint behaves correctly at the transport layer. These tests send raw HTTP requests with minimal JSON-RPC payloads.
 
@@ -250,9 +253,36 @@ Transport tests run **before** the MCP initialization handshake. They validate t
 - **Pass criteria:** Server returns HTTP 400 when the `MCP-Session-Id` header is omitted from a request (after the server issued one during init). **Auto-pass** if the server did not issue a session ID.
 - **Fail criteria:** Server returns 2xx when the session ID header is missing (and the server had previously issued one).
 
+#### `transport-content-type-init` -- Initialize Response Has Valid Content Type
+
+- **Category:** transport
+- **Default required:** No
+- **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+- **Description:** Validates that the initialize response uses `application/json` or `text/event-stream` content type.
+- **Pass criteria:** Content-Type includes `application/json` or `text/event-stream`.
+- **Fail criteria:** Content-Type is neither `application/json` nor `text/event-stream`.
+
+#### `transport-get-stream` -- GET with Session Returns SSE or 405
+
+- **Category:** transport
+- **Default required:** No
+- **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+- **Description:** Tests the GET endpoint with an active session ID for server-initiated messages. After initialization, the server should either return an SSE stream or 405.
+- **Pass criteria:** Returns `text/event-stream` or HTTP 405.
+- **Fail criteria:** Returns other status or content type.
+
+#### `transport-concurrent` -- Handles Concurrent Requests
+
+- **Category:** transport
+- **Default required:** No
+- **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+- **Description:** Sends multiple JSON-RPC requests in parallel and verifies the server responds to all with correct matching IDs.
+- **Pass criteria:** All concurrent requests receive responses with correct matching IDs.
+- **Fail criteria:** Any response has a mismatched ID or non-2xx status.
+
 ---
 
-### 3.2 lifecycle -- Protocol Lifecycle (10 tests)
+### 3.2 lifecycle -- Protocol Lifecycle (12 tests)
 
 Lifecycle tests validate the MCP initialization handshake and post-initialization protocol behavior. The test harness first performs the `initialize` request and sends the `notifications/initialized` notification, then validates the response fields and tests post-init operations.
 
@@ -365,6 +395,24 @@ Lifecycle tests validate the MCP initialization handshake and post-initializatio
 - **Description:** If the server declares the `completions` capability, it must support the `completion/complete` method. This test sends a completion request with a test prompt reference.
 - **Pass criteria:** The request returns a `result`, or returns error code `-32602` (InvalidParams), which is acceptable since the test prompt reference does not exist. **Auto-pass** if the server does not declare `completions` capability.
 - **Fail criteria:** The server returns any other error.
+
+#### `lifecycle-cancellation` -- Handles Cancellation Notifications
+
+- **Category:** lifecycle
+- **Default required:** No
+- **Spec reference:** [basic/utilities#cancellation](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities#cancellation)
+- **Description:** Tests that the server accepts `notifications/cancelled` without error. Servers should gracefully handle cancellation of unknown or completed requests.
+- **Pass criteria:** Server accepts the cancellation notification (2xx response).
+- **Fail criteria:** Server returns an error for the cancellation notification.
+
+#### `lifecycle-progress` -- Accepts Progress Notifications
+
+- **Category:** lifecycle
+- **Default required:** No
+- **Spec reference:** [basic/utilities#progress](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities#progress)
+- **Description:** Tests that the server accepts `notifications/progress` without error. Servers should handle progress notifications for request tracking.
+- **Pass criteria:** Server accepts the progress notification (2xx response).
+- **Fail criteria:** Server returns an error for the progress notification.
 
 ---
 
@@ -690,11 +738,202 @@ Schema validation tests examine the structural correctness of the data returned 
 - **Fail criteria:** Any resource is missing `uri`, has an unparseable URI, or is missing `name`.
 - **Warnings:** Emitted for resources missing `description` or `mimeType` fields (does not cause failure).
 
+### 3.8 security -- Security Validation (21 tests)
+
+Security tests verify authentication enforcement, input validation, tool integrity, information disclosure, and rate limiting. These tests run after all functional tests and require an established MCP session.
+
+**Sub-categories:**
+
+- **Auth & Transport** (8 tests) -- Verifies authentication is required and properly enforced, TLS is required, session IDs are high-entropy, OAuth metadata exists, and CORS is restrictive.
+- **Input Validation** (6 tests) -- Tests tools for command injection, SQL injection, path traversal, SSRF, oversized input handling, and extra parameter handling. Input validation tests are capability-gated on `tools`.
+- **Tool Integrity** (4 tests) -- Checks that all tools define schemas, tool definitions are stable across calls (rug-pull detection), descriptions are free of prompt injection patterns, and tools don't cross-reference each other.
+- **Information Disclosure** (3 tests) -- Verifies error responses don't leak stack traces, internal IP addresses, or sensitive data. Also tests rate limiting enforcement.
+
+All security tests are **optional** by default (severity: warning). They do not affect the overall pass/fail determination for protocol compliance but significantly impact the security posture score.
+
+#### `security-auth-required` -- Rejects unauthenticated requests
+
+- **Default required:** No
+- **Spec reference:** [basic/authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+- **Description:** Sends a request without an Authorization header and verifies the server returns HTTP 401 or 403.
+- **Pass criteria:** HTTP 401 or 403 for unauthenticated request.
+- **Fail criteria:** Server accepts unauthenticated request, or no auth is configured (no `--auth` provided).
+- **Prerequisites:** Requires `--auth` to be passed so the test can strip it and verify rejection.
+
+#### `security-auth-malformed` -- Rejects malformed auth credentials
+
+- **Default required:** No
+- **Spec reference:** [basic/authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+- **Description:** Sends a request with a garbage Authorization header value and verifies the server rejects it.
+- **Pass criteria:** HTTP 401 or 403 for malformed auth token.
+- **Fail criteria:** Server accepts malformed auth token.
+
+#### `security-tls-required` -- Enforces HTTPS/TLS
+
+- **Default required:** No
+- **Spec reference:** [basic/authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+- **Description:** If the server URL uses HTTPS, attempts a plaintext HTTP connection and verifies it is rejected or redirected.
+- **Pass criteria:** HTTP connection rejected, redirected (301/302/308), or returns 4xx.
+- **Fail criteria:** Server accepts plaintext HTTP connections alongside HTTPS.
+
+#### `security-session-entropy` -- Session IDs are high-entropy
+
+- **Default required:** No
+- **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+- **Description:** Analyzes the MCP-Session-Id for length (≥16 chars), non-sequential patterns, and character diversity (≥8 unique chars).
+- **Pass criteria:** Session ID is ≥16 chars, non-numeric, with ≥8 unique characters. Auto-passes if server does not issue session IDs.
+- **Fail criteria:** Session ID is too short, purely numeric, or has low character diversity.
+
+#### `security-session-not-auth` -- Session ID does not bypass auth
+
+- **Default required:** No
+- **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+- **Description:** Sends a request with a valid MCP-Session-Id but no Authorization header. Per spec, servers MUST NOT use sessions for authentication.
+- **Pass criteria:** HTTP 401 or 403 when session ID is sent without auth.
+- **Fail criteria:** Server accepts request with session ID but no auth token.
+
+#### `security-oauth-metadata` -- OAuth metadata endpoint exists
+
+- **Default required:** No
+- **Spec reference:** [basic/authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+- **Description:** Fetches `/.well-known/oauth-authorization-server` and validates it returns JSON with `issuer` and `token_endpoint` fields.
+- **Pass criteria:** Endpoint returns valid OAuth metadata JSON. Auto-passes if server does not require auth.
+- **Fail criteria:** Endpoint missing, returns non-JSON, or lacks required fields.
+
+#### `security-token-in-uri` -- Rejects auth tokens in query string
+
+- **Default required:** No
+- **Spec reference:** [basic/authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+- **Description:** Extracts the token from the Authorization header and places it in the URL query string as `access_token`. Verifies the server rejects it.
+- **Pass criteria:** HTTP 401 or 403 when token is in query string.
+- **Fail criteria:** Server accepts token from query string (spec: MUST NOT transmit credentials in URIs).
+
+#### `security-cors-headers` -- CORS headers are restrictive
+
+- **Default required:** No
+- **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+- **Description:** Sends an OPTIONS request with `Origin: https://evil.example.com` and checks the CORS response headers.
+- **Pass criteria:** No CORS headers, or Access-Control-Allow-Origin is a specific origin (not `*` or reflected).
+- **Fail criteria:** Access-Control-Allow-Origin is `*` or reflects arbitrary origins.
+
+#### `security-command-injection` -- Resists command injection in tool params
+
+- **Default required:** No
+- **Capability-gated:** tools
+- **Spec reference:** [server/tools#calling-tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#calling-tools)
+- **Description:** Sends OS command injection payloads (`;`, `$()`, `` ` ` ``, `|`, `&&`) in tool string parameters. Checks output for evidence of command execution.
+- **Pass criteria:** Tool output does not contain command execution indicators (uid, file listings, etc.).
+- **Fail criteria:** Tool output matches command execution patterns.
+
+#### `security-sql-injection` -- Resists SQL injection in tool params
+
+- **Default required:** No
+- **Capability-gated:** tools
+- **Spec reference:** [server/tools#calling-tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#calling-tools)
+- **Description:** Sends SQL injection payloads (`' OR 1=1 --`, `'; DROP TABLE`, `UNION SELECT`) in tool string parameters. Checks output for database errors.
+- **Pass criteria:** Tool output does not contain SQL error messages or database metadata.
+- **Fail criteria:** Tool output contains SQL syntax errors, table names, or database metadata.
+
+#### `security-path-traversal` -- Resists path traversal in tool params
+
+- **Default required:** No
+- **Capability-gated:** tools
+- **Spec reference:** [server/tools#calling-tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#calling-tools)
+- **Description:** Sends path traversal payloads (`../../etc/passwd`, `..\\..\\windows\\system.ini`) in tool string parameters.
+- **Pass criteria:** Tool output does not contain sensitive file contents (e.g., `/etc/passwd`, `[boot loader]`).
+- **Fail criteria:** Tool output matches sensitive file content patterns.
+
+#### `security-ssrf-internal` -- Resists SSRF to internal networks
+
+- **Default required:** No
+- **Capability-gated:** tools
+- **Spec reference:** [server/tools#calling-tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#calling-tools)
+- **Description:** For tools with URL-like parameters, submits internal IP addresses (169.254.169.254, 127.0.0.1) and cloud metadata endpoints.
+- **Pass criteria:** Tool output does not contain cloud metadata (ami-id, instance-id, security-credentials).
+- **Fail criteria:** Tool output contains internal network or cloud metadata responses.
+
+#### `security-oversized-input` -- Handles oversized inputs gracefully
+
+- **Default required:** No
+- **Spec reference:** [server/tools#calling-tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#calling-tools)
+- **Description:** Sends a 1MB+ payload in a tools/call request. Verifies the server rejects it or handles it without crashing.
+- **Pass criteria:** HTTP 413, any 4xx error, or server handles the request without timeout.
+- **Fail criteria:** Server times out or crashes.
+
+#### `security-extra-params` -- Rejects or ignores extra tool params
+
+- **Default required:** No
+- **Capability-gated:** tools
+- **Spec reference:** [server/tools#calling-tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#calling-tools)
+- **Description:** Calls a tool with unexpected additional parameters (`__injected_param__`, `__proto__`). Verifies the server handles them safely.
+- **Pass criteria:** Server rejects with error or silently ignores extra parameters.
+- **Fail criteria:** Server crashes or exhibits unexpected behavior from prototype pollution.
+
+#### `security-tool-schema-defined` -- All tools define inputSchema
+
+- **Default required:** No
+- **Capability-gated:** tools
+- **Spec reference:** [server/tools#data-types](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#data-types)
+- **Description:** Verifies all tools have an `inputSchema` with `type: "object"`. Tools without schemas cannot have their inputs validated.
+- **Pass criteria:** All tools have `inputSchema` with `type: "object"`.
+- **Fail criteria:** Any tool is missing `inputSchema` or has the wrong type.
+
+#### `security-tool-rug-pull` -- Tool definitions are stable across calls
+
+- **Default required:** No
+- **Capability-gated:** tools
+- **Spec reference:** [server/tools#listing-tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#listing-tools)
+- **Description:** Calls `tools/list` twice and compares results. Tool definitions should not change silently within a session.
+- **Pass criteria:** Tool count, names, and descriptions are identical across both calls.
+- **Fail criteria:** Any difference in tool count, names, or descriptions (possible rug-pull attack).
+
+#### `security-tool-description-poisoning` -- Tool descriptions free of injection patterns
+
+- **Default required:** No
+- **Capability-gated:** tools
+- **Spec reference:** [server/tools#data-types](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#data-types)
+- **Description:** Scans tool names, descriptions, and parameter descriptions for prompt injection patterns: "ignore previous", "override", "system prompt", hidden Unicode (U+200B, U+200C, U+200D, U+FEFF), and Base64-encoded payloads.
+- **Pass criteria:** No suspicious patterns found.
+- **Fail criteria:** Any tool contains injection patterns, hidden characters, or Base64 payloads.
+
+#### `security-tool-cross-reference` -- Tools do not reference other tools by name
+
+- **Default required:** No
+- **Capability-gated:** tools
+- **Spec reference:** [server/tools#data-types](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#data-types)
+- **Description:** Checks that no tool's description contains the name of another tool. Cross-references can manipulate LLM tool selection.
+- **Pass criteria:** No tool description contains another tool's name.
+- **Fail criteria:** A tool description references another tool by name.
+
+#### `security-error-no-stacktrace` -- Error responses do not leak stack traces
+
+- **Default required:** No
+- **Spec reference:** [basic](https://modelcontextprotocol.io/specification/2025-11-25/basic)
+- **Description:** Triggers error conditions (invalid JSON, unknown methods, unknown tools) and inspects responses for stack traces, file paths, database connection strings, and other implementation details.
+- **Pass criteria:** No stack traces, file paths, connection strings, or credential references in error responses.
+- **Fail criteria:** Error response matches known stack trace patterns (Node.js `at ... ()`, Python `Traceback`, Go `.go:`, etc.).
+
+#### `security-error-no-internal-ip` -- Error responses do not leak internal IPs
+
+- **Default required:** No
+- **Spec reference:** [basic](https://modelcontextprotocol.io/specification/2025-11-25/basic)
+- **Description:** Triggers errors and inspects response bodies for private IP addresses (10.x, 172.16-31.x, 192.168.x, 127.x).
+- **Pass criteria:** No private IP addresses found in error responses.
+- **Fail criteria:** Error response contains a private IP address.
+
+#### `security-rate-limiting` -- Rate limiting is enforced
+
+- **Default required:** No
+- **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+- **Description:** Sends 50 rapid concurrent requests and checks for HTTP 429 responses. Production servers should implement rate limiting.
+- **Pass criteria:** At least one HTTP 429 response during the burst.
+- **Fail criteria:** All 50 requests accepted without rate limiting, or server crashes (>50% 5xx errors).
+
 ---
 
 ## 4. Rule Catalog (Machine-Readable)
 
-The file `mcp-compliance-rules.json` provides a machine-readable catalog of all 43 test rules. It is the canonical source for rule metadata and is intended for tooling integration (IDEs, CI pipelines, dashboards).
+The file `mcp-compliance-rules.json` provides a machine-readable catalog of all 69 test rules. It is the canonical source for rule metadata and is intended for tooling integration (IDEs, CI pipelines, dashboards).
 
 **Schema:**
 

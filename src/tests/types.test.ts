@@ -10,11 +10,12 @@ const VALID_CATEGORIES: TestCategory[] = [
   "prompts",
   "errors",
   "schema",
+  "security",
 ];
 
 describe("TEST_DEFINITIONS", () => {
-  it("contains exactly 48 test definitions", () => {
-    expect(TEST_DEFINITIONS).toHaveLength(48);
+  it("contains exactly 69 test definitions", () => {
+    expect(TEST_DEFINITIONS).toHaveLength(69);
   });
 
   it("all IDs are unique", () => {
@@ -65,6 +66,7 @@ describe("TEST_DEFINITIONS", () => {
     expect(counts.prompts).toBe(3);
     expect(counts.errors).toBe(8);
     expect(counts.schema).toBe(6);
+    expect(counts.security).toBe(21);
   });
 
   it("has correct required test count", () => {
