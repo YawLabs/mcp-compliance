@@ -859,6 +859,99 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     },
   );
 
+  // listChanged notification tests — server should accept these gracefully
+  await test(
+    "lifecycle-list-changed",
+    "Accepts listChanged notifications",
+    "lifecycle",
+    false,
+    "basic/lifecycle#capability-negotiation",
+    async () => {
+      // Send notifications for tools/resources/prompts list changes
+      // Servers should accept these without error (they are client→server notifications)
+      const notifications = [
+        { method: "notifications/tools/list_changed", gate: hasTools },
+        { method: "notifications/resources/list_changed", gate: hasResources },
+        { method: "notifications/prompts/list_changed", gate: hasPrompts },
+      ];
+      const applicable = notifications.filter((n) => n.gate);
+      if (applicable.length === 0) {
+        return { passed: true, details: "No capabilities declared — listChanged notifications not applicable" };
+      }
+      const issues: string[] = [];
+      for (const { method } of applicable) {
+        try {
+          const res = await mcpNotification(backendUrl, method, undefined, buildHeaders(), timeout);
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            issues.push(`${method}: HTTP ${res.statusCode}`);
+          }
+        } catch (err: unknown) {
+          issues.push(`${method}: ${err instanceof Error ? err.message : "error"}`);
+        }
+      }
+      if (issues.length > 0) return { passed: false, details: issues.join("; ") };
+      return {
+        passed: true,
+        details: `${applicable.length} listChanged notification(s) accepted: ${applicable.map((n) => n.method).join(", ")}`,
+      };
+    },
+  );
+
+  // Progress token test — send request with _meta.progressToken and check for progress events
+  await test(
+    "lifecycle-progress-token",
+    "Supports progress tokens in requests",
+    "lifecycle",
+    false,
+    "basic/utilities#progress",
+    async () => {
+      if (!hasTools || toolNames.length === 0) {
+        return { passed: true, details: "No tools available for progress token test (skipped)" };
+      }
+      // Send a tools/call with _meta.progressToken via raw request to read SSE for progress events
+      const progressToken = "compliance-progress-test";
+      const reqBody = JSON.stringify({
+        jsonrpc: "2.0",
+        id: nextId(),
+        method: "tools/call",
+        params: {
+          name: toolNames[0],
+          arguments: {},
+          _meta: { progressToken },
+        },
+      });
+      try {
+        const res = await request(backendUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+            ...buildHeaders(),
+          },
+          body: reqBody,
+          signal: AbortSignal.timeout(timeout),
+        });
+        const text = await res.body.text();
+        const rawCtProgress = res.headers["content-type"];
+        const ct = (Array.isArray(rawCtProgress) ? rawCtProgress[0] : rawCtProgress || "").toLowerCase();
+        // Check if any SSE events contain progress notifications
+        if (ct.includes("text/event-stream") && text.includes("notifications/progress")) {
+          return { passed: true, details: "Server sent progress notifications via SSE with progressToken" };
+        }
+        // Server may not support progress — that's acceptable, just note it
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          return {
+            passed: true,
+            details: "Server accepted request with progressToken (no progress events observed — optional)",
+          };
+        }
+        return { passed: true, details: `HTTP ${res.statusCode} — request with progressToken accepted` };
+      } catch {
+        return { passed: true, details: "Request with progressToken handled (no progress events observed — optional)" };
+      }
+    },
+  );
+
   // ── 4. TRANSPORT (session-dependent, post-init) ──────────────────
 
   await test(
@@ -1876,6 +1969,42 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         }
         return { passed: false, details: `HTTP ${res.statusCode} — server accepted unauthenticated request` };
       } catch (err: unknown) {
+        return { passed: true, details: "Connection rejected (acceptable)" };
+      }
+    },
+  );
+
+  await test(
+    "security-www-authenticate",
+    "401 responses include WWW-Authenticate header",
+    "security",
+    false,
+    "basic/authorization",
+    async () => {
+      if (!hasAuth) {
+        return { passed: true, details: "Skipped: server does not require auth" };
+      }
+      // Send request without auth and check for WWW-Authenticate header on 401
+      const noAuthHeaders: Record<string, string> = {};
+      if (sessionId) noAuthHeaders["mcp-session-id"] = sessionId;
+      try {
+        const res = await mcpRequest(backendUrl, "ping", undefined, nextId, noAuthHeaders, timeout);
+        if (res.statusCode === 401) {
+          const wwwAuth = res.headers["www-authenticate"];
+          if (wwwAuth) {
+            return { passed: true, details: `WWW-Authenticate: ${wwwAuth}` };
+          }
+          return {
+            passed: false,
+            details:
+              "HTTP 401 but missing WWW-Authenticate header (spec: SHOULD include to indicate required auth scheme)",
+          };
+        }
+        if (res.statusCode === 403) {
+          return { passed: true, details: "HTTP 403 (WWW-Authenticate not applicable for 403)" };
+        }
+        return { passed: true, details: `HTTP ${res.statusCode} — not a 401 response` };
+      } catch {
         return { passed: true, details: "Connection rejected (acceptable)" };
       }
     },

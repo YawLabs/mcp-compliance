@@ -5,7 +5,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/YawLabs/mcp-compliance)](https://github.com/YawLabs/mcp-compliance/stargazers)
 [![CI](https://github.com/YawLabs/mcp-compliance/actions/workflows/ci.yml/badge.svg)](https://github.com/YawLabs/mcp-compliance/actions/workflows/ci.yml)
 
-**Test any MCP server for spec compliance.** 78-test suite covering transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). CLI, MCP server, and programmatic API.
+**Test any MCP server for spec compliance.** 81-test suite covering transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). CLI, MCP server, and programmatic API.
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
@@ -15,7 +15,7 @@ MCP servers are multiplying fast — but most ship without compliance testing. B
 
 This tool solves that:
 
-- **78 tests across 8 categories** — transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security. No gaps.
+- **81 tests across 8 categories** — transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security. No gaps.
 - **Capability-driven** — tests adapt to what the server declares. If it says it supports tools, tool tests become required. No false failures for features the server doesn't claim.
 - **Graded scoring** — A-F letter grade with a weighted score (required tests 70%, optional 30%). One number to communicate compliance.
 - **CI-ready** — `--strict` mode exits with code 1 on required test failures. Drop it into any pipeline.
@@ -100,7 +100,7 @@ mcp-compliance badge https://my-server.com/mcp
 
 Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https://mcp.hosting).
 
-## What the 78 tests check
+## What the 81 tests check
 
 <details>
 <summary><strong>Transport (13 tests)</strong></summary>
@@ -122,7 +122,7 @@ Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https:
 </details>
 
 <details>
-<summary><strong>Lifecycle (15 tests)</strong></summary>
+<summary><strong>Lifecycle (17 tests)</strong></summary>
 
 - **lifecycle-init** — Initialize handshake succeeds (required)
 - **lifecycle-proto-version** — Returns valid YYYY-MM-DD protocol version (required)
@@ -139,6 +139,8 @@ Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https:
 - **lifecycle-completions** — completion/complete accepted (required if completions capability declared)
 - **lifecycle-cancellation** — Handles cancellation notifications
 - **lifecycle-progress** — Handles progress notifications gracefully
+- **lifecycle-list-changed** — Accepts listChanged notifications for declared capabilities
+- **lifecycle-progress-token** — Supports progress tokens in requests via SSE
 
 </details>
 
@@ -201,9 +203,10 @@ Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https:
 </details>
 
 <details>
-<summary><strong>Security (22 tests)</strong></summary>
+<summary><strong>Security (23 tests)</strong></summary>
 
 - **security-auth-required** — Rejects unauthenticated requests
+- **security-www-authenticate** — 401 responses include WWW-Authenticate header
 - **security-auth-malformed** — Rejects malformed auth credentials
 - **security-tls-required** — Enforces HTTPS/TLS
 - **security-session-entropy** — Session IDs are high-entropy
@@ -318,7 +321,7 @@ Restart your MCP client and approve the server when prompted.
 
 ### Tools
 
-- **mcp_compliance_test** — Run the full 78-test suite against a URL. Supports auth, custom headers, timeout, retries, and category/test filtering. Returns grade, score, and detailed results.
+- **mcp_compliance_test** — Run the full 81-test suite against a URL. Supports auth, custom headers, timeout, retries, and category/test filtering. Returns grade, score, and detailed results.
 - **mcp_compliance_badge** — Get the badge markdown/HTML for a server. Supports auth and custom headers.
 - **mcp_compliance_explain** — Explain what a specific test ID checks and why it matters.
 
@@ -345,7 +348,7 @@ const report2 = await runComplianceSuite('https://my-server.com/mcp', {
 
 The compliance testing methodology is published as an open specification:
 
-- **[MCP Compliance Testing Specification](./MCP_COMPLIANCE_SPEC.md)** — test execution model, scoring algorithm, all 78 test rules with pass/fail criteria (CC BY 4.0)
+- **[MCP Compliance Testing Specification](./MCP_COMPLIANCE_SPEC.md)** — test execution model, scoring algorithm, all 81 test rules with pass/fail criteria (CC BY 4.0)
 - **[Machine-readable rule catalog](./mcp-compliance-rules.json)** — JSON Schema-compliant catalog for programmatic consumption
 
 These are complementary to (not competing with) the [official MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). The MCP spec defines what servers must do; this spec defines how to verify compliance.

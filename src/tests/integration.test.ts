@@ -135,10 +135,10 @@ describe("integration — full compliance suite against real server", () => {
     expect(report.promptCount).toBeGreaterThan(0);
   }, 30000);
 
-  it("runs all 78 tests", async () => {
+  it("runs all 81 tests", async () => {
     const report = await runComplianceSuite(serverUrl, { timeout: 3000 });
-    // Should run a significant number of tests (all 78 tests including security)
-    expect(report.tests.length).toBeGreaterThanOrEqual(68);
+    // Should run a significant number of tests (all 81 tests including security)
+    expect(report.tests.length).toBeGreaterThanOrEqual(71);
   }, 30000);
 
   it("has no preflight warning for reachable server", async () => {

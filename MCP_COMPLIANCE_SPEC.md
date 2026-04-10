@@ -17,7 +17,7 @@ This specification is tool-agnostic. Any compliance testing tool can implement t
 
 **Scope:**
 
-- **78 compliance test rules** across 8 categories, each with a defined severity (required or optional)
+- **81 compliance test rules** across 8 categories, each with a defined severity (required or optional)
 - **Scoring algorithm** that weights required vs. optional tests and produces a numerical score
 - **Grading methodology** that maps scores to letter grades (A through F)
 - **Capability-driven test execution model** that dynamically adjusts test requirements based on server-declared capabilities
@@ -933,7 +933,7 @@ All security tests are **optional** by default (severity: warning). They do not 
 
 ## 4. Rule Catalog (Machine-Readable)
 
-The file `mcp-compliance-rules.json` provides a machine-readable catalog of all 78 test rules. It is the canonical source for rule metadata and is intended for tooling integration (IDEs, CI pipelines, dashboards).
+The file `mcp-compliance-rules.json` provides a machine-readable catalog of all 81 test rules. It is the canonical source for rule metadata and is intended for tooling integration (IDEs, CI pipelines, dashboards).
 
 **Schema:**
 

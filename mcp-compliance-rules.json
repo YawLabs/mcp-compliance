@@ -393,6 +393,30 @@
       "failCriteria": "Server returns non-2xx for an unexpected notification"
     },
     {
+      "id": "lifecycle-list-changed",
+      "name": "Accepts listChanged notifications",
+      "category": "lifecycle",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/lifecycle#capability-negotiation",
+      "description": "Sends listChanged notifications for declared capabilities and verifies server accepts them",
+      "passCriteria": "Server accepts all applicable listChanged notifications (2xx)",
+      "failCriteria": "Server rejects listChanged notification with non-2xx"
+    },
+    {
+      "id": "lifecycle-progress-token",
+      "name": "Supports progress tokens in requests",
+      "category": "lifecycle",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/utilities#progress",
+      "description": "Sends request with _meta.progressToken and checks for progress events in SSE",
+      "passCriteria": "Server accepts request with progressToken (progress events optional)",
+      "failCriteria": "Server rejects request with progressToken"
+    },
+    {
       "id": "tools-list",
       "name": "tools/list returns valid response",
       "category": "tools",
@@ -739,6 +763,18 @@
       "description": "Verifies the server rejects requests without an Authorization header",
       "passCriteria": "HTTP 401 or 403 for unauthenticated request",
       "failCriteria": "Server accepts unauthenticated request or no auth is configured"
+    },
+    {
+      "id": "security-www-authenticate",
+      "name": "401 responses include WWW-Authenticate header",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/authorization",
+      "description": "Checks that 401 responses include WWW-Authenticate header per RFC 9110",
+      "passCriteria": "401 response includes WWW-Authenticate header, or server returns 403",
+      "failCriteria": "401 response missing WWW-Authenticate header"
     },
     {
       "id": "security-auth-malformed",

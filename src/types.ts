@@ -70,7 +70,7 @@ export interface TestDefinition {
   recommendation: string;
 }
 
-/** All 78 test IDs with descriptions for the explain command */
+/** All 81 test IDs with descriptions for the explain command */
 export const TEST_DEFINITIONS: TestDefinition[] = [
   // ── Transport (13 tests) ─────────────────────────────────────────
   {
@@ -221,7 +221,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       'Include "event: message" before each "data:" line in your SSE responses. This is required by the MCP spec for JSON-RPC messages sent over SSE.',
   },
 
-  // ── Lifecycle (15 tests) ─────────────────────────────────────────
+  // ── Lifecycle (17 tests) ─────────────────────────────────────────
   {
     id: "lifecycle-init",
     name: "Initialize handshake",
@@ -388,6 +388,29 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Sends a notifications/progress to the server and verifies it does not error. Note: per spec, progress flows from server to client during long-running requests. This test validates the server handles unexpected notifications gracefully.",
     recommendation:
       "Accept unknown notifications without returning an error. The server should not crash or return a non-2xx status for notifications it does not recognize.",
+  },
+
+  {
+    id: "lifecycle-list-changed",
+    name: "Accepts listChanged notifications",
+    category: "lifecycle",
+    required: false,
+    specRef: "basic/lifecycle#capability-negotiation",
+    description:
+      "Sends notifications/tools/list_changed, notifications/resources/list_changed, and notifications/prompts/list_changed for declared capabilities and verifies the server accepts them.",
+    recommendation:
+      "Accept listChanged notifications gracefully. When received, re-fetch the relevant list to detect changes. These notifications signal that the client's cached list may be stale.",
+  },
+  {
+    id: "lifecycle-progress-token",
+    name: "Supports progress tokens in requests",
+    category: "lifecycle",
+    required: false,
+    specRef: "basic/utilities#progress",
+    description:
+      "Sends a tools/call request with _meta.progressToken and checks if the server sends progress notifications via SSE. Progress support is optional but recommended for long-running operations.",
+    recommendation:
+      "When a request includes _meta.progressToken, send notifications/progress events via SSE to report progress. Include progressToken, progress (current), and optionally total fields.",
   },
 
   // ── Tools (4 tests) ──────────────────────────────────────────────
@@ -705,7 +728,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Ensure every resource has a valid, parseable URI and a name field. Add description and mimeType for better client integration.",
   },
 
-  // ── Security: Auth & Transport (9 tests) ─────────────────────────
+  // ── Security: Auth & Transport (10 tests) ────────────────────────
   {
     id: "security-auth-required",
     name: "Rejects unauthenticated requests",
@@ -716,6 +739,17 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Sends a request without an Authorization header and verifies the server returns HTTP 401. Servers exposed over the network should require authentication.",
     recommendation:
       "Implement authentication on your MCP endpoint. Return HTTP 401 Unauthorized for requests without valid credentials. Use OAuth 2.1 or Bearer tokens as recommended by the MCP spec.",
+  },
+  {
+    id: "security-www-authenticate",
+    name: "401 responses include WWW-Authenticate header",
+    category: "security",
+    required: false,
+    specRef: "basic/authorization",
+    description:
+      "When the server returns HTTP 401, checks for a WWW-Authenticate header indicating the required authentication scheme. Per HTTP spec (RFC 9110), servers SHOULD include this header.",
+    recommendation:
+      "Include a WWW-Authenticate header in 401 responses to indicate the required auth scheme (e.g., 'WWW-Authenticate: Bearer realm=\"mcp\"').",
   },
   {
     id: "security-auth-malformed",
