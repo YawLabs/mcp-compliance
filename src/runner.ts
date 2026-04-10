@@ -69,7 +69,7 @@ function createIdCounter(start = 0) {
  */
 export function parseSSEResponse(text: string): any {
   const lines = text.split("\n");
-  let lastJsonRpcResponse: any = null;
+  let firstJsonRpcResponse: any = null;
   let currentData: string[] = [];
 
   function flushEvent() {
@@ -79,8 +79,10 @@ export function parseSSEResponse(text: string): any {
     if (!data.trim()) return;
     try {
       const parsed = JSON.parse(data);
-      if (parsed.jsonrpc === "2.0" && parsed.id !== undefined) {
-        lastJsonRpcResponse = parsed;
+      // Keep the first JSON-RPC response (the actual result).
+      // Later events may be notifications that lack an id — skip those.
+      if (!firstJsonRpcResponse && parsed.jsonrpc === "2.0" && parsed.id !== undefined) {
+        firstJsonRpcResponse = parsed;
       }
     } catch {
       // Not valid JSON, skip
@@ -100,7 +102,7 @@ export function parseSSEResponse(text: string): any {
   // Handle trailing data without final empty line
   flushEvent();
 
-  return lastJsonRpcResponse;
+  return firstJsonRpcResponse;
 }
 
 async function mcpRequest(
@@ -221,7 +223,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
 
   const backendUrl = url;
 
-  // Preflight connectivity check — fail fast instead of running 69 failing tests
+  // Preflight connectivity check — fail fast instead of running all tests against an unreachable server
   let serverReachable = true;
   try {
     const preflight = await request(backendUrl, {
@@ -385,6 +387,34 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   );
 
   await test(
+    "transport-content-type-reject",
+    "Rejects non-JSON request Content-Type",
+    "transport",
+    false,
+    "basic/transports#streamable-http",
+    async () => {
+      // Send a request with text/plain instead of application/json
+      const res = await request(backendUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain", Accept: "application/json, text/event-stream", ...userHeaders },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 99905, method: "ping" }),
+        signal: AbortSignal.timeout(timeout),
+      });
+      await res.body.text();
+      if (res.statusCode >= 400 && res.statusCode < 500) {
+        return { passed: true, details: `HTTP ${res.statusCode} (incorrect Content-Type rejected)` };
+      }
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        return {
+          passed: false,
+          details: `HTTP ${res.statusCode} — server accepted text/plain Content-Type (should require application/json)`,
+        };
+      }
+      return { passed: false, details: `HTTP ${res.statusCode}` };
+    },
+  );
+
+  await test(
     "transport-get",
     "GET returns SSE stream or 405",
     "transport",
@@ -398,7 +428,8 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         signal: AbortSignal.timeout(timeout),
       });
       const body = await res.body.text();
-      const ct = ((res.headers["content-type"] as string) || "").toLowerCase();
+      const rawCt = res.headers["content-type"];
+      const ct = (Array.isArray(rawCt) ? rawCt[0] : rawCt || "").toLowerCase();
       if (res.statusCode === 405) {
         return { passed: true, details: "HTTP 405 Method Not Allowed (acceptable)" };
       }
@@ -520,6 +551,53 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   );
 
   await test(
+    "lifecycle-version-negotiate",
+    "Handles unknown protocol version",
+    "lifecycle",
+    false,
+    "basic/lifecycle#version-negotiation",
+    async () => {
+      // Send initialize with a future version — server should respond with its own supported version
+      try {
+        const futureRes = await mcpRequest(
+          backendUrl,
+          "initialize",
+          {
+            protocolVersion: "2099-01-01",
+            capabilities: {},
+            clientInfo: { name: "mcp-compliance", version: TOOL_VERSION },
+          },
+          createIdCounter(99960),
+          userHeaders,
+          timeout,
+        );
+        const result = futureRes.body?.result;
+        const error = futureRes.body?.error;
+        if (error) {
+          return {
+            passed: true,
+            details: `Server rejected unknown version with error: ${error.code} — ${error.message}`,
+          };
+        }
+        if (result?.protocolVersion) {
+          const offered = result.protocolVersion;
+          if (offered === "2099-01-01") {
+            return {
+              passed: false,
+              details:
+                'Server accepted impossible future version "2099-01-01" — should offer a version it actually supports',
+            };
+          }
+          return { passed: true, details: `Server negotiated down to ${offered} (correct)` };
+        }
+        return { passed: false, details: "No protocolVersion or error in response" };
+      } catch {
+        return { passed: true, details: "Connection rejected for unknown version (acceptable)" };
+      }
+    },
+  );
+
+  await test(
     "lifecycle-server-info",
     "Includes serverInfo",
     "lifecycle",
@@ -599,6 +677,76 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         : `Request id=${res.requestId}, response id=${body.id} (MISMATCH)`,
     };
   });
+
+  await test("lifecycle-string-id", "Supports string request IDs", "lifecycle", false, "basic", async () => {
+    // JSON-RPC 2.0 allows both string and number IDs — send a string ID and verify echo
+    const stringId = "compliance-test-string-id";
+    const body = JSON.stringify({ jsonrpc: "2.0", id: stringId, method: "ping", params: {} });
+    const res = await request(backendUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        ...buildHeaders(),
+      },
+      body,
+      signal: AbortSignal.timeout(timeout),
+    });
+    const text = await res.body.text();
+    const rawCtStr = res.headers["content-type"];
+    const ct = (Array.isArray(rawCtStr) ? rawCtStr[0] : rawCtStr || "").toLowerCase();
+    let parsed: any;
+    if (ct.includes("text/event-stream")) {
+      parsed = parseSSEResponse(text);
+    }
+    if (!parsed) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {}
+    }
+    if (!parsed) return { passed: false, details: "Could not parse response" };
+    if (parsed.id === stringId) {
+      return { passed: true, details: `String id="${stringId}" echoed back correctly` };
+    }
+    if (parsed.id === undefined) {
+      return { passed: false, details: "No id in response" };
+    }
+    return {
+      passed: false,
+      details: `String id="${stringId}" sent, got back id=${JSON.stringify(parsed.id)} (type: ${typeof parsed.id})`,
+    };
+  });
+
+  await test(
+    "lifecycle-reinit-reject",
+    "Rejects second initialize request",
+    "lifecycle",
+    false,
+    "basic/lifecycle#initialization",
+    async () => {
+      // Spec: client MUST NOT send initialize more than once per session
+      try {
+        const res = await rpc("initialize", {
+          protocolVersion: SPEC_VERSION,
+          capabilities: {},
+          clientInfo: { name: "mcp-compliance", version: TOOL_VERSION },
+        });
+        const error = res.body?.error;
+        if (error) {
+          return { passed: true, details: `Re-initialization rejected with error: ${error.code} — ${error.message}` };
+        }
+        if (res.statusCode >= 400) {
+          return { passed: true, details: `HTTP ${res.statusCode} (re-initialization rejected)` };
+        }
+        return {
+          passed: false,
+          details: `Server accepted second initialize (HTTP ${res.statusCode}) — should reject duplicate initialization`,
+        };
+      } catch {
+        return { passed: true, details: "Connection rejected (acceptable)" };
+      }
+    },
+  );
 
   // Logging capability test
   const hasLogging = !!serverInfo.capabilities.logging;
@@ -685,10 +833,11 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     },
   );
 
-  // Progress notification test
+  // Progress notification test — validates server gracefully handles unexpected notifications.
+  // Note: per spec, progress flows from server→client. This tests server resilience, not spec compliance.
   await test(
     "lifecycle-progress",
-    "Accepts progress notifications",
+    "Handles progress notifications gracefully",
     "lifecycle",
     false,
     "basic/utilities#progress",
@@ -701,9 +850,12 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         timeout,
       );
       if (res.statusCode >= 200 && res.statusCode < 300) {
-        return { passed: true, details: `HTTP ${res.statusCode} (progress notification accepted)` };
+        return { passed: true, details: `HTTP ${res.statusCode} (notification handled gracefully)` };
       }
-      return { passed: false, details: `HTTP ${res.statusCode} — server should accept progress notifications` };
+      return {
+        passed: false,
+        details: `HTTP ${res.statusCode} — server should accept unknown notifications without error`,
+      };
     },
   );
 
@@ -748,9 +900,13 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       if (res.statusCode === 202) {
         return { passed: true, details: "HTTP 202 Accepted (correct)" };
       }
-      // Some servers return 200 or 204 for notifications — acceptable but not ideal
+      // Spec says MUST return 202; other 2xx codes violate this requirement
       if (res.statusCode >= 200 && res.statusCode < 300) {
-        return { passed: true, details: `HTTP ${res.statusCode} (accepted, but 202 is preferred)` };
+        warnings.push(`Notification returned HTTP ${res.statusCode} instead of spec-required 202 Accepted`);
+        return {
+          passed: false,
+          details: `HTTP ${res.statusCode} — spec requires 202 Accepted for notifications (MUST)`,
+        };
       }
       return { passed: false, details: `HTTP ${res.statusCode} — expected 202 Accepted for notifications` };
     },
@@ -787,6 +943,36 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   );
 
   await test(
+    "transport-session-invalid",
+    "Returns 404 for unknown session ID",
+    "transport",
+    false,
+    "basic/transports#streamable-http",
+    async () => {
+      if (!sessionId) {
+        return { passed: true, details: "Server did not issue session ID (test not applicable)" };
+      }
+      // Send a request with a fabricated/unknown session ID
+      const fakeHeaders: Record<string, string> = {
+        ...userHeaders,
+        "mcp-session-id": "invalid-nonexistent-session-id",
+      };
+      if (negotiatedProtocolVersion) fakeHeaders["mcp-protocol-version"] = negotiatedProtocolVersion;
+      const res = await mcpRequest(backendUrl, "ping", undefined, createIdCounter(99915), fakeHeaders, timeout);
+      if (res.statusCode === 404) {
+        return { passed: true, details: "HTTP 404 for unknown session ID (correct per spec)" };
+      }
+      if (res.statusCode === 400) {
+        return {
+          passed: false,
+          details: "HTTP 400 — spec requires 404 (Not Found) for unrecognized session IDs, not 400",
+        };
+      }
+      return { passed: false, details: `HTTP ${res.statusCode} — spec requires 404 for unrecognized MCP-Session-Id` };
+    },
+  );
+
+  await test(
     "transport-get-stream",
     "GET with session returns SSE or 405",
     "transport",
@@ -803,7 +989,8 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         signal: AbortSignal.timeout(Math.min(timeout, 3000)),
       });
       const body = await res.body.text();
-      const ct = ((res.headers["content-type"] as string) || "").toLowerCase();
+      const rawCt2 = res.headers["content-type"];
+      const ct = (Array.isArray(rawCt2) ? rawCt2[0] : rawCt2 || "").toLowerCase();
       if (res.statusCode === 405) {
         return { passed: true, details: "HTTP 405 (server does not support server-initiated messages)" };
       }
@@ -845,7 +1032,8 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
           signal: AbortSignal.timeout(timeout),
         }).then(async (res) => {
           const text = await res.body.text();
-          const ct = ((res.headers["content-type"] as string) || "").toLowerCase();
+          const rawCtConcurrent = res.headers["content-type"];
+          const ct = (Array.isArray(rawCtConcurrent) ? rawCtConcurrent[0] : rawCtConcurrent || "").toLowerCase();
           let body: any;
           if (ct.includes("text/event-stream")) {
             body = parseSSEResponse(text);
@@ -869,6 +1057,48 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       }
       if (issues.length > 0) return { passed: false, details: issues.join("; ") };
       return { passed: true, details: `${results.length} concurrent requests handled correctly` };
+    },
+  );
+
+  // SSE event field validation — spec requires event: message for JSON-RPC messages in SSE
+  await test(
+    "transport-sse-event-field",
+    "SSE responses include event: message",
+    "transport",
+    false,
+    "basic/transports#streamable-http",
+    async () => {
+      // Send a request and check if SSE responses include the event: message field
+      const res = await request(backendUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          ...buildHeaders(),
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: createIdCounter(99940)(), method: "ping" }),
+        signal: AbortSignal.timeout(timeout),
+      });
+      const text = await res.body.text();
+      const rawCtSse = res.headers["content-type"];
+      const ct = (Array.isArray(rawCtSse) ? rawCtSse[0] : rawCtSse || "").toLowerCase();
+      if (!ct.includes("text/event-stream")) {
+        // Server responded with JSON, not SSE — test is not applicable
+        return { passed: true, details: "Server responded with JSON (not SSE) — event field check not applicable" };
+      }
+      // Check that the SSE response includes event: message
+      const hasEventMessage = /^event:\s*message\s*$/m.test(text);
+      if (hasEventMessage) {
+        return { passed: true, details: "SSE response includes required event: message field" };
+      }
+      if (text.includes("data:")) {
+        return {
+          passed: false,
+          details:
+            "SSE response has data: fields but missing required event: message field (spec: MUST include event: message)",
+        };
+      }
+      return { passed: true, details: "SSE response empty or no data fields — check not applicable" };
     },
   );
 
@@ -958,9 +1188,6 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
           if (ann[field] !== undefined && typeof ann[field] !== "boolean") {
             issues.push(`${tool.name}: annotations.${field} should be boolean, got ${typeof ann[field]}`);
           }
-        }
-        if (ann.title !== undefined && typeof ann.title !== "string") {
-          issues.push(`${tool.name}: annotations.title should be string`);
         }
       }
       if (issues.length > 0) return { passed: false, details: issues.join("; ") };
@@ -1551,6 +1778,74 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     return { passed: false, details: `HTTP ${res.statusCode} — expected error code -32600` };
   });
 
+  // Capability-gated method rejection — tests that undeclared methods return errors
+  const undeclaredMethods: Array<{ method: string; capability: string; declared: boolean }> = [
+    { method: "tools/list", capability: "tools", declared: hasTools },
+    { method: "resources/list", capability: "resources", declared: hasResources },
+    { method: "prompts/list", capability: "prompts", declared: hasPrompts },
+  ];
+  const undeclared = undeclaredMethods.filter((m) => !m.declared);
+  await test(
+    "error-capability-gated",
+    "Rejects methods for undeclared capabilities",
+    "errors",
+    false,
+    "basic/lifecycle#capability-negotiation",
+    async () => {
+      if (undeclared.length === 0) {
+        return {
+          passed: true,
+          details: "Server declares all capabilities (tools, resources, prompts) — no undeclared methods to test",
+        };
+      }
+      const issues: string[] = [];
+      for (const { method, capability } of undeclared) {
+        const res = await rpc(method);
+        const error = res.body?.error;
+        if (!error && res.body?.result) {
+          issues.push(`${method} returned success despite missing ${capability} capability`);
+        }
+      }
+      if (issues.length > 0) return { passed: false, details: issues.join("; ") };
+      return {
+        passed: true,
+        details: `Tested ${undeclared.length} undeclared method(s): ${undeclared.map((m) => m.method).join(", ")} — all returned errors`,
+      };
+    },
+  );
+
+  // Invalid cursor test — send garbage cursor to a list method
+  const listMethodForCursor = hasTools
+    ? "tools/list"
+    : hasResources
+      ? "resources/list"
+      : hasPrompts
+        ? "prompts/list"
+        : null;
+  await test(
+    "error-invalid-cursor",
+    "Handles invalid pagination cursor gracefully",
+    "errors",
+    false,
+    "basic",
+    async () => {
+      if (!listMethodForCursor) {
+        return { passed: true, details: "No list methods available to test (skipped)" };
+      }
+      const res = await rpc(listMethodForCursor, { cursor: "!!!invalid-garbage-cursor-$$$" });
+      const error = res.body?.error;
+      if (error) {
+        return { passed: true, details: `Invalid cursor rejected with error: ${error.code} — ${error.message}` };
+      }
+      // If server ignores the invalid cursor and returns first page, that's also acceptable
+      const result = res.body?.result;
+      if (result) {
+        return { passed: true, details: "Server returned results (likely ignored invalid cursor)" };
+      }
+      return { passed: false, details: "No error or result for invalid cursor" };
+    },
+  );
+
   // ── 9. SECURITY TESTS ────────────────────────────────────────────
 
   // Auth & Transport security tests
@@ -1712,7 +2007,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
 
   await test(
     "security-oauth-metadata",
-    "OAuth metadata endpoint exists",
+    "Protected Resource Metadata endpoint exists",
     "security",
     false,
     "basic/authorization",
@@ -1721,9 +2016,11 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         return { passed: true, details: "Skipped: server does not require auth" };
       }
       const parsedUrl = new URL(url);
-      const metadataUrl = `${parsedUrl.protocol}//${parsedUrl.host}/.well-known/oauth-authorization-server`;
+      // Per MCP 2025-11-25: the MCP server hosts Protected Resource Metadata (RFC 9728)
+      // at /.well-known/oauth-protected-resource, which points to the authorization server(s).
+      const prmUrl = `${parsedUrl.protocol}//${parsedUrl.host}/.well-known/oauth-protected-resource`;
       try {
-        const res = await request(metadataUrl, {
+        const res = await request(prmUrl, {
           method: "GET",
           headers: { Accept: "application/json" },
           signal: AbortSignal.timeout(Math.min(timeout, 5000)),
@@ -1732,20 +2029,50 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         if (res.statusCode === 200) {
           try {
             const meta = JSON.parse(text);
-            if (meta.issuer && meta.token_endpoint) {
-              return { passed: true, details: `OAuth metadata found: issuer=${meta.issuer}` };
+            if (!meta.resource) {
+              return { passed: false, details: "PRM response missing required 'resource' field" };
+            }
+            if (!Array.isArray(meta.authorization_servers) || meta.authorization_servers.length === 0) {
+              return { passed: false, details: "PRM response missing 'authorization_servers' array" };
             }
             return {
-              passed: false,
-              details: "OAuth metadata response missing required fields (issuer, token_endpoint)",
+              passed: true,
+              details: `Protected Resource Metadata found: resource=${meta.resource}, ${meta.authorization_servers.length} auth server(s)`,
             };
           } catch {
-            return { passed: false, details: "OAuth metadata endpoint returned non-JSON response" };
+            return { passed: false, details: "PRM endpoint returned non-JSON response" };
           }
         }
-        return { passed: false, details: `OAuth metadata endpoint returned HTTP ${res.statusCode}` };
+        // Fall back to legacy /.well-known/oauth-authorization-server check
+        const legacyUrl = `${parsedUrl.protocol}//${parsedUrl.host}/.well-known/oauth-authorization-server`;
+        try {
+          const legacyRes = await request(legacyUrl, {
+            method: "GET",
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(Math.min(timeout, 5000)),
+          });
+          const legacyText = await legacyRes.body.text();
+          if (legacyRes.statusCode === 200) {
+            try {
+              const legacyMeta = JSON.parse(legacyText);
+              if (legacyMeta.issuer && legacyMeta.token_endpoint) {
+                warnings.push(
+                  "Server uses legacy /.well-known/oauth-authorization-server instead of /.well-known/oauth-protected-resource (RFC 9728). Update to PRM for 2025-11-25 compliance.",
+                );
+                return {
+                  passed: true,
+                  details: `Legacy OAuth AS metadata found: issuer=${legacyMeta.issuer} (should migrate to PRM)`,
+                };
+              }
+            } catch {}
+          }
+        } catch {}
+        return {
+          passed: false,
+          details: `PRM endpoint returned HTTP ${res.statusCode} and no legacy OAuth metadata found`,
+        };
       } catch {
-        return { passed: false, details: "OAuth metadata endpoint unreachable" };
+        return { passed: false, details: "PRM endpoint unreachable" };
       }
     },
   );
@@ -1823,6 +2150,46 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         return { passed: true, details: `CORS restricted to: ${acao}` };
       } catch {
         return { passed: true, details: "OPTIONS request failed (no CORS, acceptable)" };
+      }
+    },
+  );
+
+  await test(
+    "security-origin-validation",
+    "Validates Origin header on requests",
+    "security",
+    false,
+    "basic/transports#streamable-http",
+    async () => {
+      // Send a POST with a suspicious Origin header — server should validate it for DNS rebinding protection
+      try {
+        const res = await request(backendUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            Origin: "https://evil-rebinding-attack.example.com",
+            ...buildHeaders(),
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: createIdCounter(99970)(), method: "ping" }),
+          signal: AbortSignal.timeout(timeout),
+        });
+        await res.body.text();
+        if (res.statusCode === 403 || res.statusCode === 401) {
+          return { passed: true, details: `HTTP ${res.statusCode} (suspicious Origin rejected)` };
+        }
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          return {
+            passed: false,
+            details: `HTTP ${res.statusCode} — server accepted request with untrusted Origin header (spec: MUST validate Origin for DNS rebinding protection)`,
+          };
+        }
+        if (res.statusCode >= 400) {
+          return { passed: true, details: `HTTP ${res.statusCode} (suspicious Origin rejected)` };
+        }
+        return { passed: false, details: `HTTP ${res.statusCode}` };
+      } catch {
+        return { passed: true, details: "Connection rejected (acceptable)" };
       }
     },
   );

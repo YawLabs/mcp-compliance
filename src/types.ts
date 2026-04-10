@@ -70,9 +70,9 @@ export interface TestDefinition {
   recommendation: string;
 }
 
-/** All 69 test IDs with descriptions for the explain command */
+/** All 78 test IDs with descriptions for the explain command */
 export const TEST_DEFINITIONS: TestDefinition[] = [
-  // ── Transport (10 tests) ─────────────────────────────────────────
+  // ── Transport (13 tests) ─────────────────────────────────────────
   {
     id: "transport-post",
     name: "HTTP POST accepted",
@@ -102,9 +102,9 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/transports#streamable-http",
     description:
-      "Verifies that sending a JSON-RPC notification (no id field) returns HTTP 202 Accepted with no body. Per spec, servers MUST return 202 for notifications.",
+      "Verifies that sending a JSON-RPC notification (no id field) returns exactly HTTP 202 Accepted with no body. Per spec, servers MUST return 202 — not 200 or 204.",
     recommendation:
-      "Detect JSON-RPC messages without an id field and return HTTP 202 with an empty body. Do not attempt to send a JSON-RPC response for notifications.",
+      "Detect JSON-RPC messages without an id field and return HTTP 202 with an empty body. Do not return 200 or 204 — the spec requires exactly 202 Accepted.",
   },
   {
     id: "transport-session-id",
@@ -116,6 +116,28 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Tests that the server returns HTTP 400 when MCP-Session-Id header is missing on requests after initialization (when the server issued a session ID).",
     recommendation:
       "If your server issues an MCP-Session-Id header in the initialize response, reject subsequent requests that omit this header with HTTP 400.",
+  },
+  {
+    id: "transport-session-invalid",
+    name: "Returns 404 for unknown session ID",
+    category: "transport",
+    required: false,
+    specRef: "basic/transports#streamable-http",
+    description:
+      "Sends a request with a fabricated MCP-Session-Id and verifies the server returns HTTP 404. Per spec, servers managing sessions MUST return 404 for unrecognized session IDs.",
+    recommendation:
+      "Return HTTP 404 (Not Found) for requests with an MCP-Session-Id that does not match any active session. Do not return 400 — that is for missing session IDs.",
+  },
+  {
+    id: "transport-content-type-reject",
+    name: "Rejects non-JSON request Content-Type",
+    category: "transport",
+    required: false,
+    specRef: "basic/transports#streamable-http",
+    description:
+      "Sends a POST with Content-Type: text/plain instead of application/json and verifies the server rejects it with a 4xx status.",
+    recommendation:
+      "Validate the Content-Type header on incoming POST requests. Reject requests that are not application/json with HTTP 415 (Unsupported Media Type) or 400.",
   },
   {
     id: "transport-get",
@@ -187,7 +209,19 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Ensure your server can handle multiple simultaneous requests. Each response must include the correct id matching the request. Use async handlers or connection pooling.",
   },
 
-  // ── Lifecycle (12 tests) ─────────────────────────────────────────
+  {
+    id: "transport-sse-event-field",
+    name: "SSE responses include event: message",
+    category: "transport",
+    required: false,
+    specRef: "basic/transports#streamable-http",
+    description:
+      "Sends a request with Accept: text/event-stream and checks that SSE responses include the event: message field. Per spec, servers MUST set event: message for JSON-RPC messages in SSE streams.",
+    recommendation:
+      'Include "event: message" before each "data:" line in your SSE responses. This is required by the MCP spec for JSON-RPC messages sent over SSE.',
+  },
+
+  // ── Lifecycle (15 tests) ─────────────────────────────────────────
   {
     id: "lifecycle-init",
     name: "Initialize handshake",
@@ -277,6 +311,39 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Copy the id field from the request into the response. This is a core JSON-RPC 2.0 requirement. Check that your framework does not modify or discard the request ID.",
   },
   {
+    id: "lifecycle-string-id",
+    name: "Supports string request IDs",
+    category: "lifecycle",
+    required: false,
+    specRef: "basic",
+    description:
+      "Sends a request with a string id instead of a number. JSON-RPC 2.0 allows both string and number IDs. The server must echo back the exact string id in the response.",
+    recommendation:
+      "Ensure your JSON-RPC implementation supports both string and number request IDs. Echo the id back exactly as received, preserving its type.",
+  },
+  {
+    id: "lifecycle-version-negotiate",
+    name: "Handles unknown protocol version",
+    category: "lifecycle",
+    required: false,
+    specRef: "basic/lifecycle#version-negotiation",
+    description:
+      'Sends an initialize request with a future protocol version ("2099-01-01") and verifies the server either negotiates down to a version it supports or returns an error.',
+    recommendation:
+      "When the client requests an unsupported protocol version, respond with the closest version your server supports. Do not blindly accept unknown versions.",
+  },
+  {
+    id: "lifecycle-reinit-reject",
+    name: "Rejects second initialize request",
+    category: "lifecycle",
+    required: false,
+    specRef: "basic/lifecycle#initialization",
+    description:
+      "Sends a second initialize request within the same session. Per spec, the client MUST NOT send initialize more than once. The server should reject it.",
+    recommendation:
+      "Track initialization state per session. Reject duplicate initialize requests with a JSON-RPC error or HTTP 4xx. Do not reset session state on re-initialization.",
+  },
+  {
     id: "lifecycle-logging",
     name: "logging/setLevel accepted",
     category: "lifecycle",
@@ -313,14 +380,14 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
 
   {
     id: "lifecycle-progress",
-    name: "Accepts progress notifications",
+    name: "Handles progress notifications gracefully",
     category: "lifecycle",
     required: false,
     specRef: "basic/utilities#progress",
     description:
-      "Tests that the server accepts notifications/progress without error. Servers should handle progress notifications for request tracking.",
+      "Sends a notifications/progress to the server and verifies it does not error. Note: per spec, progress flows from server to client during long-running requests. This test validates the server handles unexpected notifications gracefully.",
     recommendation:
-      "Accept notifications/progress with progressToken, progress, and optional total fields. Ignore notifications for unknown progress tokens.",
+      "Accept unknown notifications without returning an error. The server should not crash or return a non-2xx status for notifications it does not recognize.",
   },
 
   // ── Tools (4 tests) ──────────────────────────────────────────────
@@ -331,7 +398,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#listing-tools",
     description:
-      "Calls tools/list and validates it returns an array of tool definitions. Required if the server declares tools capability.",
+      "Calls tools/list and validates it returns an array of tool definitions. Dynamically required at runtime if the server declares tools capability.",
     recommendation:
       "Implement the tools/list handler to return { tools: [...] } with an array of tool definition objects. Each tool needs at least a name and inputSchema.",
   },
@@ -377,7 +444,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/resources#listing-resources",
     description:
-      "Calls resources/list and validates it returns an array. Required if the server declares resources capability.",
+      "Calls resources/list and validates it returns an array. Dynamically required at runtime if the server declares resources capability.",
     recommendation:
       "Implement resources/list to return { resources: [...] } with an array of resource objects. Each resource needs at least a uri and name.",
   },
@@ -434,7 +501,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/prompts#listing-prompts",
     description:
-      "Calls prompts/list and validates it returns an array. Required if the server declares prompts capability.",
+      "Calls prompts/list and validates it returns an array. Dynamically required at runtime if the server declares prompts capability.",
     recommendation:
       "Implement prompts/list to return { prompts: [...] } with an array of prompt objects. Each prompt needs at least a name field.",
   },
@@ -461,7 +528,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "If you return nextCursor in prompts/list, ensure it is a string and that passing it back as cursor in the next request returns valid results.",
   },
 
-  // ── Error Handling (8 tests) ─────────────────────────────────────
+  // ── Error Handling (10 tests) ────────────────────────────────────
   {
     id: "error-unknown-method",
     name: "Returns JSON-RPC error for unknown method",
@@ -549,6 +616,29 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Return a JSON-RPC error or set isError: true when tools/call receives an unrecognized tool name. Do not return an empty success response.",
   },
 
+  {
+    id: "error-capability-gated",
+    name: "Rejects methods for undeclared capabilities",
+    category: "errors",
+    required: false,
+    specRef: "basic/lifecycle#capability-negotiation",
+    description:
+      "Calls list methods (tools/list, resources/list, prompts/list) for capabilities the server did NOT declare, and verifies the server returns an error instead of success.",
+    recommendation:
+      "Return a JSON-RPC error (e.g., -32601 Method not found) for methods associated with capabilities not declared in your initialize response.",
+  },
+  {
+    id: "error-invalid-cursor",
+    name: "Handles invalid pagination cursor gracefully",
+    category: "errors",
+    required: false,
+    specRef: "basic",
+    description:
+      "Sends a garbage pagination cursor to a list method and verifies the server handles it gracefully — either returning an error or ignoring the invalid cursor.",
+    recommendation:
+      "Validate pagination cursors before use. Return a JSON-RPC error for unrecognized cursors, or treat invalid cursors as a request for the first page.",
+  },
+
   // ── Schema Validation (6 tests) ──────────────────────────────────
   {
     id: "tools-schema",
@@ -568,9 +658,9 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#annotations",
     description:
-      "Validates tool annotation fields if present: readOnlyHint, destructiveHint, idempotentHint, openWorldHint should be booleans; title should be a string.",
+      "Validates tool annotation fields if present: readOnlyHint, destructiveHint, idempotentHint, openWorldHint should be booleans.",
     recommendation:
-      "If you include annotations on tools, ensure readOnlyHint, destructiveHint, idempotentHint, and openWorldHint are booleans. Title must be a string.",
+      "If you include annotations on tools, ensure readOnlyHint, destructiveHint, idempotentHint, and openWorldHint are booleans. Note: title belongs on the Tool object, not inside annotations.",
   },
   {
     id: "tools-title-field",
@@ -615,7 +705,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Ensure every resource has a valid, parseable URI and a name field. Add description and mimeType for better client integration.",
   },
 
-  // ── Security: Auth & Transport (8 tests) ─────────────────────────
+  // ── Security: Auth & Transport (9 tests) ─────────────────────────
   {
     id: "security-auth-required",
     name: "Rejects unauthenticated requests",
@@ -673,14 +763,14 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
   },
   {
     id: "security-oauth-metadata",
-    name: "OAuth metadata endpoint exists",
+    name: "Protected Resource Metadata endpoint exists",
     category: "security",
     required: false,
     specRef: "basic/authorization",
     description:
-      "Checks for a well-known OAuth authorization server metadata endpoint at /.well-known/oauth-authorization-server. If the server requires auth, it should advertise how to obtain tokens.",
+      "Checks for a Protected Resource Metadata (RFC 9728) endpoint at /.well-known/oauth-protected-resource. Per MCP 2025-11-25, the MCP server publishes PRM with a resource identifier and authorization_servers array. Falls back to legacy /.well-known/oauth-authorization-server with a warning.",
     recommendation:
-      "Publish an OAuth 2.0 Authorization Server Metadata document at /.well-known/oauth-authorization-server on your server's origin. Include issuer, token_endpoint, and supported grant types.",
+      "Publish a Protected Resource Metadata document at /.well-known/oauth-protected-resource on your server's origin. Include 'resource' (your server's URL) and 'authorization_servers' (array of OAuth AS URLs). See RFC 9728.",
   },
   {
     id: "security-token-in-uri",
@@ -703,6 +793,18 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "If the server returns CORS headers, verifies that Access-Control-Allow-Origin is not set to wildcard (*). Wildcard CORS on an authenticated API allows cross-origin credential theft.",
     recommendation:
       'Set Access-Control-Allow-Origin to specific trusted origins, not "*". If CORS is not needed (server-to-server only), do not send CORS headers at all.',
+  },
+
+  {
+    id: "security-origin-validation",
+    name: "Validates Origin header on requests",
+    category: "security",
+    required: false,
+    specRef: "basic/transports#streamable-http",
+    description:
+      "Sends a request with a suspicious Origin header (https://evil-rebinding-attack.example.com) and verifies the server rejects it. Per spec, servers MUST validate the Origin header to prevent DNS rebinding attacks.",
+    recommendation:
+      "Validate the Origin header on all incoming requests. Reject requests from untrusted origins with HTTP 403. Maintain an allowlist of permitted origins.",
   },
 
   // ── Security: Input Validation (6 tests) ─────────────────────────

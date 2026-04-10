@@ -81,6 +81,18 @@
       "failCriteria": "Content-Type is neither application/json nor text/event-stream"
     },
     {
+      "id": "transport-content-type-reject",
+      "name": "Rejects non-JSON request Content-Type",
+      "category": "transport",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#streamable-http",
+      "description": "Sends POST with Content-Type: text/plain and verifies server rejects it",
+      "passCriteria": "Server returns 4xx for non-application/json Content-Type",
+      "failCriteria": "Server accepts request with incorrect Content-Type"
+    },
+    {
       "id": "transport-get",
       "name": "GET returns SSE stream or 405",
       "category": "transport",
@@ -124,9 +136,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/transports#streamable-http",
-      "description": "Verifies the server returns 2xx for JSON-RPC notifications",
-      "passCriteria": "Any 2xx response for notification",
-      "failCriteria": "Non-2xx response for notification"
+      "description": "Verifies the server returns exactly HTTP 202 Accepted for JSON-RPC notifications (MUST per spec)",
+      "passCriteria": "HTTP 202 Accepted response",
+      "failCriteria": "Any status code other than 202 (including 200, 204)"
     },
     {
       "id": "transport-session-id",
@@ -139,6 +151,18 @@
       "description": "Verifies the server enforces MCP-Session-Id header after initialization",
       "passCriteria": "Returns 400 for missing session ID, or auto-pass if no session ID was issued",
       "failCriteria": "Returns 2xx without required session ID header"
+    },
+    {
+      "id": "transport-session-invalid",
+      "name": "Returns 404 for unknown session ID",
+      "category": "transport",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#streamable-http",
+      "description": "Sends request with fabricated MCP-Session-Id, verifies server returns 404",
+      "passCriteria": "HTTP 404 for unknown session ID",
+      "failCriteria": "Server accepts unknown session ID or returns wrong status code"
     },
     {
       "id": "transport-content-type-init",
@@ -175,6 +199,18 @@
       "description": "Sends multiple JSON-RPC requests in parallel and verifies correct responses",
       "passCriteria": "All concurrent requests receive responses with correct matching IDs",
       "failCriteria": "Any response has mismatched ID or non-2xx status"
+    },
+    {
+      "id": "transport-sse-event-field",
+      "name": "SSE responses include event: message",
+      "category": "transport",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#streamable-http",
+      "description": "Checks that SSE responses include the required event: message field",
+      "passCriteria": "SSE response includes event: message, or server responds with JSON (not SSE)",
+      "failCriteria": "SSE response has data: fields but no event: message field"
     },
     {
       "id": "lifecycle-init",
@@ -273,6 +309,42 @@
       "failCriteria": "Response id does not match request id"
     },
     {
+      "id": "lifecycle-string-id",
+      "name": "Supports string request IDs",
+      "category": "lifecycle",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic",
+      "description": "Sends request with string id and verifies server echoes it back correctly",
+      "passCriteria": "String id echoed back with correct value and type",
+      "failCriteria": "Server does not echo back string id correctly"
+    },
+    {
+      "id": "lifecycle-version-negotiate",
+      "name": "Handles unknown protocol version",
+      "category": "lifecycle",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/lifecycle#version-negotiation",
+      "description": "Sends initialize with future protocol version, verifies server negotiates down or errors",
+      "passCriteria": "Server returns its own supported version or rejects with error",
+      "failCriteria": "Server blindly accepts impossible future version"
+    },
+    {
+      "id": "lifecycle-reinit-reject",
+      "name": "Rejects second initialize request",
+      "category": "lifecycle",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/lifecycle#initialization",
+      "description": "Sends second initialize in same session, verifies server rejects it",
+      "passCriteria": "Server returns error or 4xx for duplicate initialize",
+      "failCriteria": "Server accepts second initialize without error"
+    },
+    {
       "id": "lifecycle-logging",
       "name": "logging/setLevel accepted",
       "category": "lifecycle",
@@ -310,15 +382,15 @@
     },
     {
       "id": "lifecycle-progress",
-      "name": "Accepts progress notifications",
+      "name": "Handles progress notifications gracefully",
       "category": "lifecycle",
       "severity": "warning",
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/utilities#progress",
-      "description": "Verifies the server accepts notifications/progress without error",
-      "passCriteria": "Server accepts progress notification (2xx response)",
-      "failCriteria": "Server returns error for progress notification"
+      "description": "Sends notifications/progress to the server and verifies it handles it gracefully. Note: per spec, progress flows server-to-client; this tests resilience to unexpected notifications.",
+      "passCriteria": "Server accepts notification without error (2xx response)",
+      "failCriteria": "Server returns non-2xx for an unexpected notification"
     },
     {
       "id": "tools-list",
@@ -561,6 +633,30 @@
       "failCriteria": "No error returned for unknown tool"
     },
     {
+      "id": "error-capability-gated",
+      "name": "Rejects methods for undeclared capabilities",
+      "category": "errors",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/lifecycle#capability-negotiation",
+      "description": "Calls list methods for undeclared capabilities and verifies server returns errors",
+      "passCriteria": "Server returns error for methods of undeclared capabilities",
+      "failCriteria": "Server returns success for methods it did not declare capability for"
+    },
+    {
+      "id": "error-invalid-cursor",
+      "name": "Handles invalid pagination cursor gracefully",
+      "category": "errors",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic",
+      "description": "Sends garbage pagination cursor to a list method",
+      "passCriteria": "Server returns error or ignores invalid cursor",
+      "failCriteria": "Server crashes or returns no error/result"
+    },
+    {
       "id": "tools-schema",
       "name": "All tools have name and inputSchema",
       "category": "schema",
@@ -694,15 +790,15 @@
     },
     {
       "id": "security-oauth-metadata",
-      "name": "OAuth metadata endpoint exists",
+      "name": "Protected Resource Metadata endpoint exists",
       "category": "security",
       "severity": "warning",
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/authorization",
-      "description": "Verifies the OAuth authorization server metadata endpoint exists",
-      "passCriteria": "/.well-known/oauth-authorization-server returns valid JSON with issuer and token_endpoint",
-      "failCriteria": "Endpoint missing, non-JSON, or missing required fields"
+      "description": "Verifies the Protected Resource Metadata (RFC 9728) endpoint exists at /.well-known/oauth-protected-resource. Falls back to legacy /.well-known/oauth-authorization-server with a warning.",
+      "passCriteria": "/.well-known/oauth-protected-resource returns valid JSON with resource and authorization_servers, or legacy OAuth AS metadata exists",
+      "failCriteria": "Neither PRM nor legacy OAuth AS metadata endpoint is reachable or valid"
     },
     {
       "id": "security-token-in-uri",
@@ -727,6 +823,18 @@
       "description": "Verifies CORS headers do not use wildcard origin",
       "passCriteria": "No CORS headers, or Access-Control-Allow-Origin is not '*' or reflected",
       "failCriteria": "Access-Control-Allow-Origin is '*' or reflects arbitrary origins"
+    },
+    {
+      "id": "security-origin-validation",
+      "name": "Validates Origin header on requests",
+      "category": "security",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#streamable-http",
+      "description": "Sends request with suspicious Origin header, verifies server validates it for DNS rebinding protection",
+      "passCriteria": "Server rejects request with untrusted Origin (4xx response)",
+      "failCriteria": "Server accepts request with untrusted Origin header"
     },
     {
       "id": "security-command-injection",

@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import chalk from "chalk";
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import { startServer } from "./mcp/server.js";
 import { formatJson, formatSarif, formatTerminal } from "./reporter.js";
 import { runComplianceSuite } from "./runner.js";
@@ -42,7 +42,9 @@ program
   .command("test")
   .description("Run the full compliance test suite against an MCP server")
   .argument("<url>", "MCP server URL to test")
-  .option("--format <format>", "Output format: terminal, json, or sarif", "terminal")
+  .addOption(
+    new Option("--format <format>", "Output format").choices(["terminal", "json", "sarif"]).default("terminal"),
+  )
   .option("--strict", "Exit with code 1 on any required test failure (for CI)")
   .option("-H, --header <header>", 'Add header to all requests (format: "Key: Value", repeatable)', parseHeaderArg, {})
   .option("--auth <token>", 'Shorthand for -H "Authorization: <token>"')

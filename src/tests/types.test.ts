@@ -14,8 +14,8 @@ const VALID_CATEGORIES: TestCategory[] = [
 ];
 
 describe("TEST_DEFINITIONS", () => {
-  it("contains exactly 69 test definitions", () => {
-    expect(TEST_DEFINITIONS).toHaveLength(69);
+  it("contains exactly 78 test definitions", () => {
+    expect(TEST_DEFINITIONS).toHaveLength(78);
   });
 
   it("all IDs are unique", () => {
@@ -59,14 +59,14 @@ describe("TEST_DEFINITIONS", () => {
     for (const def of TEST_DEFINITIONS) {
       counts[def.category] = (counts[def.category] || 0) + 1;
     }
-    expect(counts.transport).toBe(10);
-    expect(counts.lifecycle).toBe(12);
+    expect(counts.transport).toBe(13);
+    expect(counts.lifecycle).toBe(15);
     expect(counts.tools).toBe(4);
     expect(counts.resources).toBe(5);
     expect(counts.prompts).toBe(3);
-    expect(counts.errors).toBe(8);
+    expect(counts.errors).toBe(10);
     expect(counts.schema).toBe(6);
-    expect(counts.security).toBe(21);
+    expect(counts.security).toBe(22);
   });
 
   it("has correct required test count", () => {

@@ -9,7 +9,7 @@ import { TEST_DEFINITIONS } from "../types.js";
 export function registerTools(server: McpServer) {
   server.tool(
     "mcp_compliance_test",
-    "Run the full MCP compliance test suite against a server URL. Returns grade (A-F), score, and detailed results for all 69 tests covering transport, lifecycle, tools, resources, prompts, errors, schema validation, and security.",
+    "Run the full MCP compliance test suite against a server URL. Returns grade (A-F), score, and detailed results for all 78 tests covering transport, lifecycle, tools, resources, prompts, errors, schema validation, and security.",
     {
       url: z.string().url().describe("The MCP server URL to test (must be HTTP or HTTPS)"),
       auth: z.string().optional().describe('Authorization header value (e.g., "Bearer tok123")'),
@@ -17,8 +17,20 @@ export function registerTools(server: McpServer) {
         .record(z.string())
         .optional()
         .describe('Additional headers to include on all requests (e.g., {"X-Api-Key": "abc"})'),
-      timeout: z.number().optional().describe("Request timeout in milliseconds (default: 15000)"),
-      retries: z.number().optional().describe("Number of retries for failed tests (default: 0)"),
+      timeout: z
+        .number()
+        .int()
+        .min(1)
+        .max(300000)
+        .optional()
+        .describe("Request timeout in milliseconds (default: 15000, max: 300000)"),
+      retries: z
+        .number()
+        .int()
+        .min(0)
+        .max(10)
+        .optional()
+        .describe("Number of retries for failed tests (default: 0, max: 10)"),
       only: z.array(z.string()).optional().describe("Only run tests matching these categories or test IDs"),
       skip: z.array(z.string()).optional().describe("Skip tests matching these categories or test IDs"),
     },
@@ -86,7 +98,13 @@ export function registerTools(server: McpServer) {
       url: z.string().url().describe("The MCP server URL to test"),
       auth: z.string().optional().describe('Authorization header value (e.g., "Bearer tok123")'),
       headers: z.record(z.string()).optional().describe("Additional headers to include on all requests"),
-      timeout: z.number().optional().describe("Request timeout in milliseconds (default: 15000)"),
+      timeout: z
+        .number()
+        .int()
+        .min(1)
+        .max(300000)
+        .optional()
+        .describe("Request timeout in milliseconds (default: 15000, max: 300000)"),
     },
     {
       title: "Get Compliance Badge",

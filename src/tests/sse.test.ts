@@ -8,7 +8,7 @@ describe("parseSSEResponse", () => {
     expect(result).toEqual({ jsonrpc: "2.0", id: 1, result: {} });
   });
 
-  it("returns the last JSON-RPC response when multiple events exist", () => {
+  it("returns the first JSON-RPC response when multiple events exist", () => {
     const text = [
       'data: {"jsonrpc":"2.0","id":1,"result":{"first":true}}',
       "",
@@ -16,7 +16,7 @@ describe("parseSSEResponse", () => {
       "",
     ].join("\n");
     const result = parseSSEResponse(text);
-    expect(result).toEqual({ jsonrpc: "2.0", id: 2, result: { second: true } });
+    expect(result).toEqual({ jsonrpc: "2.0", id: 1, result: { first: true } });
   });
 
   it("handles multi-line data fields concatenated with newlines", () => {
