@@ -142,7 +142,7 @@ NPM_VERSION=$(npm view @yawlabs/mcp-compliance version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "Already published to npm — skipping"
 else
-  npm publish --access public
+  npm publish --access public --provenance
   info "Published @yawlabs/mcp-compliance@${VERSION} to npm"
 fi
 
