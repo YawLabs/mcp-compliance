@@ -49,6 +49,7 @@ program
   .option("-H, --header <header>", 'Add header to all requests (format: "Key: Value", repeatable)', parseHeaderArg, {})
   .option("--auth <token>", 'Shorthand for -H "Authorization: <token>"')
   .option("--timeout <ms>", "Request timeout in milliseconds", "15000")
+  .option("--preflight-timeout <ms>", "Preflight connectivity check timeout in milliseconds")
   .option("--retries <n>", "Number of retries for failed tests", "0")
   .option(
     "--only <items>",
@@ -70,6 +71,7 @@ program
         header: Record<string, string>;
         auth?: string;
         timeout: string;
+        preflightTimeout?: string;
         retries: string;
         only?: string[];
         skip?: string[];
@@ -87,6 +89,9 @@ program
         const report = await runComplianceSuite(url, {
           headers,
           timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
+          preflightTimeout: opts.preflightTimeout
+            ? parsePositiveInt(opts.preflightTimeout, "--preflight-timeout", 1)
+            : undefined,
           retries: parsePositiveInt(opts.retries, "--retries"),
           only: opts.only,
           skip: opts.skip,

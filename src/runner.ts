@@ -205,6 +205,8 @@ export interface RunOptions {
   only?: string[];
   /** Skip tests matching these category names or test IDs */
   skip?: string[];
+  /** Preflight connectivity check timeout in milliseconds (default: min(timeout, 10000)) */
+  preflightTimeout?: number;
 }
 
 /**
@@ -234,7 +236,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
         ...options.headers,
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "ping" }),
-      signal: AbortSignal.timeout(Math.min(options.timeout || 15000, 10000)),
+      signal: AbortSignal.timeout(options.preflightTimeout ?? Math.min(options.timeout || 15000, 10000)),
     });
     await preflight.body.text();
   } catch {
@@ -1462,7 +1464,13 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   // ── 6. RESOURCES ─────────────────────────────────────────────────
 
   const hasResources = !!serverInfo.capabilities.resources;
-  const hasSubscribe = !!(serverInfo.capabilities.resources as any)?.subscribe;
+  const resourcesCap = serverInfo.capabilities.resources;
+  const hasSubscribe = !!(
+    typeof resourcesCap === "object" &&
+    resourcesCap !== null &&
+    "subscribe" in resourcesCap &&
+    (resourcesCap as Record<string, unknown>).subscribe
+  );
 
   if (hasResources) {
     let cachedResourcesList: any[] | null = null;
@@ -2867,7 +2875,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
 
   // ── Cap warnings ─────────────────────────────────────────────────
 
-  const MAX_WARNINGS = 50;
+  const MAX_WARNINGS = 100;
   if (warnings.length > MAX_WARNINGS) {
     const truncated = warnings.length - MAX_WARNINGS;
     warnings.splice(MAX_WARNINGS, truncated, `... and ${truncated} more warning(s) suppressed`);

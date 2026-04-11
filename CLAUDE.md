@@ -25,7 +25,7 @@ MCP server compliance testing tool. Tests any Streamable HTTP MCP server against
 - Transport tests run pre-initialization using raw HTTP (undici).
 - Lifecycle tests drive the MCP initialize handshake, then run post-init tests.
 - Capability-gated tests (tools, resources, prompts) only run if the server declares the capability. Their `required` flag is dynamic.
-- Security tests (21) run after all functional tests. Auth tests require `--auth`; input validation tests are gated on `tools` capability. All security tests are optional by default.
+- Security tests (23) run after all functional tests. Auth tests require `--auth`; input validation tests are gated on `tools` capability. All security tests are optional by default.
 - Request IDs use a counter starting at 1000 to avoid collision with hardcoded transport test IDs (99901-99904).
 - SSE parsing handles multi-line `data:` fields per the SSE spec. Exported and unit-tested.
 - Session state (MCP-Session-Id, protocol version) is tracked and injected into subsequent requests.
