@@ -3,14 +3,28 @@ name: CI
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - 'LICENSE'
   pull_request:
     branches: [master]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - 'LICENSE'
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    # Cross-platform matrix: stdio transport behaves differently on Windows
+    # (shell:true for npx .cmd shims) and macOS — bugs there shouldn't ship.
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
         node-version: [20, 22]
 
     steps:
