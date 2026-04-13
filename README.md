@@ -5,7 +5,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/YawLabs/mcp-compliance)](https://github.com/YawLabs/mcp-compliance/stargazers)
 [![CI](https://github.com/YawLabs/mcp-compliance/actions/workflows/ci.yml/badge.svg)](https://github.com/YawLabs/mcp-compliance/actions/workflows/ci.yml)
 
-**Test any MCP server for spec compliance.** 84-test suite covering transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). Works against **HTTP endpoints** (`https://my-server.com/mcp`) and **stdio servers** (`npx @modelcontextprotocol/server-filesystem /tmp`) alike. CLI, MCP server, and programmatic API.
+**Test any MCP server for spec compliance.** 85-test suite covering transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). Works against **HTTP endpoints** (`https://my-server.com/mcp`) and **stdio servers** (`npx @modelcontextprotocol/server-filesystem /tmp`) alike. CLI, MCP server, and programmatic API.
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
@@ -479,7 +479,7 @@ Restart your MCP client and approve the server when prompted.
 
 ### Tools
 
-- **mcp_compliance_test** — Run the full 84-test suite against a URL or stdio command. Supports auth, custom headers, env vars, timeout, retries, and category/test filtering. Returns grade, score, and detailed results.
+- **mcp_compliance_test** — Run the full 85-test suite against a URL or stdio command. Supports auth, custom headers, env vars, timeout, retries, and category/test filtering. Returns grade, score, and detailed results.
 - **mcp_compliance_badge** — Get the badge markdown/HTML for a server. Supports auth and custom headers.
 - **mcp_compliance_explain** — Explain what a specific test ID checks and why it matters.
 

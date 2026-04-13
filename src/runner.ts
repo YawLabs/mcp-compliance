@@ -1049,6 +1049,33 @@ export async function runComplianceSuite(
       },
     );
 
+    // _meta tolerance: send a ping with a benign _meta and verify the
+    // server doesn't choke on unknown _meta keys. Spec (2025-11-25)
+    // reserves _meta for protocol metadata + extension; servers must
+    // pass it through validation gracefully.
+    await test(
+      "lifecycle-meta-tolerance",
+      "Tolerates _meta field on requests",
+      "lifecycle",
+      false,
+      "basic/utilities#_meta",
+      async () => {
+        try {
+          const res = await rpc("ping", { _meta: { "mcp-compliance/probe": "1" } });
+          const body = res.body as { error?: { code?: number }; result?: unknown };
+          if (body.error) {
+            return {
+              passed: false,
+              details: `Server rejected _meta on ping (code ${body.error.code}). _meta should be ignored, not error.`,
+            };
+          }
+          return { passed: true, details: "Server accepted ping with arbitrary _meta field" };
+        } catch (err: unknown) {
+          return { passed: false, details: `Error: ${err instanceof Error ? err.message : String(err)}` };
+        }
+      },
+    );
+
     // ── 4. TRANSPORT (session-dependent, post-init) ──────────────────
 
     await test(
