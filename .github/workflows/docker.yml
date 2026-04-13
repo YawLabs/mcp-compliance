@@ -1,8 +1,17 @@
 name: Docker
 
+# Triggers in priority order:
+#   1. workflow_run on Release completion — the "happy path"; npm publish
+#      has finished, so `npm install -g @yawlabs/mcp-compliance@<v>` works.
+#   2. workflow_dispatch — manual rebuild of any version.
+#
+# Tag-push (v*) was the original trigger but races npm publish — when
+# both fire on the same tag, Docker would try to install the version
+# before it landed on the registry and fail with ETARGET. Removed.
 on:
-  push:
-    tags: ['v*']
+  workflow_run:
+    workflows: ['Release']
+    types: [completed]
   workflow_dispatch:
     inputs:
       version:
@@ -13,11 +22,19 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Only run when the upstream Release workflow succeeded. Skips on
+    # release failures (no point baking a broken/missing version).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          # When triggered by workflow_run, GITHUB_SHA is the head of the
+          # default branch at trigger time, not the release commit. Pin
+          # to the release workflow's head SHA for label accuracy.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: docker/setup-buildx-action@v3
 
@@ -31,13 +48,33 @@ jobs:
         id: ver
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
-            echo "tag=${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
           else
-            v="${GITHUB_REF#refs/tags/v}"
-            echo "version=$v" >> $GITHUB_OUTPUT
-            echo "tag=$v" >> $GITHUB_OUTPUT
+            # workflow_run: read the version from package.json on the
+            # release commit. This is the canonical source — the tag and
+            # the npm publish are both derived from it.
+            v=$(node -p "require('./package.json').version")
+            echo "version=$v" >> "$GITHUB_OUTPUT"
+            echo "tag=$v" >> "$GITHUB_OUTPUT"
           fi
+
+      # Belt-and-suspenders: even after Release completes, npm registry
+      # propagation can lag a few seconds. Poll up to 60s for the version
+      # to appear before kicking off the Docker build.
+      - name: Wait for npm publish to propagate
+        run: |
+          v="${{ steps.ver.outputs.version }}"
+          for i in $(seq 1 12); do
+            if npm view "@yawlabs/mcp-compliance@$v" version >/dev/null 2>&1; then
+              echo "Found @yawlabs/mcp-compliance@$v on registry"
+              exit 0
+            fi
+            echo "Not yet; retry $i/12 in 5s..."
+            sleep 5
+          done
+          echo "ERROR: @yawlabs/mcp-compliance@$v never appeared on npm" >&2
+          exit 1
 
       - name: Build & push
         uses: docker/build-push-action@v6
@@ -51,4 +88,4 @@ jobs:
             ghcr.io/yawlabs/mcp-compliance:${{ steps.ver.outputs.tag }}
           labels: |
             org.opencontainers.image.version=${{ steps.ver.outputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha || github.sha }}
