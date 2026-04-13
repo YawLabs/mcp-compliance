@@ -32,6 +32,10 @@ export function generateBadge(url: string): {
     imageUrl,
     reportUrl,
     markdown: `[![MCP Compliant](${imageUrl})](${reportUrl})`,
-    html: `<a href="${reportUrl}"><img src="${imageUrl}" alt="MCP Compliant"></a>`,
+    // loading="lazy" so READMEs that embed many badges don't block first
+    // paint on this image. Markdown renderers (GitHub, npmjs.com) emit
+    // their own <img> from the markdown form so the attribute only
+    // matters for the HTML form people paste into custom pages.
+    html: `<a href="${reportUrl}"><img src="${imageUrl}" alt="MCP Compliant" loading="lazy"></a>`,
   };
 }

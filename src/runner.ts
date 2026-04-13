@@ -187,6 +187,17 @@ export interface RunOptions {
    * docs/PERFORMANCE.md for the design.
    */
   concurrency?: number;
+  /**
+   * AbortSignal that cancels the suite mid-flight. When the signal fires,
+   * no further tests start; the in-flight test is cancelled if its
+   * underlying request supports the signal. The promise rejects with the
+   * signal's reason (an `AbortError` by default).
+   *
+   * Useful for live UIs (SSE, WebSocket) where the client may disconnect
+   * before the suite finishes — wiring the disconnect to abort here
+   * stops the server from burning compute on a dropped client.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -422,6 +433,15 @@ export async function runComplianceSuite(
       specRef: string,
       fn: () => Promise<{ passed: boolean; details: string }>,
     ): Promise<void> {
+      // Abort gate: if the caller's signal has fired, drop any pending
+      // parallel work and propagate the reason. We check at the top of
+      // every test() call so the first awaited test after abort returns
+      // immediately rather than waiting on the rest of the suite.
+      if (options.signal?.aborted) {
+        if (inFlight.size > 0) await drainPool().catch(() => {});
+        throw options.signal.reason ?? new Error("Aborted");
+      }
+
       if (!shouldRun(id, category)) return;
 
       const def = TEST_DEFINITIONS_MAP.get(id);
