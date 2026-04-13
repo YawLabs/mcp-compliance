@@ -96,7 +96,9 @@ const STDIO_INCOMPATIBLE_IDS = new Set<string>([
   "error-parse-code",
   "error-invalid-request-code",
   // Security tests that are inherently HTTP-layer (auth headers,
-  // sessions, CORS, TLS, rate limits, RFC 9728 metadata).
+  // sessions, CORS, TLS, rate limits, RFC 9728 metadata). For stdio
+  // servers these don't apply — the parent process owns the trust
+  // boundary, not the server.
   "security-tls-required",
   "security-oauth-metadata",
   "security-token-in-uri",
@@ -104,6 +106,10 @@ const STDIO_INCOMPATIBLE_IDS = new Set<string>([
   "security-cors-headers",
   "security-origin-validation",
   "security-session-not-auth",
+  "security-auth-required",
+  "security-auth-malformed",
+  "security-www-authenticate",
+  "security-session-entropy",
 ]);
 
 /**
@@ -2449,6 +2455,36 @@ export async function runComplianceSuite(
 
     // Input validation security tests (only run if tools are available)
     // Shared helper for injection tests: sends payloads to a tool param, checks output against a detection pattern
+    /**
+     * Heuristic patterns that indicate the server REJECTED the payload
+     * rather than executing it. If a response matches both `detectPattern`
+     * (suggesting execution) AND a rejection pattern, treat as a pass —
+     * the server defended correctly and just happened to echo the payload
+     * in its error message. Without this, well-defended servers like
+     * @modelcontextprotocol/server-filesystem look like they're vulnerable
+     * just because their error responses include the offending input.
+     */
+    const REJECTION_PATTERNS = [
+      /access denied/i,
+      /permission denied/i,
+      /not allowed/i,
+      /not permitted/i,
+      /outside (allowed|permitted)/i,
+      /forbidden/i,
+      /unauthorized/i,
+      /invalid (path|input|argument|parameter|request)/i,
+      /(payload|request) (rejected|blocked|refused)/i,
+      /enoent|eacces|eperm/i,
+      /sandbox(ed)?/i,
+      /(no such file|file not found)/i,
+      /\binvalid\b.*\b(input|json|argument|parameter|character)/i,
+    ];
+
+    function looksRejected(text: string, isErrorFlag: boolean): boolean {
+      if (isErrorFlag) return true;
+      return REJECTION_PATTERNS.some((p) => p.test(text));
+    }
+
     async function runInjectionTest(
       toolName: string,
       paramName: string,
@@ -2457,24 +2493,37 @@ export async function runComplianceSuite(
       label: string,
     ): Promise<{ passed: boolean; details: string }> {
       const issues: string[] = [];
+      let defended = 0;
       for (const payload of payloads) {
         try {
           const res = await rpc("tools/call", { name: toolName, arguments: { [paramName]: payload } });
-          const content = res.body?.result?.content;
+          const result = res.body?.result;
+          const content = result?.content;
+          const isErrorFlag = result?.isError === true;
           if (Array.isArray(content)) {
             const text = content.map((c: any) => c.text || "").join(" ");
             if (detectPattern.test(text)) {
-              issues.push(`Payload "${payload}" ${label} (output: ${text.substring(0, 100)})`);
+              if (looksRejected(text, isErrorFlag)) {
+                defended++;
+              } else {
+                issues.push(`Payload "${payload}" ${label} (output: ${text.substring(0, 100)})`);
+              }
+            } else {
+              defended++;
             }
           }
         } catch {
           // Error is acceptable — server rejected the input
+          defended++;
         }
       }
       if (issues.length > 0) return { passed: false, details: issues.join("; ") };
       return {
         passed: true,
-        details: `Tested ${payloads.length} payloads against ${toolName}.${paramName} — no ${label.split(" ")[0]} detected`,
+        details:
+          defended === payloads.length
+            ? `Tested ${payloads.length} payloads against ${toolName}.${paramName} — server defended (rejected or sanitized)`
+            : `Tested ${payloads.length} payloads against ${toolName}.${paramName} — no ${label.split(" ")[0]} detected`,
       };
     }
 
