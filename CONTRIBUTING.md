@@ -48,6 +48,22 @@ npm test
 - No unnecessary abstractions — keep code simple and direct
 - Add tests for new functionality
 
+## Report schema discipline
+
+The JSON output of `runComplianceSuite()` is a **stable, versioned contract** consumed by downstream renderers (mcp.hosting, third-party dashboards). Every report carries a top-level `schemaVersion` field, defined by `REPORT_SCHEMA_VERSION` in `src/types.ts`, and is described by `schemas/report.v1.json`.
+
+When changing the `ComplianceReport` type:
+
+- **Adding a field** (non-breaking): update both `src/types.ts` and `schemas/report.v1.json` in the same PR. No version bump needed.
+- **Renaming, removing, or changing the type of an existing field** (breaking): bump `REPORT_SCHEMA_VERSION` to `"2"`, create `schemas/report.v2.json`, and keep `schemas/report.v1.json` for downstream consumers still on v1.
+- **Anything that affects determinism** (new non-deterministic field, new warning that includes a timestamp/duration/random ID): the integration test `produces deterministic output` will catch this. Don't bypass it — fix the root cause.
+
+The CI suite enforces this:
+
+- `src/tests/schema.test.ts` validates a hand-crafted sample against the schema.
+- `src/tests/integration.test.ts` validates a real CLI run against the schema.
+- Drift between `ComplianceReport` and `report.v1.json` will fail CI.
+
 ## For AI Coding Agents
 
 If you're an AI agent (Claude Code, Copilot, Cursor, etc.) submitting a PR:

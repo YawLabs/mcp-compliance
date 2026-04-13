@@ -475,6 +475,17 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     recommendation:
       "When a request includes _meta.progressToken, send notifications/progress events via SSE to report progress. Include progressToken, progress (current), and optionally total fields.",
   },
+  {
+    id: "lifecycle-meta-tolerance",
+    name: "Tolerates _meta field on requests",
+    category: "lifecycle",
+    required: false,
+    specRef: "basic/utilities#_meta",
+    description:
+      "Sends a ping with params._meta = { extra: 'value' } and verifies the server doesn't error. The 2025-11-25 spec allows arbitrary _meta on any request; servers should ignore unknown _meta fields gracefully.",
+    recommendation:
+      "Treat the _meta field as opaque — pass it through your request validator, but do not reject requests for unknown _meta keys. The MCP spec reserves _meta for protocol/transport metadata and forward-compat extensibility.",
+  },
 
   // ── Tools (4 tests) ──────────────────────────────────────────────
   {

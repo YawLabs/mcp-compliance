@@ -5,16 +5,14 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
+import Ajv2020 from "ajv/dist/2020.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { runComplianceSuite } from "../runner.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const reportSchema = JSON.parse(
-  readFileSync(resolve(__dirname, "../../schemas/report.v1.json"), "utf8"),
-);
+const reportSchema = JSON.parse(readFileSync(resolve(__dirname, "../../schemas/report.v1.json"), "utf8"));
 const ajv = new Ajv2020({ strict: true, allErrors: true });
 addFormats(ajv);
 const validateReport = ajv.compile(reportSchema);
@@ -196,5 +194,9 @@ describe("integration — full compliance suite against real server", () => {
     expect(bStable.summary).toEqual(aStable.summary);
     expect(bStable.categories).toEqual(aStable.categories);
     expect(bStable.tests.map((t) => [t.id, t.passed])).toEqual(aStable.tests.map((t) => [t.id, t.passed]));
+    // Warnings are content-deterministic: every push site uses static text
+    // or stable identifiers (tool names, status codes, version numbers).
+    // Drift here means a non-deterministic warning crept in.
+    expect([...bStable.warnings].sort()).toEqual([...aStable.warnings].sort());
   }, 60000);
 });
