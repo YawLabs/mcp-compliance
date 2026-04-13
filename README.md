@@ -5,7 +5,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/YawLabs/mcp-compliance)](https://github.com/YawLabs/mcp-compliance/stargazers)
 [![CI](https://github.com/YawLabs/mcp-compliance/actions/workflows/ci.yml/badge.svg)](https://github.com/YawLabs/mcp-compliance/actions/workflows/ci.yml)
 
-**Test any MCP server for spec compliance.** 85-test suite covering transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). Works against **HTTP endpoints** (`https://my-server.com/mcp`) and **stdio servers** (`npx @modelcontextprotocol/server-filesystem /tmp`) alike. CLI, MCP server, and programmatic API.
+**Test any MCP server for spec compliance.** 88-test suite covering transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). Works against **HTTP endpoints** (`https://my-server.com/mcp`) and **stdio servers** (`npx @modelcontextprotocol/server-filesystem /tmp`) alike. CLI, MCP server, and programmatic API.
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
@@ -479,7 +479,7 @@ Restart your MCP client and approve the server when prompted.
 
 ### Tools
 
-- **mcp_compliance_test** — Run the full 85-test suite against a URL or stdio command. Supports auth, custom headers, env vars, timeout, retries, and category/test filtering. Returns grade, score, and detailed results.
+- **mcp_compliance_test** — Run the full 88-test suite against a URL or stdio command. Supports auth, custom headers, env vars, timeout, retries, and category/test filtering. Returns grade, score, and detailed results.
 - **mcp_compliance_badge** — Get the badge markdown/HTML for a server. Supports auth and custom headers.
 - **mcp_compliance_explain** — Explain what a specific test ID checks and why it matters.
 
@@ -540,10 +540,15 @@ Consumer guidance:
 
 The compliance testing methodology is published as an open specification:
 
-- **[MCP Compliance Testing Specification](./MCP_COMPLIANCE_SPEC.md)** — test execution model, scoring algorithm, all 85 test rules with pass/fail criteria (CC BY 4.0)
+- **[MCP Compliance Testing Specification](./MCP_COMPLIANCE_SPEC.md)** — test execution model, scoring algorithm, all 88 test rules with pass/fail criteria (CC BY 4.0)
 - **[Machine-readable rule catalog](./mcp-compliance-rules.json)** — JSON Schema-compliant catalog for programmatic consumption
+- **[Why `mcp-compliance`](./docs/WHY.md)** — the problem, existing alternatives, what this tool does differently
+- **[Fixing common failures](./docs/FIXES.md)** — recipes for the most frequent test failures with code snippets
 - **[Spec version migration policy](./docs/SPEC_VERSION_MIGRATION.md)** — how this tool evolves with MCP spec releases
 - **[mcp.hosting external API](./docs/EXT_API.md)** — public submit/retrieve/badge/delete endpoints used by `mcp-compliance badge` and any custom integrations
+- **[Enterprise tier (draft)](./docs/ENTERPRISE.md)** — paid tier structure for organizations with scheduled/private/audit-track compliance needs
+- **[Performance deep-dive](./docs/PERFORMANCE.md)** — why the suite is sequential and what parallel execution would cost
+- **[Spec PR drafts](./docs/spec-prs/)** — our proposed MCP spec clarifications for ambiguous cases we've hit
 - **[mcp.hosting integration spec](./docs/mcp-hosting-integration.md)** — the contract between this engine and the mcp.hosting platform: URL surfaces, data flow, storage model, badge API, leaderboard, router integration
 
 These are complementary to (not competing with) the [official MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). The MCP spec defines what servers must do; this spec defines how to verify compliance.

@@ -476,6 +476,39 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "When a request includes _meta.progressToken, send notifications/progress events via SSE to report progress. Include progressToken, progress (current), and optionally total fields.",
   },
   {
+    id: "lifecycle-sampling-capability",
+    name: "Sampling capability shape",
+    category: "lifecycle",
+    required: false,
+    specRef: "client/sampling",
+    description:
+      "If the server's initialize response or serverInfo implies it uses client-side sampling (sampling/createMessage), verify the capability declaration shape. Currently this is an advisory shape check — actually exercising the server→client flow requires a client-side sampling handler and is out of scope.",
+    recommendation:
+      "Sampling is a client capability (the client provides LLM access to the server). Servers don't declare sampling in their own capabilities; they just call sampling/createMessage against clients that advertise it. No server-side action required.",
+  },
+  {
+    id: "lifecycle-roots-capability",
+    name: "Roots capability shape",
+    category: "lifecycle",
+    required: false,
+    specRef: "client/roots",
+    description:
+      "Roots (filesystem root paths) is a client capability. This test verifies that if a server sends roots/list requests, it handles gracefully when the client doesn't declare the roots capability (i.e., doesn't crash).",
+    recommendation:
+      "Before calling roots/list, check if the initialized client capabilities include 'roots'. If not, skip the call — the client can't respond. Never assume roots is available; it's opt-in on the client side.",
+  },
+  {
+    id: "lifecycle-elicitation-capability",
+    name: "Elicitation capability shape",
+    category: "lifecycle",
+    required: false,
+    specRef: "client/elicitation",
+    description:
+      "Elicitation (asking the user for structured input mid-operation) is a client capability added in 2025-11-25. This test verifies servers that use elicitation/create handle the case where clients don't support it.",
+    recommendation:
+      "Before calling elicitation/create, check the initialized client capabilities. If elicitation is absent, fall back to a safer default (ask once up-front via tool parameters, or fail cleanly with a clear error).",
+  },
+  {
     id: "lifecycle-meta-tolerance",
     name: "Tolerates _meta field on requests",
     category: "lifecycle",

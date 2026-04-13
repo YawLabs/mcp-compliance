@@ -165,7 +165,7 @@ describe("runComplianceSuite — exports", () => {
   it("exports TEST_DEFINITIONS", async () => {
     const { TEST_DEFINITIONS } = await import("../runner.js");
     expect(Array.isArray(TEST_DEFINITIONS)).toBe(true);
-    expect(TEST_DEFINITIONS.length).toBe(85);
+    expect(TEST_DEFINITIONS.length).toBe(88);
     for (const def of TEST_DEFINITIONS) {
       expect(def.id).toBeDefined();
       expect(def.name).toBeDefined();

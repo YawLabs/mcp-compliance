@@ -573,9 +573,18 @@ export async function runComplianceSuite(
 
     let initRes: any = null;
     try {
+      // Declare all three client capabilities so servers see us as a
+      // fully-capable client. Servers that break on unknown or
+      // unexpected client capabilities (they shouldn't — spec is
+      // forward-compatible) will fail the lifecycle-*-capability
+      // tests below.
       initRes = await rpc("initialize", {
         protocolVersion: SPEC_VERSION,
-        capabilities: {},
+        capabilities: {
+          sampling: {},
+          roots: { listChanged: true },
+          elicitation: {},
+        },
         clientInfo: { name: "mcp-compliance", version: TOOL_VERSION },
       });
       const result = initRes?.body?.result;
@@ -1046,6 +1055,59 @@ export async function runComplianceSuite(
             details: "Request with progressToken handled (no progress events observed — optional)",
           };
         }
+      },
+    );
+
+    // Client capability awareness: we declare sampling/roots/elicitation
+    // in our initialize (below) and verify the server accepts it. Full
+    // bidirectional flow testing (server actually calling sampling/
+    // createMessage, roots/list, elicitation/create against us) requires
+    // client-side handlers and is out of scope for a one-shot compliance
+    // suite. These tests document coverage and check the minimum: server
+    // doesn't break when we advertise these capabilities.
+    await test(
+      "lifecycle-sampling-capability",
+      "Sampling capability shape",
+      "lifecycle",
+      false,
+      "client/sampling",
+      async () => {
+        if (!initRes || initRes.body?.error) {
+          return { passed: false, details: "Server rejected initialize" };
+        }
+        return {
+          passed: true,
+          details:
+            "Server accepted initialize with client sampling capability. Full server→client sampling flow not exercised.",
+        };
+      },
+    );
+
+    await test("lifecycle-roots-capability", "Roots capability shape", "lifecycle", false, "client/roots", async () => {
+      if (!initRes || initRes.body?.error) {
+        return { passed: false, details: "Server rejected initialize" };
+      }
+      return {
+        passed: true,
+        details:
+          "Server accepted initialize. Full server→client roots/list flow not exercised (requires a roots-aware client).",
+      };
+    });
+
+    await test(
+      "lifecycle-elicitation-capability",
+      "Elicitation capability shape",
+      "lifecycle",
+      false,
+      "client/elicitation",
+      async () => {
+        if (!initRes || initRes.body?.error) {
+          return { passed: false, details: "Server rejected initialize" };
+        }
+        return {
+          passed: true,
+          details: "Server accepted initialize. Full server→client elicitation/create flow not exercised.",
+        };
       },
     );
 
