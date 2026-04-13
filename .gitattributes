@@ -1,0 +1,24 @@
+# Force LF line endings on all text files so Windows checkouts match
+# Linux/macOS. Without this, biome formatter on the Windows CI runner
+# rejects CRLF line endings introduced by git's autocrlf default.
+
+* text=auto eol=lf
+
+# Source + config — strictly LF
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+
+# Binaries — leave alone
+*.png binary
+*.jpg binary
+*.svg binary
+*.ico binary
