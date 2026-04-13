@@ -81,6 +81,13 @@ import { parseSSEResponse } from "./sse.js";
 const STDIO_INCOMPATIBLE_IDS = new Set<string>([
   // Lifecycle tests that use raw undici for HTTP-specific checks
   "lifecycle-string-id",
+  // Error tests that send hand-crafted malformed bytes via raw HTTP
+  // (JSON-RPC layer would reject them before they hit the wire). Could
+  // be reimplemented for stdio later by writing raw bytes to stdin.
+  "error-invalid-jsonrpc",
+  "error-invalid-json",
+  "error-parse-code",
+  "error-invalid-request-code",
   // Security tests that are inherently HTTP-layer
   "security-tls-required",
   "security-oauth-metadata",
@@ -104,6 +111,35 @@ function supportsTransport(def: TestDefinition | undefined, kind: "http" | "stdi
   if (def.category === "transport") return false;
   if (STDIO_INCOMPATIBLE_IDS.has(def.id)) return false;
   return true;
+}
+
+export interface PreviewOptions {
+  /** Transport to filter against. Defaults to "http". */
+  transport?: "http" | "stdio";
+  /** Only include matching categories or test IDs. */
+  only?: string[];
+  /** Exclude matching categories or test IDs. */
+  skip?: string[];
+}
+
+/**
+ * Return the set of TestDefinitions that would actually run given the
+ * filters. Powers the CLI's --list flag without requiring a connection.
+ * Capability-gated tests are still included — that gating happens after
+ * the live initialize handshake and can't be predicted offline.
+ */
+export function previewTests(opts: PreviewOptions = {}): TestDefinition[] {
+  const transport = opts.transport ?? "http";
+  return TEST_DEFINITIONS.filter((def) => {
+    if (!supportsTransport(def, transport)) return false;
+    if (opts.only?.length) {
+      if (!opts.only.includes(def.category) && !opts.only.includes(def.id)) return false;
+    }
+    if (opts.skip?.length) {
+      if (opts.skip.includes(def.category) || opts.skip.includes(def.id)) return false;
+    }
+    return true;
+  });
 }
 
 export interface RunOptions {
@@ -177,11 +213,16 @@ export async function runComplianceSuite(
       ? resolvedTarget.url
       : `stdio:${resolvedTarget.command}${resolvedTarget.args?.length ? ` ${resolvedTarget.args.join(" ")}` : ""}`;
 
-  // Preflight connectivity check — fail fast instead of running all tests against an unreachable server.
+  // Preflight connectivity check — fail fast instead of running all tests
+  // against an unreachable server. HTTP-only: a quick ping catches DNS,
+  // TLS, and connection-refused failures before we burn through 80
+  // tests. For stdio there's no equivalent — spawn errors surface via
+  // the child 'error' event (handled by the transport) and the
+  // lifecycle-init test is the real reachability signal.
   let serverReachable = true;
-  try {
-    const preflightTimeout = options.preflightTimeout ?? Math.min(options.timeout || 15000, 10000);
-    if (resolvedTarget.type === "http") {
+  if (resolvedTarget.type === "http") {
+    try {
+      const preflightTimeout = options.preflightTimeout ?? Math.min(options.timeout || 15000, 10000);
       const preflight = await request(resolvedTarget.url, {
         method: "POST",
         headers: {
@@ -193,11 +234,9 @@ export async function runComplianceSuite(
         signal: AbortSignal.timeout(preflightTimeout),
       });
       await preflight.body.text();
-    } else {
-      await transport.request("ping", undefined, () => 0, { timeout: preflightTimeout });
+    } catch {
+      serverReachable = false;
     }
-  } catch {
-    serverReachable = false;
   }
 
   const tests: TestResult[] = [];

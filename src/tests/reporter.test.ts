@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatJson, formatSarif, formatTerminal } from "../reporter.js";
+import { formatGithub, formatJson, formatMarkdown, formatSarif, formatTerminal } from "../reporter.js";
 import type { ComplianceReport } from "../types.js";
 
 function makeReport(overrides: Partial<ComplianceReport> = {}): ComplianceReport {
@@ -360,5 +360,113 @@ describe("formatSarif", () => {
     );
     const parsed = JSON.parse(output);
     expect(parsed.runs[0].results).toHaveLength(0);
+  });
+});
+
+describe("formatGithub", () => {
+  it("emits ::error for failed required tests and ::warning for failed optional tests", () => {
+    const output = formatGithub(
+      makeReport({
+        tests: [
+          {
+            id: "transport-post",
+            name: "HTTP POST",
+            category: "transport",
+            passed: false,
+            required: true,
+            details: "HTTP 500",
+            durationMs: 10,
+          },
+          {
+            id: "tools-pagination",
+            name: "Pagination",
+            category: "tools",
+            passed: false,
+            required: false,
+            details: "no nextCursor",
+            durationMs: 5,
+          },
+          {
+            id: "lifecycle-ping",
+            name: "Ping",
+            category: "lifecycle",
+            passed: true,
+            required: true,
+            details: "ok",
+            durationMs: 1,
+          },
+        ],
+      }),
+    );
+    expect(output).toContain("::error title=transport-post::HTTP 500");
+    expect(output).toContain("::warning title=tools-pagination::no nextCursor");
+    expect(output).not.toContain("lifecycle-ping");
+  });
+
+  it("always emits a ::notice summary line with grade and counts", () => {
+    const output = formatGithub(makeReport());
+    // % is URL-encoded as %25 per GitHub Actions workflow command rules
+    expect(output).toMatch(/::notice title=MCP Compliance::Grade B \(85%25\)/);
+  });
+
+  it("escapes %, \\r, and \\n in titles and messages", () => {
+    const output = formatGithub(
+      makeReport({
+        tests: [
+          {
+            id: "evil",
+            name: "x",
+            category: "errors",
+            passed: false,
+            required: true,
+            details: "first\nsecond\rthird %literal",
+            durationMs: 1,
+          },
+        ],
+      }),
+    );
+    expect(output).toContain("first%0Asecond%0Dthird %25literal");
+  });
+});
+
+describe("formatMarkdown", () => {
+  it("includes a header with grade and target", () => {
+    const output = formatMarkdown(makeReport());
+    expect(output).toContain("# MCP Compliance Report");
+    expect(output).toContain("**Grade:");
+    expect(output).toContain("B (85%)");
+    expect(output).toContain("`https://example.com/mcp`");
+  });
+
+  it("renders a per-category summary table", () => {
+    const output = formatMarkdown(makeReport());
+    expect(output).toContain("| Category | Passed | Total |");
+    expect(output).toContain("| Transport | 3 | 3 |");
+    expect(output).toContain("| Lifecycle | 5 | 7 |");
+  });
+
+  it("lists failed tests with id and details", () => {
+    const output = formatMarkdown(makeReport());
+    expect(output).toContain("## Failed tests (1)");
+    expect(output).toContain("**lifecycle-init**");
+  });
+
+  it("omits the failed tests section when none failed", () => {
+    const output = formatMarkdown(
+      makeReport({
+        tests: [
+          {
+            id: "lifecycle-ping",
+            name: "Ping",
+            category: "lifecycle",
+            passed: true,
+            required: true,
+            details: "ok",
+            durationMs: 1,
+          },
+        ],
+      }),
+    );
+    expect(output).not.toContain("## Failed tests");
   });
 });

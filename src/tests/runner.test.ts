@@ -197,3 +197,37 @@ describe("runComplianceSuite — exports", () => {
     expect(badge.markdown).toContain("MCP Compliant");
   });
 });
+
+describe("previewTests", () => {
+  it("includes every test for HTTP", async () => {
+    const { previewTests, TEST_DEFINITIONS } = await import("../runner.js");
+    const http = previewTests({ transport: "http" });
+    // HTTP excludes the 3 stdio-only tests
+    expect(http.length).toBe(TEST_DEFINITIONS.length - 3);
+  });
+
+  it("excludes HTTP-specific tests for stdio", async () => {
+    const { previewTests } = await import("../runner.js");
+    const stdio = previewTests({ transport: "stdio" });
+    const ids = stdio.map((t) => t.id);
+    // Wire-format transport tests are skipped
+    expect(ids).not.toContain("transport-post");
+    expect(ids).not.toContain("transport-content-type");
+    // The stdio-only tests are included
+    expect(ids).toContain("stdio-framing");
+    expect(ids).toContain("stdio-unicode");
+    expect(ids).toContain("stdio-unknown-method-recovers");
+    // HTTP-only error/security tests are skipped
+    expect(ids).not.toContain("error-invalid-jsonrpc");
+    expect(ids).not.toContain("security-tls-required");
+  });
+
+  it("respects --only and --skip filters", async () => {
+    const { previewTests } = await import("../runner.js");
+    const onlyLifecycle = previewTests({ transport: "http", only: ["lifecycle"] });
+    expect(onlyLifecycle.every((t) => t.category === "lifecycle")).toBe(true);
+
+    const skipSecurity = previewTests({ transport: "http", skip: ["security"] });
+    expect(skipSecurity.some((t) => t.category === "security")).toBe(false);
+  });
+});

@@ -107,21 +107,48 @@ On Windows, `npx` and other `.cmd` shims are handled automatically by spawning t
 
 | Option | Applies to | Description |
 |--------|-----------|-------------|
-| `--format <format>` | both | Output format: `terminal`, `json`, or `sarif` (default: `terminal`) |
+| `--format <format>` | both | Output format: `terminal`, `json`, `sarif`, `github`, or `markdown` (default: `terminal`) |
 | `--config <path>` | both | Load defaults from a config file (default: `mcp-compliance.config.json` in cwd) |
 | `--output <file>` | both | Write a local SVG badge to the given path after the run |
+| `--list` | both | Print test IDs that would run given current filters, then exit (no connection) |
+| `--transport <kind>` | both | Filter by `http` or `stdio` (only used with `--list` when no target is provided) |
 | `--strict` | both | Exit with code 1 on any required test failure (for CI) |
+| `--min-grade <grade>` | both | Exit with code 1 if grade is below this threshold (`A`–`F`) |
 | `-H, --header <h>` | HTTP | Add header to all requests, format `"Key: Value"` (repeatable) |
 | `--auth <token>` | HTTP | Shorthand for `-H "Authorization: <token>"` |
 | `-E, --env <var>` | stdio | Set env var for stdio command, format `"KEY=VALUE"` (repeatable) |
 | `--env-file <path>` | stdio | Load env vars from a file (one `KEY=VALUE` per line) |
 | `--cwd <dir>` | stdio | Working directory for the stdio command |
 | `--timeout <ms>` | both | Request timeout in milliseconds (default: `15000`) |
-| `--preflight-timeout <ms>` | both | Preflight connectivity check timeout |
+| `--preflight-timeout <ms>` | HTTP | Preflight connectivity check timeout (HTTP only) |
 | `--retries <n>` | both | Number of retries for failed tests (default: `0`) |
 | `--only <items>` | both | Only run tests matching these categories or test IDs (comma-separated) |
 | `--skip <items>` | both | Skip tests matching these categories or test IDs (comma-separated) |
 | `--verbose` | both | Print each test result as it runs (also forwards stdio stderr) |
+
+### CI integration
+
+```bash
+# GitHub Actions: emits ::error / ::warning annotations inline on the PR
+mcp-compliance test https://my-server.com/mcp --format github --strict
+
+# Slack/Linear/PR comment: drop the body straight into a comment
+mcp-compliance test https://my-server.com/mcp --format markdown > report.md
+
+# Block release if grade slips below B
+mcp-compliance test https://my-server.com/mcp --min-grade B
+
+# Preview which tests will run before connecting (handy for --only/--skip authoring)
+mcp-compliance test --list --transport stdio --skip security
+```
+
+### Scaffold a config
+
+```bash
+mcp-compliance init
+```
+
+Interactive prompts walk you through transport (http/stdio), command/url, env vars, timeout, and strict mode — then write a `mcp-compliance.config.json` you can commit.
 
 ### Config file
 

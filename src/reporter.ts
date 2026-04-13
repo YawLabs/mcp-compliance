@@ -240,3 +240,88 @@ export function formatSarif(report: ComplianceReport): string {
 
   return JSON.stringify(sarif, null, 2);
 }
+
+/**
+ * Encode a value for use in a GitHub Actions workflow command. Per the
+ * GitHub docs, %, \r and \n must be URL-encoded so the runner doesn't
+ * truncate or split the message.
+ */
+function ghEscape(s: string): string {
+  return s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+}
+
+/**
+ * Emit GitHub Actions workflow commands so test failures appear inline
+ * on PRs as annotations. Required failures become ::error, optional
+ * become ::warning, and a single ::notice carries the grade summary.
+ */
+export function formatGithub(report: ComplianceReport): string {
+  const lines: string[] = [];
+  for (const t of report.tests) {
+    if (t.passed) continue;
+    const level = t.required ? "error" : "warning";
+    const title = ghEscape(t.id);
+    const message = ghEscape(t.details || "(no details)");
+    lines.push(`::${level} title=${title}::${message}`);
+  }
+  const summaryTitle = "MCP Compliance";
+  const summary = `Grade ${report.grade} (${report.score}%) — ${report.summary.passed}/${report.summary.total} passed, ${report.summary.failed} failed (${report.summary.requiredPassed}/${report.summary.required} required)`;
+  lines.push(`::notice title=${ghEscape(summaryTitle)}::${ghEscape(summary)}`);
+  return lines.join("\n");
+}
+
+/**
+ * Format report as Markdown for PR comments / issue bodies.
+ */
+export function formatMarkdown(report: ComplianceReport): string {
+  const lines: string[] = [];
+  const gradeEmoji: Record<string, string> = { A: "🟢", B: "🟢", C: "🟡", D: "🟠", F: "🔴" };
+  lines.push("# MCP Compliance Report");
+  lines.push("");
+  lines.push(
+    `**Grade: ${gradeEmoji[report.grade] || ""} ${report.grade} (${report.score}%)** — ${report.overall.toUpperCase()}`,
+  );
+  lines.push("");
+  lines.push(`- **Target:** \`${report.url}\``);
+  lines.push(`- **Spec:** ${report.specVersion}`);
+  lines.push(`- **Tested:** ${report.timestamp}`);
+  lines.push(`- **Tool:** v${report.toolVersion}`);
+  if (report.serverInfo.name) {
+    lines.push(
+      `- **Server:** ${report.serverInfo.name}${report.serverInfo.version ? ` v${report.serverInfo.version}` : ""}`,
+    );
+  }
+  lines.push("");
+
+  lines.push("## Summary");
+  lines.push("");
+  lines.push("| Category | Passed | Total |");
+  lines.push("|---|---:|---:|");
+  for (const cat of CATEGORY_ORDER) {
+    const stats = report.categories[cat];
+    if (!stats || stats.total === 0) continue;
+    lines.push(`| ${CATEGORY_LABELS[cat] || cat} | ${stats.passed} | ${stats.total} |`);
+  }
+  lines.push(`| **Total** | **${report.summary.passed}** | **${report.summary.total}** |`);
+  lines.push("");
+
+  const failed = report.tests.filter((t) => !t.passed);
+  if (failed.length > 0) {
+    lines.push(`## Failed tests (${failed.length})`);
+    lines.push("");
+    for (const t of failed) {
+      const req = t.required ? " *(required)*" : "";
+      lines.push(`- ❌ **${t.id}**${req} — ${t.details}`);
+    }
+    lines.push("");
+  }
+
+  if (report.warnings.length > 0) {
+    lines.push("## Warnings");
+    lines.push("");
+    for (const w of report.warnings) lines.push(`- ${w}`);
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}

@@ -7,8 +7,8 @@ import { renderBadgeSvg } from "./badge-svg.js";
 import { type ComplianceConfig, loadConfig } from "./config.js";
 import { startServer } from "./mcp/server.js";
 import { publishReport, unpublishReport } from "./publish.js";
-import { formatJson, formatSarif, formatTerminal } from "./reporter.js";
-import { runComplianceSuite } from "./runner.js";
+import { formatGithub, formatJson, formatMarkdown, formatSarif, formatTerminal } from "./reporter.js";
+import { previewTests, runComplianceSuite } from "./runner.js";
 import { getTokenForUrl, deleteToken as removeStoredToken, saveToken } from "./token-store.js";
 import type { TransportTarget } from "./types.js";
 
@@ -183,11 +183,29 @@ program
   )
   .argument("[extraArgs...]", "Additional args passed to the stdio command")
   .addOption(
-    new Option("--format <format>", "Output format").choices(["terminal", "json", "sarif"]).default("terminal"),
+    new Option("--format <format>", "Output format")
+      .choices(["terminal", "json", "sarif", "github", "markdown"])
+      .default("terminal"),
   )
   .option("--config <path>", "Load options from a config file (default: mcp-compliance.config.json in cwd)")
   .option("--output <file>", "Write a local SVG badge to the given path after the run (works with any transport)")
+  .option("--list", "Print the test IDs that would run given current filters, then exit (no connection)")
+  .addOption(
+    new Option(
+      "--transport <kind>",
+      "Filter tests by transport (only used with --list when no target is provided)",
+    ).choices(["http", "stdio"]),
+  )
   .option("--strict", "Exit with code 1 on any required test failure (for CI)")
+  .addOption(
+    new Option("--min-grade <grade>", "Exit with code 1 if grade is below this threshold").choices([
+      "A",
+      "B",
+      "C",
+      "D",
+      "F",
+    ]),
+  )
   .option(
     "-H, --header <header>",
     'Add header to all requests (format: "Key: Value", repeatable; HTTP only)',
@@ -219,8 +237,11 @@ program
       opts: {
         config?: string;
         output?: string;
+        list?: boolean;
+        transport?: "http" | "stdio";
         format: string;
         strict?: boolean;
+        minGrade?: "A" | "B" | "C" | "D" | "F";
         header: Record<string, string>;
         auth?: string;
         env: Record<string, string>;
@@ -236,6 +257,28 @@ program
     ) => {
       try {
         const config = loadConfig(opts.config);
+
+        // --list short-circuits before connecting. Transport defaults to
+        // http when not specified and no target is provided; if a target
+        // is given we infer from it (URL → http, else stdio).
+        if (opts.list) {
+          let transportKind: "http" | "stdio" = opts.transport ?? "http";
+          if (!opts.transport && (target || config?.target)) {
+            const t = target ? (looksLikeUrl(target) ? "http" : "stdio") : config?.target?.type;
+            if (t === "http" || t === "stdio") transportKind = t;
+          }
+          const defs = previewTests({
+            transport: transportKind,
+            only: opts.only ?? config?.only,
+            skip: opts.skip ?? config?.skip,
+          });
+          for (const d of defs) {
+            const req = d.required ? chalk.yellow("required") : chalk.dim("optional");
+            console.log(`${chalk.bold(d.id.padEnd(38))} ${chalk.cyan(d.category.padEnd(10))} ${req}  ${d.name}`);
+          }
+          console.log(chalk.dim(`\n${defs.length} tests would run for transport=${transportKind}`));
+          return;
+        }
 
         const transportTarget = resolveTarget(
           target,
@@ -283,6 +326,10 @@ program
           console.log(formatJson(report));
         } else if (opts.format === "sarif") {
           console.log(formatSarif(report));
+        } else if (opts.format === "github") {
+          console.log(formatGithub(report));
+        } else if (opts.format === "markdown") {
+          console.log(formatMarkdown(report));
         } else {
           console.log(formatTerminal(report));
         }
@@ -299,10 +346,20 @@ program
         if (strict && report.overall === "fail") {
           process.exit(1);
         }
+
+        if (opts.minGrade) {
+          const order = ["F", "D", "C", "B", "A"];
+          if (order.indexOf(report.grade) < order.indexOf(opts.minGrade)) {
+            console.error(chalk.red(`Grade ${report.grade} is below threshold ${opts.minGrade}`));
+            process.exit(1);
+          }
+        }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         if (opts.format === "json" || opts.format === "sarif") {
           console.error(JSON.stringify({ error: message }));
+        } else if (opts.format === "github") {
+          console.error(`::error title=mcp-compliance::${message.replace(/[\r\n]/g, " ")}`);
         } else {
           console.error(chalk.red(`\nError: ${message}\n`));
         }
@@ -461,6 +518,90 @@ program
       const message = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`\nError: ${message}\n`));
       process.exit(1);
+    }
+  });
+
+program
+  .command("init")
+  .description("Scaffold a mcp-compliance.config.json in the current directory")
+  .option("--force", "Overwrite an existing config file without asking")
+  .action(async (opts: { force?: boolean }) => {
+    const { existsSync, writeFileSync: write } = await import("node:fs");
+    const { join: joinPath } = await import("node:path");
+    const out = joinPath(process.cwd(), "mcp-compliance.config.json");
+
+    if (existsSync(out) && !opts.force) {
+      console.error(chalk.red(`\nA config already exists at ${out}.`));
+      console.error(chalk.dim("Re-run with --force to overwrite.\n"));
+      process.exit(1);
+    }
+
+    if (!process.stdin.isTTY) {
+      console.error(chalk.red("\nmcp-compliance init is interactive — run it from a terminal."));
+      process.exit(1);
+    }
+
+    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    async function ask(q: string, fallback?: string): Promise<string> {
+      const suffix = fallback ? chalk.dim(` [${fallback}]`) : "";
+      const answer = (await rl.question(`${q}${suffix}: `)).trim();
+      return answer || fallback || "";
+    }
+
+    try {
+      console.log(chalk.bold("\nmcp-compliance config\n"));
+      const kind = (await ask("Transport (http or stdio)", "stdio")).toLowerCase();
+      if (kind !== "http" && kind !== "stdio") {
+        console.error(chalk.red(`\nUnknown transport: ${kind}`));
+        process.exit(1);
+      }
+
+      let target: object;
+      if (kind === "http") {
+        const url = await ask("Server URL");
+        if (!url) {
+          console.error(chalk.red("\nURL is required."));
+          process.exit(1);
+        }
+        const auth = await ask("Authorization header value (optional, e.g. 'Bearer xxx')");
+        target = auth ? { type: "http", url, headers: { Authorization: auth } } : { type: "http", url };
+      } else {
+        const command = await ask("Command", "node");
+        if (!command) {
+          console.error(chalk.red("\nCommand is required."));
+          process.exit(1);
+        }
+        const argsStr = await ask("Args (space-separated)", "./dist/server.js");
+        const args = argsStr ? argsStr.split(/\s+/).filter(Boolean) : [];
+        const envStr = await ask("Env vars (KEY=VALUE space-separated, optional)");
+        let env: Record<string, string> | undefined;
+        if (envStr) {
+          env = {};
+          for (const pair of envStr.split(/\s+/)) {
+            const idx = pair.indexOf("=");
+            if (idx > 0) env[pair.slice(0, idx)] = pair.slice(idx + 1);
+          }
+        }
+        const stdioTarget: { type: "stdio"; command: string; args: string[]; env?: Record<string, string> } = {
+          type: "stdio",
+          command,
+          args,
+        };
+        if (env) stdioTarget.env = env;
+        target = stdioTarget;
+      }
+
+      const timeoutStr = await ask("Request timeout (ms)", "15000");
+      const strict = (await ask("Exit non-zero on required-test failures? (y/N)")).toLowerCase().startsWith("y");
+
+      const config: Record<string, unknown> = { target, timeout: Number.parseInt(timeoutStr, 10) || 15000 };
+      if (strict) config.strict = true;
+
+      write(out, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+      console.log(chalk.green(`\nWrote ${out}\n`));
+      console.log(chalk.dim("Run `mcp-compliance test` (no args) to use this config.\n"));
+    } finally {
+      rl.close();
     }
   });
 
