@@ -11,7 +11,7 @@ import { REPORT_SCHEMA_VERSION, TEST_DEFINITIONS } from "./types.js";
 export type { TestResult, ComplianceReport } from "./types.js";
 export { TEST_DEFINITIONS } from "./types.js";
 export { computeGrade, computeScore } from "./grader.js";
-export { generateBadge } from "./badge.js";
+export { generateBadge, urlHash } from "./badge.js";
 
 const TEST_DEFINITIONS_MAP = new Map(TEST_DEFINITIONS.map((t) => [t.id, t]));
 
