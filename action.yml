@@ -1,0 +1,159 @@
+name: 'MCP Compliance Test'
+description: 'Run the MCP compliance suite against an MCP server (HTTP URL or stdio command) in CI. Emits PR annotations and SARIF for code-scanning.'
+author: 'Yaw Labs'
+branding:
+  icon: 'check-circle'
+  color: 'green'
+
+inputs:
+  target:
+    description: 'MCP server URL (e.g. https://my-server.com/mcp) OR stdio command (e.g. "node ./dist/server.js" or "npx -y @modelcontextprotocol/server-filesystem /tmp"). Stdio commands run after a `--` separator handled internally.'
+    required: true
+  version:
+    description: 'mcp-compliance npm version to use (default: latest)'
+    required: false
+    default: 'latest'
+  format:
+    description: 'Output format: terminal, json, sarif, github, markdown'
+    required: false
+    default: 'github'
+  strict:
+    description: 'Exit non-zero on any required-test failure'
+    required: false
+    default: 'true'
+  min-grade:
+    description: 'Exit non-zero if grade is below this threshold (A, B, C, D, F)'
+    required: false
+  output:
+    description: 'Write a local SVG badge to this path (e.g. badge.svg)'
+    required: false
+  publish:
+    description: 'Publish the report to mcp.hosting (HTTP targets only)'
+    required: false
+    default: 'false'
+  auth:
+    description: 'Authorization header value, e.g. "Bearer xxx" (HTTP only)'
+    required: false
+  env-file:
+    description: 'Path to .env file with KEY=VALUE pairs for stdio command'
+    required: false
+  timeout:
+    description: 'Per-request timeout in milliseconds'
+    required: false
+    default: '30000'
+  only:
+    description: 'Comma-separated categories or test IDs to run exclusively'
+    required: false
+  skip:
+    description: 'Comma-separated categories or test IDs to skip'
+    required: false
+  upload-sarif:
+    description: 'Also produce a sarif file at compliance.sarif (use with upload-sarif action for Code Scanning)'
+    required: false
+    default: 'false'
+
+outputs:
+  grade:
+    description: 'Final grade (A-F)'
+    value: ${{ steps.run.outputs.grade }}
+  score:
+    description: 'Numeric score 0-100'
+    value: ${{ steps.run.outputs.score }}
+  passed:
+    description: 'Number of passing tests'
+    value: ${{ steps.run.outputs.passed }}
+  failed:
+    description: 'Number of failing tests'
+    value: ${{ steps.run.outputs.failed }}
+  report-url:
+    description: 'Public report URL on mcp.hosting (only set when publish=true and target is HTTP)'
+    value: ${{ steps.run.outputs.report-url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@v5
+      with:
+        node-version: '20'
+
+    - name: Run MCP compliance suite
+      id: run
+      shell: bash
+      env:
+        MCP_TARGET: ${{ inputs.target }}
+        MCP_VERSION: ${{ inputs.version }}
+        MCP_FORMAT: ${{ inputs.format }}
+        MCP_STRICT: ${{ inputs.strict }}
+        MCP_MIN_GRADE: ${{ inputs.min-grade }}
+        MCP_OUTPUT: ${{ inputs.output }}
+        MCP_PUBLISH: ${{ inputs.publish }}
+        MCP_AUTH: ${{ inputs.auth }}
+        MCP_ENV_FILE: ${{ inputs.env-file }}
+        MCP_TIMEOUT: ${{ inputs.timeout }}
+        MCP_ONLY: ${{ inputs.only }}
+        MCP_SKIP: ${{ inputs.skip }}
+        MCP_UPLOAD_SARIF: ${{ inputs.upload-sarif }}
+      run: |
+        set -e
+
+        # Build the argv. Targets are either a URL or a stdio command;
+        # split on whitespace for stdio so quoted args reach the spawn.
+        args=()
+        if [[ "$MCP_TARGET" =~ ^https?:// ]]; then
+          args+=("$MCP_TARGET")
+        else
+          # stdio: use -- separator so commander stops parsing flags
+          args+=("--")
+          # shellcheck disable=SC2206
+          parts=($MCP_TARGET)
+          args+=("${parts[@]}")
+        fi
+
+        cmd_flags=()
+        cmd_flags+=("--format" "$MCP_FORMAT")
+        cmd_flags+=("--timeout" "$MCP_TIMEOUT")
+        [[ "$MCP_STRICT" == "true" ]] && cmd_flags+=("--strict")
+        [[ -n "$MCP_MIN_GRADE" ]] && cmd_flags+=("--min-grade" "$MCP_MIN_GRADE")
+        [[ -n "$MCP_OUTPUT" ]] && cmd_flags+=("--output" "$MCP_OUTPUT")
+        [[ -n "$MCP_AUTH" ]] && cmd_flags+=("--auth" "$MCP_AUTH")
+        [[ -n "$MCP_ENV_FILE" ]] && cmd_flags+=("--env-file" "$MCP_ENV_FILE")
+        [[ -n "$MCP_ONLY" ]] && cmd_flags+=("--only" "$MCP_ONLY")
+        [[ -n "$MCP_SKIP" ]] && cmd_flags+=("--skip" "$MCP_SKIP")
+
+        # Choose between `test` (default) and `badge` (when publishing)
+        subcommand="test"
+        if [[ "$MCP_PUBLISH" == "true" && "$MCP_TARGET" =~ ^https?:// ]]; then
+          subcommand="badge"
+        fi
+
+        # Pin to the requested version
+        pkg="@yawlabs/mcp-compliance@$MCP_VERSION"
+        echo "Running: npx -y $pkg $subcommand ${cmd_flags[*]} ${args[*]}"
+
+        # Capture both human + machine readable. Run twice if user wants
+        # SARIF upload, since formats are mutually exclusive.
+        if [[ "$MCP_UPLOAD_SARIF" == "true" ]]; then
+          npx -y "$pkg" "$subcommand" --format sarif "${cmd_flags[@]/--format/--format-skipped}" "${args[@]}" > compliance.sarif || true
+        fi
+
+        # Run the requested format and capture JSON for outputs at the same time.
+        # We always do a JSON pass to extract grade/score for outputs.
+        json_out=$(npx -y "$pkg" "$subcommand" --format json "${args[@]}" --timeout "$MCP_TIMEOUT" || true)
+        echo "$json_out" > compliance.json
+        grade=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).grade)}catch(e){console.log('?')}")
+        score=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).score)}catch(e){console.log(0)}")
+        passed=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).summary.passed)}catch(e){console.log(0)}")
+        failed=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).summary.failed)}catch(e){console.log(0)}")
+        report_url=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).badge.reportUrl||'')}catch(e){console.log('')}")
+
+        {
+          echo "grade=$grade"
+          echo "score=$score"
+          echo "passed=$passed"
+          echo "failed=$failed"
+          echo "report-url=$report_url"
+        } >> "$GITHUB_OUTPUT"
+
+        # Now run the user-requested format for visible output
+        npx -y "$pkg" "$subcommand" "${cmd_flags[@]}" "${args[@]}"

@@ -1,13 +1,15 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { watch as fsWatch, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline/promises";
 import chalk from "chalk";
 import { Command, Option } from "commander";
 import { renderBadgeSvg } from "./badge-svg.js";
+import { formatBenchmark, runBenchmark } from "./benchmark.js";
 import { type ComplianceConfig, loadConfig } from "./config.js";
+import { diffReports, formatDiff, hasRegressions } from "./diff.js";
 import { startServer } from "./mcp/server.js";
 import { publishReport, unpublishReport } from "./publish.js";
-import { formatGithub, formatJson, formatMarkdown, formatSarif, formatTerminal } from "./reporter.js";
+import { formatGithub, formatHtml, formatJson, formatMarkdown, formatSarif, formatTerminal } from "./reporter.js";
 import { previewTests, runComplianceSuite } from "./runner.js";
 import { getTokenForUrl, deleteToken as removeStoredToken, saveToken } from "./token-store.js";
 import type { TransportTarget } from "./types.js";
@@ -195,7 +197,7 @@ program
   .argument("[extraArgs...]", "Additional args passed to the stdio command")
   .addOption(
     new Option("--format <format>", "Output format")
-      .choices(["terminal", "json", "sarif", "github", "markdown"])
+      .choices(["terminal", "json", "sarif", "github", "markdown", "html"])
       .default("terminal"),
   )
   .option("--config <path>", "Load options from a config file (default: mcp-compliance.config.json in cwd)")
@@ -233,6 +235,7 @@ program
     "15000",
   )
   .option("--no-color", "Disable colored output (also honors NO_COLOR env var)")
+  .option("--watch", "Re-run tests when files in the cwd change (stdio targets only)")
   .option("--preflight-timeout <ms>", "Preflight connectivity check timeout in milliseconds")
   .option("--retries <n>", "Number of retries for failed tests", "0")
   .option(
@@ -256,6 +259,7 @@ program
         list?: boolean;
         transport?: "http" | "stdio";
         color?: boolean;
+        watch?: boolean;
         format: string;
         strict?: boolean;
         minGrade?: "A" | "B" | "C" | "D" | "F";
@@ -313,55 +317,102 @@ program
           config,
         );
 
-        if (opts.format === "terminal") {
-          console.log(chalk.dim(`\nTesting ${describeTarget(transportTarget)}...\n`));
-        }
-
         const only = opts.only ?? config?.only;
         const skip = opts.skip ?? config?.skip;
         const verbose = opts.verbose ?? config?.verbose;
-
-        const report = await runComplianceSuite(transportTarget, {
-          timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
-          preflightTimeout: opts.preflightTimeout
-            ? parsePositiveInt(opts.preflightTimeout, "--preflight-timeout", 1)
-            : config?.preflightTimeout,
-          retries: parsePositiveInt(opts.retries, "--retries"),
-          only,
-          skip,
-          onProgress: verbose
-            ? (testId, passed, details) => {
-                const icon = passed ? chalk.green("PASS") : chalk.red("FAIL");
-                console.log(`  ${icon} ${testId} — ${details}`);
-              }
-            : undefined,
-        });
-
-        if (verbose && opts.format === "terminal") {
-          console.log(""); // blank line after verbose output
-        }
-
-        if (opts.format === "json") {
-          console.log(formatJson(report));
-        } else if (opts.format === "sarif") {
-          console.log(formatSarif(report));
-        } else if (opts.format === "github") {
-          console.log(formatGithub(report));
-        } else if (opts.format === "markdown") {
-          console.log(formatMarkdown(report));
-        } else {
-          console.log(formatTerminal(report));
-        }
-
-        if (opts.output) {
-          const svg = renderBadgeSvg({ grade: report.grade, score: report.score, timestamp: report.timestamp });
-          writeFileSync(opts.output, svg, "utf8");
-          if (opts.format === "terminal") {
-            console.log(chalk.dim(`\nBadge SVG written to ${opts.output}`));
-          }
-        }
-
         const strict = opts.strict ?? config?.strict;
+
+        async function runOnce() {
+          if (opts.format === "terminal") {
+            console.log(chalk.dim(`\nTesting ${describeTarget(transportTarget)}...\n`));
+          }
+
+          const report = await runComplianceSuite(transportTarget, {
+            timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
+            preflightTimeout: opts.preflightTimeout
+              ? parsePositiveInt(opts.preflightTimeout, "--preflight-timeout", 1)
+              : config?.preflightTimeout,
+            retries: parsePositiveInt(opts.retries, "--retries"),
+            only,
+            skip,
+            onProgress: verbose
+              ? (testId, passed, details) => {
+                  const icon = passed ? chalk.green("PASS") : chalk.red("FAIL");
+                  console.log(`  ${icon} ${testId} — ${details}`);
+                }
+              : undefined,
+          });
+
+          if (verbose && opts.format === "terminal") {
+            console.log(""); // blank line after verbose output
+          }
+
+          if (opts.format === "json") {
+            console.log(formatJson(report));
+          } else if (opts.format === "sarif") {
+            console.log(formatSarif(report));
+          } else if (opts.format === "github") {
+            console.log(formatGithub(report));
+          } else if (opts.format === "markdown") {
+            console.log(formatMarkdown(report));
+          } else if (opts.format === "html") {
+            console.log(formatHtml(report));
+          } else {
+            console.log(formatTerminal(report));
+          }
+
+          if (opts.output) {
+            const svg = renderBadgeSvg({ grade: report.grade, score: report.score, timestamp: report.timestamp });
+            writeFileSync(opts.output, svg, "utf8");
+            if (opts.format === "terminal") {
+              console.log(chalk.dim(`\nBadge SVG written to ${opts.output}`));
+            }
+          }
+          return report;
+        }
+
+        // --watch: stay alive, re-run on filesystem changes in cwd.
+        // Only meaningful for stdio (HTTP servers don't change because we
+        // edited a local file). Cleanup on SIGINT.
+        if (opts.watch) {
+          if (transportTarget.type !== "stdio") {
+            console.error(chalk.red("\nError: --watch only applies to stdio targets (HTTP servers are remote).\n"));
+            process.exit(1);
+          }
+          await runOnce();
+          let pending: NodeJS.Timeout | null = null;
+          let running = false;
+          const watcher = fsWatch(process.cwd(), { recursive: true }, (_event, filename) => {
+            // Skip noise: dot-folders, node_modules, dist, lock files
+            if (!filename) return;
+            const f = String(filename).replace(/\\/g, "/");
+            if (/(^|\/)(node_modules|\.git|dist|coverage|\.next|\.cache|\.turbo)(\/|$)/.test(f)) return;
+            if (/\.(log|swp|tmp)$|~$/.test(f)) return;
+            if (pending) clearTimeout(pending);
+            pending = setTimeout(async () => {
+              if (running) return;
+              running = true;
+              try {
+                console.log(chalk.dim(`\n[watch] ${f} changed — re-running...\n`));
+                await runOnce();
+              } catch (err) {
+                console.error(chalk.red(`[watch] ${err instanceof Error ? err.message : String(err)}`));
+              } finally {
+                running = false;
+              }
+            }, 500);
+          });
+          process.on("SIGINT", () => {
+            watcher.close();
+            console.log(chalk.dim("\n[watch] stopped"));
+            process.exit(0);
+          });
+          // Block forever — watcher keeps event loop alive
+          await new Promise(() => {});
+          return;
+        }
+
+        const report = await runOnce();
         if (strict && report.overall === "fail") {
           process.exit(1);
         }
@@ -536,6 +587,89 @@ program
       await unpublishReport(stored.hash, stored.entry.deleteToken);
       removeStoredToken(stored.hash);
       console.log(chalk.green(`\nRemoved report for ${url}.\n`));
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(chalk.red(`\nError: ${message}\n`));
+      process.exit(1);
+    }
+  });
+
+program
+  .command("benchmark")
+  .description("Measure ping latency and throughput against an MCP server (URL or stdio command)")
+  .argument("[target]", "Server URL or stdio command")
+  .argument("[extraArgs...]", "Additional args for stdio command")
+  .option("-r, --requests <n>", "Number of ping requests to send", "100")
+  .option("-c, --concurrency <n>", "Concurrent in-flight requests", "1")
+  .option("--timeout <ms>", "Per-request timeout in milliseconds", "15000")
+  .option("--config <path>", "Load options from a config file")
+  .option("--format <format>", "terminal or json", "terminal")
+  .option("-H, --header <header>", "HTTP header (repeatable)", parseHeaderArg, {})
+  .option("--auth <token>", 'Shorthand for -H "Authorization: <token>"')
+  .option("-E, --env <var>", "Env var for stdio (repeatable)", parseEnvVar, {})
+  .option("--env-file <path>", "Load env vars from file")
+  .option("--cwd <dir>", "Working directory for stdio command")
+  .action(
+    async (
+      target: string | undefined,
+      extraArgs: string[],
+      opts: {
+        requests: string;
+        concurrency: string;
+        timeout: string;
+        config?: string;
+        format: string;
+        header: Record<string, string>;
+        auth?: string;
+        env: Record<string, string>;
+        envFile?: string;
+        cwd?: string;
+      },
+    ) => {
+      try {
+        const config = loadConfig(opts.config);
+        const t = resolveTarget(
+          target,
+          extraArgs,
+          { header: opts.header, auth: opts.auth, env: opts.env, envFile: opts.envFile, cwd: opts.cwd },
+          config,
+        );
+        const result = await runBenchmark(t, {
+          requests: parsePositiveInt(opts.requests, "--requests", 1),
+          concurrency: parsePositiveInt(opts.concurrency, "--concurrency", 1),
+          timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
+        });
+        if (opts.format === "json") {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(formatBenchmark(result));
+        }
+        if (result.failed > 0) process.exit(1);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(chalk.red(`\nError: ${message}\n`));
+        process.exit(1);
+      }
+    },
+  );
+
+program
+  .command("diff")
+  .description("Compare two compliance JSON reports; exit 1 if there are regressions")
+  .argument("<baseline>", "Baseline report JSON file")
+  .argument("<current>", "Current report JSON file")
+  .option("--format <format>", "terminal or json", "terminal")
+  .action((baselinePath: string, currentPath: string, opts: { format: string }) => {
+    try {
+      const baseline = JSON.parse(readFileSync(baselinePath, "utf8"));
+      const current = JSON.parse(readFileSync(currentPath, "utf8"));
+      const summary = diffReports(baseline, current);
+      if (opts.format === "json") {
+        console.log(JSON.stringify(summary, null, 2));
+      } else {
+        console.log(formatDiff(summary));
+      }
+      if (hasRegressions(summary)) process.exit(1);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`\nError: ${message}\n`));

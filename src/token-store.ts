@@ -15,7 +15,9 @@ export interface TokenEntry {
 type Store = Record<string, TokenEntry>;
 
 export function hashUrl(url: string): string {
-  return createHash("sha256").update(url).digest("hex").slice(0, 12);
+  // Must match mcp-hosting's hash width (24 hex = 96 bits). Older v0.9.0
+  // installs used 12 chars; the server accepts both for read/delete.
+  return createHash("sha256").update(url).digest("hex").slice(0, 24);
 }
 
 function readStore(): Store {

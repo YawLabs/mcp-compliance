@@ -1,0 +1,36 @@
+# Example: how server authors will consume the action.
+# This workflow runs against our own MCP server (mcp-compliance dogfood)
+# on every push, so a regression that breaks our own compliance shows up
+# immediately. Doubles as integration test for the action itself.
+name: Dogfood compliance
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'action.yml'
+      - '.github/workflows/example-action.yml'
+  pull_request:
+    branches: [master]
+
+jobs:
+  dogfood:
+    name: Test our own MCP server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+
+      - name: Compliance test (dogfood)
+        uses: ./
+        with:
+          target: 'node dist/index.js mcp'
+          format: github
+          strict: 'true'
+          min-grade: 'A'

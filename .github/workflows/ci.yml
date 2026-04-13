@@ -40,3 +40,19 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
+      # Production-only audit catches CVEs in shipped deps (devDeps don't ship to users)
+      - name: Audit production deps
+        run: npm audit --omit=dev --audit-level=high
+      # Generate SBOM (CycloneDX format) — uploadable to dependency tracking systems
+      - name: Generate SBOM
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == '22'
+        run: |
+          npx --yes @cyclonedx/cyclonedx-npm --output-file sbom.cdx.json --output-format JSON
+        continue-on-error: true
+      - name: Upload SBOM
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == '22'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          if-no-files-found: ignore

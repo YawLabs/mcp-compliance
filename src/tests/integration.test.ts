@@ -1,10 +1,23 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { type Server, createServer } from "node:http";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { runComplianceSuite } from "../runner.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const reportSchema = JSON.parse(
+  readFileSync(resolve(__dirname, "../../schemas/report.v1.json"), "utf8"),
+);
+const ajv = new Ajv2020({ strict: true, allErrors: true });
+addFormats(ajv);
+const validateReport = ajv.compile(reportSchema);
 
 let server: Server;
 let serverUrl: string;
@@ -145,4 +158,43 @@ describe("integration — full compliance suite against real server", () => {
     const report = await runComplianceSuite(serverUrl, { timeout: 3000 });
     expect(report.warnings.some((w) => w.includes("unreachable"))).toBe(false);
   }, 30000);
+
+  it("real report validates against schemas/report.v1.json", async () => {
+    const report = await runComplianceSuite(serverUrl, { timeout: 3000 });
+    const ok = validateReport(report);
+    if (!ok) {
+      // Surface the validator errors so drift is obvious — without this,
+      // a missing field would just show as `false` and require manual digging.
+      throw new Error(
+        `Real CLI output does not match report.v1 schema:\n${JSON.stringify(validateReport.errors, null, 2)}`,
+      );
+    }
+    expect(ok).toBe(true);
+  }, 30000);
+
+  it("produces deterministic output (modulo timings/timestamps)", async () => {
+    const [a, b] = await Promise.all([
+      runComplianceSuite(serverUrl, { timeout: 3000 }),
+      runComplianceSuite(serverUrl, { timeout: 3000 }),
+    ]);
+
+    const stripVolatile = (report: typeof a) => ({
+      ...report,
+      timestamp: "FIXED",
+      tests: report.tests.map((t) => ({ ...t, durationMs: 0 })),
+    });
+
+    const aStable = stripVolatile(a);
+    const bStable = stripVolatile(b);
+
+    // The two runs must agree on grade, score, per-test pass/fail, and every
+    // structural field. Any drift here is a determinism bug that would make
+    // leaderboards unstable.
+    expect(bStable.grade).toBe(aStable.grade);
+    expect(bStable.score).toBe(aStable.score);
+    expect(bStable.overall).toBe(aStable.overall);
+    expect(bStable.summary).toEqual(aStable.summary);
+    expect(bStable.categories).toEqual(aStable.categories);
+    expect(bStable.tests.map((t) => [t.id, t.passed])).toEqual(aStable.tests.map((t) => [t.id, t.passed]));
+  }, 60000);
 });

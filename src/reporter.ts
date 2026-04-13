@@ -342,3 +342,158 @@ export function formatMarkdown(report: ComplianceReport): string {
 
   return lines.join("\n");
 }
+
+/**
+ * Self-contained HTML report. Single file, embedded CSS, no external
+ * dependencies. Suitable for `--output report.html` and serving as a
+ * static artifact (CI artifact upload, GitHub Pages, S3 static hosting).
+ */
+export function formatHtml(report: ComplianceReport): string {
+  const gradeColors: Record<string, string> = {
+    A: "#10b981",
+    B: "#84cc16",
+    C: "#eab308",
+    D: "#f97316",
+    F: "#ef4444",
+  };
+  const gradeColor = gradeColors[report.grade] || "#6b7280";
+
+  function esc(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  const failed = report.tests.filter((t) => !t.passed);
+  const grouped = new Map<string, TestResult[]>();
+  for (const cat of CATEGORY_ORDER) grouped.set(cat, []);
+  for (const t of report.tests) grouped.get(t.category)?.push(t);
+
+  const isStdio = report.url.startsWith("stdio:");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP Compliance — ${esc(report.url)} — Grade ${report.grade}</title>
+<style>
+  :root { color-scheme: light dark; }
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; background: #0b0f17; color: #e5e7eb; }
+  @media (prefers-color-scheme: light) { body { background: #f9fafb; color: #111827; } .card { background: #fff !important; border-color: #e5e7eb !important; } .muted { color: #6b7280 !important; } }
+  .container { max-width: 960px; margin: 0 auto; padding: 32px 24px; }
+  header { text-align: center; margin-bottom: 32px; }
+  h1 { font-size: 28px; margin: 0 0 4px; }
+  .muted { color: #9ca3af; font-size: 13px; }
+  .grade-card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 32px; margin: 24px 0; text-align: center; }
+  .grade-letter { font-size: 96px; font-weight: 700; line-height: 1; color: ${gradeColor}; margin: 0; }
+  .grade-score { font-size: 24px; font-weight: 600; margin-top: 4px; }
+  .grade-overall { display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; text-transform: uppercase; margin-top: 12px; }
+  .grade-overall.pass { background: #064e3b; color: #6ee7b7; }
+  .grade-overall.partial { background: #78350f; color: #fcd34d; }
+  .grade-overall.fail { background: #7f1d1d; color: #fca5a5; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 24px 0; }
+  .cat-card { background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 16px; text-align: center; }
+  .cat-stat { font-size: 24px; font-weight: 700; }
+  .cat-label { font-size: 12px; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; }
+  .cat-stat.full { color: #10b981; }
+  .cat-stat.partial { color: #eab308; }
+  .cat-stat.empty { color: #ef4444; }
+  .card { background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 20px; margin: 16px 0; }
+  .card h2 { margin-top: 0; font-size: 16px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #1f2937; vertical-align: top; }
+  th { font-weight: 600; color: #9ca3af; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  td.status { white-space: nowrap; font-weight: 600; }
+  td.status.pass { color: #10b981; }
+  td.status.fail { color: #ef4444; }
+  td.id { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: #9ca3af; }
+  .badge-tag { display: inline-block; background: #1f2937; color: #fcd34d; font-size: 10px; padding: 2px 6px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .warn { background: #78350f; color: #fcd34d; padding: 12px 16px; border-radius: 8px; margin: 8px 0; font-size: 13px; }
+  .badge-img { background: #fff; padding: 8px; border-radius: 6px; display: inline-block; margin-top: 8px; }
+  code { background: #1f2937; padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+  details summary { cursor: pointer; padding: 8px 0; font-weight: 600; }
+  footer { text-align: center; color: #6b7280; font-size: 12px; margin-top: 48px; }
+  footer a { color: #60a5fa; text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>MCP Compliance Report</h1>
+    <div class="muted">${esc(report.url)}</div>
+    <div class="muted" style="margin-top:6px">Spec ${esc(report.specVersion)} · Tool v${esc(report.toolVersion)} · ${new Date(report.timestamp).toLocaleString()}</div>
+    ${report.serverInfo.name ? `<div class="muted">Server: ${esc(report.serverInfo.name)}${report.serverInfo.version ? ` v${esc(report.serverInfo.version)}` : ""}</div>` : ""}
+  </header>
+
+  <div class="grade-card">
+    <div class="grade-letter">${esc(report.grade)}</div>
+    <div class="grade-score">${report.score}%</div>
+    <div class="grade-overall ${esc(report.overall)}">${esc(report.overall)}</div>
+    <div class="muted" style="margin-top:12px">${report.summary.passed} / ${report.summary.total} tests passed · ${report.summary.requiredPassed} / ${report.summary.required} required</div>
+  </div>
+
+  <div class="grid">
+    ${CATEGORY_ORDER.filter((c) => report.categories[c] && report.categories[c].total > 0)
+      .map((c) => {
+        const s = report.categories[c];
+        const cls = s.passed === s.total ? "full" : s.passed > 0 ? "partial" : "empty";
+        return `<div class="cat-card"><div class="cat-stat ${cls}">${s.passed}/${s.total}</div><div class="cat-label">${esc(CATEGORY_LABELS[c] || c)}</div></div>`;
+      })
+      .join("")}
+  </div>
+
+  ${report.warnings.length ? `<div class="card"><h2>Warnings (${report.warnings.length})</h2>${report.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("")}</div>` : ""}
+
+  ${
+    failed.length
+      ? `<div class="card"><h2>Failed tests (${failed.length})</h2>
+    <table><thead><tr><th>Status</th><th>Test</th><th>Details</th></tr></thead><tbody>
+    ${failed
+      .map(
+        (t) => `<tr>
+      <td class="status fail">FAIL</td>
+      <td><div>${esc(t.name)} ${t.required ? '<span class="badge-tag">Required</span>' : ""}</div><div class="id">${esc(t.id)}</div></td>
+      <td>${esc(t.details)}${t.specRef ? ` <a href="${esc(t.specRef)}" class="muted">[spec]</a>` : ""}</td>
+    </tr>`,
+      )
+      .join("")}
+    </tbody></table></div>`
+      : ""
+  }
+
+  ${[...grouped.entries()]
+    .filter(([, tests]) => tests.length > 0)
+    .map(
+      ([cat, tests]) => `<div class="card"><h2>${esc(CATEGORY_LABELS[cat] || cat)}</h2>
+    <table><thead><tr><th>Status</th><th>Test</th><th>Details</th><th>Time</th></tr></thead><tbody>
+    ${tests
+      .map(
+        (t) => `<tr>
+      <td class="status ${t.passed ? "pass" : "fail"}">${t.passed ? "PASS" : "FAIL"}</td>
+      <td><div>${esc(t.name)} ${t.required ? '<span class="badge-tag">Required</span>' : ""}</div><div class="id">${esc(t.id)}</div></td>
+      <td>${esc(t.details)}${t.specRef ? ` <a href="${esc(t.specRef)}" class="muted">[spec]</a>` : ""}</td>
+      <td class="muted">${t.durationMs}ms</td>
+    </tr>`,
+      )
+      .join("")}
+    </tbody></table></div>`,
+    )
+    .join("")}
+
+  ${
+    !isStdio
+      ? `<div class="card"><h2>Embed badge</h2>
+    <div class="badge-img"><img src="${esc(report.badge.imageUrl)}" alt="MCP Compliance"></div>
+    <p class="muted" style="margin-top:12px">Markdown:</p>
+    <code style="display:block; padding:8px; background:#0b0f17">${esc(report.badge.markdown)}</code></div>`
+      : `<div class="card"><h2>Local badge</h2>
+    <p class="muted">Stdio servers can't be published to mcp.hosting (no public URL). Use <code>--output badge.svg</code> to write a local badge image.</p></div>`
+  }
+
+  <footer>
+    Generated by <a href="https://www.npmjs.com/package/@yawlabs/mcp-compliance">@yawlabs/mcp-compliance</a> v${esc(report.toolVersion)}
+  </footer>
+</div>
+</body>
+</html>`;
+}

@@ -57,9 +57,28 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
   let exited = false;
   let exitCode: number | null = null;
   let spawnError: Error | null = null;
+  let spawned = false;
   const pending = new Map<number, PendingRequest>();
   let stdoutBuffer = "";
   let stderrBuffer = "";
+
+  // Wait for the 'spawn' event before accepting writes. Without this,
+  // request() called immediately after createStdioTransport() would
+  // race the spawn — pending requests would queue but spawn errors
+  // could fire AFTER the timer was set, leaving the request hung.
+  const spawnReady = new Promise<void>((resolve, reject) => {
+    child.once("spawn", () => {
+      spawned = true;
+      resolve();
+    });
+    child.once("error", (err) => {
+      // If spawn never fires (binary not found, EACCES, etc.) the
+      // 'error' event surfaces here. Reject so first request fails fast.
+      if (!spawned) reject(err);
+    });
+  });
+  // Swallow unhandled rejection — request() awaits this promise itself.
+  spawnReady.catch(() => {});
 
   child.on("error", (err) => {
     spawnError = err;
@@ -144,12 +163,30 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
   }
 
   async function writeLine(line: string): Promise<void> {
+    // Wait for the child to actually spawn before the first write.
+    // Subsequent writes resolve immediately (spawnReady is already settled).
+    if (!spawned && !spawnError) {
+      try {
+        await spawnReady;
+      } catch (err) {
+        throw new Error(
+          annotateWithStderr(`stdio transport: spawn failed — ${err instanceof Error ? err.message : String(err)}`),
+        );
+      }
+    }
     if (exited) {
       throw new Error(annotateWithStderr(`stdio transport: child has exited (code ${exitCode})`));
     }
     if (spawnError) throw new Error(annotateWithStderr(`stdio transport: spawn failed — ${spawnError.message}`));
     const stdin = child.stdin;
     if (!stdin || stdin.destroyed) throw new Error(annotateWithStderr("stdio transport: stdin is closed"));
+    // The write callback fires when the data is flushed to the OS pipe.
+    // For sequential request() callers (await-pattern), this naturally
+    // serializes — each request waits for its own write to flush before
+    // the next is issued. For concurrent callers (e.g., benchmark with
+    // --concurrency > 1), Node's internal buffer absorbs the writes; we
+    // accept slightly higher memory under burst load rather than
+    // building a queue.
     return new Promise<void>((resolve, reject) => {
       stdin.write(`${line}\n`, "utf8", (err) => (err ? reject(err) : resolve()));
     });

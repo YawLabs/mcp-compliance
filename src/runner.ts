@@ -6,7 +6,7 @@ import { type HttpTransport, createHttpTransport } from "./transport/http.js";
 import type { Transport } from "./transport/index.js";
 import { createStdioTransport } from "./transport/stdio.js";
 import type { ComplianceReport, TestDefinition, TestResult, TransportTarget } from "./types.js";
-import { TEST_DEFINITIONS } from "./types.js";
+import { REPORT_SCHEMA_VERSION, TEST_DEFINITIONS } from "./types.js";
 
 export type { TestResult, ComplianceReport } from "./types.js";
 export { TEST_DEFINITIONS } from "./types.js";
@@ -158,8 +158,15 @@ export function previewTests(opts: PreviewOptions = {}): TestDefinition[] {
 }
 
 export interface RunOptions {
-  /** Optional callback for progress updates */
+  /** Optional callback for progress updates (legacy minimal signature). */
   onProgress?: (testId: string, passed: boolean, details: string) => void;
+  /**
+   * Optional callback fired after each test completes with the full
+   * TestResult (category, required, durationMs, specRef). Prefer this
+   * over onProgress for live dashboards and streaming UIs that need
+   * structured data per test.
+   */
+  onTestComplete?: (result: TestResult) => void;
   /** Extra headers to include on all requests */
   headers?: Record<string, string>;
   /** Request timeout in milliseconds (default: 15000) */
@@ -372,7 +379,7 @@ export async function runComplianceSuite(
         }
       }
 
-      tests.push({
+      const result: TestResult = {
         id,
         name,
         category,
@@ -381,8 +388,10 @@ export async function runComplianceSuite(
         details: lastResult.details,
         durationMs: Date.now() - start,
         specRef: `${SPEC_BASE}/${specRef}`,
-      });
+      };
+      tests.push(result);
       options.onProgress?.(id, lastResult.passed, lastResult.details);
+      options.onTestComplete?.(result);
     }
 
     // ── 1. TRANSPORT (basic, pre-init) ───────────────────────────────
@@ -3130,6 +3139,7 @@ export async function runComplianceSuite(
     const badge = generateBadge(displayUrl);
 
     return {
+      schemaVersion: REPORT_SCHEMA_VERSION,
       specVersion: SPEC_VERSION,
       toolVersion: TOOL_VERSION,
       url: displayUrl,

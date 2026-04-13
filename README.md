@@ -128,6 +128,19 @@ On Windows, `npx` and other `.cmd` shims are handled automatically by spawning t
 
 ### CI integration
 
+**GitHub Action** (drop into any `.github/workflows/*.yml`):
+
+```yaml
+- uses: YawLabs/mcp-compliance@v0
+  with:
+    target: 'node ./dist/server.js'   # or a URL like https://my-server.com/mcp
+    format: github                     # ::error / ::warning annotations on the PR
+    strict: 'true'                     # exit non-zero if any required test fails
+    min-grade: 'A'                     # also exit if grade slips
+```
+
+**Manual CLI invocation:**
+
 ```bash
 # GitHub Actions: emits ::error / ::warning annotations inline on the PR
 mcp-compliance test https://my-server.com/mcp --format github --strict
@@ -135,11 +148,30 @@ mcp-compliance test https://my-server.com/mcp --format github --strict
 # Slack/Linear/PR comment: drop the body straight into a comment
 mcp-compliance test https://my-server.com/mcp --format markdown > report.md
 
+# HTML report (self-contained, share anywhere — issue comments, S3, GitHub Pages)
+mcp-compliance test https://my-server.com/mcp --format html > report.html
+
 # Block release if grade slips below B
 mcp-compliance test https://my-server.com/mcp --min-grade B
 
 # Preview which tests will run before connecting (handy for --only/--skip authoring)
 mcp-compliance test --list --transport stdio --skip security
+
+# Diff two runs — exit 1 if anything that was passing is now failing
+mcp-compliance test https://my-server.com/mcp --format json > current.json
+mcp-compliance diff baseline.json current.json
+
+# Watch mode for stdio dev loop — re-runs on file changes in cwd
+mcp-compliance test --watch -- node ./dist/server.js
+
+# Latency benchmark
+mcp-compliance benchmark -- node ./dist/server.js -r 200 -c 4
+```
+
+**Docker:**
+
+```bash
+docker run --rm ghcr.io/yawlabs/mcp-compliance test https://my-server.com/mcp
 ```
 
 ### Scaffold a config
@@ -468,7 +500,41 @@ const report2 = await runComplianceSuite('https://my-server.com/mcp', {
   retries: 1,
   only: ['transport', 'lifecycle'],
 });
+
+// Live progress for streaming UIs (e.g. server-sent-events to a browser)
+await runComplianceSuite('https://my-server.com/mcp', {
+  onTestComplete: (result) => {
+    // result has the full TestResult: id, name, category, required,
+    // passed, details, durationMs, specRef. Push it to your client.
+    sendToClient(result);
+  },
+});
 ```
+
+## Report schema
+
+The JSON output of the test suite is a stable, versioned contract. Every report includes a `schemaVersion` field at the top level. The full JSON Schema lives at [`schemas/report.v1.json`](./schemas/report.v1.json) and is shipped with the npm package.
+
+```jsonc
+{
+  "schemaVersion": "1",        // bumped on breaking changes to the report shape
+  "specVersion": "2025-11-25", // MCP spec version tested against
+  "toolVersion": "0.10.0",     // mcp-compliance version that produced the report
+  "url": "...",
+  "timestamp": "...",
+  "grade": "A",
+  "score": 92.5,
+  "tests": [ ... ],
+  // ...
+}
+```
+
+Consumer guidance:
+
+- Pin against `schemaVersion`. Reject reports with an unknown version rather than guessing at the shape.
+- The schema validates with any Draft 2020-12 validator (e.g. `ajv`).
+- Within a major version, additions are non-breaking. Renames, removals, or type changes bump the version.
+- Two runs against the same server produce equivalent grade, score, and per-test pass/fail (modulo timings/timestamps).
 
 ## Specification
 

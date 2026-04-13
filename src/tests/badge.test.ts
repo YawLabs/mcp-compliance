@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { generateBadge } from "../badge.js";
 
 function expectedHash(url: string): string {
-  return createHash("sha256").update(url).digest("hex").slice(0, 12);
+  return createHash("sha256").update(url).digest("hex").slice(0, 24);
 }
 
 describe("generateBadge", () => {

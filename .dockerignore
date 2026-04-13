@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.github
+coverage
+*.log
+.env*
+.claude
+src
+*.test.ts
+tsconfig*.json
+biome.json
+tsup.config.ts

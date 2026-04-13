@@ -2,10 +2,11 @@ import { createHash } from "node:crypto";
 
 /**
  * Generate a short, deterministic hash of a URL for badge paths.
- * Uses SHA-256 truncated to 12 hex chars (48 bits of entropy).
+ * SHA-256 truncated to 24 hex chars (96 bits of entropy) — matches the
+ * server-side hash width used by mcp.hosting for `/compliance/ext/<hash>`.
  */
 function urlHash(url: string): string {
-  return createHash("sha256").update(url).digest("hex").slice(0, 12);
+  return createHash("sha256").update(url).digest("hex").slice(0, 24);
 }
 
 /**

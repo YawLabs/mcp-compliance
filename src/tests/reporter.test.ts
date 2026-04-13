@@ -57,6 +57,7 @@ function makeReport(overrides: Partial<ComplianceReport> = {}): ComplianceReport
       html: '<a href="https://mcp.hosting/compliance/test"><img src="https://mcp.hosting/api/compliance/test/badge" alt="MCP Compliant"></a>',
     },
     ...overrides,
+    schemaVersion: "1",
   };
 }
 

@@ -22,7 +22,18 @@ export interface TestResult {
 export type Grade = "A" | "B" | "C" | "D" | "F";
 export type Overall = "pass" | "partial" | "fail";
 
+/**
+ * Version of the ComplianceReport JSON schema. Incremented on breaking
+ * changes to the report shape. Downstream consumers (mcp.hosting report
+ * renderer, third-party dashboards) pin against this.
+ *
+ * See schemas/report.v1.json for the authoritative schema definition.
+ */
+export const REPORT_SCHEMA_VERSION = "1";
+
 export interface ComplianceReport {
+  /** Stable report-format version. See REPORT_SCHEMA_VERSION. */
+  schemaVersion: string;
   specVersion: string;
   toolVersion: string;
   url: string;

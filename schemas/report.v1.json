@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mcp.hosting/schemas/compliance/report.v1.json",
+  "title": "MCP Compliance Report",
+  "description": "Structured output of the mcp-compliance test suite. Stable, versioned contract — increment schemaVersion on breaking changes. Consumed by mcp.hosting and third-party dashboards.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "specVersion",
+    "toolVersion",
+    "url",
+    "timestamp",
+    "score",
+    "grade",
+    "overall",
+    "summary",
+    "categories",
+    "tests",
+    "warnings",
+    "serverInfo",
+    "toolCount",
+    "toolNames",
+    "resourceCount",
+    "resourceNames",
+    "promptCount",
+    "promptNames",
+    "badge"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "1",
+      "description": "Version of this report schema. Breaking changes bump the major version."
+    },
+    "specVersion": {
+      "type": "string",
+      "description": "MCP spec version tested against, e.g. \"2025-11-25\"."
+    },
+    "toolVersion": {
+      "type": "string",
+      "description": "Version of the mcp-compliance tool that produced this report."
+    },
+    "url": {
+      "type": "string",
+      "description": "HTTP URL or stdio display string for the server under test."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of when the report was generated."
+    },
+    "score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Weighted compliance score: required tests 70%, optional 30%."
+    },
+    "grade": {
+      "type": "string",
+      "enum": ["A", "B", "C", "D", "F"],
+      "description": "Letter grade derived from score. A>=90, B>=75, C>=60, D>=40, F<40."
+    },
+    "overall": {
+      "type": "string",
+      "enum": ["pass", "partial", "fail"],
+      "description": "High-level verdict: pass = all required tests passed, partial = some failed, fail = many failed."
+    },
+    "summary": {
+      "type": "object",
+      "required": ["total", "passed", "failed", "required", "requiredPassed"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "required": { "type": "integer", "minimum": 0 },
+        "requiredPassed": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "categories": {
+      "type": "object",
+      "description": "Per-category pass/total counts, keyed by TestCategory.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["passed", "total"],
+        "properties": {
+          "passed": { "type": "integer", "minimum": 0 },
+          "total": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "tests": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/TestResult" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Non-fatal diagnostics from the test run. Capped at 100 entries."
+    },
+    "serverInfo": {
+      "type": "object",
+      "required": ["protocolVersion", "name", "version", "capabilities"],
+      "properties": {
+        "protocolVersion": { "type": ["string", "null"] },
+        "name": { "type": ["string", "null"] },
+        "version": { "type": ["string", "null"] },
+        "capabilities": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "toolCount": { "type": "integer", "minimum": 0 },
+    "toolNames": { "type": "array", "items": { "type": "string" } },
+    "resourceCount": { "type": "integer", "minimum": 0 },
+    "resourceNames": { "type": "array", "items": { "type": "string" } },
+    "promptCount": { "type": "integer", "minimum": 0 },
+    "promptNames": { "type": "array", "items": { "type": "string" } },
+    "badge": {
+      "type": "object",
+      "required": ["imageUrl", "reportUrl", "markdown", "html"],
+      "properties": {
+        "imageUrl": { "type": "string", "format": "uri" },
+        "reportUrl": { "type": "string", "format": "uri" },
+        "markdown": { "type": "string" },
+        "html": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "TestResult": {
+      "type": "object",
+      "required": ["id", "name", "category", "passed", "required", "details", "durationMs"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "category": {
+          "type": "string",
+          "enum": [
+            "transport",
+            "lifecycle",
+            "tools",
+            "resources",
+            "prompts",
+            "errors",
+            "schema",
+            "security"
+          ]
+        },
+        "passed": { "type": "boolean" },
+        "required": { "type": "boolean" },
+        "details": { "type": "string" },
+        "durationMs": { "type": "integer", "minimum": 0 },
+        "specRef": {
+          "type": "string",
+          "format": "uri",
+          "description": "Deep link to the relevant spec section."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
