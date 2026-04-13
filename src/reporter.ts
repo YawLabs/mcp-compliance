@@ -145,8 +145,16 @@ export function formatTerminal(report: ComplianceReport): string {
   }
 
   lines.push("");
-  lines.push(chalk.dim("  Badge markdown:"));
-  lines.push(`  ${report.badge.markdown}`);
+  // For stdio targets the badge URL would always render "unknown" (no
+  // public report), so suppress the markdown and point at --output instead.
+  if (report.url.startsWith("stdio:")) {
+    lines.push(
+      chalk.dim("  Badge: stdio servers can't be published. Use `--output badge.svg` for a local badge image."),
+    );
+  } else {
+    lines.push(chalk.dim("  Badge markdown:"));
+    lines.push(`  ${report.badge.markdown}`);
+  }
   lines.push("");
 
   return lines.join("\n");
@@ -320,6 +328,15 @@ export function formatMarkdown(report: ComplianceReport): string {
     lines.push("## Warnings");
     lines.push("");
     for (const w of report.warnings) lines.push(`- ${w}`);
+    lines.push("");
+  }
+
+  if (!report.url.startsWith("stdio:")) {
+    lines.push("## Badge");
+    lines.push("");
+    lines.push("```markdown");
+    lines.push(report.badge.markdown);
+    lines.push("```");
     lines.push("");
   }
 

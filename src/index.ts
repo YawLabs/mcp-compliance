@@ -52,7 +52,18 @@ function parseEnvVar(value: string, prev: Record<string, string>): Record<string
 }
 
 function readEnvFile(path: string): Record<string, string> {
-  const contents = readFileSync(path, "utf8");
+  let contents: string;
+  try {
+    contents = readFileSync(path, "utf8");
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") throw new Error(`--env-file: file not found: ${path}`);
+    if (code === "EACCES") throw new Error(`--env-file: permission denied reading ${path}`);
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`--env-file: failed to read ${path}: ${message}`);
+  }
+  // Strip UTF-8 BOM if present
+  if (contents.charCodeAt(0) === 0xfeff) contents = contents.slice(1);
   const out: Record<string, string> = {};
   for (const line of contents.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -216,7 +227,12 @@ program
   .option("-E, --env <var>", 'Set env var for stdio command ("KEY=VALUE", repeatable)', parseEnvVar, {})
   .option("--env-file <path>", "Load env vars from file (KEY=VALUE per line, stdio only)")
   .option("--cwd <dir>", "Working directory for stdio command")
-  .option("--timeout <ms>", "Request timeout in milliseconds", "15000")
+  .option(
+    "--timeout <ms>",
+    "Request timeout in milliseconds (bump to 30000+ for stdio servers with slow startup)",
+    "15000",
+  )
+  .option("--no-color", "Disable colored output (also honors NO_COLOR env var)")
   .option("--preflight-timeout <ms>", "Preflight connectivity check timeout in milliseconds")
   .option("--retries <n>", "Number of retries for failed tests", "0")
   .option(
@@ -239,6 +255,7 @@ program
         output?: string;
         list?: boolean;
         transport?: "http" | "stdio";
+        color?: boolean;
         format: string;
         strict?: boolean;
         minGrade?: "A" | "B" | "C" | "D" | "F";
@@ -255,6 +272,8 @@ program
         verbose?: boolean;
       },
     ) => {
+      // --no-color (and NO_COLOR env, handled by chalk natively)
+      if (opts.color === false) chalk.level = 0;
       try {
         const config = loadConfig(opts.config);
 
@@ -390,12 +409,14 @@ program
   .option("--timeout <ms>", "Request timeout in milliseconds", "15000")
   .option("--no-publish", "Do not publish the report to mcp.hosting")
   .option("--output <file>", "Write a local SVG badge to the given path (works for any transport)")
+  .option("--no-color", "Disable colored output (also honors NO_COLOR env var)")
   .action(
     async (
       target: string | undefined,
       extraArgs: string[],
       opts: {
         config?: string;
+        color?: boolean;
         header: Record<string, string>;
         auth?: string;
         env: Record<string, string>;
@@ -406,6 +427,7 @@ program
         output?: string;
       },
     ) => {
+      if (opts.color === false) chalk.level = 0;
       try {
         const config = loadConfig(opts.config);
         const transportTarget = resolveTarget(
@@ -503,13 +525,13 @@ program
     try {
       const stored = getTokenForUrl(url);
       if (!stored) {
-        console.error(chalk.red(`\nError: no delete token found for ${url}.`));
-        console.error(
+        console.log(chalk.dim(`\nNo delete token found locally for ${url} — nothing to unpublish from this machine.`));
+        console.log(
           chalk.dim(
-            "Tokens are saved locally when you publish. If you published from another machine, you cannot unpublish from here.\n",
+            "(Delete tokens are stored locally at publish time. If you published from a different machine, run unpublish from there.)\n",
           ),
         );
-        process.exit(1);
+        return; // exit 0 — this isn't a failure
       }
       await unpublishReport(stored.hash, stored.entry.deleteToken);
       removeStoredToken(stored.hash);
@@ -591,10 +613,22 @@ program
         target = stdioTarget;
       }
 
-      const timeoutStr = await ask("Request timeout (ms)", "15000");
+      let timeout = 15000;
+      for (let attempts = 0; attempts < 3; attempts++) {
+        const timeoutStr = await ask("Request timeout (ms)", "15000");
+        const parsed = Number.parseInt(timeoutStr, 10);
+        if (Number.isFinite(parsed) && parsed > 0 && /^\d+$/.test(timeoutStr.trim())) {
+          timeout = parsed;
+          break;
+        }
+        console.error(chalk.yellow(`  "${timeoutStr}" is not a positive integer — try again.`));
+        if (attempts === 2) {
+          console.error(chalk.red("  Too many invalid attempts — keeping default 15000."));
+        }
+      }
       const strict = (await ask("Exit non-zero on required-test failures? (y/N)")).toLowerCase().startsWith("y");
 
-      const config: Record<string, unknown> = { target, timeout: Number.parseInt(timeoutStr, 10) || 15000 };
+      const config: Record<string, unknown> = { target, timeout };
       if (strict) config.strict = true;
 
       write(out, `${JSON.stringify(config, null, 2)}\n`, "utf8");
@@ -611,5 +645,11 @@ program
   .action(async () => {
     await startServer();
   });
+
+// No subcommand? Print help instead of silently exiting.
+if (process.argv.length <= 2) {
+  program.outputHelp();
+  process.exit(0);
+}
 
 program.parse();

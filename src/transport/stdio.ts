@@ -11,6 +11,12 @@ export interface StdioTransportOptions {
   verbose?: boolean;
   /** Rolling stderr buffer size in bytes. Default 64KB. */
   stderrBufferSize?: number;
+  /**
+   * Hard cap on un-newline-terminated stdout buffer in bytes. A
+   * misbehaving server that spews one giant line without a trailing
+   * newline would otherwise grow this unbounded. Default 1MB.
+   */
+  stdoutBufferSize?: number;
 }
 
 export interface StdioTransport extends Transport {
@@ -36,6 +42,7 @@ interface PendingRequest {
 export function createStdioTransport(opts: StdioTransportOptions): StdioTransport {
   const { command, args = [], env, cwd, verbose = false } = opts;
   const stderrBufferSize = opts.stderrBufferSize ?? 64 * 1024;
+  const stdoutBufferSize = opts.stdoutBufferSize ?? 1024 * 1024;
 
   const isWindows = process.platform === "win32";
   const child: ChildProcess = spawn(command, args, {
@@ -78,6 +85,12 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
       stdoutBuffer = stdoutBuffer.slice(idx + 1);
       handleLine(line);
     }
+    // Hard cap: if a single line never terminates, drop the buffer to
+    // keep memory bounded. The dropped bytes are gone — no parsing
+    // attempt — and the next newline starts a fresh line.
+    if (stdoutBuffer.length > stdoutBufferSize) {
+      stdoutBuffer = "";
+    }
   });
 
   child.stderr?.setEncoding("utf8");
@@ -113,18 +126,30 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
   }
 
   function rejectAllPending(err: Error) {
+    const annotated = err.message.includes("child stderr") ? err : new Error(annotateWithStderr(err.message));
     for (const p of pending.values()) {
       clearTimeout(p.timer);
-      p.reject(err);
+      p.reject(annotated);
     }
     pending.clear();
   }
 
+  function annotateWithStderr(message: string): string {
+    const tail = stderrBuffer.trim();
+    if (!tail) return message;
+    // Include up to the last 800 chars of stderr to keep error messages
+    // bounded while still useful for debugging.
+    const snippet = tail.length > 800 ? `…${tail.slice(-800)}` : tail;
+    return `${message}\n  child stderr:\n    ${snippet.replace(/\n/g, "\n    ")}`;
+  }
+
   async function writeLine(line: string): Promise<void> {
-    if (exited) throw new Error("stdio transport: child has exited");
-    if (spawnError) throw new Error(`stdio transport: spawn failed — ${spawnError.message}`);
+    if (exited) {
+      throw new Error(annotateWithStderr(`stdio transport: child has exited (code ${exitCode})`));
+    }
+    if (spawnError) throw new Error(annotateWithStderr(`stdio transport: spawn failed — ${spawnError.message}`));
     const stdin = child.stdin;
-    if (!stdin || stdin.destroyed) throw new Error("stdio transport: stdin is closed");
+    if (!stdin || stdin.destroyed) throw new Error(annotateWithStderr("stdio transport: stdin is closed"));
     return new Promise<void>((resolve, reject) => {
       stdin.write(`${line}\n`, "utf8", (err) => (err ? reject(err) : resolve()));
     });
@@ -152,7 +177,11 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
       return new Promise<TransportResponse>((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
-          reject(new Error(`stdio transport: request timed out after ${init.timeout}ms (method=${method})`));
+          reject(
+            new Error(
+              annotateWithStderr(`stdio transport: request timed out after ${init.timeout}ms (method=${method})`),
+            ),
+          );
         }, init.timeout);
         pending.set(id, { resolve, reject, id, timer });
         writeLine(body).catch((err: Error) => {

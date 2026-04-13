@@ -469,4 +469,28 @@ describe("formatMarkdown", () => {
     );
     expect(output).not.toContain("## Failed tests");
   });
+
+  it("includes the badge section for HTTP targets", () => {
+    const output = formatMarkdown(makeReport());
+    expect(output).toContain("## Badge");
+    expect(output).toContain("MCP Compliant");
+  });
+
+  it("omits the badge section for stdio targets (no public URL)", () => {
+    const output = formatMarkdown(makeReport({ url: "stdio:node ./server.js" }));
+    expect(output).not.toContain("## Badge");
+  });
+});
+
+describe("formatTerminal — stdio targets", () => {
+  it("does not print badge markdown for stdio (would render unknown)", () => {
+    const output = formatTerminal(makeReport({ url: "stdio:node ./server.js" }));
+    expect(output).not.toContain("Badge markdown:");
+    expect(output).toContain("--output");
+  });
+
+  it("still prints badge markdown for HTTP targets", () => {
+    const output = formatTerminal(makeReport());
+    expect(output).toContain("Badge markdown:");
+  });
 });

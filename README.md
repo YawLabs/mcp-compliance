@@ -15,7 +15,7 @@ MCP servers are multiplying fast — but most ship without compliance testing. B
 
 This tool solves that:
 
-- **84 tests across 8 categories** — transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security. No gaps.
+- **84 tests across 8 categories** — transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security. No gaps. (HTTP runs all 81 transport-applicable tests; stdio runs ~70 — HTTP-specific tests like CORS, TLS, session headers, and rate limiting are gated out.)
 - **Capability-driven** — tests adapt to what the server declares. If it says it supports tools, tool tests become required. No false failures for features the server doesn't claim.
 - **Graded scoring** — A-F letter grade with a weighted score (required tests 70%, optional 30%). One number to communicate compliance.
 - **CI-ready** — `--strict` mode exits with code 1 on required test failures. Drop it into any pipeline.

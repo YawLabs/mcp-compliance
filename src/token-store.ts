@@ -31,8 +31,23 @@ function readStore(): Store {
 
 function writeStore(store: Store): void {
   const dir = dirname(STORE_PATH);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(STORE_PATH, JSON.stringify(store, null, 2), { mode: 0o600 });
+  try {
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(STORE_PATH, JSON.stringify(store, null, 2), { mode: 0o600 });
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "EACCES" || code === "EPERM") {
+      throw new Error(
+        `Cannot write delete-token store at ${STORE_PATH}: permission denied. ` +
+          "If you don't need to publish, re-run with --no-publish. Otherwise, ensure your home directory is writable.",
+      );
+    }
+    if (code === "ENOSPC") {
+      throw new Error(`Cannot write delete-token store at ${STORE_PATH}: no space left on device.`);
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Cannot write delete-token store at ${STORE_PATH}: ${message}`);
+  }
 }
 
 export function saveToken(hash: string, entry: TokenEntry): void {
