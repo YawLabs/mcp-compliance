@@ -92,13 +92,30 @@ mcp-compliance test https://my-server.com/mcp --verbose
 | `--skip <items>` | Skip tests matching these categories or test IDs (comma-separated) |
 | `--verbose` | Print each test result as it runs |
 
-### Get badge markdown
+### Publish a shareable badge
 
 ```bash
 mcp-compliance badge https://my-server.com/mcp
 ```
 
-Outputs the markdown embed for a compliance badge hosted at [mcp.hosting](https://mcp.hosting).
+Runs the compliance suite, publishes the report to [mcp.hosting](https://mcp.hosting), and prints the markdown embed for your README. The badge image reflects the real grade (A–F) and links to the full report.
+
+| Option | Description |
+|--------|-------------|
+| `-H, --header <header>` | Add header to all requests, format `"Key: Value"` (repeatable) |
+| `--auth <token>` | Shorthand for `-H "Authorization: <token>"` |
+| `--timeout <ms>` | Request timeout in milliseconds (default: `15000`) |
+| `--no-publish` | Skip publishing; print a local badge markdown only |
+
+Reports are kept for 90 days from last submission; resubmitting the same URL overwrites the previous report. Auth headers are stripped client-side before upload. Private/loopback URLs (`localhost`, `127.0.0.1`, `192.168.*`, etc.) trigger an interactive confirmation before publishing, and are rejected by the server in any case.
+
+A delete token is returned at publish time and stored at `~/.mcp-compliance/tokens.json` (mode `0600`). Use it to take a report down:
+
+```bash
+mcp-compliance unpublish https://my-server.com/mcp
+```
+
+The `test` command never publishes — use it for CI, debugging, and local iteration. `badge` is the only command that publishes.
 
 ## What the 81 tests check
 

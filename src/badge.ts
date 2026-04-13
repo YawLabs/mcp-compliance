@@ -20,8 +20,8 @@ export function generateBadge(url: string): {
 } {
   const hash = urlHash(url);
 
-  const imageUrl = `https://mcp.hosting/api/compliance/${hash}/badge`;
-  const reportUrl = `https://mcp.hosting/compliance/${hash}`;
+  const imageUrl = `https://mcp.hosting/api/compliance/ext/${hash}/badge`;
+  const reportUrl = `https://mcp.hosting/compliance/ext/${hash}`;
 
   return {
     imageUrl,
