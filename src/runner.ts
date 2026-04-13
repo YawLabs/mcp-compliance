@@ -179,6 +179,14 @@ export interface RunOptions {
   skip?: string[];
   /** Preflight connectivity check timeout in milliseconds (default: min(timeout, 10000)) */
   preflightTimeout?: number;
+  /**
+   * Maximum number of parallel-safe tests in flight at once. Default 1
+   * (strictly sequential — matches pre-0.12 behavior). Tests are only
+   * eligible for parallel execution when their `TestDefinition.parallelSafe`
+   * is true; everything else stays sequential regardless. See
+   * docs/PERFORMANCE.md for the design.
+   */
+  concurrency?: number;
 }
 
 /**
@@ -354,7 +362,21 @@ export async function runComplianceSuite(
     let promptCount = 0;
     let promptNames: string[] = [];
 
-    async function test(
+    // Parallel execution pool. Tests marked `parallelSafe: true` in
+    // TEST_DEFINITIONS are queued here up to `concurrency` at a time.
+    // Sequential tests call `drainPool()` first to barrier against any
+    // pending parallel work, so order-dependent state (cachedToolsList,
+    // sessionId, etc.) stays consistent.
+    const concurrency = Math.max(1, options.concurrency ?? 1);
+    const inFlight = new Set<Promise<void>>();
+
+    async function drainPool(): Promise<void> {
+      while (inFlight.size > 0) {
+        await Promise.race(inFlight);
+      }
+    }
+
+    async function runTestFn(
       id: string,
       name: string,
       category: TestResult["category"],
@@ -362,8 +384,6 @@ export async function runComplianceSuite(
       specRef: string,
       fn: () => Promise<{ passed: boolean; details: string }>,
     ): Promise<void> {
-      if (!shouldRun(id, category)) return;
-
       const start = Date.now();
       let lastResult = { passed: false, details: "" };
 
@@ -392,6 +412,36 @@ export async function runComplianceSuite(
       tests.push(result);
       options.onProgress?.(id, lastResult.passed, lastResult.details);
       options.onTestComplete?.(result);
+    }
+
+    async function test(
+      id: string,
+      name: string,
+      category: TestResult["category"],
+      required: boolean,
+      specRef: string,
+      fn: () => Promise<{ passed: boolean; details: string }>,
+    ): Promise<void> {
+      if (!shouldRun(id, category)) return;
+
+      const def = TEST_DEFINITIONS_MAP.get(id);
+      const eligible = concurrency > 1 && def?.parallelSafe === true;
+
+      if (!eligible) {
+        // Sequential path: barrier against any in-flight parallel tests
+        // first, then execute synchronously. Preserves the pre-0.12
+        // ordering semantics.
+        if (inFlight.size > 0) await drainPool();
+        await runTestFn(id, name, category, required, specRef, fn);
+        return;
+      }
+
+      // Parallel path: wait for a slot, then launch without awaiting.
+      while (inFlight.size >= concurrency) await Promise.race(inFlight);
+      const p = runTestFn(id, name, category, required, specRef, fn).finally(() => {
+        inFlight.delete(p);
+      });
+      inFlight.add(p);
     }
 
     // ── 1. TRANSPORT (basic, pre-init) ───────────────────────────────
@@ -3221,6 +3271,12 @@ export async function runComplianceSuite(
       const truncated = warnings.length - MAX_WARNINGS;
       warnings.splice(MAX_WARNINGS, truncated, `... and ${truncated} more warning(s) suppressed`);
     }
+
+    // Drain any still-pending parallel tests before finalizing the
+    // report. Individual sequential tests already barrier, but if the
+    // last-declared test was parallel-safe we still have work in flight
+    // when we get here.
+    if (inFlight.size > 0) await drainPool();
 
     // ── Compute score ────────────────────────────────────────────────
 

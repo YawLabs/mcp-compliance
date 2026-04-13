@@ -236,6 +236,11 @@ program
   )
   .option("--no-color", "Disable colored output (also honors NO_COLOR env var)")
   .option("--watch", "Re-run tests when files in the cwd change (stdio targets only)")
+  .option(
+    "--concurrency <n>",
+    "Max parallel-safe tests in flight (default 1; see docs/PERFORMANCE.md before raising)",
+    "1",
+  )
   .option("--preflight-timeout <ms>", "Preflight connectivity check timeout in milliseconds")
   .option("--retries <n>", "Number of retries for failed tests", "0")
   .option(
@@ -260,6 +265,7 @@ program
         transport?: "http" | "stdio";
         color?: boolean;
         watch?: boolean;
+        concurrency: string;
         format: string;
         strict?: boolean;
         minGrade?: "A" | "B" | "C" | "D" | "F";
@@ -333,6 +339,7 @@ program
               ? parsePositiveInt(opts.preflightTimeout, "--preflight-timeout", 1)
               : config?.preflightTimeout,
             retries: parsePositiveInt(opts.retries, "--retries"),
+            concurrency: parsePositiveInt(opts.concurrency, "--concurrency", 1),
             only,
             skip,
             onProgress: verbose

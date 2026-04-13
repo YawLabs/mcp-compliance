@@ -40,6 +40,9 @@ interface ServerEntry {
 // notable community-distributed ones. Servers that need credentials (GitHub
 // token, Slack webhook, etc.) declare `requires`. If the env var isn't set,
 // that row is skipped with status: "skipped-missing-env".
+// npm packages confirmed to exist on the registry at time of writing.
+// Some servers (git, fetch, time, sqlite) are Python-only on PyPI and
+// aren't on npm — they need `uvx` to run and are out of scope here.
 const SERVERS: ServerEntry[] = [
   {
     id: "filesystem",
@@ -50,29 +53,7 @@ const SERVERS: ServerEntry[] = [
       command: "npx",
       args: ["-y", "@modelcontextprotocol/server-filesystem", tmpdir()],
     },
-    notes: "Reference implementation — read/write files under a sandbox root",
-  },
-  {
-    id: "git",
-    name: "Git",
-    package: "@modelcontextprotocol/server-git",
-    target: {
-      type: "stdio",
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-git", "--repository", process.cwd()],
-    },
-    notes: "Reference implementation — git operations on a local repo",
-  },
-  {
-    id: "fetch",
-    name: "Fetch",
-    package: "@modelcontextprotocol/server-fetch",
-    target: {
-      type: "stdio",
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-fetch"],
-    },
-    notes: "Reference implementation — HTTP fetches with content extraction",
+    notes: "Reference — read/write files under a sandbox root",
   },
   {
     id: "memory",
@@ -83,7 +64,7 @@ const SERVERS: ServerEntry[] = [
       command: "npx",
       args: ["-y", "@modelcontextprotocol/server-memory"],
     },
-    notes: "Reference implementation — knowledge-graph-style memory",
+    notes: "Reference — knowledge-graph-style memory",
   },
   {
     id: "sequentialthinking",
@@ -94,18 +75,30 @@ const SERVERS: ServerEntry[] = [
       command: "npx",
       args: ["-y", "@modelcontextprotocol/server-sequential-thinking"],
     },
-    notes: "Reference implementation — structured reasoning steps",
+    notes: "Reference — structured reasoning steps",
   },
   {
-    id: "time",
-    name: "Time",
-    package: "@modelcontextprotocol/server-time",
+    id: "puppeteer",
+    name: "Puppeteer",
+    package: "@modelcontextprotocol/server-puppeteer",
     target: {
       type: "stdio",
       command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-time"],
+      args: ["-y", "@modelcontextprotocol/server-puppeteer"],
     },
-    notes: "Reference implementation — time/zone conversions",
+    timeoutMs: 60_000,
+    notes: "Reference — browser automation (slow boot: downloads chrome)",
+  },
+  {
+    id: "everything",
+    name: "Everything",
+    package: "@modelcontextprotocol/server-everything",
+    target: {
+      type: "stdio",
+      command: "npx",
+      args: ["-y", "@modelcontextprotocol/server-everything"],
+    },
+    notes: "Reference — demo server exercising all capabilities",
   },
   {
     id: "github",
@@ -120,7 +113,7 @@ const SERVERS: ServerEntry[] = [
         : undefined,
     },
     requires: ["GITHUB_PERSONAL_ACCESS_TOKEN"],
-    notes: "GitHub repo/issue/PR operations (needs a PAT)",
+    notes: "GitHub repo/issue/PR ops (needs PAT)",
   },
   {
     id: "slack",
@@ -130,38 +123,13 @@ const SERVERS: ServerEntry[] = [
       type: "stdio",
       command: "npx",
       args: ["-y", "@modelcontextprotocol/server-slack"],
-      env: process.env.SLACK_BOT_TOKEN
-        ? {
-            SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN,
-            SLACK_TEAM_ID: process.env.SLACK_TEAM_ID ?? "",
-          }
-        : undefined,
+      env:
+        process.env.SLACK_BOT_TOKEN && process.env.SLACK_TEAM_ID
+          ? { SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN, SLACK_TEAM_ID: process.env.SLACK_TEAM_ID }
+          : undefined,
     },
     requires: ["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"],
-    notes: "Slack channel/message ops (needs a bot token)",
-  },
-  {
-    id: "sqlite",
-    name: "SQLite",
-    package: "@modelcontextprotocol/server-sqlite",
-    target: {
-      type: "stdio",
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-sqlite", "--db-path", join(tmpdir(), "mcp-compliance-probe.sqlite")],
-    },
-    notes: "SQLite database query/mutate",
-  },
-  {
-    id: "puppeteer",
-    name: "Puppeteer",
-    package: "@modelcontextprotocol/server-puppeteer",
-    target: {
-      type: "stdio",
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-puppeteer"],
-    },
-    timeoutMs: 60_000,
-    notes: "Browser automation — slow boot (downloads chrome the first run)",
+    notes: "Slack channel/message ops (needs bot token)",
   },
 ];
 

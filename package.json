@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/mcp-compliance",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "CLI tool and MCP server that tests MCP servers for spec compliance",
   "license": "MIT",
   "author": "Yaw Labs <contact@yaw.sh> (https://yaw.sh)",
@@ -51,6 +51,7 @@
     "ajv": "^8.18.0",
     "ajv-formats": "^3.0.1",
     "tsup": "^8.4.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.8.3",
     "vitest": "^3.1.1"
   },

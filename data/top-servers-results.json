@@ -1,0 +1,93 @@
+[
+  {
+    "id": "filesystem",
+    "name": "Filesystem",
+    "package": "@modelcontextprotocol/server-filesystem",
+    "status": "ok",
+    "notes": "Reference — read/write files under a sandbox root",
+    "grade": "A",
+    "score": 99,
+    "passed": 44,
+    "failed": 1,
+    "total": 45,
+    "requiredPassed": 10,
+    "requiredTotal": 10,
+    "durationMs": 1053
+  },
+  {
+    "id": "memory",
+    "name": "Memory",
+    "package": "@modelcontextprotocol/server-memory",
+    "status": "ok",
+    "notes": "Reference — knowledge-graph-style memory",
+    "grade": "A",
+    "score": 100,
+    "passed": 45,
+    "failed": 0,
+    "total": 45,
+    "requiredPassed": 10,
+    "requiredTotal": 10,
+    "durationMs": 935
+  },
+  {
+    "id": "sequentialthinking",
+    "name": "Sequential Thinking",
+    "package": "@modelcontextprotocol/server-sequential-thinking",
+    "status": "ok",
+    "notes": "Reference — structured reasoning steps",
+    "grade": "A",
+    "score": 100,
+    "passed": 45,
+    "failed": 0,
+    "total": 45,
+    "requiredPassed": 10,
+    "requiredTotal": 10,
+    "durationMs": 1094
+  },
+  {
+    "id": "puppeteer",
+    "name": "Puppeteer",
+    "package": "@modelcontextprotocol/server-puppeteer",
+    "status": "ok",
+    "notes": "Reference — browser automation (slow boot: downloads chrome)",
+    "grade": "A",
+    "score": 99,
+    "passed": 49,
+    "failed": 1,
+    "total": 50,
+    "requiredPassed": 12,
+    "requiredTotal": 12,
+    "durationMs": 24646
+  },
+  {
+    "id": "everything",
+    "name": "Everything",
+    "package": "@modelcontextprotocol/server-everything",
+    "status": "ok",
+    "notes": "Reference — demo server exercising all capabilities",
+    "grade": "A",
+    "score": 98,
+    "passed": 53,
+    "failed": 2,
+    "total": 55,
+    "requiredPassed": 17,
+    "requiredTotal": 17,
+    "durationMs": 3331
+  },
+  {
+    "id": "github",
+    "name": "GitHub",
+    "package": "@modelcontextprotocol/server-github",
+    "status": "skipped-missing-env",
+    "notes": "GitHub repo/issue/PR ops (needs PAT)",
+    "error": "Missing env: GITHUB_PERSONAL_ACCESS_TOKEN"
+  },
+  {
+    "id": "slack",
+    "name": "Slack",
+    "package": "@modelcontextprotocol/server-slack",
+    "status": "skipped-missing-env",
+    "notes": "Slack channel/message ops (needs bot token)",
+    "error": "Missing env: SLACK_BOT_TOKEN, SLACK_TEAM_ID"
+  }
+]

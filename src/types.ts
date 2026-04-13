@@ -81,6 +81,18 @@ export interface TestDefinition {
   recommendation: string;
   /** Transports this test applies to. Omit = all transports. */
   transports?: ("http" | "stdio")[];
+  /**
+   * Declares this test safe to run concurrently with other parallel-safe
+   * tests. Default = false (serialized with other tests in the runner
+   * loop). Tests are parallel-safe when they:
+   *   - don't mutate shared closure state (sessionId, cachedToolsList, …)
+   *   - don't depend on the result of another concurrently-running test
+   *   - tolerate the server seeing >1 in-flight request at a time
+   *
+   * Setup tests (init, notifications/initialized) and tests that
+   * populate caches (tools/list, resources/list) must stay `false`.
+   */
+  parallelSafe?: boolean;
 }
 
 /** Describes the server under test. URL string = HTTP for backwards compat. */
@@ -350,6 +362,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Tests that the server responds to the ping method with an empty result object. This is a required utility method.",
     recommendation:
       'Implement a "ping" method handler that returns an empty result object {}. This is required by the MCP spec for keepalive and connectivity checking.',
+    parallelSafe: true,
   },
   {
     id: "lifecycle-instructions",
@@ -361,6 +374,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "If the server includes an instructions field in the initialize response, validates it is a string. Instructions provide guidance for how the client should interact with the server.",
     recommendation:
       "If you include an instructions field in the initialize response, ensure it is a string. Remove the field or fix the type if it is not a string.",
+    parallelSafe: true,
   },
   {
     id: "lifecycle-id-match",
@@ -485,6 +499,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "If the server's initialize response or serverInfo implies it uses client-side sampling (sampling/createMessage), verify the capability declaration shape. Currently this is an advisory shape check — actually exercising the server→client flow requires a client-side sampling handler and is out of scope.",
     recommendation:
       "Sampling is a client capability (the client provides LLM access to the server). Servers don't declare sampling in their own capabilities; they just call sampling/createMessage against clients that advertise it. No server-side action required.",
+    parallelSafe: true,
   },
   {
     id: "lifecycle-roots-capability",
@@ -496,6 +511,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Roots (filesystem root paths) is a client capability. This test verifies that if a server sends roots/list requests, it handles gracefully when the client doesn't declare the roots capability (i.e., doesn't crash).",
     recommendation:
       "Before calling roots/list, check if the initialized client capabilities include 'roots'. If not, skip the call — the client can't respond. Never assume roots is available; it's opt-in on the client side.",
+    parallelSafe: true,
   },
   {
     id: "lifecycle-elicitation-capability",
@@ -507,6 +523,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Elicitation (asking the user for structured input mid-operation) is a client capability added in 2025-11-25. This test verifies servers that use elicitation/create handle the case where clients don't support it.",
     recommendation:
       "Before calling elicitation/create, check the initialized client capabilities. If elicitation is absent, fall back to a safer default (ask once up-front via tool parameters, or fail cleanly with a clear error).",
+    parallelSafe: true,
   },
   {
     id: "lifecycle-meta-tolerance",
@@ -518,6 +535,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Sends a ping with params._meta = { extra: 'value' } and verifies the server doesn't error. The 2025-11-25 spec allows arbitrary _meta on any request; servers should ignore unknown _meta fields gracefully.",
     recommendation:
       "Treat the _meta field as opaque — pass it through your request validator, but do not reject requests for unknown _meta keys. The MCP spec reserves _meta for protocol/transport metadata and forward-compat extensibility.",
+    parallelSafe: true,
   },
 
   // ── Tools (4 tests) ──────────────────────────────────────────────
