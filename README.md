@@ -540,8 +540,10 @@ Consumer guidance:
 
 The compliance testing methodology is published as an open specification:
 
-- **[MCP Compliance Testing Specification](./MCP_COMPLIANCE_SPEC.md)** — test execution model, scoring algorithm, all 84 test rules with pass/fail criteria (CC BY 4.0)
+- **[MCP Compliance Testing Specification](./MCP_COMPLIANCE_SPEC.md)** — test execution model, scoring algorithm, all 85 test rules with pass/fail criteria (CC BY 4.0)
 - **[Machine-readable rule catalog](./mcp-compliance-rules.json)** — JSON Schema-compliant catalog for programmatic consumption
+- **[Spec version migration policy](./docs/SPEC_VERSION_MIGRATION.md)** — how this tool evolves with MCP spec releases
+- **[mcp.hosting external API](./docs/EXT_API.md)** — public submit/retrieve/badge/delete endpoints used by `mcp-compliance badge` and any custom integrations
 
 These are complementary to (not competing with) the [official MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). The MCP spec defines what servers must do; this spec defines how to verify compliance.
 
