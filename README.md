@@ -544,6 +544,7 @@ The compliance testing methodology is published as an open specification:
 - **[Machine-readable rule catalog](./mcp-compliance-rules.json)** — JSON Schema-compliant catalog for programmatic consumption
 - **[Spec version migration policy](./docs/SPEC_VERSION_MIGRATION.md)** — how this tool evolves with MCP spec releases
 - **[mcp.hosting external API](./docs/EXT_API.md)** — public submit/retrieve/badge/delete endpoints used by `mcp-compliance badge` and any custom integrations
+- **[mcp.hosting integration spec](./docs/mcp-hosting-integration.md)** — the contract between this engine and the mcp.hosting platform: URL surfaces, data flow, storage model, badge API, leaderboard, router integration
 
 These are complementary to (not competing with) the [official MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). The MCP spec defines what servers must do; this spec defines how to verify compliance.
 
