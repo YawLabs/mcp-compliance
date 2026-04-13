@@ -1,12 +1,16 @@
+import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline/promises";
 import chalk from "chalk";
 import { Command, Option } from "commander";
+import { renderBadgeSvg } from "./badge-svg.js";
+import { type ComplianceConfig, loadConfig } from "./config.js";
 import { startServer } from "./mcp/server.js";
 import { publishReport, unpublishReport } from "./publish.js";
 import { formatJson, formatSarif, formatTerminal } from "./reporter.js";
 import { runComplianceSuite } from "./runner.js";
 import { getTokenForUrl, deleteToken as removeStoredToken, saveToken } from "./token-store.js";
+import type { TransportTarget } from "./types.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json");
@@ -35,6 +39,103 @@ function parseList(value: string): string[] {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function parseEnvVar(value: string, prev: Record<string, string>): Record<string, string> {
+  const idx = value.indexOf("=");
+  if (idx === -1) throw new Error(`Invalid env var: "${value}" (expected "KEY=VALUE")`);
+  const key = value.slice(0, idx);
+  const val = value.slice(idx + 1);
+  if (!key) throw new Error(`Invalid env var: "${value}" (empty key)`);
+  prev[key] = val;
+  return prev;
+}
+
+function readEnvFile(path: string): Record<string, string> {
+  const contents = readFileSync(path, "utf8");
+  const out: Record<string, string> = {};
+  for (const line of contents.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const idx = trimmed.indexOf("=");
+    if (idx === -1) continue;
+    const key = trimmed.slice(0, idx).trim();
+    let val = trimmed.slice(idx + 1).trim();
+    // Strip surrounding quotes, single or double
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    if (key) out[key] = val;
+  }
+  return out;
+}
+
+function looksLikeUrl(s: string): boolean {
+  return /^https?:\/\//i.test(s);
+}
+
+/**
+ * Build a TransportTarget from a positional argument and optional
+ * trailing args. URLs dispatch to HTTP; anything else is treated as a
+ * stdio command. Extra args become the command's argv.
+ */
+function buildTarget(
+  positional: string,
+  extraArgs: string[],
+  opts: {
+    header?: Record<string, string>;
+    auth?: string;
+    env?: Record<string, string>;
+    envFile?: string;
+    cwd?: string;
+    verbose?: boolean;
+  },
+): TransportTarget {
+  if (looksLikeUrl(positional)) {
+    const headers = { ...(opts.header ?? {}) };
+    if (opts.auth) headers.Authorization = opts.auth;
+    return { type: "http", url: positional, headers };
+  }
+  const env: Record<string, string> = {
+    ...(opts.envFile ? readEnvFile(opts.envFile) : {}),
+    ...(opts.env ?? {}),
+  };
+  return {
+    type: "stdio",
+    command: positional,
+    args: extraArgs,
+    env: Object.keys(env).length ? env : undefined,
+    cwd: opts.cwd,
+    verbose: opts.verbose,
+  };
+}
+
+function describeTarget(t: TransportTarget): string {
+  if (t.type === "http") return t.url;
+  return `stdio:${t.command}${t.args?.length ? ` ${t.args.join(" ")}` : ""}`;
+}
+
+/**
+ * Resolve the target: CLI positional wins, then config file, then error.
+ * Loads the config only if needed (so the error message can point users
+ * at both options).
+ */
+function resolveTarget(
+  cliTarget: string | undefined,
+  cliExtraArgs: string[],
+  cliOpts: {
+    header?: Record<string, string>;
+    auth?: string;
+    env?: Record<string, string>;
+    envFile?: string;
+    cwd?: string;
+    verbose?: boolean;
+  },
+  config: ComplianceConfig | null,
+): TransportTarget {
+  if (cliTarget) return buildTarget(cliTarget, cliExtraArgs, cliOpts);
+  if (config?.target) return config.target;
+  throw new Error("No target specified. Pass a URL or command, or add 'target' to mcp-compliance.config.json.");
 }
 
 function isPrivateHost(urlStr: string): boolean {
@@ -75,14 +176,28 @@ program.name("mcp-compliance").description("Test MCP servers for spec compliance
 
 program
   .command("test")
-  .description("Run the full compliance test suite against an MCP server")
-  .argument("<url>", "MCP server URL to test")
+  .description("Run the full compliance test suite against an MCP server (URL or stdio command)")
+  .argument(
+    "[target]",
+    "Server URL, or command to spawn as a stdio server (optional when a config file defines 'target')",
+  )
+  .argument("[extraArgs...]", "Additional args passed to the stdio command")
   .addOption(
     new Option("--format <format>", "Output format").choices(["terminal", "json", "sarif"]).default("terminal"),
   )
+  .option("--config <path>", "Load options from a config file (default: mcp-compliance.config.json in cwd)")
+  .option("--output <file>", "Write a local SVG badge to the given path after the run (works with any transport)")
   .option("--strict", "Exit with code 1 on any required test failure (for CI)")
-  .option("-H, --header <header>", 'Add header to all requests (format: "Key: Value", repeatable)', parseHeaderArg, {})
-  .option("--auth <token>", 'Shorthand for -H "Authorization: <token>"')
+  .option(
+    "-H, --header <header>",
+    'Add header to all requests (format: "Key: Value", repeatable; HTTP only)',
+    parseHeaderArg,
+    {},
+  )
+  .option("--auth <token>", 'Shorthand for -H "Authorization: <token>" (HTTP only)')
+  .option("-E, --env <var>", 'Set env var for stdio command ("KEY=VALUE", repeatable)', parseEnvVar, {})
+  .option("--env-file <path>", "Load env vars from file (KEY=VALUE per line, stdio only)")
+  .option("--cwd <dir>", "Working directory for stdio command")
   .option("--timeout <ms>", "Request timeout in milliseconds", "15000")
   .option("--preflight-timeout <ms>", "Preflight connectivity check timeout in milliseconds")
   .option("--retries <n>", "Number of retries for failed tests", "0")
@@ -96,15 +211,21 @@ program
     'Skip matching categories or test IDs, comma-separated (e.g., "schema" or "tools-pagination")',
     parseList,
   )
-  .option("--verbose", "Print each test result as it runs")
+  .option("--verbose", "Print each test result as it runs (also forwards stdio stderr)")
   .action(
     async (
-      url: string,
+      target: string | undefined,
+      extraArgs: string[],
       opts: {
+        config?: string;
+        output?: string;
         format: string;
         strict?: boolean;
         header: Record<string, string>;
         auth?: string;
+        env: Record<string, string>;
+        envFile?: string;
+        cwd?: string;
         timeout: string;
         preflightTimeout?: string;
         retries: string;
@@ -114,23 +235,39 @@ program
       },
     ) => {
       try {
-        const headers = { ...opts.header };
-        if (opts.auth) headers.Authorization = opts.auth;
+        const config = loadConfig(opts.config);
+
+        const transportTarget = resolveTarget(
+          target,
+          extraArgs,
+          {
+            header: opts.header,
+            auth: opts.auth,
+            env: opts.env,
+            envFile: opts.envFile,
+            cwd: opts.cwd,
+            verbose: opts.verbose,
+          },
+          config,
+        );
 
         if (opts.format === "terminal") {
-          console.log(chalk.dim(`\nTesting ${url}...\n`));
+          console.log(chalk.dim(`\nTesting ${describeTarget(transportTarget)}...\n`));
         }
 
-        const report = await runComplianceSuite(url, {
-          headers,
+        const only = opts.only ?? config?.only;
+        const skip = opts.skip ?? config?.skip;
+        const verbose = opts.verbose ?? config?.verbose;
+
+        const report = await runComplianceSuite(transportTarget, {
           timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
           preflightTimeout: opts.preflightTimeout
             ? parsePositiveInt(opts.preflightTimeout, "--preflight-timeout", 1)
-            : undefined,
+            : config?.preflightTimeout,
           retries: parsePositiveInt(opts.retries, "--retries"),
-          only: opts.only,
-          skip: opts.skip,
-          onProgress: opts.verbose
+          only,
+          skip,
+          onProgress: verbose
             ? (testId, passed, details) => {
                 const icon = passed ? chalk.green("PASS") : chalk.red("FAIL");
                 console.log(`  ${icon} ${testId} — ${details}`);
@@ -138,7 +275,7 @@ program
             : undefined,
         });
 
-        if (opts.verbose && opts.format === "terminal") {
+        if (verbose && opts.format === "terminal") {
           console.log(""); // blank line after verbose output
         }
 
@@ -150,7 +287,16 @@ program
           console.log(formatTerminal(report));
         }
 
-        if (opts.strict && report.overall === "fail") {
+        if (opts.output) {
+          const svg = renderBadgeSvg({ grade: report.grade, score: report.score, timestamp: report.timestamp });
+          writeFileSync(opts.output, svg, "utf8");
+          if (opts.format === "terminal") {
+            console.log(chalk.dim(`\nBadge SVG written to ${opts.output}`));
+          }
+        }
+
+        const strict = opts.strict ?? config?.strict;
+        if (strict && report.overall === "fail") {
           process.exit(1);
         }
       } catch (err: unknown) {
@@ -167,30 +313,64 @@ program
 
 program
   .command("badge")
-  .description("Run tests and publish a shareable compliance badge to mcp.hosting")
-  .argument("<url>", "MCP server URL to test")
-  .option("-H, --header <header>", 'Add header to all requests (format: "Key: Value", repeatable)', parseHeaderArg, {})
-  .option("--auth <token>", 'Shorthand for -H "Authorization: <token>"')
+  .description("Run tests and publish a shareable compliance badge to mcp.hosting (HTTP targets only)")
+  .argument(
+    "[target]",
+    "Server URL, or command to spawn as a stdio server (optional when a config file defines 'target')",
+  )
+  .argument("[extraArgs...]", "Additional args passed to the stdio command")
+  .option("--config <path>", "Load options from a config file")
+  .option(
+    "-H, --header <header>",
+    'Add header to all requests (format: "Key: Value", repeatable; HTTP only)',
+    parseHeaderArg,
+    {},
+  )
+  .option("--auth <token>", 'Shorthand for -H "Authorization: <token>" (HTTP only)')
+  .option("-E, --env <var>", 'Set env var for stdio command ("KEY=VALUE", repeatable)', parseEnvVar, {})
+  .option("--env-file <path>", "Load env vars from file (stdio only)")
+  .option("--cwd <dir>", "Working directory for stdio command")
   .option("--timeout <ms>", "Request timeout in milliseconds", "15000")
   .option("--no-publish", "Do not publish the report to mcp.hosting")
+  .option("--output <file>", "Write a local SVG badge to the given path (works for any transport)")
   .action(
     async (
-      url: string,
+      target: string | undefined,
+      extraArgs: string[],
       opts: {
+        config?: string;
         header: Record<string, string>;
         auth?: string;
+        env: Record<string, string>;
+        envFile?: string;
+        cwd?: string;
         timeout: string;
         publish: boolean;
+        output?: string;
       },
     ) => {
       try {
-        const headers = { ...opts.header };
-        if (opts.auth) headers.Authorization = opts.auth;
+        const config = loadConfig(opts.config);
+        const transportTarget = resolveTarget(
+          target,
+          extraArgs,
+          {
+            header: opts.header,
+            auth: opts.auth,
+            env: opts.env,
+            envFile: opts.envFile,
+            cwd: opts.cwd,
+          },
+          config,
+        );
 
-        if (opts.publish && isPrivateHost(url)) {
+        // Stdio targets cannot be published — no public URL to key on.
+        const shouldPublish = opts.publish && transportTarget.type === "http";
+
+        if (shouldPublish && transportTarget.type === "http" && isPrivateHost(transportTarget.url)) {
           console.error(
             chalk.yellow(
-              `\nWarning: ${url} looks like a private/internal address. Publishing will send the report (with the URL) to mcp.hosting.`,
+              `\nWarning: ${transportTarget.url} looks like a private/internal address. Publishing will send the report (with the URL) to mcp.hosting.`,
             ),
           );
           const ok = await promptYesNo(chalk.yellow("Publish anyway?"));
@@ -200,28 +380,27 @@ program
           }
         }
 
-        console.log(chalk.dim(`\nTesting ${url}...\n`));
+        console.log(chalk.dim(`\nTesting ${describeTarget(transportTarget)}...\n`));
 
-        const report = await runComplianceSuite(url, {
-          headers,
+        const report = await runComplianceSuite(transportTarget, {
           timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
         });
 
         let markdown = report.badge.markdown;
 
-        if (opts.publish) {
+        if (shouldPublish && transportTarget.type === "http") {
           try {
             const res = await publishReport(report);
             saveToken(res.hash, {
               deleteToken: res.deleteToken,
-              url,
+              url: transportTarget.url,
               publishedAt: new Date().toISOString(),
             });
             markdown = `[![MCP Compliant](${res.badgeUrl})](${res.reportUrl})`;
             console.log(`Grade: ${report.grade} (${report.score}%)\n`);
             console.log(markdown);
             console.log(chalk.dim(`\nReport published: ${res.reportUrl}`));
-            console.log(chalk.dim(`Remove with: mcp-compliance unpublish ${url}\n`));
+            console.log(chalk.dim(`Remove with: mcp-compliance unpublish ${transportTarget.url}\n`));
           } catch (err: unknown) {
             const message = err instanceof Error ? err.message : String(err);
             console.error(chalk.yellow(`\nWarning: publish failed — ${message}`));
@@ -232,8 +411,24 @@ program
           }
         } else {
           console.log(`Grade: ${report.grade} (${report.score}%)\n`);
-          console.log(markdown);
+          if (transportTarget.type === "stdio") {
+            if (!opts.output) {
+              console.log(
+                chalk.dim(
+                  "Stdio servers cannot be published. Pass --output <file.svg> to write a local badge image for your README.",
+                ),
+              );
+            }
+          } else {
+            console.log(markdown);
+          }
           console.log("");
+        }
+
+        if (opts.output) {
+          const svg = renderBadgeSvg({ grade: report.grade, score: report.score, timestamp: report.timestamp });
+          writeFileSync(opts.output, svg, "utf8");
+          console.log(chalk.dim(`Badge SVG written to ${opts.output}\n`));
         }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);

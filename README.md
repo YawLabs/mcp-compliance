@@ -5,7 +5,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/YawLabs/mcp-compliance)](https://github.com/YawLabs/mcp-compliance/stargazers)
 [![CI](https://github.com/YawLabs/mcp-compliance/actions/workflows/ci.yml/badge.svg)](https://github.com/YawLabs/mcp-compliance/actions/workflows/ci.yml)
 
-**Test any MCP server for spec compliance.** 81-test suite covering transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). CLI, MCP server, and programmatic API.
+**Test any MCP server for spec compliance.** 84-test suite covering transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security against the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). Works against **HTTP endpoints** (`https://my-server.com/mcp`) and **stdio servers** (`npx @modelcontextprotocol/server-filesystem /tmp`) alike. CLI, MCP server, and programmatic API.
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
@@ -15,7 +15,7 @@ MCP servers are multiplying fast — but most ship without compliance testing. B
 
 This tool solves that:
 
-- **81 tests across 8 categories** — transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security. No gaps.
+- **84 tests across 8 categories** — transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security. No gaps.
 - **Capability-driven** — tests adapt to what the server declares. If it says it supports tools, tool tests become required. No false failures for features the server doesn't claim.
 - **Graded scoring** — A-F letter grade with a weighted score (required tests 70%, optional 30%). One number to communicate compliance.
 - **CI-ready** — `--strict` mode exits with code 1 on required test failures. Drop it into any pipeline.
@@ -25,13 +25,26 @@ This tool solves that:
 
 ## Quick start
 
-**Run against any MCP server:**
+**Remote HTTP server:**
 
 ```bash
 npx @yawlabs/mcp-compliance test https://my-server.com/mcp
 ```
 
-**Or install globally:**
+**Local stdio server** (the vast majority of MCP servers on npm):
+
+```bash
+# Pass the command directly, Inspector-style
+npx @yawlabs/mcp-compliance test npx @modelcontextprotocol/server-filesystem /tmp
+
+# Or a local build
+npx @yawlabs/mcp-compliance test node ./dist/server.js
+
+# With env vars
+npx @yawlabs/mcp-compliance test -E GITHUB_TOKEN=$GITHUB_TOKEN -- npx @modelcontextprotocol/server-github
+```
+
+**Install globally:**
 
 ```bash
 npm install -g @yawlabs/mcp-compliance
@@ -42,57 +55,110 @@ That's it. You'll get a colored terminal report with a letter grade (A-F), per-t
 
 ## CLI usage
 
+### HTTP targets
+
 ```bash
 # Terminal output with colors and grade
 mcp-compliance test https://my-server.com/mcp
 
-# JSON output (for scripting)
+# JSON / SARIF for scripting + GitHub Code Scanning
 mcp-compliance test https://my-server.com/mcp --format json
-
-# SARIF output (for GitHub Code Scanning)
 mcp-compliance test https://my-server.com/mcp --format sarif > compliance.sarif
 
-# Strict mode — exits with code 1 on required test failure (for CI)
+# Strict mode for CI — exits 1 on required-test failure
 mcp-compliance test https://my-server.com/mcp --strict
 
-# With authentication
+# Auth (shorthand or full header)
 mcp-compliance test https://my-server.com/mcp --auth "Bearer tok123"
+mcp-compliance test https://my-server.com/mcp -H "X-Api-Key: abc"
 
-# Custom headers (repeatable)
-mcp-compliance test https://my-server.com/mcp -H "Authorization: Bearer tok123" -H "X-Api-Key: abc"
-
-# Custom timeout (default: 15000ms)
-mcp-compliance test https://my-server.com/mcp --timeout 30000
-
-# Retry failed tests
-mcp-compliance test https://my-server.com/mcp --retries 2
-
-# Only run specific categories or test IDs
+# Focus the run
 mcp-compliance test https://my-server.com/mcp --only transport,lifecycle
-mcp-compliance test https://my-server.com/mcp --only lifecycle-init,tools-list
-
-# Skip specific categories or test IDs
 mcp-compliance test https://my-server.com/mcp --skip prompts,resources
-
-# Verbose mode — print each test result as it runs
 mcp-compliance test https://my-server.com/mcp --verbose
 ```
 
+### stdio targets
+
+Pass the command and its args as positional arguments (MCP Inspector-style). Use `--` to disambiguate when the target needs flags that collide with ours.
+
+```bash
+# npm-distributed stdio servers
+mcp-compliance test npx -y @modelcontextprotocol/server-filesystem /tmp
+mcp-compliance test uvx mcp-server-git
+
+# Local build
+mcp-compliance test node ./dist/server.js
+
+# With env vars (repeatable -E, or --env-file)
+mcp-compliance test -E API_KEY=secret -E REGION=us-east-1 -- npx my-server
+mcp-compliance test --env-file .env -- node ./server.js
+
+# Set working directory
+mcp-compliance test --cwd ./services/mcp -- node ./dist/server.js
+
+# Target uses a flag that collides with ours — use `--` to separate
+mcp-compliance test --verbose -- node ./server.js --verbose
+```
+
+On Windows, `npx` and other `.cmd` shims are handled automatically by spawning through the shell.
+
 ### Options
 
-| Option | Description |
-|--------|-------------|
-| `--format <format>` | Output format: `terminal`, `json`, or `sarif` (default: `terminal`) |
-| `--strict` | Exit with code 1 on any required test failure (for CI) |
-| `-H, --header <header>` | Add header to all requests, format `"Key: Value"` (repeatable) |
-| `--auth <token>` | Shorthand for `-H "Authorization: <token>"` |
-| `--timeout <ms>` | Request timeout in milliseconds (default: `15000`) |
-| `--retries <n>` | Number of retries for failed tests (default: `0`) |
-| `--only <items>` | Only run tests matching these categories or test IDs (comma-separated) |
-| `--skip <items>` | Skip tests matching these categories or test IDs (comma-separated) |
-| `--verbose` | Print each test result as it runs |
+| Option | Applies to | Description |
+|--------|-----------|-------------|
+| `--format <format>` | both | Output format: `terminal`, `json`, or `sarif` (default: `terminal`) |
+| `--config <path>` | both | Load defaults from a config file (default: `mcp-compliance.config.json` in cwd) |
+| `--output <file>` | both | Write a local SVG badge to the given path after the run |
+| `--strict` | both | Exit with code 1 on any required test failure (for CI) |
+| `-H, --header <h>` | HTTP | Add header to all requests, format `"Key: Value"` (repeatable) |
+| `--auth <token>` | HTTP | Shorthand for `-H "Authorization: <token>"` |
+| `-E, --env <var>` | stdio | Set env var for stdio command, format `"KEY=VALUE"` (repeatable) |
+| `--env-file <path>` | stdio | Load env vars from a file (one `KEY=VALUE` per line) |
+| `--cwd <dir>` | stdio | Working directory for the stdio command |
+| `--timeout <ms>` | both | Request timeout in milliseconds (default: `15000`) |
+| `--preflight-timeout <ms>` | both | Preflight connectivity check timeout |
+| `--retries <n>` | both | Number of retries for failed tests (default: `0`) |
+| `--only <items>` | both | Only run tests matching these categories or test IDs (comma-separated) |
+| `--skip <items>` | both | Skip tests matching these categories or test IDs (comma-separated) |
+| `--verbose` | both | Print each test result as it runs (also forwards stdio stderr) |
 
-### Publish a shareable badge
+### Config file
+
+Check in a `mcp-compliance.config.json` so CI and your dev loop can run `mcp-compliance test` with no arguments. Supported locations (searched in order): `mcp-compliance.config.json`, `.mcp-compliancerc.json`, `.mcp-compliancerc`, and the `"mcp-compliance"` field of `package.json`. Pass `--config <path>` to load an explicit file.
+
+**HTTP:**
+
+```json
+{
+  "target": {
+    "type": "http",
+    "url": "https://my-server.com/mcp",
+    "headers": { "Authorization": "Bearer tok123" }
+  },
+  "timeout": 20000,
+  "strict": true
+}
+```
+
+**stdio:**
+
+```json
+{
+  "target": {
+    "type": "stdio",
+    "command": "node",
+    "args": ["./dist/server.js"],
+    "env": { "LOG_LEVEL": "error" }
+  },
+  "skip": ["security"],
+  "strict": true
+}
+```
+
+Precedence: CLI flags > config file > defaults. Any field can be overridden on the command line.
+
+### Publish a shareable badge (HTTP only)
 
 ```bash
 mcp-compliance badge https://my-server.com/mcp
@@ -106,6 +172,7 @@ Runs the compliance suite, publishes the report to [mcp.hosting](https://mcp.hos
 | `--auth <token>` | Shorthand for `-H "Authorization: <token>"` |
 | `--timeout <ms>` | Request timeout in milliseconds (default: `15000`) |
 | `--no-publish` | Skip publishing; print a local badge markdown only |
+| `--output <file>` | Also write a local SVG badge to the given path |
 
 Reports are kept for 90 days from last submission; resubmitting the same URL overwrites the previous report. Auth headers are stripped client-side before upload. Private/loopback URLs (`localhost`, `127.0.0.1`, `192.168.*`, etc.) trigger an interactive confirmation before publishing, and are rejected by the server in any case.
 
@@ -115,9 +182,24 @@ A delete token is returned at publish time and stored at `~/.mcp-compliance/toke
 mcp-compliance unpublish https://my-server.com/mcp
 ```
 
-The `test` command never publishes — use it for CI, debugging, and local iteration. `badge` is the only command that publishes.
+### Local SVG badge (any transport)
 
-## What the 81 tests check
+Stdio servers can't be published (no public URL to key on), but you can commit a local SVG reflecting the real grade:
+
+```bash
+mcp-compliance test node ./dist/server.js --output badge.svg
+mcp-compliance badge npx -y @modelcontextprotocol/server-filesystem /tmp --output badge.svg
+```
+
+Then embed it in your README:
+
+```markdown
+![MCP Compliance](./badge.svg)
+```
+
+The `test` command never publishes — use it for CI, debugging, and local iteration. `badge` is the only command that publishes to mcp.hosting.
+
+## What the 84 tests check
 
 <details>
 <summary><strong>Transport (13 tests)</strong></summary>
@@ -338,7 +420,7 @@ Restart your MCP client and approve the server when prompted.
 
 ### Tools
 
-- **mcp_compliance_test** — Run the full 81-test suite against a URL. Supports auth, custom headers, timeout, retries, and category/test filtering. Returns grade, score, and detailed results.
+- **mcp_compliance_test** — Run the full 84-test suite against a URL or stdio command. Supports auth, custom headers, env vars, timeout, retries, and category/test filtering. Returns grade, score, and detailed results.
 - **mcp_compliance_badge** — Get the badge markdown/HTML for a server. Supports auth and custom headers.
 - **mcp_compliance_explain** — Explain what a specific test ID checks and why it matters.
 
@@ -365,7 +447,7 @@ const report2 = await runComplianceSuite('https://my-server.com/mcp', {
 
 The compliance testing methodology is published as an open specification:
 
-- **[MCP Compliance Testing Specification](./MCP_COMPLIANCE_SPEC.md)** — test execution model, scoring algorithm, all 81 test rules with pass/fail criteria (CC BY 4.0)
+- **[MCP Compliance Testing Specification](./MCP_COMPLIANCE_SPEC.md)** — test execution model, scoring algorithm, all 84 test rules with pass/fail criteria (CC BY 4.0)
 - **[Machine-readable rule catalog](./mcp-compliance-rules.json)** — JSON Schema-compliant catalog for programmatic consumption
 
 These are complementary to (not competing with) the [official MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). The MCP spec defines what servers must do; this spec defines how to verify compliance.

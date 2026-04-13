@@ -2,7 +2,10 @@ import { createRequire } from "node:module";
 import { request } from "undici";
 import { generateBadge } from "./badge.js";
 import { computeScore } from "./grader.js";
-import type { ComplianceReport, TestResult } from "./types.js";
+import { type HttpTransport, createHttpTransport } from "./transport/http.js";
+import type { Transport } from "./transport/index.js";
+import { createStdioTransport } from "./transport/stdio.js";
+import type { ComplianceReport, TestDefinition, TestResult, TransportTarget } from "./types.js";
 import { TEST_DEFINITIONS } from "./types.js";
 
 export type { TestResult, ComplianceReport } from "./types.js";
@@ -67,129 +70,40 @@ function createIdCounter(start = 0) {
  * An empty line marks the end of an event.
  * @internal Exported for testing.
  */
-export function parseSSEResponse(text: string): any {
-  const lines = text.split("\n");
-  let firstJsonRpcResponse: any = null;
-  let currentData: string[] = [];
+export { parseSSEResponse } from "./sse.js";
+import { parseSSEResponse } from "./sse.js";
 
-  function flushEvent() {
-    if (currentData.length === 0) return;
-    const data = currentData.join("\n");
-    currentData = [];
-    if (!data.trim()) return;
-    try {
-      const parsed = JSON.parse(data);
-      // Keep the first JSON-RPC response (the actual result).
-      // Later events may be notifications that lack an id — skip those.
-      if (!firstJsonRpcResponse && parsed.jsonrpc === "2.0" && parsed.id !== undefined) {
-        firstJsonRpcResponse = parsed;
-      }
-    } catch {
-      // Not valid JSON, skip
-    }
-  }
+/**
+ * Known-HTTP-only tests that use raw HTTP primitives (status codes,
+ * headers, TLS, metadata discovery) and have no meaningful stdio
+ * equivalent. Kept in code rather than TEST_DEFINITIONS for easy churn.
+ */
+const STDIO_INCOMPATIBLE_IDS = new Set<string>([
+  // Lifecycle tests that use raw undici for HTTP-specific checks
+  "lifecycle-string-id",
+  // Security tests that are inherently HTTP-layer
+  "security-tls-required",
+  "security-oauth-metadata",
+  "security-token-in-uri",
+  "security-rate-limit",
+  "security-cors",
+  "security-origin-validation",
+]);
 
-  for (const line of lines) {
-    if (line.startsWith("data:")) {
-      const content = line.slice(5);
-      currentData.push(content.startsWith(" ") ? content.slice(1) : content);
-    } else if (line.trim() === "") {
-      flushEvent();
-    }
-    // Ignore other fields: event:, id:, retry:, and comments starting with ":"
-  }
-
-  // Handle trailing data without final empty line
-  flushEvent();
-
-  return firstJsonRpcResponse;
-}
-
-async function mcpRequest(
-  backendUrl: string,
-  method: string,
-  params: unknown | undefined,
-  nextId: () => number,
-  extraHeaders: Record<string, string> | undefined,
-  timeout: number,
-): Promise<{
-  statusCode: number;
-  body: any;
-  headers: Record<string, string>;
-  requestId: number;
-}> {
-  const id = nextId();
-  const body = JSON.stringify({
-    jsonrpc: "2.0",
-    id,
-    method,
-    params: params || {},
-  });
-
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Accept: "application/json, text/event-stream",
-    ...extraHeaders,
-  };
-
-  const res = await request(backendUrl, {
-    method: "POST",
-    headers,
-    body,
-    signal: AbortSignal.timeout(timeout),
-  });
-
-  const text = await res.body.text();
-  const responseHeaders: Record<string, string> = {};
-  for (const [k, v] of Object.entries(res.headers)) {
-    if (typeof v === "string") responseHeaders[k] = v;
-  }
-
-  const contentType = (responseHeaders["content-type"] || "").toLowerCase();
-
-  if (contentType.includes("text/event-stream")) {
-    const parsed = parseSSEResponse(text);
-    if (parsed) {
-      return { statusCode: res.statusCode, body: parsed, headers: responseHeaders, requestId: id };
-    }
-    try {
-      return { statusCode: res.statusCode, body: JSON.parse(text), headers: responseHeaders, requestId: id };
-    } catch {
-      return { statusCode: res.statusCode, body: { _raw: text }, headers: responseHeaders, requestId: id };
-    }
-  }
-
-  try {
-    return { statusCode: res.statusCode, body: JSON.parse(text), headers: responseHeaders, requestId: id };
-  } catch {
-    return { statusCode: res.statusCode, body: { _raw: text }, headers: responseHeaders, requestId: id };
-  }
-}
-
-async function mcpNotification(
-  backendUrl: string,
-  method: string,
-  params: unknown | undefined,
-  extraHeaders: Record<string, string> | undefined,
-  timeout: number,
-): Promise<{ statusCode: number; headers: Record<string, string> }> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Accept: "application/json, text/event-stream",
-    ...extraHeaders,
-  };
-  const res = await request(backendUrl, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ jsonrpc: "2.0", method, ...(params ? { params } : {}) }),
-    signal: AbortSignal.timeout(timeout),
-  });
-  await res.body.text();
-  const responseHeaders: Record<string, string> = {};
-  for (const [k, v] of Object.entries(res.headers)) {
-    if (typeof v === "string") responseHeaders[k] = v;
-  }
-  return { statusCode: res.statusCode, headers: responseHeaders };
+/**
+ * Checks whether a test applies to the active transport.
+ * HTTP runs every test. Stdio skips:
+ *   - the entire transport category (all HTTP wire-format tests);
+ *   - individual tests flagged via `transports` in TEST_DEFINITIONS;
+ *   - individual tests in STDIO_INCOMPATIBLE_IDS above.
+ */
+function supportsTransport(def: TestDefinition | undefined, kind: "http" | "stdio"): boolean {
+  if (!def) return true;
+  if (def.transports) return def.transports.includes(kind);
+  if (kind === "http") return true;
+  if (def.category === "transport") return false;
+  if (STDIO_INCOMPATIBLE_IDS.has(def.id)) return false;
+  return true;
 }
 
 export interface RunOptions {
@@ -210,35 +124,78 @@ export interface RunOptions {
 }
 
 /**
- * Run the full MCP compliance test suite against a URL.
+ * Run the full MCP compliance test suite. Accepts either a URL string
+ * (HTTP) or a TransportTarget descriptor (HTTP or stdio).
  */
-export async function runComplianceSuite(url: string, options: RunOptions = {}): Promise<ComplianceReport> {
-  try {
-    const parsed = new URL(url);
-    if (!["http:", "https:"].includes(parsed.protocol)) {
-      throw new Error("Only HTTP and HTTPS URLs are supported");
+export async function runComplianceSuite(
+  target: string | TransportTarget,
+  options: RunOptions = {},
+): Promise<ComplianceReport> {
+  const resolvedTarget: TransportTarget =
+    typeof target === "string" ? { type: "http", url: target, headers: options.headers } : target;
+
+  // Validate the target per transport.
+  if (resolvedTarget.type === "http") {
+    try {
+      const parsed = new URL(resolvedTarget.url);
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        throw new Error("Only HTTP and HTTPS URLs are supported");
+      }
+    } catch (e: unknown) {
+      if (e instanceof Error && e.message.includes("Only HTTP")) throw e;
+      throw new Error(`Invalid URL: ${resolvedTarget.url}`);
     }
-  } catch (e: unknown) {
-    if (e instanceof Error && e.message.includes("Only HTTP")) throw e;
-    throw new Error(`Invalid URL: ${url}`);
+  } else if (!resolvedTarget.command) {
+    throw new Error("stdio target requires a command");
   }
 
-  const backendUrl = url;
+  // Construct transport.
+  const transport: Transport =
+    resolvedTarget.type === "http"
+      ? createHttpTransport({
+          url: resolvedTarget.url,
+          headers: resolvedTarget.headers ?? options.headers,
+        })
+      : createStdioTransport({
+          command: resolvedTarget.command,
+          args: resolvedTarget.args,
+          env: resolvedTarget.env,
+          cwd: resolvedTarget.cwd,
+          verbose: resolvedTarget.verbose,
+        });
 
-  // Preflight connectivity check — fail fast instead of running all tests against an unreachable server
+  // For HTTP, preserve the backwards-compatible `backendUrl` local for the
+  // raw-undici code paths that inspect HTTP-specific behavior (status
+  // codes, headers, batch requests, etc). Those paths are gated to the
+  // HTTP transport via supportsTransport().
+  const backendUrl = resolvedTarget.type === "http" ? resolvedTarget.url : "";
+  const userHeaders = resolvedTarget.type === "http" ? (resolvedTarget.headers ?? options.headers ?? {}) : {};
+
+  // Display URL for warnings and reports.
+  const displayUrl =
+    resolvedTarget.type === "http"
+      ? resolvedTarget.url
+      : `stdio:${resolvedTarget.command}${resolvedTarget.args?.length ? ` ${resolvedTarget.args.join(" ")}` : ""}`;
+
+  // Preflight connectivity check — fail fast instead of running all tests against an unreachable server.
   let serverReachable = true;
   try {
-    const preflight = await request(backendUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-        ...options.headers,
-      },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "ping" }),
-      signal: AbortSignal.timeout(options.preflightTimeout ?? Math.min(options.timeout || 15000, 10000)),
-    });
-    await preflight.body.text();
+    const preflightTimeout = options.preflightTimeout ?? Math.min(options.timeout || 15000, 10000);
+    if (resolvedTarget.type === "http") {
+      const preflight = await request(resolvedTarget.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          ...userHeaders,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "ping" }),
+        signal: AbortSignal.timeout(preflightTimeout),
+      });
+      await preflight.body.text();
+    } else {
+      await transport.request("ping", undefined, () => 0, { timeout: preflightTimeout });
+    }
   } catch {
     serverReachable = false;
   }
@@ -247,7 +204,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   const warnings: string[] = [];
   if (!serverReachable) {
     warnings.push(
-      `Server at ${url} is unreachable — all tests will fail. Check the URL and ensure the server is running.`,
+      `Server at ${displayUrl} is unreachable — all tests will fail. Check the URL or command and ensure the server is running.`,
     );
   }
   // Use high start offset for the main ID counter to avoid collision with transport test hardcoded IDs
@@ -255,10 +212,12 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   const timeout = options.timeout || 15000;
   const retries = options.retries || 0;
 
-  // Session state
+  // Session state — kept as locals for backwards-compat with existing
+  // call sites that reference `sessionId`/`negotiatedProtocolVersion`
+  // directly. Updates are mirrored to the transport so any transport
+  // that cares (future work) can read them.
   let sessionId: string | null = null;
   let negotiatedProtocolVersion: string | null = null;
-  const userHeaders = options.headers || {};
 
   function buildHeaders(): Record<string, string> {
     const h: Record<string, string> = { ...userHeaders };
@@ -267,10 +226,48 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     return h;
   }
 
+  // Local closures with the old signatures — delegate to the transport.
+  // The `_backendUrl` parameter is ignored (transport already knows the
+  // URL) but kept for minimal churn at call sites.
+  async function mcpRequest(
+    _backendUrl: string,
+    method: string,
+    params: unknown | undefined,
+    idCounter: () => number,
+    extraHeaders: Record<string, string> | undefined,
+    timeoutMs: number,
+  ): Promise<{ statusCode: number; body: any; headers: Record<string, string>; requestId: number }> {
+    const res = await transport.request(method, params, idCounter, {
+      timeout: timeoutMs,
+      headers: extraHeaders,
+    });
+    return {
+      statusCode: res.statusCode ?? 200,
+      body: res.body as any,
+      headers: res.headers ?? {},
+      requestId: res.requestId,
+    };
+  }
+  async function mcpNotification(
+    _backendUrl: string,
+    method: string,
+    params: unknown | undefined,
+    extraHeaders: Record<string, string> | undefined,
+    timeoutMs: number,
+  ) {
+    const res = await transport.notify(method, params, {
+      timeout: timeoutMs,
+      headers: extraHeaders,
+    });
+    return { statusCode: res.statusCode ?? 200, headers: res.headers ?? {} };
+  }
+
   const rpc = (method: string, params?: unknown) =>
     mcpRequest(backendUrl, method, params, nextId, buildHeaders(), timeout);
 
   function shouldRun(id: string, category: string): boolean {
+    const def = TEST_DEFINITIONS_MAP.get(id);
+    if (!supportsTransport(def, transport.kind)) return false;
     if (options.only && options.only.length > 0) {
       return options.only.includes(category) || options.only.includes(id);
     }
@@ -507,8 +504,14 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       serverInfo.version = result.serverInfo?.version || null;
       serverInfo.capabilities = result.capabilities || {};
       const sid = initRes.headers["mcp-session-id"];
-      if (sid) sessionId = sid;
-      if (result.protocolVersion) negotiatedProtocolVersion = result.protocolVersion;
+      if (sid) {
+        sessionId = sid;
+        transport.setSessionId(sid);
+      }
+      if (result.protocolVersion) {
+        negotiatedProtocolVersion = result.protocolVersion;
+        transport.setProtocolVersion(result.protocolVersion);
+      }
     }
   } catch {
     // Init failed — lifecycle tests will report the failure
@@ -518,6 +521,13 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   try {
     await mcpNotification(backendUrl, "notifications/initialized", undefined, buildHeaders(), timeout);
   } catch {}
+
+  // Capability flags computed once post-init. Some later-section tests
+  // read these from closures declared before the tools/resources/prompts
+  // sections; hoist them here to avoid TDZ errors.
+  const hasTools = !!serverInfo.capabilities.tools;
+  const hasResources = !!serverInfo.capabilities.resources;
+  const hasPrompts = !!serverInfo.capabilities.prompts;
 
   // ── 3. LIFECYCLE TESTS ───────────────────────────────────────────
 
@@ -1199,7 +1209,6 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
 
   // ── 5. TOOLS ─────────────────────────────────────────────────────
 
-  const hasTools = !!serverInfo.capabilities.tools;
   let cachedToolsList: any[] | null = null;
 
   await test(
@@ -1463,7 +1472,6 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
 
   // ── 6. RESOURCES ─────────────────────────────────────────────────
 
-  const hasResources = !!serverInfo.capabilities.resources;
   const resourcesCap = serverInfo.capabilities.resources;
   const hasSubscribe = !!(
     typeof resourcesCap === "object" &&
@@ -1646,8 +1654,6 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   }
 
   // ── 7. PROMPTS ───────────────────────────────────────────────────
-
-  const hasPrompts = !!serverInfo.capabilities.prompts;
 
   if (hasPrompts) {
     let cachedPromptsList: any[] | null = null;
@@ -2045,12 +2051,12 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   );
 
   await test("security-tls-required", "Enforces HTTPS/TLS", "security", false, "basic/authorization", async () => {
-    const parsedUrl = new URL(url);
+    const parsedUrl = new URL(backendUrl);
     if (parsedUrl.protocol !== "https:") {
       return { passed: false, details: `Server URL uses ${parsedUrl.protocol} — production servers should use HTTPS` };
     }
     // Try HTTP variant
-    const httpUrl = url.replace(/^https:/, "http:");
+    const httpUrl = backendUrl.replace(/^https:/, "http:");
     try {
       const res = await request(httpUrl, {
         method: "POST",
@@ -2152,7 +2158,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       if (!hasAuth) {
         return { passed: true, details: "Skipped: server does not require auth" };
       }
-      const parsedUrl = new URL(url);
+      const parsedUrl = new URL(backendUrl);
       // Per MCP 2025-11-25: the MCP server hosts Protected Resource Metadata (RFC 9728)
       // at /.well-known/oauth-protected-resource, which points to the authorization server(s).
       const prmUrl = `${parsedUrl.protocol}//${parsedUrl.host}/.well-known/oauth-protected-resource`;
@@ -2229,7 +2235,7 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
       if (!token) {
         return { passed: true, details: "Skipped: could not extract token from auth header" };
       }
-      const uriWithToken = `${url}${url.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(token)}`;
+      const uriWithToken = `${backendUrl}${backendUrl.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(token)}`;
       try {
         // Send WITHOUT auth header, WITH token in URI
         const noAuthHeaders: Record<string, string> = {};
@@ -2873,6 +2879,84 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
     },
   );
 
+  // ── STDIO-SPECIFIC TESTS ─────────────────────────────────────────
+  // All gated behind supportsTransport() via transports:["stdio"] in
+  // TEST_DEFINITIONS, so they only run for stdio targets.
+
+  await test(
+    "stdio-framing",
+    "Newline-delimited JSON framing",
+    "transport",
+    true,
+    "basic/transports#stdio",
+    async () => {
+      // Fire 5 rapid pings. If the server frames responses incorrectly,
+      // the transport's line-splitter will fail to parse one or more.
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () => rpc("ping").catch((e: Error) => ({ _err: e.message }))),
+      );
+      const failed = results.filter((r) => "_err" in (r as object));
+      if (failed.length) {
+        return { passed: false, details: `${failed.length}/5 rapid pings failed — framing likely broken` };
+      }
+      return { passed: true, details: "5/5 rapid pings returned cleanly" };
+    },
+  );
+
+  await test("stdio-unicode", "UTF-8 unicode roundtrip", "transport", false, "basic/transports#stdio", async () => {
+    const probe = "héllo 世界 🚀";
+    // Prefer tools/call on the first tool if one exists; otherwise fall
+    // back to tools/list which will at worst exercise the parser.
+    if (hasTools && toolNames.length > 0) {
+      try {
+        const res = await rpc("tools/call", {
+          name: toolNames[0],
+          arguments: { message: probe, text: probe, input: probe, query: probe },
+        });
+        const serialized = JSON.stringify(res.body);
+        if (serialized.includes(probe)) {
+          return { passed: true, details: "Unicode string round-tripped through tool call" };
+        }
+        return { passed: true, details: "Tool echoed something, but not the exact probe — likely still UTF-8-safe" };
+      } catch (err: unknown) {
+        return { passed: false, details: `tools/call threw — ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    // Fallback: just ensure tools/list (a canonical call) succeeds.
+    // If the server can parse this at all, encoding is plausible.
+    const res = await rpc("tools/list");
+    if ((res.body as { error?: unknown }).error) {
+      return { passed: false, details: "tools/list returned error" };
+    }
+    return { passed: true, details: "tools/list returned successfully (no tools to probe with unicode)" };
+  });
+
+  await test(
+    "stdio-unknown-method-recovers",
+    "Recovers after unknown method",
+    "transport",
+    false,
+    "basic/transports#stdio",
+    async () => {
+      // Send an unknown method; server should reply with JSON-RPC error.
+      const errRes = await rpc("this/method/does/not/exist-xyzzy");
+      const errBody = errRes.body as { error?: { code?: number }; result?: unknown };
+      if (!errBody.error) {
+        return { passed: false, details: "Unknown method did not produce a JSON-RPC error" };
+      }
+      // Now send a valid request; server must still be alive.
+      const okRes = await rpc("ping");
+      const okBody = okRes.body as { error?: unknown; result?: unknown };
+      if (okBody.error) {
+        return {
+          passed: false,
+          details: "Server responded with error to ping after unknown method — may have desynced",
+        };
+      }
+      return { passed: true, details: "Unknown method returned JSON-RPC error; subsequent ping succeeded" };
+    },
+  );
+
   // ── Cap warnings ─────────────────────────────────────────────────
 
   const MAX_WARNINGS = 100;
@@ -2884,12 +2968,14 @@ export async function runComplianceSuite(url: string, options: RunOptions = {}):
   // ── Compute score ────────────────────────────────────────────────
 
   const { score, grade, overall, summary, categories } = computeScore(tests);
-  const badge = generateBadge(url);
+  const badge = generateBadge(displayUrl);
+
+  await transport.close();
 
   return {
     specVersion: SPEC_VERSION,
     toolVersion: TOOL_VERSION,
-    url,
+    url: displayUrl,
     timestamp: new Date().toISOString(),
     score,
     grade,

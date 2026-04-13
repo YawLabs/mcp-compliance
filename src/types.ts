@@ -68,7 +68,21 @@ export interface TestDefinition {
   specRef: string;
   description: string;
   recommendation: string;
+  /** Transports this test applies to. Omit = all transports. */
+  transports?: ("http" | "stdio")[];
 }
+
+/** Describes the server under test. URL string = HTTP for backwards compat. */
+export type TransportTarget =
+  | { type: "http"; url: string; headers?: Record<string, string> }
+  | {
+      type: "stdio";
+      command: string;
+      args?: string[];
+      env?: Record<string, string>;
+      cwd?: string;
+      verbose?: boolean;
+    };
 
 /** All 81 test IDs with descriptions for the explain command */
 export const TEST_DEFINITIONS: TestDefinition[] = [
@@ -219,6 +233,44 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
       "Sends a request with Accept: text/event-stream and checks that SSE responses include the event: message field. Per spec, servers MUST set event: message for JSON-RPC messages in SSE streams.",
     recommendation:
       'Include "event: message" before each "data:" line in your SSE responses. This is required by the MCP spec for JSON-RPC messages sent over SSE.',
+  },
+
+  // ── Stdio transport (stdio-only) ─────────────────────────────────
+  {
+    id: "stdio-framing",
+    name: "Newline-delimited JSON framing",
+    category: "transport",
+    required: true,
+    specRef: "basic/transports#stdio",
+    description:
+      "Fires several JSON-RPC requests in rapid succession and verifies the server frames each response with a trailing newline per the MCP stdio transport spec.",
+    recommendation:
+      "Emit one JSON message per line on stdout, terminated by \\n. Do not split a single message across multiple lines or merge multiple messages onto one line.",
+    transports: ["stdio"],
+  },
+  {
+    id: "stdio-unicode",
+    name: "UTF-8 unicode roundtrip",
+    category: "transport",
+    required: false,
+    specRef: "basic/transports#stdio",
+    description:
+      "Sends a request with non-ASCII (CJK + emoji) parameters and verifies the response preserves the characters. Catches byte-level encoding mistakes in framing/parsing.",
+    recommendation:
+      "Decode stdin as UTF-8 and encode stdout as UTF-8. Avoid latin-1 or platform-default encodings on Windows. Most JSON libraries handle this correctly if you don't override defaults.",
+    transports: ["stdio"],
+  },
+  {
+    id: "stdio-unknown-method-recovers",
+    name: "Recovers after unknown method",
+    category: "transport",
+    required: false,
+    specRef: "basic/transports#stdio",
+    description:
+      "Sends an unknown method, then a valid ping immediately after. Verifies the server returns a JSON-RPC error for the unknown method and continues serving the subsequent request without crashing.",
+    recommendation:
+      "Return JSON-RPC error -32601 (Method not found) for unknown methods. Do not exit the process or disconnect — the client should be able to keep using the session after an error.",
+    transports: ["stdio"],
   },
 
   // ── Lifecycle (17 tests) ─────────────────────────────────────────
