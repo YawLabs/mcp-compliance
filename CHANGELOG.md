@@ -2,36 +2,37 @@
 
 All notable changes to this project are documented here.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-from 1.0.0 onward.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Pre-1.0 releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
+loosely — breaking changes can still land in a minor bump, but we'll call them
+out explicitly here.
 
-## [1.0.0] — 2026-04-13
+## [0.13.0] — 2026-04-13
 
-First stable release. The CLI surface (`test`, `badge`, `mcp`), the library
-exports (`runComplianceSuite`, `SPEC_VERSION`, `SPEC_BASE`, `parseSSEResponse`,
-the `./mcp/server` entry, the `./schemas/*.json` entries), the report JSON
-schema (`schemas/report.v1.json`), the grading algorithm, and the stable test
-IDs are now covered by semver. Breaking changes to any of these will ship as a
-major version bump.
+Catalog + spec sync to the shipped 88-test implementation, plus ops
+scaffolding for the repo.
 
-- The MCP spec revision the suite tests against is surfaced via the
-  `SPEC_VERSION` export rather than the package version, so ecosystem spec
-  updates do not force a major bump here.
-- No functional changes versus 0.12.2 — this release cuts the semver
-  commitment and adds CHANGELOG, Dependabot, nightly reference-server
-  regression workflow, and issue/PR templates.
+- **Spec `v1.1.0`** (`MCP_COMPLIANCE_SPEC.md` + `mcp-compliance-rules.json`):
+  synced the published catalog to the shipped **88-test** implementation
+  (was 81 in the catalog, already 88 in `TEST_DEFINITIONS`); added stdio
+  transport coverage and 2025-11-25 capability coverage to the spec prose.
+  Renamed `mcpSpecVersion` → `mcpSpecCompatibility` to align with
+  `ctxlint`'s catalog and with both specs' prose headers. Value unchanged
+  (`2025-11-25`). Consumers reading the old key should move to the new one.
 - `MCP_COMPLIANCE_SPEC.md` now has a "Related specifications" section
   cross-referencing `mcp-config-lint` (ctxlint). Runtime-vs-static split is
   documented so consumers know which spec covers which problem.
-- **Spec `v1.1.0`** (`MCP_COMPLIANCE_SPEC.md` + `mcp-compliance-rules.json`):
-  synced the published catalog to the shipped **88-test** implementation (was
-  81 in the catalog, already 88 in `TEST_DEFINITIONS`); added stdio transport
-  coverage and 2025-11-25 capability coverage to the spec prose. Renamed
-  `mcpSpecVersion` → `mcpSpecCompatibility` to align with `ctxlint`'s
-  catalog and with both specs' prose headers. Value unchanged (`2025-11-25`).
-  Consumers reading the old key should move to the new one; both specs now
-  use the same field name.
+- **Ops scaffolding:** introduced this `CHANGELOG.md`, `.github/dependabot.yml`
+  (weekly grouped npm / github-actions / docker updates),
+  `.github/workflows/nightly.yml` (daily sweep against reference servers,
+  uploads artifacts, auto-files a deduplicated issue on regression), and
+  `.github/ISSUE_TEMPLATE/*` + `.github/PULL_REQUEST_TEMPLATE.md`.
+- **Count reconciliation:** fixed stale 81/84/85 references in README, docs,
+  content, and three user-facing `src/` strings (MCP tool description, jsdoc,
+  integration test name) so all copy agrees with the shipped 88.
+- Ignored `.claude/` (local Claude Code settings, per-user state).
+- No runtime behavior changes vs 0.12.2. The test runner, grading, and
+  report schema are byte-identical.
 
 ## [0.12.2] — 2026-04-13
 
@@ -180,7 +181,7 @@ major version bump.
 
 - Initial release: MCP compliance tester CLI and MCP server.
 
-[1.0.0]: https://github.com/YawLabs/mcp-compliance/releases/tag/v1.0.0
+[0.13.0]: https://github.com/YawLabs/mcp-compliance/releases/tag/v0.13.0
 [0.12.2]: https://github.com/YawLabs/mcp-compliance/releases/tag/v0.12.2
 [0.12.1]: https://github.com/YawLabs/mcp-compliance/releases/tag/v0.12.1
 [0.12.0]: https://github.com/YawLabs/mcp-compliance/releases/tag/v0.12.0
