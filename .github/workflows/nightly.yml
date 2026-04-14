@@ -1,0 +1,96 @@
+name: Nightly reference-server sweep
+
+# Regression guard against the MCP reference servers. If one of them stops
+# passing its required tests — because the spec moved, because a server
+# release regressed, or because our tests drifted — we want to find out
+# before a user files an issue.
+#
+# The sweep runs `scripts/run-top-servers.ts` against the no-secret-required
+# entries in the allowlist. The script exits non-zero if any server with
+# status=ok has required-test failures, which fails this job.
+
+on:
+  schedule:
+    # 11:00 UTC daily = 04:00 America/Los_Angeles. Off-peak for GitHub's
+    # scheduler so the job actually starts close to on-time.
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: Run sweep
+        id: sweep
+        # Servers without declared env vars (filesystem, memory,
+        # sequentialthinking, puppeteer, everything) run; github/slack are
+        # skipped automatically because their required env vars are unset.
+        run: node --import tsx scripts/run-top-servers.ts
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: top-servers-results
+          path: data/top-servers-results.*
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Open issue on regression
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { repo, owner } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const title = `Nightly sweep regression — ${new Date().toISOString().slice(0, 10)}`;
+            // Deduplicate: if an open regression issue from today already
+            // exists, add a comment instead of spamming a new one.
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: "open",
+              labels: "nightly-regression",
+              per_page: 20,
+            });
+            const todayTitle = title;
+            const dup = existing.find((i) => i.title === todayTitle);
+            if (dup) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: dup.number,
+                body: `Another failure: ${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                labels: ["nightly-regression", "bug"],
+                body: [
+                  "The nightly reference-server sweep failed.",
+                  "",
+                  `- Run: ${runUrl}`,
+                  "- Artifact: `top-servers-results` on the run above",
+                  "",
+                  "One of the allowlisted reference servers has required-test failures.",
+                  "Download the artifact to see which server and which tests regressed.",
+                ].join("\n"),
+              });
+            }

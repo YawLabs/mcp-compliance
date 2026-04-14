@@ -26,7 +26,7 @@ These aren't obscure corner cases. They're the top failures we've seen running c
 
 ## What `mcp-compliance` does
 
-**85 tests across 8 categories, written against the published spec.** Every test cites the exact section of the spec it verifies. Every failure links to the spec reference. No ambiguity about what's being tested or why.
+**88 tests across 8 categories, written against the published spec.** Every test cites the exact section of the spec it verifies. Every failure links to the spec reference. No ambiguity about what's being tested or why.
 
 **Works against every transport.** HTTP and stdio servers alike. Point it at `https://my-server.com/mcp` or `node ./dist/server.js` or `npx -y @modelcontextprotocol/server-filesystem` — same suite, same grading, same output.
 

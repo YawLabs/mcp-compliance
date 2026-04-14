@@ -66,4 +66,4 @@ Raw data is in [`data/top-servers-results.json`](https://github.com/YawLabs/mcp-
 - **Community leaderboard**. The backend at [mcp.hosting](https://mcp.hosting) has the data model; the dashboard `/explore/compliance` route is next.
 - **Spec PRs**. We've drafted clarifications for 5 ambiguous corners the test suite had to guess at. They're at [`docs/spec-prs/`](https://github.com/YawLabs/mcp-compliance/tree/master/docs/spec-prs) in the repo. Eventually, those go upstream.
 
-The compliance suite itself is at [85 tests across 8 categories](https://github.com/YawLabs/mcp-compliance) (MIT-licensed). It runs locally, on CI, or against the hosted badge service. If you ship an MCP server on npm, running it takes 30 seconds and tells you exactly where you stand against the spec.
+The compliance suite itself is at [88 tests across 8 categories](https://github.com/YawLabs/mcp-compliance) (MIT-licensed). It runs locally, on CI, or against the hosted badge service. If you ship an MCP server on npm, running it takes 30 seconds and tells you exactly where you stand against the spec.

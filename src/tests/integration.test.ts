@@ -146,9 +146,9 @@ describe("integration — full compliance suite against real server", () => {
     expect(report.promptCount).toBeGreaterThan(0);
   }, 30000);
 
-  it("runs all 81 tests", async () => {
+  it("runs all 88 tests", async () => {
     const report = await runComplianceSuite(serverUrl, { timeout: 3000 });
-    // Should run a significant number of tests (all 81 tests including security)
+    // Should run a significant number of tests (all 88 tests including security)
     expect(report.tests.length).toBeGreaterThanOrEqual(71);
   }, 30000);
 

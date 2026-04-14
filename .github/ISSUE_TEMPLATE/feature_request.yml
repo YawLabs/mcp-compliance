@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest a new test, a CLI/library improvement, or a new output format.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For open-ended discussion, use [Discussions](https://github.com/YawLabs/mcp-compliance/discussions) instead. Issues are for concrete proposals.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind of change
+      options:
+        - New spec test
+        - CLI option or output format
+        - Library API change
+        - Grading / scoring change
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem would this solve? Who hits it?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How should it work? Rough CLI/API shape, expected output, etc.
+    validations:
+      required: true
+  - type: textarea
+    id: spec-anchor
+    attributes:
+      label: Spec anchor (for new tests)
+      description: Link to the relevant section of the MCP spec, RFC, or other normative document. New tests should be spec-anchored, not opinion-anchored.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

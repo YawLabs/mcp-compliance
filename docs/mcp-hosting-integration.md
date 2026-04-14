@@ -186,7 +186,7 @@ Open Graph metadata:
 ```html
 <meta property="og:title" content="MCP Compliance: Grade A (92%) — example.com">
 <meta property="og:image" content="https://mcp.hosting/api/compliance/ext/<hash>/og.png">
-<meta property="og:description" content="75/81 tests passed. Tested 2026-04-12.">
+<meta property="og:description" content="82/88 tests passed. Tested 2026-04-12.">
 ```
 
 The `og.png` is generated from the badge + summary at request time (or pre-generated on report insert).

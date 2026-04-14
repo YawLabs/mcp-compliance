@@ -29,7 +29,7 @@
 >
 > 3. **What we're seeding with.** Day-one leaderboard includes the servers in `modelcontextprotocol/servers` plus ~20 prominent community servers. We've reached out individually to authors of the most-graded servers with their reports first; nobody is being publicly listed without a heads-up.
 >
-> 4. **Open source the test corpus.** The 85 test definitions, their spec references, and the JSON Schema for the report shape all live in the public repo. If anything is misaligned with the spec's intent, please file an issue or PR — we'd rather correct than be wrong.
+> 4. **Open source the test corpus.** The 88 test definitions, their spec references, and the JSON Schema for the report shape all live in the public repo. If anything is misaligned with the spec's intent, please file an issue or PR — we'd rather correct than be wrong.
 >
 > Happy to demo, walk through the test corpus, or sit on this if there's a reason. Ping back at jeff@yaw.sh or here.
 >

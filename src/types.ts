@@ -107,7 +107,7 @@ export type TransportTarget =
       verbose?: boolean;
     };
 
-/** All 81 test IDs with descriptions for the explain command */
+/** All 88 test IDs with descriptions for the explain command */
 export const TEST_DEFINITIONS: TestDefinition[] = [
   // ── Transport (13 tests) ─────────────────────────────────────────
   {

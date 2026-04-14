@@ -66,7 +66,7 @@ Target: companies deploying MCP servers to customers or regulated industries.
 
 ## What we explicitly do NOT gate
 
-- **No charging for the core test suite.** Even enterprise users run the same 85 tests the free tier runs.
+- **No charging for the core test suite.** Even enterprise users run the same 88 tests the free tier runs.
 - **No rate-limiting the CLI itself.** The binary is MIT; you can run it in a for-loop if you want.
 - **No ads on public report pages.** The free tier is the funnel; user experience stays clean.
 - **No per-report-submission fees.** Scale of submissions alone doesn't gate — you'd need one of the specific feature needs (private, scheduled, aggregated) to justify paying.
