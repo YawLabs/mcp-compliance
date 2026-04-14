@@ -77,7 +77,7 @@ jobs:
           exit 1
 
       - name: Build & push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
