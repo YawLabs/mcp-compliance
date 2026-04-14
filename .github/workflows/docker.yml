@@ -29,7 +29,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           # When triggered by workflow_run, GITHUB_SHA is the head of the
           # default branch at trigger time, not the release commit. Pin
