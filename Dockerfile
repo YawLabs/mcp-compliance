@@ -4,7 +4,7 @@
 # published version baked in. Use --version to override.
 
 # ── builder ──────────────────────────────────────────────────────────
-FROM node:22-alpine AS builder
+FROM node:25-alpine AS builder
 WORKDIR /build
 
 # Install only the published CLI globally — no source build inside
@@ -13,7 +13,7 @@ ARG MCP_COMPLIANCE_VERSION=latest
 RUN npm install -g "@yawlabs/mcp-compliance@${MCP_COMPLIANCE_VERSION}"
 
 # ── runtime ──────────────────────────────────────────────────────────
-FROM node:22-alpine
+FROM node:25-alpine
 LABEL org.opencontainers.image.title="@yawlabs/mcp-compliance" \
       org.opencontainers.image.description="MCP server compliance testing CLI" \
       org.opencontainers.image.source="https://github.com/YawLabs/mcp-compliance" \
