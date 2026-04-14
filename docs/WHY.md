@@ -52,7 +52,7 @@ These aren't obscure corner cases. They're the top failures we've seen running c
 
 ## Who maintains this
 
-Built and maintained by [Yaw Labs](https://yaw.sh). The tool is MIT-licensed; the underlying [Compliance Testing Specification](../MCP_COMPLIANCE_SPEC.md) is CC BY 4.0. Both are designed to be forkable and independently implementable — we want other vendors to publish compatible tooling, not lock the ecosystem into one implementation.
+Built and maintained by [Yaw Labs](https://yaw.sh). The tool is MIT-licensed; the underlying [testing methodology](../COMPLIANCE_RUBRIC.md) is CC BY 4.0. Both are designed to be forkable and independently implementable — we want other vendors to publish compatible tooling, not lock the ecosystem into one implementation.
 
 The companion mcp.hosting service hosts the public badge and report pages and is free for any MCP server author. Paid tiers around bulk/scheduled/private testing exist for organizations with larger ops needs; see [ENTERPRISE.md](./ENTERPRISE.md).
 

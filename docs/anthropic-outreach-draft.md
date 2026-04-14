@@ -19,7 +19,7 @@
 >
 > Quick heads up rather than an ask: Yaw Labs is launching a third-party conformance grader for the MCP 2025-11-25 spec at **mcp.hosting/compliance**. It runs an 85-test suite covering transport, lifecycle, tools, resources, prompts, error handling, schema, and security; produces a graded report (A through F); and emits an embeddable badge.
 >
-> The engine is open source as `@yawlabs/mcp-compliance` (MIT). We've also published our test methodology as a separate spec at [link to MCP_COMPLIANCE_SPEC.md] so the grading is auditable rather than a black box.
+> The engine is open source as `@yawlabs/mcp-compliance` (MIT). We've also published our test methodology as a separate document at [link to COMPLIANCE_RUBRIC.md] so the grading is auditable rather than a black box — it's explicitly framed as our tool's choices, not an authoritative conformance standard.
 >
 > A few things worth flagging:
 >
@@ -45,7 +45,7 @@
 - **What to include as attachments / links.**
   - Direct link to a sample report (A-grade and a D-grade both, so they can see the format).
   - Link to the GitHub repo.
-  - Link to MCP_COMPLIANCE_SPEC.md.
+  - Link to COMPLIANCE_RUBRIC.md (the testing methodology doc).
   - Link to mcp.hosting/compliance/leaderboard once it has ≥20 entries.
 - **What NOT to do.**
   - Don't ask for endorsement.

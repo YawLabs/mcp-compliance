@@ -21,7 +21,7 @@ This tool solves that:
 - **CI-ready** — `--strict` mode exits with code 1 on required test failures. Drop it into any pipeline.
 - **Spec-referenced** — every test links to the exact section of the MCP specification it validates. No ambiguity about what's being tested or why.
 - **Three interfaces** — CLI for humans, MCP server for AI assistants, programmatic API for integration.
-- **Published specification** — the [testing methodology](./MCP_COMPLIANCE_SPEC.md) and [rule catalog](./mcp-compliance-rules.json) are open (CC BY 4.0) so anyone can implement compatible tooling.
+- **Published methodology** — the [testing methodology](./COMPLIANCE_RUBRIC.md) and [rule catalog](./mcp-compliance-rules.json) are open (CC BY 4.0) so anyone can build compatible tooling or fork the rules.
 
 ## Quick start
 
@@ -399,7 +399,7 @@ The `test` command never publishes — use it for CI, debugging, and local itera
 | D     | 40-59  |
 | F     | 0-39   |
 
-Required tests are worth 70% of the score, optional tests 30%. See the [full scoring algorithm](./MCP_COMPLIANCE_SPEC.md#2-scoring-algorithm) in the specification.
+Required tests are worth 70% of the score, optional tests 30%. See the [full scoring algorithm](./COMPLIANCE_RUBRIC.md#2-scoring-algorithm) in the methodology doc.
 
 ## CI integration
 
@@ -536,11 +536,11 @@ Consumer guidance:
 - Within a major version, additions are non-breaking. Renames, removals, or type changes bump the version.
 - Two runs against the same server produce equivalent grade, score, and per-test pass/fail (modulo timings/timestamps).
 
-## Specification
+## Methodology & docs
 
-The compliance testing methodology is published as an open specification:
+The testing methodology is published openly so the grading is auditable:
 
-- **[MCP Compliance Testing Specification](./MCP_COMPLIANCE_SPEC.md)** — test execution model, scoring algorithm, all 88 test rules with pass/fail criteria (CC BY 4.0)
+- **[Testing methodology](./COMPLIANCE_RUBRIC.md)** — test execution model, scoring algorithm, all 88 test rules with pass/fail criteria (CC BY 4.0)
 - **[Machine-readable rule catalog](./mcp-compliance-rules.json)** — JSON Schema-compliant catalog for programmatic consumption
 - **[Why `mcp-compliance`](./docs/WHY.md)** — the problem, existing alternatives, what this tool does differently
 - **[Fixing common failures](./docs/FIXES.md)** — recipes for the most frequent test failures with code snippets
@@ -551,7 +551,7 @@ The compliance testing methodology is published as an open specification:
 - **[Spec PR drafts](./docs/spec-prs/)** — our proposed MCP spec clarifications for ambiguous cases we've hit
 - **[mcp.hosting integration spec](./docs/mcp-hosting-integration.md)** — the contract between this engine and the mcp.hosting platform: URL surfaces, data flow, storage model, badge API, leaderboard, router integration
 
-These are complementary to (not competing with) the [official MCP specification](https://modelcontextprotocol.io/specification/2025-11-25). The MCP spec defines what servers must do; this spec defines how to verify compliance.
+The methodology is not an authoritative conformance standard — it's one tool's choices, published so they can be inspected, adopted, or forked. The [official MCP specification](https://modelcontextprotocol.io/specification/2025-11-25) defines what servers must do; this document describes how `@yawlabs/mcp-compliance` verifies it.
 
 ## Requirements
 
@@ -583,7 +583,7 @@ npm test
 
 - [mcp.hosting](https://mcp.hosting) — Hosted MCP server infrastructure
 - [MCP Specification](https://modelcontextprotocol.io/specification/2025-11-25)
-- [MCP Compliance Testing Spec](./MCP_COMPLIANCE_SPEC.md)
+- [Testing methodology](./COMPLIANCE_RUBRIC.md)
 - [Yaw Labs](https://yaw.sh)
 
 ## License

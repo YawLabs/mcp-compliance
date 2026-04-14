@@ -44,7 +44,7 @@ When the MCP project announces a new spec version:
 2. Read the spec diff
 3. Add new tests for new capabilities (optional first — easier to get into a release)
 4. Update `SPEC_VERSION` constant in `src/runner.ts`
-5. Update `MCP_COMPLIANCE_SPEC.md` with new test rules
+5. Update `COMPLIANCE_RUBRIC.md` with new test rules
 6. Bump version (minor unless the diff includes new MUSTs that affect existing servers)
 7. Cut a release; update README to mention the new version
 8. The previous CLI version stays available on npm forever; pinned consumers keep working

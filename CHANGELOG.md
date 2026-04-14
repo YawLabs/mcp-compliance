@@ -12,14 +12,14 @@ out explicitly here.
 Catalog + spec sync to the shipped 88-test implementation, plus ops
 scaffolding for the repo.
 
-- **Spec `v1.1.0`** (`MCP_COMPLIANCE_SPEC.md` + `mcp-compliance-rules.json`):
+- **Spec `v1.1.0`** (`COMPLIANCE_RUBRIC.md` + `mcp-compliance-rules.json`):
   synced the published catalog to the shipped **88-test** implementation
   (was 81 in the catalog, already 88 in `TEST_DEFINITIONS`); added stdio
   transport coverage and 2025-11-25 capability coverage to the spec prose.
   Renamed `mcpSpecVersion` → `mcpSpecCompatibility` to align with
   `ctxlint`'s catalog and with both specs' prose headers. Value unchanged
   (`2025-11-25`). Consumers reading the old key should move to the new one.
-- `MCP_COMPLIANCE_SPEC.md` now has a "Related specifications" section
+- `COMPLIANCE_RUBRIC.md` now has a "Related specifications" section
   cross-referencing `mcp-config-lint` (ctxlint). Runtime-vs-static split is
   documented so consumers know which spec covers which problem.
 - **Ops scaffolding:** introduced this `CHANGELOG.md`, `.github/dependabot.yml`

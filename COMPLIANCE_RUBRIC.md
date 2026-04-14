@@ -1,19 +1,19 @@
-# MCP Compliance Testing Specification
+# @yawlabs/mcp-compliance Testing Methodology
 
 **Version:** 1.1.0
 **Date:** 2026-04-13
 **MCP Spec Compatibility:** [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25)
 **License:** [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 **Maintained by:** [Yaw Labs / mcp-compliance](https://github.com/YawLabs/mcp-compliance)
-**Reference implementation:** `@yawlabs/mcp-compliance` v0.12.2+
+**Implementation:** `@yawlabs/mcp-compliance` v0.12.2+
 
 ---
 
 ## What Is This?
 
-This document defines a **testing methodology** for verifying MCP (Model Context Protocol) server compliance. It does not redefine the protocol itself. The [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25) defines what servers MUST do; this specification defines **how to verify** that they do it.
+This document describes the **testing methodology** used by `@yawlabs/mcp-compliance` to verify MCP (Model Context Protocol) server compliance. It is not the MCP specification and does not redefine the protocol itself — the [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25) defines what servers MUST do. This document records how one tool chooses to verify those requirements, and publishes the choices (rule IDs, severities, scoring weights, grade thresholds) so the grading is auditable rather than a black box.
 
-This specification is tool-agnostic. Any compliance testing tool can implement these rules. The reference implementation is [`@yawlabs/mcp-compliance`](https://github.com/YawLabs/mcp-compliance), but conformance to this specification is not limited to any single tool.
+The methodology is published openly (CC BY 4.0) so other tools can adopt, fork, or diverge from it. It is not an authoritative conformance standard.
 
 **Scope:**
 
@@ -26,16 +26,9 @@ This specification is tool-agnostic. Any compliance testing tool can implement t
 
 **Companion specification:** [MCP Protocol Specification (2025-11-25)](https://modelcontextprotocol.io/specification/2025-11-25)
 
-## Related specifications
+## Related Yaw Labs tools
 
-This spec is part of a family of open specifications maintained by Yaw Labs for MCP tooling:
-
-| Spec | Scope | Input |
-|---|---|---|
-| **mcp-compliance** (this spec) | Runtime testing of live MCP servers | A live server URL + transport |
-| [**mcp-config-lint**](https://github.com/YawLabs/ctxlint/blob/main/MCP_CONFIG_LINT_SPEC.md) | Static analysis of MCP client config files | `.cursor/mcp.json`, `.vscode/mcp.json`, `.mcp.json`, etc. |
-
-Both target MCP spec [`2025-11-25`](https://modelcontextprotocol.io/specification/2025-11-25) and ship machine-readable rule catalogs with stable rule IDs. Run both for end-to-end coverage: lint configs pre-deploy, test servers post-deploy.
+Yaw Labs also maintains [`mcp-config-lint`](https://github.com/YawLabs/ctxlint) — static analysis for MCP client config files (`.cursor/mcp.json`, `.vscode/mcp.json`, `.mcp.json`, etc.). It targets the same `2025-11-25` MCP spec and ships its own machine-readable rule catalog. Running both covers both sides of the deployment: lint configs pre-deploy, test servers post-deploy.
 
 ---
 
@@ -60,7 +53,7 @@ Both target MCP spec [`2025-11-25`](https://modelcontextprotocol.io/specificatio
   - [3.7 schema -- Schema Validation (6 tests)](#37-schema----schema-validation-6-tests)
   - [3.8 security -- Security Validation (23 tests)](#38-security----security-validation-23-tests)
 - [4. Rule Catalog (Machine-Readable)](#4-rule-catalog-machine-readable)
-- [5. Implementing This Specification](#5-implementing-this-specification)
+- [5. Adopting This Methodology](#5-adopting-this-methodology)
 - [6. Contributing](#6-contributing)
 
 ---
@@ -115,7 +108,7 @@ Test requirements are not fully static. Some tests become **required** based on 
 
 ### 1.3 Retry Behavior
 
-Implementations SHOULD support configurable retry behavior:
+The reference tool supports configurable retry behavior:
 
 - **Retry count** is configurable (default: 0, meaning no retries).
 - **Backoff** is linear: 1 second after the first failure, 2 seconds after the second, 3 seconds after the third, and so on.
@@ -125,7 +118,7 @@ Implementations SHOULD support configurable retry behavior:
 
 ### 1.4 Test Filtering
 
-Implementations SHOULD support filtering tests by category name or individual test ID:
+Tests can be filtered by category name or individual test ID:
 
 - **Include list** (`only`): If provided, only tests whose category or ID appears in the list will run.
 - **Exclude list** (`skip`): If provided, tests whose category or ID appears in the list will be skipped.
@@ -193,7 +186,7 @@ Two MCP transports are covered:
 - **Streamable HTTP** (13 tests) — Tests an HTTP endpoint with raw `undici` requests. Applies to servers addressed by URL.
 - **stdio** (3 tests) — Tests the framing and encoding of a child-process stdio server. Applies to servers launched by command. Identified by rules whose ID begins with `stdio-` and whose catalog entry includes `"transports": ["stdio"]`.
 
-Implementations SHOULD run only the tests for the transport under test; transport-gated rules that do not apply are **skipped** and do not count toward pass or fail. For a Streamable HTTP server, the three `stdio-*` tests are skipped; for a stdio server, the thirteen HTTP transport tests are skipped. Post-initialization transport tests (`transport-notification-202`, `transport-session-id`, `transport-session-invalid`, `transport-sse-event-field`) run after the initialize handshake completes, because they require session state.
+Only tests for the transport under test run; transport-gated rules that do not apply are **skipped** and do not count toward pass or fail. For a Streamable HTTP server, the three `stdio-*` tests are skipped; for a stdio server, the thirteen HTTP transport tests are skipped. Post-initialization transport tests (`transport-notification-202`, `transport-session-id`, `transport-session-invalid`, `transport-sse-event-field`) run after the initialize handshake completes, because they require session state.
 
 ---
 
@@ -564,7 +557,7 @@ Lifecycle tests validate the MCP initialization handshake and post-initializatio
 - **Category:** lifecycle
 - **Default required:** No
 - **Spec reference:** [client/sampling](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling)
-- **Description:** `sampling` is a *client* capability — the client offers LLM access to the server. This test performs a shape check: the server's `initialize` response MUST NOT declare `sampling` in its own `capabilities` object (servers are consumers of sampling, not providers). A dedicated round-trip exercise requires a client-side sampling handler and is out of scope for this specification.
+- **Description:** `sampling` is a *client* capability — the client offers LLM access to the server. This test performs a shape check: the server's `initialize` response MUST NOT declare `sampling` in its own `capabilities` object (servers are consumers of sampling, not providers). A dedicated round-trip exercise requires a client-side sampling handler and is out of scope for this methodology.
 - **Pass criteria:** The server's `capabilities` object does not include a `sampling` key.
 - **Fail criteria:** The server declares a `sampling` capability on its own side (shape error).
 
@@ -1201,13 +1194,13 @@ Each rule object contains:
 
 ---
 
-## 5. Implementing This Specification
+## 5. Adopting This Methodology
 
-This section provides guidance for anyone building a tool that implements the MCP Compliance Testing Specification.
+This section provides guidance for anyone building a tool that adopts the methodology described here.
 
 ### Test Ordering
 
-Test ordering is not arbitrary. Implementations MUST respect the following constraints:
+Test ordering is not arbitrary; the reference tool runs tests in this order:
 
 1. **Transport tests run first**, before the initialization handshake. They validate raw HTTP behavior.
 2. **The initialization handshake** (`initialize` + `notifications/initialized`) runs after transport tests. All subsequent tests depend on the session state it establishes.
@@ -1219,7 +1212,7 @@ Test ordering is not arbitrary. Implementations MUST respect the following const
 
 ### Session State Management
 
-Implementations MUST track:
+The reference tool tracks:
 
 - The `MCP-Session-Id` header value (if issued by the server during initialization) and include it on all subsequent requests.
 - The negotiated `protocolVersion` for protocol-version-aware behavior.
@@ -1227,7 +1220,7 @@ Implementations MUST track:
 
 ### Capability-Driven Requirement Changes
 
-Implementations MUST dynamically adjust test requirements after initialization:
+The reference tool dynamically adjusts test requirements after initialization:
 
 - Read the `capabilities` object from the `initialize` response.
 - Upgrade tests from optional to required per the mapping in [section 1.2](#12-capability-driven-execution).
@@ -1235,7 +1228,7 @@ Implementations MUST dynamically adjust test requirements after initialization:
 
 ### Result Reporting
 
-Implementations SHOULD produce a result for each test containing at minimum:
+Each test result produced by the reference tool contains at minimum:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1254,7 +1247,7 @@ Implementations SHOULD produce a result for each test containing at minimum:
 
 ### Versioning
 
-This specification follows [Semantic Versioning](https://semver.org/):
+This document follows [Semantic Versioning](https://semver.org/):
 
 - **Patch** (e.g., 1.0.1): Clarifications, typo fixes, and documentation improvements that do not change test behavior.
 - **Minor** (e.g., 1.1.0): New test rules, new categories, or new optional fields in the rule catalog. Existing tests are not removed or have their pass/fail logic changed.
@@ -1274,8 +1267,8 @@ All new rules must include:
 
 ### Process
 
-Changes to this specification are proposed via pull request to the [mcp-compliance repository](https://github.com/YawLabs/mcp-compliance). All changes should update both this document and the `mcp-compliance-rules.json` catalog in the same PR.
+Changes to this methodology are proposed via pull request to the [mcp-compliance repository](https://github.com/YawLabs/mcp-compliance). All changes should update both this document and the `mcp-compliance-rules.json` catalog in the same PR.
 
 ---
 
-*This specification is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). You are free to share and adapt this material for any purpose, including commercially, provided you give appropriate credit.*
+*This document is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). You are free to share and adapt this material for any purpose, including commercially, provided you give appropriate credit.*

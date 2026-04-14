@@ -1,6 +1,6 @@
 # Fixing common compliance failures
 
-Recipes for the most frequent test failures, grouped by category. Every recipe names the test ID so you can cross-reference with the [compliance spec](../MCP_COMPLIANCE_SPEC.md) and the `--only <test-id>` flag.
+Recipes for the most frequent test failures, grouped by category. Every recipe names the test ID so you can cross-reference with the [testing methodology](../COMPLIANCE_RUBRIC.md) and the `--only <test-id>` flag.
 
 Code samples use the official MCP TypeScript SDK where applicable and vanilla HTTP / stdio where not.
 
