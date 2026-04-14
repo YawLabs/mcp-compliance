@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MCP Server Compliance Test Rules",
   "description": "Machine-readable catalog of compliance test rules for MCP servers",
-  "specVersion": "1.0.0-draft",
-  "specDate": "2026-04-07",
-  "mcpSpecVersion": "2025-11-25",
+  "specVersion": "1.1.0",
+  "specDate": "2026-04-13",
+  "mcpSpecCompatibility": "2025-11-25",
   "categories": [
     {
       "id": "transport",
@@ -1027,6 +1027,93 @@
       "description": "Verifies the server implements rate limiting under burst load",
       "passCriteria": "HTTP 429 returned during 50-request burst",
       "failCriteria": "All 50 rapid requests accepted without rate limiting"
+    },
+    {
+      "id": "stdio-framing",
+      "name": "Newline-delimited JSON framing",
+      "category": "transport",
+      "severity": "error",
+      "defaultRequired": true,
+      "capabilityGated": null,
+      "specRef": "basic/transports#stdio",
+      "description": "Verifies a stdio server emits each JSON-RPC response as a single line on stdout, terminated by \\n, under rapid-fire requests",
+      "passCriteria": "Every response is exactly one newline-terminated line of parseable JSON",
+      "failCriteria": "Any response is split across lines, merged with another response, or missing a trailing newline",
+      "transports": ["stdio"]
+    },
+    {
+      "id": "stdio-unicode",
+      "name": "UTF-8 unicode roundtrip",
+      "category": "transport",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#stdio",
+      "description": "Sends non-ASCII (CJK + emoji) parameters to a stdio server and verifies the response preserves the byte-level encoding",
+      "passCriteria": "Response echoes the non-ASCII payload byte-for-byte when decoded as UTF-8",
+      "failCriteria": "Response returns mojibake, replacement characters, or byte-mangled output",
+      "transports": ["stdio"]
+    },
+    {
+      "id": "stdio-unknown-method-recovers",
+      "name": "Recovers after unknown method",
+      "category": "transport",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/transports#stdio",
+      "description": "Sends an unknown method followed by a valid ping; verifies the server errors on the unknown method but keeps serving subsequent requests",
+      "passCriteria": "Unknown method receives a JSON-RPC error and the follow-up ping succeeds",
+      "failCriteria": "Server exits, closes stdout, or fails to respond to the follow-up ping",
+      "transports": ["stdio"]
+    },
+    {
+      "id": "lifecycle-sampling-capability",
+      "name": "Sampling capability shape",
+      "category": "lifecycle",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "client/sampling",
+      "description": "Verifies the server's initialize response does NOT declare sampling as its own capability (sampling is a client capability)",
+      "passCriteria": "Server capabilities object does not contain a 'sampling' key",
+      "failCriteria": "Server declares 'sampling' in its own capabilities"
+    },
+    {
+      "id": "lifecycle-roots-capability",
+      "name": "Roots capability shape",
+      "category": "lifecycle",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "client/roots",
+      "description": "Verifies the server's initialize response does NOT declare roots as its own capability (roots is a client capability)",
+      "passCriteria": "Server capabilities object does not contain a 'roots' key",
+      "failCriteria": "Server declares 'roots' in its own capabilities"
+    },
+    {
+      "id": "lifecycle-elicitation-capability",
+      "name": "Elicitation capability shape",
+      "category": "lifecycle",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "client/elicitation",
+      "description": "Verifies the server's initialize response does NOT declare elicitation as its own capability (elicitation is a client capability added in 2025-11-25)",
+      "passCriteria": "Server capabilities object does not contain an 'elicitation' key",
+      "failCriteria": "Server declares 'elicitation' in its own capabilities"
+    },
+    {
+      "id": "lifecycle-meta-tolerance",
+      "name": "Tolerates _meta field on requests",
+      "category": "lifecycle",
+      "severity": "warning",
+      "defaultRequired": false,
+      "capabilityGated": null,
+      "specRef": "basic/utilities#_meta",
+      "description": "Sends a ping with params._meta = { extra: 'value' } and verifies the server does not reject the request. The 2025-11-25 spec reserves _meta for forward-compat extension metadata on any request",
+      "passCriteria": "Server returns a normal result regardless of unknown _meta keys",
+      "failCriteria": "Server returns a JSON-RPC error that cites the _meta field"
     }
   ]
 }

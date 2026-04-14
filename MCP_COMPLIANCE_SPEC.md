@@ -1,11 +1,11 @@
 # MCP Compliance Testing Specification
 
-**Version:** 1.0.0-draft
-**Date:** 2026-04-07
+**Version:** 1.1.0
+**Date:** 2026-04-13
 **MCP Spec Compatibility:** [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25)
 **License:** [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 **Maintained by:** [Yaw Labs / mcp-compliance](https://github.com/YawLabs/mcp-compliance)
-**Reference implementation:** `@yawlabs/mcp-compliance` v0.3.0+
+**Reference implementation:** `@yawlabs/mcp-compliance` v0.12.2+
 
 ---
 
@@ -17,13 +17,25 @@ This specification is tool-agnostic. Any compliance testing tool can implement t
 
 **Scope:**
 
-- **81 compliance test rules** across 8 categories, each with a defined severity (required or optional)
+- **88 compliance test rules** across 8 categories, each with a defined severity (required or optional)
 - **Scoring algorithm** that weights required vs. optional tests and produces a numerical score
 - **Grading methodology** that maps scores to letter grades (A through F)
 - **Capability-driven test execution model** that dynamically adjusts test requirements based on server-declared capabilities
+- **Transport-gated test execution** — stdio-specific tests run only when testing a stdio server; HTTP tests run only for Streamable HTTP servers
 - **Machine-readable rule catalog** (`mcp-compliance-rules.json`) for tooling integration
 
 **Companion specification:** [MCP Protocol Specification (2025-11-25)](https://modelcontextprotocol.io/specification/2025-11-25)
+
+## Related specifications
+
+This spec is part of a family of open specifications maintained by Yaw Labs for MCP tooling:
+
+| Spec | Scope | Input |
+|---|---|---|
+| **mcp-compliance** (this spec) | Runtime testing of live MCP servers | A live server URL + transport |
+| [**mcp-config-lint**](https://github.com/YawLabs/ctxlint/blob/main/MCP_CONFIG_LINT_SPEC.md) | Static analysis of MCP client config files | `.cursor/mcp.json`, `.vscode/mcp.json`, `.mcp.json`, etc. |
+
+Both target MCP spec [`2025-11-25`](https://modelcontextprotocol.io/specification/2025-11-25) and ship machine-readable rule catalogs with stable rule IDs. Run both for end-to-end coverage: lint configs pre-deploy, test servers post-deploy.
 
 ---
 
@@ -39,14 +51,14 @@ This specification is tool-agnostic. Any compliance testing tool can implement t
   - [2.2 Grade Thresholds](#22-grade-thresholds)
   - [2.3 Overall Status](#23-overall-status)
 - [3. Test Rules](#3-test-rules)
-  - [3.1 transport -- HTTP Transport Validation (10 tests)](#31-transport----http-transport-validation-7-tests)
-  - [3.2 lifecycle -- Protocol Lifecycle (12 tests)](#32-lifecycle----protocol-lifecycle-10-tests)
+  - [3.1 transport -- Transport Validation (16 tests)](#31-transport----transport-validation-16-tests)
+  - [3.2 lifecycle -- Protocol Lifecycle (21 tests)](#32-lifecycle----protocol-lifecycle-21-tests)
   - [3.3 tools -- Tool Operations (4 tests)](#33-tools----tool-operations-4-tests)
   - [3.4 resources -- Resource Operations (5 tests)](#34-resources----resource-operations-5-tests)
   - [3.5 prompts -- Prompt Operations (3 tests)](#35-prompts----prompt-operations-3-tests)
-  - [3.6 errors -- Error Handling (8 tests)](#36-errors----error-handling-8-tests)
+  - [3.6 errors -- Error Handling (10 tests)](#36-errors----error-handling-10-tests)
   - [3.7 schema -- Schema Validation (6 tests)](#37-schema----schema-validation-6-tests)
-  - [3.8 security -- Security Validation (21 tests)](#38-security----security-validation-21-tests)
+  - [3.8 security -- Security Validation (23 tests)](#38-security----security-validation-23-tests)
 - [4. Rule Catalog (Machine-Readable)](#4-rule-catalog-machine-readable)
 - [5. Implementing This Specification](#5-implementing-this-specification)
 - [6. Contributing](#6-contributing)
@@ -172,9 +184,16 @@ Each test rule is documented with the following fields:
 
 ---
 
-### 3.1 transport -- HTTP Transport Validation (10 tests)
+### 3.1 transport -- Transport Validation (16 tests)
 
-Transport tests run **before** the MCP initialization handshake. They validate that the server's HTTP endpoint behaves correctly at the transport layer. These tests send raw HTTP requests with minimal JSON-RPC payloads.
+Transport tests run **before** the MCP initialization handshake. They validate that the server's transport endpoint behaves correctly at the wire level, before any MCP session state exists.
+
+Two MCP transports are covered:
+
+- **Streamable HTTP** (13 tests) — Tests an HTTP endpoint with raw `undici` requests. Applies to servers addressed by URL.
+- **stdio** (3 tests) — Tests the framing and encoding of a child-process stdio server. Applies to servers launched by command. Identified by rules whose ID begins with `stdio-` and whose catalog entry includes `"transports": ["stdio"]`.
+
+Implementations SHOULD run only the tests for the transport under test; transport-gated rules that do not apply are **skipped** and do not count toward pass or fail. For a Streamable HTTP server, the three `stdio-*` tests are skipped; for a stdio server, the thirteen HTTP transport tests are skipped. Post-initialization transport tests (`transport-notification-202`, `transport-session-id`, `transport-session-invalid`, `transport-sse-event-field`) run after the initialize handshake completes, because they require session state.
 
 ---
 
@@ -282,7 +301,76 @@ Transport tests run **before** the MCP initialization handshake. They validate t
 
 ---
 
-### 3.2 lifecycle -- Protocol Lifecycle (12 tests)
+#### `transport-session-invalid` -- Returns 404 for Unknown Session ID
+
+- **Category:** transport
+- **Default required:** No
+- **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+- **Description:** Sends a request with a fabricated `MCP-Session-Id` and verifies the server returns HTTP 404. Per spec, servers managing sessions MUST return 404 for unrecognized session IDs; 400 is reserved for the case of a missing session ID.
+- **Pass criteria:** HTTP 404 for a request that carries a syntactically valid but unrecognized `MCP-Session-Id`. **Auto-pass** if the server does not issue session IDs.
+- **Fail criteria:** Server returns 2xx, 400, or any non-404 status for the fabricated session ID.
+
+---
+
+#### `transport-content-type-reject` -- Rejects Non-JSON Request Content-Type
+
+- **Category:** transport
+- **Default required:** No
+- **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+- **Description:** Sends a POST with `Content-Type: text/plain` (and a JSON body) and verifies the server rejects it. The Streamable HTTP transport requires JSON request bodies; servers that accept other content types expand their attack surface.
+- **Pass criteria:** Server returns HTTP 4xx (ideally 415 Unsupported Media Type or 400 Bad Request).
+- **Fail criteria:** Server returns 2xx, attempts to parse the body, or returns 5xx.
+
+---
+
+#### `transport-sse-event-field` -- SSE Responses Include `event: message`
+
+- **Category:** transport
+- **Default required:** No
+- **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+- **Description:** When the client sends `Accept: text/event-stream`, the server may respond with an SSE stream. Per spec, each SSE frame carrying a JSON-RPC message MUST be prefixed with an `event: message` line before its `data:` line. This runs **post-initialization** because some servers only emit SSE after an active session exists.
+- **Pass criteria:** Every SSE frame that carries a JSON-RPC payload includes an `event: message` line preceding its `data:` line. **Auto-pass** if the server responds with `application/json` (no SSE emitted).
+- **Fail criteria:** Any SSE frame with a `data:` line has no preceding `event: message` line.
+
+---
+
+#### `stdio-framing` -- Newline-Delimited JSON Framing
+
+- **Category:** transport
+- **Default required:** Yes (stdio transport only)
+- **Spec reference:** [basic/transports#stdio](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#stdio)
+- **Transports:** `stdio`
+- **Description:** Fires several JSON-RPC requests in rapid succession against a stdio server and verifies each response is emitted as a single line on stdout terminated by `\n`. The stdio transport defines one JSON message per line; merging messages, splitting a message across lines, or omitting the trailing newline breaks framing for conforming clients.
+- **Pass criteria:** Every response arrives as exactly one line (newline-terminated) with a single parseable JSON value.
+- **Fail criteria:** Any response is split across lines, merged with another response, or missing the trailing newline.
+
+---
+
+#### `stdio-unicode` -- UTF-8 Unicode Roundtrip
+
+- **Category:** transport
+- **Default required:** No (stdio transport only)
+- **Spec reference:** [basic/transports#stdio](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#stdio)
+- **Transports:** `stdio`
+- **Description:** Sends a request containing non-ASCII characters (CJK + emoji) in its parameters and verifies the response preserves the characters byte-for-byte. Catches encoding mistakes that surface most often on Windows stdio — platform-default code pages, `latin-1` decoding, or byte-swapped UTF-16.
+- **Pass criteria:** The response echoes the non-ASCII payload unchanged when the stream is read as UTF-8.
+- **Fail criteria:** The payload comes back mojibake, mangled, or replaced with `?` substitution characters.
+
+---
+
+#### `stdio-unknown-method-recovers` -- Recovers After Unknown Method
+
+- **Category:** transport
+- **Default required:** No (stdio transport only)
+- **Spec reference:** [basic/transports#stdio](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#stdio)
+- **Transports:** `stdio`
+- **Description:** Sends an unknown method, then immediately sends a valid `ping`. Verifies the server returns a JSON-RPC `-32601` error for the unknown method and continues serving the follow-up request without exiting or closing its stdio streams. A stdio server that exits on unknown methods is effectively unusable from a persistent client.
+- **Pass criteria:** The unknown-method request receives a JSON-RPC error, and the subsequent `ping` receives a valid result.
+- **Fail criteria:** The process exits, closes stdout, or fails to respond to the follow-up `ping`.
+
+---
+
+### 3.2 lifecycle -- Protocol Lifecycle (21 tests)
 
 Lifecycle tests validate the MCP initialization handshake and post-initialization protocol behavior. The test harness first performs the `initialize` request and sends the `notifications/initialized` notification, then validates the response fields and tests post-init operations.
 
@@ -413,6 +501,105 @@ Lifecycle tests validate the MCP initialization handshake and post-initializatio
 - **Description:** Tests that the server accepts `notifications/progress` without error. Servers should handle progress notifications for request tracking.
 - **Pass criteria:** Server accepts the progress notification (2xx response).
 - **Fail criteria:** Server returns an error for the progress notification.
+
+---
+
+#### `lifecycle-string-id` -- Supports String Request IDs
+
+- **Category:** lifecycle
+- **Default required:** No
+- **Spec reference:** [basic](https://modelcontextprotocol.io/specification/2025-11-25/basic)
+- **Description:** Sends a request with a string `id` (for example `"abc-123"`) instead of a number. JSON-RPC 2.0 permits both string and number IDs; the server MUST echo the exact value with its original type.
+- **Pass criteria:** The response `id` is strictly equal to the request `id` and remains a string.
+- **Fail criteria:** The response `id` is missing, has a different value, or has been coerced to a number.
+
+---
+
+#### `lifecycle-version-negotiate` -- Handles Unknown Protocol Version
+
+- **Category:** lifecycle
+- **Default required:** No
+- **Spec reference:** [basic/lifecycle#version-negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation)
+- **Description:** Sends an `initialize` request with a future `protocolVersion` (for example `"2099-01-01"`) and verifies the server negotiates down to a supported version or returns an error. Silently accepting unknown versions invites undefined behavior on both sides.
+- **Pass criteria:** The server either returns a supported `protocolVersion` it understands or returns a JSON-RPC error.
+- **Fail criteria:** The server echoes the unknown version back as if it supported it.
+
+---
+
+#### `lifecycle-reinit-reject` -- Rejects Second Initialize Request
+
+- **Category:** lifecycle
+- **Default required:** No
+- **Spec reference:** [basic/lifecycle#initialization](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#initialization)
+- **Description:** Sends a second `initialize` request within an already-initialized session. Per spec, the client MUST NOT send `initialize` more than once per session; the server SHOULD reject the duplicate rather than reset its state.
+- **Pass criteria:** Server returns a JSON-RPC error or HTTP 4xx for the second `initialize`.
+- **Fail criteria:** Server accepts the duplicate `initialize` and returns a 2xx result (session state may now be inconsistent).
+
+---
+
+#### `lifecycle-list-changed` -- Accepts listChanged Notifications
+
+- **Category:** lifecycle
+- **Default required:** No
+- **Spec reference:** [basic/lifecycle#capability-negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#capability-negotiation)
+- **Description:** Sends `notifications/tools/list_changed`, `notifications/resources/list_changed`, and `notifications/prompts/list_changed` for each declared capability, and verifies the server accepts each one without error. These notifications signal that cached list data may be stale.
+- **Pass criteria:** Server accepts every applicable `list_changed` notification (2xx response, no JSON-RPC error).
+- **Fail criteria:** Server returns an error or rejects a `list_changed` notification for a capability it declared.
+
+---
+
+#### `lifecycle-progress-token` -- Supports Progress Tokens in Requests
+
+- **Category:** lifecycle
+- **Default required:** No
+- **Spec reference:** [basic/utilities#progress](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities#progress)
+- **Description:** Sends a `tools/call` request with `_meta.progressToken` set and observes whether the server emits `notifications/progress` events carrying that token. Progress support is optional but strongly recommended for long-running tool invocations. **Auto-pass** if the server does not declare `tools` capability.
+- **Pass criteria:** Server either emits at least one progress notification that references the supplied `progressToken`, or completes the request normally and ignores the token without error.
+- **Fail criteria:** Server returns an error specifically because of the `_meta.progressToken` field.
+
+---
+
+#### `lifecycle-sampling-capability` -- Sampling Capability Shape
+
+- **Category:** lifecycle
+- **Default required:** No
+- **Spec reference:** [client/sampling](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling)
+- **Description:** `sampling` is a *client* capability — the client offers LLM access to the server. This test performs a shape check: the server's `initialize` response MUST NOT declare `sampling` in its own `capabilities` object (servers are consumers of sampling, not providers). A dedicated round-trip exercise requires a client-side sampling handler and is out of scope for this specification.
+- **Pass criteria:** The server's `capabilities` object does not include a `sampling` key.
+- **Fail criteria:** The server declares a `sampling` capability on its own side (shape error).
+
+---
+
+#### `lifecycle-roots-capability` -- Roots Capability Shape
+
+- **Category:** lifecycle
+- **Default required:** No
+- **Spec reference:** [client/roots](https://modelcontextprotocol.io/specification/2025-11-25/client/roots)
+- **Description:** `roots` is a *client* capability indicating the client exposes filesystem roots to the server. This test performs a shape check: the server's `initialize` response MUST NOT declare `roots` as its own capability. If a server ever sends `roots/list` requests, it must first confirm the connected client declared `roots` — this test does not exercise that flow, it only validates the declared shape.
+- **Pass criteria:** The server's `capabilities` object does not include a `roots` key.
+- **Fail criteria:** The server declares a `roots` capability on its own side.
+
+---
+
+#### `lifecycle-elicitation-capability` -- Elicitation Capability Shape
+
+- **Category:** lifecycle
+- **Default required:** No
+- **Spec reference:** [client/elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation)
+- **Description:** `elicitation` (asking the user for structured input mid-operation) is a *client* capability introduced in MCP spec version `2025-11-25`. The server's `initialize` response MUST NOT declare `elicitation` as its own capability. Servers that issue `elicitation/create` requests must first verify the client advertised the capability — this test validates only the declared shape.
+- **Pass criteria:** The server's `capabilities` object does not include an `elicitation` key.
+- **Fail criteria:** The server declares an `elicitation` capability on its own side.
+
+---
+
+#### `lifecycle-meta-tolerance` -- Tolerates `_meta` Field on Requests
+
+- **Category:** lifecycle
+- **Default required:** No
+- **Spec reference:** [basic/utilities#_meta](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities#_meta)
+- **Description:** Sends a `ping` with `params._meta = { extra: "value" }` and verifies the server does not error. The 2025-11-25 spec reserves `_meta` for protocol and forward-compatible extension metadata on any request; servers MUST ignore unknown `_meta` keys rather than reject the request.
+- **Pass criteria:** Server returns a normal result for the `ping` regardless of the `_meta` content.
+- **Fail criteria:** Server returns a JSON-RPC error that cites the `_meta` field as the cause.
 
 ---
 
@@ -566,7 +753,7 @@ Prompt tests only run if the server declares the `prompts` capability. They vali
 
 ---
 
-### 3.6 errors -- Error Handling (8 tests)
+### 3.6 errors -- Error Handling (10 tests)
 
 Error handling tests validate that the server correctly rejects invalid requests. These tests always run regardless of declared capabilities, because error handling is a baseline requirement for all MCP servers.
 
@@ -660,6 +847,28 @@ Error handling tests validate that the server correctly rejects invalid requests
 
 ---
 
+#### `error-capability-gated` -- Rejects Methods for Undeclared Capabilities
+
+- **Category:** errors
+- **Default required:** No
+- **Spec reference:** [basic/lifecycle#capability-negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#capability-negotiation)
+- **Description:** Calls list methods (`tools/list`, `resources/list`, `prompts/list`) for capabilities the server did **not** declare in its `initialize` response and verifies each receives an error. Servers that silently handle methods for undeclared capabilities mislead clients about their available surface.
+- **Pass criteria:** For every list method whose capability was not declared, the server returns a JSON-RPC error (preferably `-32601` Method not found).
+- **Fail criteria:** The server returns a successful result for a list method whose capability it did not declare.
+
+---
+
+#### `error-invalid-cursor` -- Handles Invalid Pagination Cursor Gracefully
+
+- **Category:** errors
+- **Default required:** No
+- **Spec reference:** [basic](https://modelcontextprotocol.io/specification/2025-11-25/basic)
+- **Description:** Sends a garbage `cursor` value to a list method that supports pagination and verifies the server handles it gracefully — either returning a JSON-RPC error or treating the invalid cursor as a request for the first page. Returning a 5xx or crashing the session indicates unvalidated cursor input.
+- **Pass criteria:** Server returns a JSON-RPC error **or** a valid first-page list response.
+- **Fail criteria:** Server returns 5xx, crashes the session, or returns a malformed body.
+
+---
+
 ### 3.7 schema -- Schema Validation (6 tests)
 
 Schema validation tests examine the structural correctness of the data returned by list operations (`tools/list`, `prompts/list`, `resources/list`). These tests run after their corresponding list operations have populated the cached data.
@@ -738,16 +947,16 @@ Schema validation tests examine the structural correctness of the data returned 
 - **Fail criteria:** Any resource is missing `uri`, has an unparseable URI, or is missing `name`.
 - **Warnings:** Emitted for resources missing `description` or `mimeType` fields (does not cause failure).
 
-### 3.8 security -- Security Validation (21 tests)
+### 3.8 security -- Security Validation (23 tests)
 
 Security tests verify authentication enforcement, input validation, tool integrity, information disclosure, and rate limiting. These tests run after all functional tests and require an established MCP session.
 
 **Sub-categories:**
 
-- **Auth & Transport** (8 tests) -- Verifies authentication is required and properly enforced, TLS is required, session IDs are high-entropy, OAuth metadata exists, and CORS is restrictive.
+- **Auth & Transport** (10 tests) -- Verifies authentication is required and properly enforced, 401 responses carry `WWW-Authenticate`, TLS is required, session IDs are high-entropy, session IDs don't bypass auth, OAuth metadata exists, tokens never appear in query strings, CORS is restrictive, and the Origin header is validated to prevent DNS rebinding.
 - **Input Validation** (6 tests) -- Tests tools for command injection, SQL injection, path traversal, SSRF, oversized input handling, and extra parameter handling. Input validation tests are capability-gated on `tools`.
 - **Tool Integrity** (4 tests) -- Checks that all tools define schemas, tool definitions are stable across calls (rug-pull detection), descriptions are free of prompt injection patterns, and tools don't cross-reference each other.
-- **Information Disclosure** (3 tests) -- Verifies error responses don't leak stack traces, internal IP addresses, or sensitive data. Also tests rate limiting enforcement.
+- **Information Disclosure & Rate Limiting** (3 tests) -- Verifies error responses don't leak stack traces or internal IPs, and that rate limiting is enforced under burst traffic.
 
 All security tests are **optional** by default (severity: warning). They do not affect the overall pass/fail determination for protocol compliance but significantly impact the security posture score.
 
@@ -767,6 +976,14 @@ All security tests are **optional** by default (severity: warning). They do not 
 - **Description:** Sends a request with a garbage Authorization header value and verifies the server rejects it.
 - **Pass criteria:** HTTP 401 or 403 for malformed auth token.
 - **Fail criteria:** Server accepts malformed auth token.
+
+#### `security-www-authenticate` -- 401 responses include `WWW-Authenticate` header
+
+- **Default required:** No
+- **Spec reference:** [basic/authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+- **Description:** Triggers a 401 response (by sending no Authorization header) and checks that the response includes a `WWW-Authenticate` header indicating the required auth scheme. RFC 9110 requires 401 responses to carry this header; MCP inherits that requirement via the Streamable HTTP transport.
+- **Pass criteria:** 401 responses include a `WWW-Authenticate` header (e.g., `WWW-Authenticate: Bearer realm="mcp"`). **Auto-pass** if the server does not require auth.
+- **Fail criteria:** The server returns 401 without a `WWW-Authenticate` header.
 
 #### `security-tls-required` -- Enforces HTTPS/TLS
 
@@ -815,6 +1032,14 @@ All security tests are **optional** by default (severity: warning). They do not 
 - **Description:** Sends an OPTIONS request with `Origin: https://evil.example.com` and checks the CORS response headers.
 - **Pass criteria:** No CORS headers, or Access-Control-Allow-Origin is a specific origin (not `*` or reflected).
 - **Fail criteria:** Access-Control-Allow-Origin is `*` or reflects arbitrary origins.
+
+#### `security-origin-validation` -- Validates `Origin` header on requests
+
+- **Default required:** No
+- **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+- **Description:** Sends a request with a suspicious `Origin` header (for example `https://evil-rebinding-attack.example.com`) and verifies the server rejects it. Per spec, servers MUST validate the `Origin` header to prevent DNS rebinding attacks, where a local server is accessed from a malicious web page after a DNS swap.
+- **Pass criteria:** Server rejects the request with HTTP 403 (or otherwise refuses to process the body) when the `Origin` is not on its allowlist.
+- **Fail criteria:** Server processes the request and returns a 2xx result despite the untrusted origin.
 
 #### `security-command-injection` -- Resists command injection in tool params
 
@@ -933,22 +1158,26 @@ All security tests are **optional** by default (severity: warning). They do not 
 
 ## 4. Rule Catalog (Machine-Readable)
 
-The file `mcp-compliance-rules.json` provides a machine-readable catalog of all 81 test rules. It is the canonical source for rule metadata and is intended for tooling integration (IDEs, CI pipelines, dashboards).
+The file `mcp-compliance-rules.json` provides a machine-readable catalog of all 88 test rules. It is the canonical source for rule metadata and is intended for tooling integration (IDEs, CI pipelines, dashboards).
 
 **Schema:**
 
 ```json
 {
-  "specVersion": "1.0.0-draft",
+  "specVersion": "1.1.0",
   "mcpVersion": "2025-11-25",
   "rules": [
     {
       "id": "transport-post",
       "name": "HTTP POST accepted",
       "category": "transport",
-      "required": true,
+      "severity": "error",
+      "defaultRequired": true,
+      "capabilityGated": null,
       "specRef": "basic/transports#streamable-http",
-      "description": "Verifies the server accepts HTTP POST requests..."
+      "description": "Verifies the server accepts HTTP POST requests...",
+      "passCriteria": "HTTP 2xx response for POST with JSON-RPC body",
+      "failCriteria": "Non-2xx response"
     }
   ]
 }
@@ -960,10 +1189,15 @@ Each rule object contains:
 |-------|------|-------------|
 | `id` | string | Unique test identifier (e.g., `transport-post`). |
 | `name` | string | Human-readable test name. |
-| `category` | string | One of: `transport`, `lifecycle`, `tools`, `resources`, `prompts`, `errors`, `schema`. |
-| `required` | boolean | Default required status. May be overridden at runtime by capability-driven logic. |
+| `category` | string | One of: `transport`, `lifecycle`, `tools`, `resources`, `prompts`, `errors`, `schema`, `security`. |
+| `severity` | string | `error` (default-required rules) or `warning` (default-optional rules). Determines how the rule contributes to the overall pass/fail status. |
+| `defaultRequired` | boolean | Default required status. May be overridden at runtime by capability-driven logic. |
+| `capabilityGated` | string \| null | If non-null, the server capability (e.g., `"tools"`) that activates this rule. Gated rules only run when the capability is declared. |
 | `specRef` | string | Relative path to the relevant MCP spec section (base: `https://modelcontextprotocol.io/specification/2025-11-25/`). |
 | `description` | string | Detailed description of what the test verifies. |
+| `passCriteria` | string | Exact conditions under which the test is marked as passed. |
+| `failCriteria` | string | Exact conditions under which the test is marked as failed. |
+| `transports` | array \| undefined | If present, the transports (e.g., `["stdio"]`) this rule applies to. If absent, the rule applies to the Streamable HTTP transport. |
 
 ---
 

@@ -1,12 +1,12 @@
 # mcp-compliance
 
-MCP server compliance testing tool. Tests any Streamable HTTP MCP server against the MCP specification (2025-11-25) with 81 tests across 8 categories.
+MCP server compliance testing tool. Tests any Streamable HTTP or stdio MCP server against the MCP specification (2025-11-25) with 88 tests across 8 categories (16 transport, 21 lifecycle, 4 tools, 5 resources, 3 prompts, 10 errors, 6 schema, 23 security).
 
 ## Architecture
 
 - `src/index.ts` — CLI entry point (Commander.js). Subcommands: `test`, `badge`, `mcp`.
-- `src/runner.ts` — Core test engine. Runs all 81 tests sequentially. Exports `runComplianceSuite()`, `SPEC_VERSION`, `SPEC_BASE`, and `parseSSEResponse()`. Includes preflight connectivity check.
-- `src/types.ts` — TypeScript interfaces + `TEST_DEFINITIONS` array (all 81 test metadata).
+- `src/runner.ts` — Core test engine. Runs all 88 tests sequentially (transport-gated: HTTP tests skipped against stdio servers and vice-versa). Exports `runComplianceSuite()`, `SPEC_VERSION`, `SPEC_BASE`, `TEST_DEFINITIONS`, `computeGrade()`, `computeScore()`, `generateBadge()`, `parseSSEResponse()`, `previewTests()`, and `urlHash()`. Includes preflight connectivity check.
+- `src/types.ts` — TypeScript interfaces + `TEST_DEFINITIONS` array (all 88 test metadata).
 - `src/grader.ts` — Scoring algorithm: required tests 70%, optional 30%. Grade thresholds: A>=90, B>=75, C>=60, D>=40, F<40.
 - `src/reporter.ts` — Terminal (chalk), JSON, and SARIF formatters. SARIF includes server context in invocations.
 - `src/badge.ts` — Badge URL generation via mcp.hosting.
@@ -25,7 +25,8 @@ MCP server compliance testing tool. Tests any Streamable HTTP MCP server against
 - Transport tests run pre-initialization using raw HTTP (undici).
 - Lifecycle tests drive the MCP initialize handshake, then run post-init tests.
 - Capability-gated tests (tools, resources, prompts) only run if the server declares the capability. Their `required` flag is dynamic.
-- Security tests (23) run after all functional tests. Auth tests require `--auth`; input validation tests are gated on `tools` capability. All security tests are optional by default.
+- Security tests (23) run after all functional tests. Auth tests require `--auth`; input validation tests are gated on `tools` capability. All security tests are optional by default (severity: warning).
+- Stdio transport tests (3) only run when testing a stdio server (spawned via command); HTTP transport tests (13) skip when the server is stdio. Rules with `transports: ["stdio"]` in the rule catalog are transport-gated.
 - Request IDs use a counter starting at 1000 to avoid collision with hardcoded transport test IDs (99901-99904).
 - SSE parsing handles multi-line `data:` fields per the SSE spec. Exported and unit-tested.
 - Session state (MCP-Session-Id, protocol version) is tracked and injected into subsequent requests.
