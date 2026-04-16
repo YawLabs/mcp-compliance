@@ -151,6 +151,31 @@ function resolveTarget(
   throw new Error("No target specified. Pass a URL or command, or add 'target' to mcp-compliance.config.json.");
 }
 
+// Special-use / private TLDs and suffixes. A hostname ending in one of these
+// is almost certainly not publicly resolvable and shouldn't be silently
+// published to mcp.hosting along with the report. Sources:
+//   RFC 6761 (.test, .example, .invalid, .localhost)
+//   RFC 6762 (.local — mDNS)
+//   RFC 8375 (.home.arpa)
+//   ICANN 2024 reservation (.internal)
+//   Widespread corporate convention (.corp, .home, .lan, .intranet, .private)
+//   Tor (.onion — RFC 7686)
+const PRIVATE_TLD_SUFFIXES = [
+  ".local",
+  ".localhost",
+  ".internal",
+  ".corp",
+  ".home",
+  ".home.arpa",
+  ".lan",
+  ".intranet",
+  ".private",
+  ".test",
+  ".invalid",
+  ".example",
+  ".onion",
+];
+
 function isPrivateHost(urlStr: string): boolean {
   let host: string;
   try {
@@ -158,7 +183,10 @@ function isPrivateHost(urlStr: string): boolean {
   } catch {
     return false;
   }
-  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (host === "localhost") return true;
+  for (const suffix of PRIVATE_TLD_SUFFIXES) {
+    if (host === suffix.slice(1) || host.endsWith(suffix)) return true;
+  }
   const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (v4) {
     const [a, b] = v4.slice(1).map(Number);
