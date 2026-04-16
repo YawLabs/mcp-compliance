@@ -3345,7 +3345,12 @@ export async function runComplianceSuite(
     // ── Compute score ────────────────────────────────────────────────
 
     const { score, grade, overall, summary, categories } = computeScore(tests);
-    const badge = generateBadge(displayUrl);
+    // Stdio targets aren't published to mcp.hosting, so any badge URL we emit
+    // would resolve to an "unknown" fallback. Blank the fields so consumers
+    // (JSON pipelines, README snippets) don't copy dead links.
+    const badge = displayUrl.startsWith("stdio:")
+      ? { imageUrl: "", reportUrl: "", markdown: "", html: "" }
+      : generateBadge(displayUrl);
 
     return {
       schemaVersion: REPORT_SCHEMA_VERSION,
