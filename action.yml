@@ -110,16 +110,20 @@ runs:
           args+=("${parts[@]}")
         fi
 
-        cmd_flags=()
-        cmd_flags+=("--format" "$MCP_FORMAT")
-        cmd_flags+=("--timeout" "$MCP_TIMEOUT")
-        [[ "$MCP_STRICT" == "true" ]] && cmd_flags+=("--strict")
-        [[ -n "$MCP_MIN_GRADE" ]] && cmd_flags+=("--min-grade" "$MCP_MIN_GRADE")
-        [[ -n "$MCP_OUTPUT" ]] && cmd_flags+=("--output" "$MCP_OUTPUT")
-        [[ -n "$MCP_AUTH" ]] && cmd_flags+=("--auth" "$MCP_AUTH")
-        [[ -n "$MCP_ENV_FILE" ]] && cmd_flags+=("--env-file" "$MCP_ENV_FILE")
-        [[ -n "$MCP_ONLY" ]] && cmd_flags+=("--only" "$MCP_ONLY")
-        [[ -n "$MCP_SKIP" ]] && cmd_flags+=("--skip" "$MCP_SKIP")
+        # Common flags shared by every invocation. NOTE: --format is NOT
+        # in here — each run chooses its own format. Previously --format
+        # lived in cmd_flags and the SARIF path did a fragile bash param
+        # substitution to rename it, which produced an unknown flag and
+        # (depending on commander version) failed silently.
+        cmd_common=()
+        cmd_common+=("--timeout" "$MCP_TIMEOUT")
+        [[ "$MCP_STRICT" == "true" ]] && cmd_common+=("--strict")
+        [[ -n "$MCP_MIN_GRADE" ]] && cmd_common+=("--min-grade" "$MCP_MIN_GRADE")
+        [[ -n "$MCP_OUTPUT" ]] && cmd_common+=("--output" "$MCP_OUTPUT")
+        [[ -n "$MCP_AUTH" ]] && cmd_common+=("--auth" "$MCP_AUTH")
+        [[ -n "$MCP_ENV_FILE" ]] && cmd_common+=("--env-file" "$MCP_ENV_FILE")
+        [[ -n "$MCP_ONLY" ]] && cmd_common+=("--only" "$MCP_ONLY")
+        [[ -n "$MCP_SKIP" ]] && cmd_common+=("--skip" "$MCP_SKIP")
 
         # Choose between `test` (default) and `badge` (when publishing)
         subcommand="test"
@@ -129,17 +133,36 @@ runs:
 
         # Pin to the requested version
         pkg="@yawlabs/mcp-compliance@$MCP_VERSION"
-        echo "Running: npx -y $pkg $subcommand ${cmd_flags[*]} ${args[*]}"
 
-        # Capture both human + machine readable. Run twice if user wants
-        # SARIF upload, since formats are mutually exclusive.
+        # Echo a redacted command line for the workflow log. GitHub's
+        # automatic secret masking only covers repo/org secrets — tokens
+        # piped in from `with: auth:` on a called workflow (or from a
+        # plain workflow input) are NOT masked, so the token value
+        # passed via `--auth` must be stripped here before echo.
+        safe_cmd=("npx" "-y" "$pkg" "$subcommand" "--format" "$MCP_FORMAT")
+        redact_next=0
+        for arg in "${cmd_common[@]}"; do
+          if [[ "$redact_next" == "1" ]]; then
+            safe_cmd+=("***")
+            redact_next=0
+          elif [[ "$arg" == "--auth" ]]; then
+            safe_cmd+=("$arg")
+            redact_next=1
+          else
+            safe_cmd+=("$arg")
+          fi
+        done
+        echo "Running: ${safe_cmd[*]} ${args[*]}"
+
+        # Optional SARIF pass for Code Scanning upload. Runs with the
+        # full common flag set so auth / only / skip / strict all apply.
         if [[ "$MCP_UPLOAD_SARIF" == "true" ]]; then
-          npx -y "$pkg" "$subcommand" --format sarif "${cmd_flags[@]/--format/--format-skipped}" "${args[@]}" > compliance.sarif || true
+          npx -y "$pkg" "$subcommand" --format sarif "${cmd_common[@]}" "${args[@]}" > compliance.sarif || true
         fi
 
-        # Run the requested format and capture JSON for outputs at the same time.
-        # We always do a JSON pass to extract grade/score for outputs.
-        json_out=$(npx -y "$pkg" "$subcommand" --format json "${args[@]}" --timeout "$MCP_TIMEOUT" || true)
+        # JSON pass to extract grade/score for workflow outputs. Must use
+        # the same flags as the user-visible run so the numbers match.
+        json_out=$(npx -y "$pkg" "$subcommand" --format json "${cmd_common[@]}" "${args[@]}" || true)
         echo "$json_out" > compliance.json
         grade=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).grade)}catch(e){console.log('?')}")
         score=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).score)}catch(e){console.log(0)}")
@@ -155,5 +178,5 @@ runs:
           echo "report-url=$report_url"
         } >> "$GITHUB_OUTPUT"
 
-        # Now run the user-requested format for visible output
-        npx -y "$pkg" "$subcommand" "${cmd_flags[@]}" "${args[@]}"
+        # User-visible run in the requested format.
+        npx -y "$pkg" "$subcommand" --format "$MCP_FORMAT" "${cmd_common[@]}" "${args[@]}"

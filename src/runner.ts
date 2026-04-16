@@ -1,5 +1,13 @@
 import { createRequire } from "node:module";
 import { request } from "undici";
+// Intentional dual-layer HTTP: this `request` import is used only by
+// wire-level transport tests that need raw status codes, headers, and
+// ill-formed bodies (batch arrays, unknown Content-Types, session-id
+// absence, etc.). Everything past `lifecycle-init` should go through
+// the Transport abstraction in ./transport/* so both HTTP and stdio
+// share the same code path. If you find yourself reaching for `request`
+// below the lifecycle gate, first check whether Transport.rawRequest /
+// rawPost already exposes what you need.
 import { generateBadge } from "./badge.js";
 import { computeScore } from "./grader.js";
 import { type HttpTransport, createHttpTransport } from "./transport/http.js";
@@ -30,6 +38,18 @@ const INJECTION_PAYLOADS = {
   ssrf: ["http://169.254.169.254/latest/meta-data/", "http://127.0.0.1:22", "http://[::1]/", "http://10.0.0.1/"],
 };
 
+// Patterns that indicate leakage of server internals in an error
+// response. The test name (security-error-no-stacktrace) is historical —
+// this catches stack traces *and* adjacent implementation-detail leaks
+// (filesystem paths, DB connection strings) as the rubric calls out.
+// Deliberately NOT included:
+//   - /password|passwd|secret|credential/i — false-positives every
+//     legitimate auth error ("Invalid password", "Missing credential").
+//     If you want a secrets-leak check, it belongs in its own test with
+//     a narrower signature (e.g. Bearer tokens, AWS keys).
+//   - bare /ENOENT|EACCES|EPERM/ — these appear in well-formed error
+//     messages ("ENOENT: no such file"), so we only flag them when they
+//     co-occur with a filesystem path below.
 const STACK_TRACE_PATTERNS = [
   /at\s+\S+\s+\(.*:\d+:\d+\)/i, // Node.js: "at Function (file.js:10:5)"
   /Traceback\s+\(most recent/i, // Python
@@ -40,12 +60,10 @@ const STACK_TRACE_PATTERNS = [
   /\.cs:line\s+\d+/i, // C#/.NET
   /#\d+\s+\/.*\.php\(\d+\)/i, // PHP
   /panicked\s+at\s+'/i, // Rust
-  /ENOENT|EACCES|EPERM/, // Node.js system errors
-  /node_modules\//, // Node.js module paths
-  /\/usr\/local\/|\/home\//, // Unix paths
-  /[A-Z]:\\.*\\/, // Windows paths
-  /password|passwd|secret|credential/i, // Sensitive terms
-  /jdbc:|mysql:|postgres:|mongodb:/i, // DB connection strings
+  /node_modules\//, // Node.js module paths (filesystem layout leak)
+  /\/usr\/local\/|\/home\/|\/root\//, // Unix absolute paths
+  /[A-Z]:\\[\w\s.-]+\\[\w\s.-]+/, // Windows absolute paths (drive + 2+ segments)
+  /jdbc:|mysql:\/\/|postgres(?:ql)?:\/\/|mongodb(?:\+srv)?:\/\//i, // DB connection strings
 ];
 
 const INTERNAL_IP_PATTERNS = [
@@ -61,6 +79,28 @@ const INTERNAL_IP_PATTERNS = [
 function createIdCounter(start = 0) {
   let id = start;
   return () => ++id;
+}
+
+/**
+ * Dedupe and cap a list of warnings, preserving insertion order and
+ * appending a truncation sentinel when capped. Extracted so the cap
+ * semantics can be unit-tested without spinning up a suite run.
+ *
+ * @internal Exported for testing.
+ */
+export function dedupAndCapWarnings(warnings: readonly string[], max: number): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const w of warnings) {
+    if (seen.has(w)) continue;
+    seen.add(w);
+    deduped.push(w);
+  }
+  if (deduped.length > max) {
+    const truncated = deduped.length - max;
+    return [...deduped.slice(0, max), `... and ${truncated} more warning(s) suppressed`];
+  }
+  return deduped;
 }
 
 /**
@@ -3284,19 +3324,23 @@ export async function runComplianceSuite(
       },
     );
 
-    // ── Cap warnings ─────────────────────────────────────────────────
-
-    const MAX_WARNINGS = 100;
-    if (warnings.length > MAX_WARNINGS) {
-      const truncated = warnings.length - MAX_WARNINGS;
-      warnings.splice(MAX_WARNINGS, truncated, `... and ${truncated} more warning(s) suppressed`);
-    }
-
     // Drain any still-pending parallel tests before finalizing the
     // report. Individual sequential tests already barrier, but if the
     // last-declared test was parallel-safe we still have work in flight
-    // when we get here.
+    // when we get here. MUST happen before warning dedup/cap below —
+    // draining can push more warnings.
     if (inFlight.size > 0) await drainPool();
+
+    // ── Dedup + cap warnings ─────────────────────────────────────────
+    // A server with, say, 60 tools all missing descriptions produces 60
+    // near-identical lines that crowd out every other signal. Preserve
+    // insertion order but collapse exact duplicates, then cap. Mutates
+    // the array in place so the return value below picks up the change.
+
+    const MAX_WARNINGS = 50;
+    const capped = dedupAndCapWarnings(warnings, MAX_WARNINGS);
+    warnings.length = 0;
+    warnings.push(...capped);
 
     // ── Compute score ────────────────────────────────────────────────
 

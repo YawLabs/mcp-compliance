@@ -23,6 +23,22 @@ export interface BadgeSvgInput {
   timestamp?: string;
 }
 
+/**
+ * XML-escape text that will be interpolated into SVG attribute values or
+ * element text. In-tree callers always pass strict `Grade` unions and
+ * server-side timestamps, but `renderBadgeSvg` is a public export — a
+ * downstream caller could easily hand it user-controlled input, and a
+ * grade of `"A"><script>` would otherwise corrupt the output SVG.
+ */
+function escXml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 export function renderBadgeSvg(input: BadgeSvgInput | null): string {
   let gradeLabel = "unknown";
   let color = UNTESTED_COLOR;
@@ -30,21 +46,26 @@ export function renderBadgeSvg(input: BadgeSvgInput | null): string {
 
   if (input?.grade) {
     gradeLabel = input.grade;
+    // Only grades we recognize get their branded color; unknown strings
+    // fall through to the neutral untested color and never reach the SVG
+    // `fill=` attribute untouched (escXml below guards the textual forms).
     color = GRADE_COLORS[input.grade] || UNTESTED_COLOR;
     const date = input.timestamp ? new Date(input.timestamp).toLocaleDateString() : "unknown date";
     title = `MCP Compliant: Grade ${input.grade}${input.score != null ? ` (${input.score}%)` : ""} - tested ${date}`;
   }
 
   const leftText = "MCP Compliant";
-  const rightText = gradeLabel;
+  const rightText = escXml(gradeLabel);
+  const ariaLabel = `${leftText}: ${escXml(gradeLabel)}`;
+  const titleEsc = escXml(title);
   const leftWidth = 95;
   const rightWidth = 40;
   const totalWidth = leftWidth + rightWidth;
   const leftX = leftWidth / 2;
   const rightX = leftWidth + rightWidth / 2;
 
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${totalWidth}" height="20" role="img" aria-label="${leftText}: ${rightText}">
-  <title>${title}</title>
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${totalWidth}" height="20" role="img" aria-label="${ariaLabel}">
+  <title>${titleEsc}</title>
   <linearGradient id="s" x2="0" y2="100%">
     <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
     <stop offset="1" stop-opacity=".1"/>

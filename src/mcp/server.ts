@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -46,9 +46,20 @@ export async function startServer(): Promise<void> {
   await server.connect(transport);
 }
 
-// Direct execution support
-const isDirectRun = process.argv[1]?.endsWith("mcp/server.js") || process.argv[1]?.endsWith("mcp\\server.js");
-if (isDirectRun) {
+// Direct execution support: when `node .../mcp/server.js` is invoked
+// (or tsx during dev), boot the stdio server. We compare realpaths so
+// symlinked node_modules layouts and bundled installs still match — the
+// previous endsWith() check broke under any wrapper path.
+function isInvokedDirectly(): boolean {
+  const argv1 = process.argv[1];
+  if (!argv1) return false;
+  try {
+    return realpathSync(argv1) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+if (isInvokedDirectly()) {
   startServer().catch((err) => {
     console.error("MCP server error:", err);
     process.exit(1);

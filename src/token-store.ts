@@ -34,6 +34,13 @@ function readStore(): Store {
 function writeStore(store: Store): void {
   const dir = dirname(STORE_PATH);
   try {
+    // The mode flags are best-effort: they constrain the file to the owner
+    // on POSIX, but Node silently ignores `mode` on Win32 (mode controls
+    // only the read-only bit). Protection on Windows comes from the
+    // default NTFS ACL on %USERPROFILE%, which already restricts the
+    // %USERPROFILE%\.mcp-compliance directory to the current user. These
+    // are delete-tokens for a public reporting service, not credentials;
+    // per-user filesystem isolation is adequate for the threat model.
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
     writeFileSync(STORE_PATH, JSON.stringify(store, null, 2), { mode: 0o600 });
   } catch (err: unknown) {

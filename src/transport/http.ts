@@ -45,7 +45,14 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
   function normalizeHeaders(raw: Record<string, string | string[] | undefined>): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(raw)) {
-      if (typeof v === "string") out[k] = v;
+      if (v === undefined) continue;
+      // undici returns repeated headers (Set-Cookie, WWW-Authenticate, etc.)
+      // as string[]. Join them so downstream tests can still inspect the
+      // value — silently dropping multi-value headers would hide exactly
+      // the kind of misconfig (e.g. multiple Mcp-Session-Id) these tests
+      // exist to catch. Set-Cookie is ambiguous under comma-join but we
+      // don't currently assert on it; revisit if that changes.
+      out[k] = Array.isArray(v) ? v.join(", ") : v;
     }
     return out;
   }

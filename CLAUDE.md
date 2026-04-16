@@ -5,7 +5,7 @@ MCP server compliance testing tool. Tests any Streamable HTTP or stdio MCP serve
 ## Architecture
 
 - `src/index.ts` — CLI entry point (Commander.js). Subcommands: `test`, `badge`, `mcp`.
-- `src/runner.ts` — Core test engine. Runs all 88 tests sequentially (transport-gated: HTTP tests skipped against stdio servers and vice-versa). Exports `runComplianceSuite()`, `SPEC_VERSION`, `SPEC_BASE`, `TEST_DEFINITIONS`, `computeGrade()`, `computeScore()`, `generateBadge()`, `parseSSEResponse()`, `previewTests()`, and `urlHash()`. Includes preflight connectivity check.
+- `src/runner.ts` — Core test engine. Runs all 88 tests (transport-gated: HTTP tests skipped against stdio servers and vice-versa). Default is sequential; tests flagged `parallelSafe: true` in `TEST_DEFINITIONS` can run concurrently when `concurrency > 1` is passed to `runComplianceSuite()`. Exports `runComplianceSuite()`, `SPEC_VERSION`, `SPEC_BASE`, `TEST_DEFINITIONS`, `computeGrade()`, `computeScore()`, `generateBadge()`, `parseSSEResponse()`, `previewTests()`, and `urlHash()`. Includes preflight connectivity check.
 - `src/types.ts` — TypeScript interfaces + `TEST_DEFINITIONS` array (all 88 test metadata).
 - `src/grader.ts` — Scoring algorithm: required tests 70%, optional 30%. Grade thresholds: A>=90, B>=75, C>=60, D>=40, F<40.
 - `src/reporter.ts` — Terminal (chalk), JSON, and SARIF formatters. SARIF includes server context in invocations.
@@ -31,7 +31,7 @@ MCP server compliance testing tool. Tests any Streamable HTTP or stdio MCP serve
 - SSE parsing handles multi-line `data:` fields per the SSE spec. Exported and unit-tested.
 - Session state (MCP-Session-Id, protocol version) is tracked and injected into subsequent requests.
 - Preflight connectivity check warns early if server is unreachable.
-- Warnings array is capped at 50 entries to prevent report bloat.
+- Warnings array is deduplicated (exact-match) and capped at 50 entries after all tests drain. A sentinel `"... and N more warning(s) suppressed"` is appended when truncation occurs.
 - `SPEC_VERSION` and `SPEC_BASE` are exported from runner.ts as the single source of truth.
 
 ## Release process

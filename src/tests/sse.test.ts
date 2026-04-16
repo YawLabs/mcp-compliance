@@ -87,4 +87,21 @@ describe("parseSSEResponse", () => {
     const result = parseSSEResponse(text);
     expect(result).toEqual({ jsonrpc: "2.0", id: 1, result: {} });
   });
+
+  it("handles CRLF line endings (proxies/CDNs that normalize)", () => {
+    // Regression guard: splitting on "\n" only would leave a trailing
+    // "\r" on each line, causing `line.startsWith("data:")` to still
+    // match but the parsed payload to carry a "\r" at the end. V8's
+    // JSON.parse happens to tolerate trailing whitespace, but matching
+    // / equality checks downstream would surprise anyone.
+    const text = 'data: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}\r\n\r\n';
+    const result = parseSSEResponse(text);
+    expect(result).toEqual({ jsonrpc: "2.0", id: 1, result: { ok: true } });
+  });
+
+  it("handles CRLF in multi-line data fields", () => {
+    const text = ['data: {"jsonrpc":"2.0",', 'data: "id":1,', 'data: "result":{}}', ""].join("\r\n");
+    const result = parseSSEResponse(text);
+    expect(result).toEqual({ jsonrpc: "2.0", id: 1, result: {} });
+  });
 });

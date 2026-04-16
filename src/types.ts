@@ -109,7 +109,7 @@ export type TransportTarget =
 
 /** All 88 test IDs with descriptions for the explain command */
 export const TEST_DEFINITIONS: TestDefinition[] = [
-  // ── Transport (13 tests) ─────────────────────────────────────────
+  // ── Transport (16 tests: 13 HTTP + 3 stdio) ──────────────────────
   {
     id: "transport-post",
     name: "HTTP POST accepted",
@@ -296,7 +296,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     transports: ["stdio"],
   },
 
-  // ── Lifecycle (17 tests) ─────────────────────────────────────────
+  // ── Lifecycle (21 tests) ─────────────────────────────────────────
   {
     id: "lifecycle-init",
     name: "Initialize handshake",

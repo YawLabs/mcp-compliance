@@ -21,6 +21,10 @@ jobs:
     # Cross-platform matrix: stdio transport behaves differently on Windows
     # (shell:true for npx .cmd shims) and macOS — bugs there shouldn't ship.
     runs-on: ${{ matrix.os }}
+    # A hung child process in stdio-transport tests could otherwise wedge
+    # for the default 360m. The full suite finishes in under 2 minutes on
+    # all platforms locally; 15m is a generous ceiling.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

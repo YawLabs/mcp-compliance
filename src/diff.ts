@@ -26,8 +26,19 @@ export interface DiffSummary {
 /**
  * Diff two compliance reports. Pure function — no I/O. The CLI loads
  * both files and renders the result.
+ *
+ * Throws if the two reports were produced against incompatible spec
+ * versions. Diffing across spec revisions would silently mis-classify
+ * renamed or repurposed test IDs as regressions/fixes.
  */
 export function diffReports(baseline: ComplianceReport, current: ComplianceReport): DiffSummary {
+  if (baseline.specVersion && current.specVersion && baseline.specVersion !== current.specVersion) {
+    throw new Error(
+      `Spec version mismatch: baseline is ${baseline.specVersion}, current is ${current.specVersion}. ` +
+        "Re-run the baseline with this tool version (or downgrade the tool to match) before diffing.",
+    );
+  }
+
   const baseById = new Map<string, TestResult>(baseline.tests.map((t) => [t.id, t]));
   const curById = new Map<string, TestResult>(current.tests.map((t) => [t.id, t]));
 

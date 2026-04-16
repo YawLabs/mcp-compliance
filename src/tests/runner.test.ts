@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { runComplianceSuite } from "../runner.js";
+import { dedupAndCapWarnings, runComplianceSuite } from "../runner.js";
 
 // Use localhost on a port that's definitely not listening for instant ECONNREFUSED
 const DEAD_URL = "http://127.0.0.1:1/mcp";
@@ -229,5 +229,39 @@ describe("previewTests", () => {
 
     const skipSecurity = previewTests({ transport: "http", skip: ["security"] });
     expect(skipSecurity.some((t) => t.category === "security")).toBe(false);
+  });
+});
+
+describe("dedupAndCapWarnings", () => {
+  it("preserves order and drops exact duplicates", () => {
+    const out = dedupAndCapWarnings(["a", "b", "a", "c", "b"], 50);
+    expect(out).toEqual(["a", "b", "c"]);
+  });
+
+  it("leaves a list below the cap untouched (after dedup)", () => {
+    const input = ["w1", "w2", "w3"];
+    const out = dedupAndCapWarnings(input, 10);
+    expect(out).toEqual(input);
+  });
+
+  it("caps and appends a truncation sentinel when over the limit", () => {
+    const input = Array.from({ length: 60 }, (_, i) => `warn-${i}`);
+    const out = dedupAndCapWarnings(input, 50);
+    expect(out).toHaveLength(51);
+    expect(out.slice(0, 50)).toEqual(input.slice(0, 50));
+    expect(out[50]).toBe("... and 10 more warning(s) suppressed");
+  });
+
+  it("counts truncation against the deduped length, not the raw input", () => {
+    // 10 uniques repeated 6 times = 60 entries → 10 after dedup → no cap
+    const dup = Array.from({ length: 6 }, () => Array.from({ length: 10 }, (_, i) => `w${i}`)).flat();
+    expect(dup).toHaveLength(60);
+    const out = dedupAndCapWarnings(dup, 50);
+    expect(out).toHaveLength(10);
+    expect(out.some((w) => w.startsWith("..."))).toBe(false);
+  });
+
+  it("handles an empty input", () => {
+    expect(dedupAndCapWarnings([], 50)).toEqual([]);
   });
 });

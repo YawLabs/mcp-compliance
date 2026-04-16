@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { TEST_DEFINITIONS } from "../types.js";
 import type { TestCategory, TestDefinition } from "../types.js";
@@ -117,5 +119,99 @@ describe("TEST_DEFINITIONS", () => {
     expect(ct).toBeDefined();
     expect(ct!.category).toBe("transport");
     expect(ct!.required).toBe(false);
+  });
+});
+
+describe("README ↔ TEST_DEFINITIONS parity", () => {
+  // Regression guard: the per-category counts shown in the README's "What
+  // the N tests check" collapsible sections must match TEST_DEFINITIONS.
+  // Drift previously went unnoticed when capability-gated tests were added
+  // (transport went 13→16 when stdio-only tests landed; lifecycle 17→21
+  // when the capability/meta-tolerance tests landed). A failing test here
+  // is a signal to update the README at the same time.
+  // README uses sentence-case labels that differ from the TestCategory
+  // union ("errors" → "Error Handling", "schema" → "Schema Validation"),
+  // so explicit mapping beats a fancy auto-cased guess.
+  const README_LABELS: Record<TestCategory, string> = {
+    transport: "Transport",
+    lifecycle: "Lifecycle",
+    tools: "Tools",
+    resources: "Resources",
+    prompts: "Prompts",
+    errors: "Error Handling",
+    schema: "Schema Validation",
+    security: "Security",
+  };
+
+  function readmeCountFor(category: TestCategory): number | null {
+    const readmePath = fileURLToPath(new URL("../../README.md", import.meta.url));
+    const src = readFileSync(readmePath, "utf8");
+    const label = README_LABELS[category];
+    const re = new RegExp(`<summary><strong>${label}\\s*\\((\\d+)\\s*tests?\\)</strong></summary>`);
+    const m = src.match(re);
+    return m ? Number.parseInt(m[1], 10) : null;
+  }
+
+  function runtimeCountFor(category: TestCategory): number {
+    return TEST_DEFINITIONS.filter((t) => t.category === category).length;
+  }
+
+  for (const cat of VALID_CATEGORIES) {
+    it(`README section "${cat}" count matches TEST_DEFINITIONS`, () => {
+      const docCount = readmeCountFor(cat);
+      expect(docCount, `README missing "<summary><strong>${cat}...</strong>" header`).not.toBeNull();
+      expect(docCount).toBe(runtimeCountFor(cat));
+    });
+  }
+
+  it("README totals match TEST_DEFINITIONS total", () => {
+    let sum = 0;
+    for (const cat of VALID_CATEGORIES) {
+      const n = readmeCountFor(cat);
+      if (n != null) sum += n;
+    }
+    expect(sum).toBe(TEST_DEFINITIONS.length);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Parity guard: every `await test("<id>", ...)` call in runner.ts MUST
+// have a matching entry in TEST_DEFINITIONS, and every TEST_DEFINITIONS
+// entry MUST be invoked by the runner at least once. Without this check
+// the two lists drift (e.g. a test gets renamed in runner but its entry
+// in types.ts stays the old id → metadata lookups silently return undef).
+// ─────────────────────────────────────────────────────────────────────
+function extractRunnerTestIds(): string[] {
+  const runnerPath = fileURLToPath(new URL("../runner.ts", import.meta.url));
+  const src = readFileSync(runnerPath, "utf8");
+  // Allow multiline match so `await test(\n  "id",\n  ...)` is captured.
+  const matches = [...src.matchAll(/await\s+test\(\s*["']([^"']+)["']/g)];
+  return matches.map((m) => m[1]);
+}
+
+describe("runner ↔ TEST_DEFINITIONS parity", () => {
+  const runnerIds = extractRunnerTestIds();
+
+  it("every runner test id has a TEST_DEFINITIONS entry", () => {
+    const defined = new Set(TEST_DEFINITIONS.map((t) => t.id));
+    const missing = runnerIds.filter((id) => !defined.has(id));
+    expect(missing).toEqual([]);
+  });
+
+  it("every TEST_DEFINITIONS id is exercised by runner", () => {
+    const runnerSet = new Set(runnerIds);
+    const orphans = TEST_DEFINITIONS.map((t) => t.id).filter((id) => !runnerSet.has(id));
+    expect(orphans).toEqual([]);
+  });
+
+  it("runner invokes each test id exactly once", () => {
+    const counts = new Map<string, number>();
+    for (const id of runnerIds) counts.set(id, (counts.get(id) ?? 0) + 1);
+    const dupes = [...counts.entries()].filter(([, n]) => n > 1);
+    expect(dupes).toEqual([]);
+  });
+
+  it("runner test count matches TEST_DEFINITIONS length", () => {
+    expect(runnerIds.length).toBe(TEST_DEFINITIONS.length);
   });
 });

@@ -146,4 +146,41 @@ describe("HttpTransport", () => {
     const t = createHttpTransport({ url: serverUrl });
     await expect(t.close()).resolves.toBeUndefined();
   });
+
+  it("preserves multi-value response headers (undici returns them as string[])", async () => {
+    // Regression: normalizeHeaders used to silently drop string[] headers.
+    // Multi-value headers like Set-Cookie and WWW-Authenticate must reach
+    // the runner so security tests can assert on them.
+    responder = () => ({
+      status: 401,
+      contentType: "application/json",
+      body: "{}",
+    });
+    // Hook in a one-shot responder that writes raw multi-value headers.
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.once("request", (req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        res.writeHead(401, {
+          "content-type": "application/json",
+          "www-authenticate": ['Bearer realm="mcp"', 'Basic realm="legacy"'],
+          "set-cookie": ["a=1; Path=/", "b=2; Path=/"],
+        });
+        res.end("{}");
+      });
+    });
+
+    const t = createHttpTransport({ url: serverUrl });
+    const raw = await t.rawPost("{}", {}, 5000);
+    expect(raw.statusCode).toBe(401);
+    expect(raw.headers["www-authenticate"]).toContain("Bearer");
+    expect(raw.headers["www-authenticate"]).toContain("Basic");
+    expect(raw.headers["set-cookie"]).toContain("a=1");
+    expect(raw.headers["set-cookie"]).toContain("b=2");
+
+    // Restore default responder.
+    for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+  });
 });

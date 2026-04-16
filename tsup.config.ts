@@ -6,7 +6,7 @@ export default defineConfig([
     format: ['esm'],
     dts: false,
     clean: true,
-    target: 'node18',
+    target: 'node20',
     banner: { js: '#!/usr/bin/env node' },
   },
   {
@@ -17,6 +17,6 @@ export default defineConfig([
     format: ['esm'],
     dts: true,
     clean: false,
-    target: 'node18',
+    target: 'node20',
   },
 ]);

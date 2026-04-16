@@ -345,7 +345,11 @@ program
             onProgress: verbose
               ? (testId, passed, details) => {
                   const icon = passed ? chalk.green("PASS") : chalk.red("FAIL");
-                  console.log(`  ${icon} ${testId} — ${details}`);
+                  // Progress goes to stderr so `--format=json > out.json` produces
+                  // clean JSON on stdout even with --verbose. chalk auto-strips
+                  // color when stderr is not a TTY (e.g., piped/captured by CI).
+                  const stream = opts.format === "terminal" ? process.stdout : process.stderr;
+                  stream.write(`  ${icon} ${testId} — ${details}\n`);
                 }
               : undefined,
           });
@@ -386,6 +390,17 @@ program
             console.error(chalk.red("\nError: --watch only applies to stdio targets (HTTP servers are remote).\n"));
             process.exit(1);
           }
+          // Machine-readable formats would be corrupted by repeated output +
+          // interleaved [watch] log lines, producing unparseable
+          // concatenated documents. Require terminal/markdown/html only.
+          if (opts.format !== "terminal" && opts.format !== "markdown" && opts.format !== "html") {
+            console.error(
+              chalk.red(
+                `\nError: --watch is incompatible with --format=${opts.format} (multi-run output would be unparseable). Use --format=terminal.\n`,
+              ),
+            );
+            process.exit(1);
+          }
           await runOnce();
           let pending: NodeJS.Timeout | null = null;
           let running = false;
@@ -400,7 +415,9 @@ program
               if (running) return;
               running = true;
               try {
-                console.log(chalk.dim(`\n[watch] ${f} changed — re-running...\n`));
+                // Route watch log lines to stderr so markdown/html output
+                // on stdout is not interleaved with re-run banners.
+                process.stderr.write(chalk.dim(`\n[watch] ${f} changed — re-running...\n\n`));
                 await runOnce();
               } catch (err) {
                 console.error(chalk.red(`[watch] ${err instanceof Error ? err.message : String(err)}`));
@@ -411,7 +428,7 @@ program
           });
           process.on("SIGINT", () => {
             watcher.close();
-            console.log(chalk.dim("\n[watch] stopped"));
+            process.stderr.write(chalk.dim("\n[watch] stopped\n"));
             process.exit(0);
           });
           // Block forever — watcher keeps event loop alive

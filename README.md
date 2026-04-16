@@ -124,6 +124,7 @@ On Windows, `npx` and other `.cmd` shims are handled automatically by spawning t
 | `--retries <n>` | both | Number of retries for failed tests (default: `0`) |
 | `--only <items>` | both | Only run tests matching these categories or test IDs (comma-separated) |
 | `--skip <items>` | both | Skip tests matching these categories or test IDs (comma-separated) |
+| `--concurrency <n>` | both | Max parallel-safe tests in flight (default: `1`; raising reduces wall time but can perturb timing-sensitive servers) |
 | `--verbose` | both | Print each test result as it runs (also forwards stdio stderr) |
 
 ### CI integration
@@ -261,8 +262,9 @@ The `test` command never publishes — use it for CI, debugging, and local itera
 ## What the 88 tests check
 
 <details>
-<summary><strong>Transport (13 tests)</strong></summary>
+<summary><strong>Transport (16 tests)</strong></summary>
 
+HTTP-only (13):
 - **transport-post** — Server accepts HTTP POST requests (required)
 - **transport-content-type** — Responds with application/json or text/event-stream (required)
 - **transport-notification-202** — Notifications return exactly 202 Accepted
@@ -277,10 +279,15 @@ The `test` command never publishes — use it for CI, debugging, and local itera
 - **transport-concurrent** — Handles concurrent requests
 - **transport-sse-event-field** — SSE responses include required event: message field
 
+stdio-only (3):
+- **stdio-framing** — Newline-delimited JSON framing (required)
+- **stdio-unicode** — UTF-8 unicode roundtrip preserves non-ASCII payloads
+- **stdio-unknown-method-recovers** — Returns -32601 for unknown methods and keeps serving
+
 </details>
 
 <details>
-<summary><strong>Lifecycle (17 tests)</strong></summary>
+<summary><strong>Lifecycle (21 tests)</strong></summary>
 
 - **lifecycle-init** — Initialize handshake succeeds (required)
 - **lifecycle-proto-version** — Returns valid YYYY-MM-DD protocol version (required)
@@ -299,6 +306,10 @@ The `test` command never publishes — use it for CI, debugging, and local itera
 - **lifecycle-progress** — Handles progress notifications gracefully
 - **lifecycle-list-changed** — Accepts listChanged notifications for declared capabilities
 - **lifecycle-progress-token** — Supports progress tokens in requests via SSE
+- **lifecycle-sampling-capability** — Advisory check for server-side use of the client sampling capability
+- **lifecycle-roots-capability** — Advisory check for server-side use of the client roots capability
+- **lifecycle-elicitation-capability** — Advisory check for the 2025-11-25 client elicitation capability
+- **lifecycle-meta-tolerance** — Server ignores unknown `_meta` fields on incoming requests
 
 </details>
 

@@ -1,3 +1,6 @@
+import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { type StdioTransport, createStdioTransport } from "../transport/stdio.js";
@@ -108,5 +111,30 @@ describe("StdioTransport", () => {
     openTransports.push(t);
     const nextId = createIdCounter();
     await expect(t.request("ping", undefined, nextId, { timeout: 2000 })).rejects.toThrow();
+  });
+
+  it("surfaces a diagnosable stderr message when stdout buffer overflows without a newline", async () => {
+    // Spawn a child that spews junk bytes without a newline past the
+    // configured cap, then sleeps past the request timeout. The overflow
+    // should leave a diagnostic line in stderrTail() so the caller can
+    // tell this apart from a generic timeout. We write the script to a
+    // temp file because passing a multi-line `-e` script through
+    // cmd.exe (used on Windows when shell:true) is unreliable.
+    const script = [
+      'const big = "X".repeat(200 * 1024);',
+      "for (let i = 0; i < 4; i++) process.stdout.write(big);",
+      "setTimeout(() => {}, 2000);",
+    ].join("\n");
+    const scriptPath = join(tmpdir(), `mcp-compliance-overflow-${process.pid}-${Date.now()}.mjs`);
+    writeFileSync(scriptPath, script, "utf8");
+    const t = createStdioTransport({
+      command: process.execPath,
+      args: [scriptPath],
+      stdoutBufferSize: 512 * 1024,
+    });
+    openTransports.push(t);
+    const nextId = createIdCounter(500);
+    await expect(t.request("ping", undefined, nextId, { timeout: 500 })).rejects.toThrow();
+    expect(t.stderrTail()).toMatch(/stdout buffer exceeded/);
   });
 });

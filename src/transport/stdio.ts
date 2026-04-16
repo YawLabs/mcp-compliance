@@ -106,8 +106,15 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     }
     // Hard cap: if a single line never terminates, drop the buffer to
     // keep memory bounded. The dropped bytes are gone — no parsing
-    // attempt — and the next newline starts a fresh line.
+    // attempt — and the next newline starts a fresh line. Warn to
+    // stderr so a server silently eating its own response (1MB+ of
+    // un-newlined output before the real JSON reply) is diagnosable
+    // rather than manifesting only as a request timeout.
     if (stdoutBuffer.length > stdoutBufferSize) {
+      stderrBuffer += `[mcp-compliance] stdout buffer exceeded ${stdoutBufferSize} bytes without a newline; discarding buffered data\n`;
+      if (stderrBuffer.length > stderrBufferSize) {
+        stderrBuffer = stderrBuffer.slice(stderrBuffer.length - stderrBufferSize);
+      }
       stdoutBuffer = "";
     }
   });

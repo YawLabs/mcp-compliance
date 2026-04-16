@@ -6,7 +6,13 @@
  * `id:`, `retry:` and comment lines.
  */
 export function parseSSEResponse(text: string): any {
-  const lines = text.split("\n");
+  // Accept both CRLF and LF line endings. Servers behind proxies (nginx,
+  // some CDNs) can normalize to CRLF, and splitting only on "\n" would
+  // leave a trailing "\r" on the field name / content, causing
+  // `line.startsWith("data:")` to still match but `JSON.parse` to see
+  // `{...}\r` as trailing garbage (tolerated by V8 but out-of-spec). The
+  // blank-line detector `line.trim() === ""` was already CRLF-tolerant.
+  const lines = text.split(/\r?\n/);
   let firstJsonRpcResponse: any = null;
   let currentData: string[] = [];
 
