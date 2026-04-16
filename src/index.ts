@@ -11,6 +11,7 @@ import { startServer } from "./mcp/server.js";
 import { publishReport, unpublishReport } from "./publish.js";
 import { formatGithub, formatHtml, formatJson, formatMarkdown, formatSarif, formatTerminal } from "./reporter.js";
 import { previewTests, runComplianceSuite } from "./runner.js";
+import { splitStdioTarget } from "./stdio-split.js";
 import { getTokenForUrl, deleteToken as removeStoredToken, saveToken } from "./token-store.js";
 import type { TransportTarget } from "./types.js";
 
@@ -91,6 +92,11 @@ function looksLikeUrl(s: string): boolean {
  * Build a TransportTarget from a positional argument and optional
  * trailing args. URLs dispatch to HTTP; anything else is treated as a
  * stdio command. Extra args become the command's argv.
+ *
+ * If the positional arrives as one whitespace-containing string (because
+ * the user quoted `"node dist/index.js serve"`) AND there are no
+ * separately-passed extraArgs, we split it ourselves so stdio spawn
+ * works cross-platform.
  */
 function buildTarget(
   positional: string,
@@ -113,10 +119,19 @@ function buildTarget(
     ...(opts.envFile ? readEnvFile(opts.envFile) : {}),
     ...(opts.env ?? {}),
   };
+
+  let command = positional;
+  let args = extraArgs;
+  if (extraArgs.length === 0 && /\s/.test(positional)) {
+    const split = splitStdioTarget(positional);
+    command = split.command;
+    args = split.args;
+  }
+
   return {
     type: "stdio",
-    command: positional,
-    args: extraArgs,
+    command,
+    args,
     env: Object.keys(env).length ? env : undefined,
     cwd: opts.cwd,
     verbose: opts.verbose,

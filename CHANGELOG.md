@@ -7,6 +7,18 @@ Pre-1.0 releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 loosely — breaking changes can still land in a minor bump, but we'll call them
 out explicitly here.
 
+## [0.13.3] — 2026-04-16
+
+- **Cross-platform stdio fix:** when a stdio target arrives as a single
+  whitespace-containing string (e.g. `mcp-compliance test "node dist/index.js
+  serve"`), auto-split it into command + argv. Previously worked on Windows
+  (spawn goes through `cmd.exe` which word-splits) but failed on Linux/macOS
+  with `ENOENT` because `shell: false` looks up the entire string as a literal
+  executable name. This is what caused the `compliance-badge.yml` workflow to
+  grade servers as `F` in CI. Reject quoted one-string forms rather than
+  silently mis-parsing shell quoting. New `splitStdioTarget()` helper exported
+  from `./stdio-split.js` and covered by unit tests.
+
 ## [0.13.0] — 2026-04-13
 
 Catalog + spec sync to the shipped 88-test implementation, plus ops
