@@ -39,6 +39,19 @@ interface PendingRequest {
   timer: NodeJS.Timeout;
 }
 
+// Turn an exit code/signal into a message that points at the likely cause
+// instead of a bare "code 0" (which normally means success and misleads
+// users). The common failure mode — a one-shot CLI passed where a
+// long-running MCP stdio server was expected — exits cleanly with code 0
+// after doing its one-shot work, so call that out explicitly.
+function exitDiagnostic(code: number | null, signal: NodeJS.Signals | null): string {
+  if (signal) return `server terminated by signal ${signal} before completing the request`;
+  if (code === 0) {
+    return "server exited cleanly (code 0) before completing the request. This usually means the command is a one-shot CLI, not a long-running MCP stdio server. If the server needs a subcommand to start (e.g. `serve`, `mcp`, `start`), include it in the command.";
+  }
+  return `server crashed with exit code ${code} before completing the request`;
+}
+
 export function createStdioTransport(opts: StdioTransportOptions): StdioTransport {
   const { command, args = [], env, cwd, verbose = false } = opts;
   const stderrBufferSize = opts.stderrBufferSize ?? 64 * 1024;
@@ -89,8 +102,7 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     exited = true;
     exitCode = code;
     if (pending.size > 0) {
-      const reason = signal ? `child exited (signal ${signal})` : `child exited with code ${code}`;
-      rejectAllPending(new Error(reason));
+      rejectAllPending(new Error(exitDiagnostic(code, signal)));
     }
   });
 
@@ -182,7 +194,7 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
       }
     }
     if (exited) {
-      throw new Error(annotateWithStderr(`stdio transport: child has exited (code ${exitCode})`));
+      throw new Error(annotateWithStderr(`stdio transport: ${exitDiagnostic(exitCode, null)}`));
     }
     if (spawnError) throw new Error(annotateWithStderr(`stdio transport: spawn failed — ${spawnError.message}`));
     const stdin = child.stdin;
