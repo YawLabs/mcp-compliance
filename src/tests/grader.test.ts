@@ -85,19 +85,32 @@ describe("computeScore", () => {
     expect(result.overall).toBe("pass");
   });
 
-  it("handles no required tests", () => {
+  it("handles no required tests (optional renormalized to 100%)", () => {
     const tests = [makeTest(true, false), makeTest(false, false)];
     const result = computeScore(tests);
-    // Required score = 70 (no required tests = full credit), optional = 50% of 30 = 15
-    expect(result.score).toBe(85);
+    // With no required tests, optional is scored against 100%, not 30% +
+    // a "free" 70. 1/2 optional passing = 50%.
+    expect(result.score).toBe(50);
     expect(result.overall).toBe("partial");
   });
 
-  it("handles empty test array", () => {
+  it("handles no optional tests (required renormalized to 100%)", () => {
+    const tests = [makeTest(true, true), makeTest(false, true)];
+    const result = computeScore(tests);
+    // With no optional tests, required is scored against 100%, not 70% +
+    // a "free" 30. 1/2 required passing = 50%, and a required failure
+    // still drops overall to "fail".
+    expect(result.score).toBe(50);
+    expect(result.overall).toBe("fail");
+  });
+
+  it("handles empty test array (nothing to attest = fail)", () => {
     const result = computeScore([]);
-    expect(result.score).toBe(100);
-    expect(result.grade).toBe("A");
-    expect(result.overall).toBe("pass");
+    // Previously awarded 100/A/pass for free. An empty run is "no data",
+    // not "passed" — score 0, grade F, overall fail.
+    expect(result.score).toBe(0);
+    expect(result.grade).toBe("F");
+    expect(result.overall).toBe("fail");
     expect(result.summary.total).toBe(0);
   });
 });

@@ -27,15 +27,36 @@ export function computeScore(tests: TestResult[]): {
 
   const requiredTests = tests.filter((t) => t.required);
   const requiredPassed = requiredTests.filter((t) => t.passed).length;
-
-  // Required tests worth 70%, optional worth 30%
-  const requiredScore = requiredTests.length > 0 ? (requiredPassed / requiredTests.length) * 70 : 70;
   const optionalTests = tests.filter((t) => !t.required);
   const optionalPassed = optionalTests.filter((t) => t.passed).length;
-  const optionalScore = optionalTests.length > 0 ? (optionalPassed / optionalTests.length) * 30 : 30;
-  const score = Math.round(requiredScore + optionalScore);
 
-  const overall = requiredPassed === requiredTests.length ? (passed === total ? "pass" : "partial") : "fail";
+  // Weighting: required tests are 70% of the score, optional 30%. When one
+  // bucket is empty we renormalize to the other — giving "free" credit for
+  // an empty bucket (the previous behavior) would inflate the score in
+  // edge cases like `--only` filters that exclude all required tests, or
+  // capability-gated suites where all remaining tests are optional.
+  let score: number;
+  if (total === 0) {
+    // No tests ran. Not a pass — there is nothing to attest.
+    score = 0;
+  } else if (requiredTests.length === 0) {
+    score = Math.round((optionalPassed / optionalTests.length) * 100);
+  } else if (optionalTests.length === 0) {
+    score = Math.round((requiredPassed / requiredTests.length) * 100);
+  } else {
+    score = Math.round((requiredPassed / requiredTests.length) * 70 + (optionalPassed / optionalTests.length) * 30);
+  }
+
+  let overall: "pass" | "partial" | "fail";
+  if (total === 0) {
+    overall = "fail";
+  } else if (requiredPassed < requiredTests.length) {
+    overall = "fail";
+  } else if (passed === total) {
+    overall = "pass";
+  } else {
+    overall = "partial";
+  }
 
   const categories: Record<string, { passed: number; total: number }> = {};
   for (const t of tests) {
