@@ -283,7 +283,7 @@ export function formatGithub(report: ComplianceReport): string {
  */
 export function formatMarkdown(report: ComplianceReport): string {
   const lines: string[] = [];
-  const gradeEmoji: Record<string, string> = { A: "🟢", B: "🟢", C: "🟡", D: "🟠", F: "🔴" };
+  const gradeEmoji: Record<string, string> = { A: "🟢", B: "🔵", C: "🟡", D: "🟠", F: "🔴" };
   lines.push("# MCP Compliance Report");
   lines.push("");
   lines.push(
