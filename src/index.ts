@@ -44,6 +44,21 @@ function parseList(value: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Warn on stderr when a machine-readable format is being printed directly
+ * to a TTY — it's almost always a user mistake (meant to pipe or redirect).
+ * Skipped when stdout is not a TTY (pipe, redirect, CI) so automation
+ * stays clean.
+ */
+function ttyHint(format: string): void {
+  if (!process.stdout.isTTY) return;
+  process.stderr.write(
+    chalk.dim(
+      `  [tip] --format=${format} is machine-readable. Redirect with \`> report.${format === "sarif" ? "sarif" : format}\` or drop --format for the human report.\n\n`,
+    ),
+  );
+}
+
 function parseEnvVar(value: string, prev: Record<string, string>): Record<string, string> {
   const idx = value.indexOf("=");
   if (idx === -1) throw new Error(`Invalid env var: "${value}" (expected "KEY=VALUE")`);
@@ -410,14 +425,17 @@ program
           }
 
           if (opts.format === "json") {
+            ttyHint("json");
             console.log(formatJson(report));
           } else if (opts.format === "sarif") {
+            ttyHint("sarif");
             console.log(formatSarif(report));
           } else if (opts.format === "github") {
             console.log(formatGithub(report));
           } else if (opts.format === "markdown") {
             console.log(formatMarkdown(report));
           } else if (opts.format === "html") {
+            ttyHint("html");
             console.log(formatHtml(report));
           } else {
             console.log(formatTerminal(report));

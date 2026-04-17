@@ -16,18 +16,26 @@ const CATEGORY_LABELS: Record<string, string> = {
 
 const CATEGORY_ORDER = ["transport", "lifecycle", "tools", "resources", "prompts", "errors", "schema", "security"];
 
-function gradeColor(grade: Grade): string {
+const GRADE_ART: Record<Grade, string[]> = {
+  A: [" █████╗ ", "██╔══██╗", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
+  B: ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██╗", "██████╔╝", "╚═════╝ "],
+  C: [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
+  D: ["██████╗ ", "██╔══██╗", "██║  ██║", "██║  ██║", "██████╔╝", "╚═════╝ "],
+  F: ["███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "██║     ", "╚═╝     "],
+};
+
+function gradeColor(grade: Grade): (s: string) => string {
   switch (grade) {
     case "A":
-      return chalk.green.bold(grade);
+      return (s) => chalk.green.bold(s);
     case "B":
-      return chalk.greenBright.bold(grade);
+      return (s) => chalk.greenBright.bold(s);
     case "C":
-      return chalk.yellow.bold(grade);
+      return (s) => chalk.yellow.bold(s);
     case "D":
-      return chalk.rgb(255, 165, 0).bold(grade);
+      return (s) => chalk.rgb(255, 165, 0).bold(s);
     case "F":
-      return chalk.red.bold(grade);
+      return (s) => chalk.red.bold(s);
   }
 }
 
@@ -44,120 +52,156 @@ function overallColor(overall: string): string {
   }
 }
 
-function testLine(t: TestResult): string {
-  const icon = t.passed ? chalk.green("  PASS") : chalk.red("  FAIL");
-  const req = t.required ? chalk.dim(" (required)") : "";
-  const dur = chalk.dim(` ${t.durationMs}ms`);
-  let line = `${icon}  ${t.name}${req}${dur}\n${chalk.dim(`         ${t.details}`)}`;
-  if (!t.passed) {
-    const def = TEST_DEFINITIONS.find((d) => d.id === t.id);
-    if (def?.recommendation) {
-      line += `\n${chalk.cyan(`         Fix: ${def.recommendation}`)}`;
-    }
-  }
-  return line;
+function makeBar(passed: number, total: number, width = 24): { filled: string; rest: string } {
+  if (total === 0) return { filled: "", rest: "─".repeat(width) };
+  const n = Math.max(0, Math.min(width, Math.round((passed / total) * width)));
+  return { filled: "█".repeat(n), rest: "░".repeat(width - n) };
 }
 
+function barColor(passed: number, total: number): (s: string) => string {
+  if (total === 0) return (s) => chalk.dim(s);
+  const pct = passed / total;
+  if (pct >= 1) return (s) => chalk.green(s);
+  if (pct >= 0.85) return (s) => chalk.greenBright(s);
+  if (pct >= 0.6) return (s) => chalk.yellow(s);
+  return (s) => chalk.red(s);
+}
+
+function padRight(s: string, n: number): string {
+  return s.length >= n ? s : s + " ".repeat(n - s.length);
+}
+
+function padLeft(s: string, n: number): string {
+  return s.length >= n ? s : " ".repeat(n - s.length) + s;
+}
+
+const RULE = "─".repeat(62);
+const HEAVY_RULE = "═".repeat(62);
+
 export function formatTerminal(report: ComplianceReport): string {
-  const lines: string[] = [];
+  const out: string[] = [];
+  const color = gradeColor(report.grade);
+  const art = GRADE_ART[report.grade];
 
-  lines.push("");
-  lines.push(chalk.bold("MCP Compliance Report"));
-  lines.push(chalk.dim(`Spec: ${report.specVersion}  |  Tool: v${report.toolVersion}  |  ${report.timestamp}`));
-  lines.push(chalk.dim(`URL: ${report.url}`));
-
+  // Header
+  out.push("");
+  out.push(chalk.bold("  MCP COMPLIANCE REPORT"));
+  out.push(chalk.dim(`  ${HEAVY_RULE}`));
   if (report.serverInfo.name) {
-    lines.push(
-      chalk.dim(
-        `Server: ${report.serverInfo.name} v${report.serverInfo.version || "?"} (protocol ${report.serverInfo.protocolVersion || "?"})`,
-      ),
-    );
+    const v = report.serverInfo.version ? ` v${report.serverInfo.version}` : "";
+    const proto = report.serverInfo.protocolVersion ? `  (protocol ${report.serverInfo.protocolVersion})` : "";
+    out.push(chalk.dim(`  Server:   ${report.serverInfo.name}${v}${proto}`));
   }
+  out.push(chalk.dim(`  Target:   ${report.url}`));
+  out.push(chalk.dim(`  Spec:     ${report.specVersion}  ·  Tool v${report.toolVersion}  ·  ${report.timestamp}`));
+  out.push("");
 
-  lines.push("");
-  lines.push(
-    `  Grade: ${gradeColor(report.grade)}  Score: ${chalk.bold(String(report.score))}%  Overall: ${overallColor(report.overall)}`,
-  );
-  lines.push(
-    `  Tests: ${chalk.green(String(report.summary.passed))} passed / ${chalk.red(String(report.summary.failed))} failed / ${report.summary.total} total`,
-  );
-  lines.push(`  Required: ${report.summary.requiredPassed}/${report.summary.required} passed`);
-
-  // Group tests by category
-  const grouped: Record<string, TestResult[]> = {};
-  for (const t of report.tests) {
-    if (!grouped[t.category]) grouped[t.category] = [];
-    grouped[t.category].push(t);
+  // Big grade block letter + side-by-side summary
+  const reqOk = report.summary.requiredPassed === report.summary.required;
+  const infoRows = [
+    "",
+    "",
+    `${chalk.bold("GRADE")}   ${color(report.grade)}       ${chalk.bold(`${report.score}%`)}`,
+    `${chalk.dim("Overall   ")}${overallColor(report.overall)}`,
+    `${chalk.dim("Tests     ")}${chalk.green(String(report.summary.passed))}${chalk.dim("/")}${report.summary.total}${report.summary.failed > 0 ? chalk.dim("  (") + chalk.red(`${report.summary.failed} failed`) + chalk.dim(")") : ""}`,
+    `${chalk.dim("Required  ")}${reqOk ? chalk.green(`${report.summary.requiredPassed}/${report.summary.required} ✓`) : chalk.red(`${report.summary.requiredPassed}/${report.summary.required}`)}`,
+  ];
+  for (let i = 0; i < 6; i++) {
+    out.push(`       ${color(art[i])}     ${infoRows[i] || ""}`);
   }
+  out.push("");
 
-  for (const cat of CATEGORY_ORDER) {
-    const catTests = grouped[cat];
-    if (!catTests || catTests.length === 0) continue;
-    const catStats = report.categories[cat];
+  // Category breakdown bars
+  out.push(chalk.bold("  CATEGORY BREAKDOWN"));
+  out.push(chalk.dim(`  ${RULE}`));
+  const cats = CATEGORY_ORDER.filter((c) => report.categories[c] && report.categories[c].total > 0);
+  const maxLabel = Math.max(...cats.map((c) => (CATEGORY_LABELS[c] || c).length));
+  for (const cat of cats) {
+    const stats = report.categories[cat];
     const label = CATEGORY_LABELS[cat] || cat;
-    const catColor = catStats && catStats.passed === catStats.total ? chalk.green : chalk.yellow;
+    const { filled, rest } = makeBar(stats.passed, stats.total, 24);
+    const colorFn = barColor(stats.passed, stats.total);
+    const pct = stats.total === 0 ? 0 : Math.round((stats.passed / stats.total) * 100);
+    const ratio = `${stats.passed}/${stats.total}`;
+    out.push(
+      `  ${padRight(label, maxLabel)}  ${colorFn(filled)}${chalk.dim(rest)}  ${padLeft(ratio, 7)}  ${padLeft(`${pct}%`, 4)}`,
+    );
+  }
+  out.push("");
 
-    lines.push("");
-    lines.push(catColor(`  ${label} (${catStats?.passed || 0}/${catStats?.total || 0})`));
-
-    for (const t of catTests) {
-      lines.push(testLine(t));
+  // Failed tests — full detail
+  const failed = report.tests.filter((t) => !t.passed);
+  if (failed.length > 0) {
+    out.push(chalk.bold.red(`  FAILED TESTS (${failed.length})`));
+    out.push(chalk.dim(`  ${RULE}`));
+    for (const t of failed) {
+      const req = t.required ? chalk.red("required") : chalk.dim("optional");
+      out.push(
+        `  ${chalk.red("✗")} ${chalk.bold(t.name)}  ${chalk.dim(`[${t.id}]`)}  ${req}  ${chalk.dim(`${t.durationMs}ms`)}`,
+      );
+      out.push(`      ${t.details}`);
+      const def = TEST_DEFINITIONS.find((d) => d.id === t.id);
+      if (def?.recommendation) {
+        out.push(`      ${chalk.cyan(`→ ${def.recommendation}`)}`);
+      }
+      if (t.specRef) {
+        out.push(chalk.dim(`      spec: ${t.specRef}`));
+      }
+      out.push("");
     }
-  }
-
-  // Capabilities summary
-  const caps = report.serverInfo.capabilities;
-  const declared = Object.keys(caps).filter((k) => caps[k] !== undefined);
-  if (declared.length > 0) {
-    lines.push("");
-    lines.push(chalk.dim(`  Capabilities: ${declared.join(", ")}`));
-  }
-
-  if (report.toolCount > 0) {
-    lines.push(
-      chalk.dim(
-        `  Tools (${report.toolCount}): ${report.toolNames.slice(0, 10).join(", ")}${report.toolCount > 10 ? "..." : ""}`,
-      ),
-    );
-  }
-  if (report.resourceCount > 0) {
-    lines.push(
-      chalk.dim(
-        `  Resources (${report.resourceCount}): ${report.resourceNames.slice(0, 10).join(", ")}${report.resourceCount > 10 ? "..." : ""}`,
-      ),
-    );
-  }
-  if (report.promptCount > 0) {
-    lines.push(
-      chalk.dim(
-        `  Prompts (${report.promptCount}): ${report.promptNames.slice(0, 10).join(", ")}${report.promptCount > 10 ? "..." : ""}`,
-      ),
-    );
+  } else {
+    out.push(`  ${chalk.green.bold("✓ All tests passed")}`);
+    out.push("");
   }
 
   // Warnings
   if (report.warnings.length > 0) {
-    lines.push("");
-    lines.push(chalk.yellow(`  Warnings (${report.warnings.length}):`));
+    out.push(chalk.bold.yellow(`  WARNINGS (${report.warnings.length})`));
+    out.push(chalk.dim(`  ${RULE}`));
     for (const w of report.warnings) {
-      lines.push(chalk.yellow(`    - ${w}`));
+      out.push(`  ${chalk.yellow("!")} ${w}`);
     }
+    out.push("");
   }
 
-  lines.push("");
-  // For stdio targets the badge URL would always render "unknown" (no
-  // public report), so suppress the markdown and point at --output instead.
+  // Server context
+  const caps = report.serverInfo.capabilities;
+  const declared = Object.keys(caps).filter((k) => caps[k] !== undefined);
+  const hasContext = declared.length > 0 || report.toolCount > 0 || report.resourceCount > 0 || report.promptCount > 0;
+  if (hasContext) {
+    out.push(chalk.bold("  SERVER CONTEXT"));
+    out.push(chalk.dim(`  ${RULE}`));
+    if (declared.length > 0) {
+      out.push(chalk.dim(`  Capabilities:  ${declared.join(", ")}`));
+    }
+    if (report.toolCount > 0) {
+      const more = report.toolCount > 10 ? ", ..." : "";
+      out.push(chalk.dim(`  Tools (${report.toolCount}):      ${report.toolNames.slice(0, 10).join(", ")}${more}`));
+    }
+    if (report.resourceCount > 0) {
+      const more = report.resourceCount > 10 ? ", ..." : "";
+      out.push(
+        chalk.dim(`  Resources (${report.resourceCount}):  ${report.resourceNames.slice(0, 10).join(", ")}${more}`),
+      );
+    }
+    if (report.promptCount > 0) {
+      const more = report.promptCount > 10 ? ", ..." : "";
+      out.push(chalk.dim(`  Prompts (${report.promptCount}):    ${report.promptNames.slice(0, 10).join(", ")}${more}`));
+    }
+    out.push("");
+  }
+
+  // Badge
   if (report.url.startsWith("stdio:")) {
-    lines.push(
-      chalk.dim("  Badge: stdio servers can't be published. Use `--output badge.svg` for a local badge image."),
+    out.push(
+      chalk.dim("  Badge:    stdio targets aren't published. Run with --output badge.svg for a local badge image."),
     );
   } else {
-    lines.push(chalk.dim("  Badge markdown:"));
-    lines.push(`  ${report.badge.markdown}`);
+    out.push(chalk.dim(`  Badge:    ${report.badge.markdown}`));
   }
-  lines.push("");
+  out.push("");
 
-  return lines.join("\n");
+  return out.join("\n");
 }
 
 export function formatJson(report: ComplianceReport): string {

@@ -93,10 +93,11 @@ describe("formatTerminal", () => {
     expect(output).toContain("10");
   });
 
-  it("includes PASS and FAIL markers", () => {
+  it("includes failed-test markers", () => {
     const output = formatTerminal(makeReport());
-    expect(output).toContain("PASS");
-    expect(output).toContain("FAIL");
+    // Failed tests get a ✗ marker plus the FAILED TESTS section header
+    expect(output).toContain("✗");
+    expect(output).toContain("FAILED");
   });
 
   it("includes category sections", () => {
@@ -123,13 +124,13 @@ describe("formatTerminal", () => {
 
   it("shows warnings when present", () => {
     const output = formatTerminal(makeReport({ warnings: ["Protocol version mismatch"] }));
-    expect(output).toContain("Warnings");
+    expect(output).toMatch(/WARNINGS|Warnings/);
     expect(output).toContain("Protocol version mismatch");
   });
 
   it("hides warnings section when empty", () => {
     const output = formatTerminal(makeReport({ warnings: [] }));
-    expect(output).not.toContain("Warnings");
+    expect(output).not.toMatch(/WARNINGS|Warnings/);
   });
 
   it("handles PASS overall", () => {
@@ -180,7 +181,7 @@ describe("formatTerminal", () => {
         ],
       }),
     );
-    expect(output).toContain("Fix:");
+    expect(output).toContain(`Implement the "initialize" method handler`);
   });
 
   it("does not show fix recommendations for passing tests", () => {
@@ -199,7 +200,7 @@ describe("formatTerminal", () => {
         ],
       }),
     );
-    expect(output).not.toContain("Fix:");
+    expect(output).not.toContain("→");
   });
 });
 
@@ -486,12 +487,12 @@ describe("formatMarkdown", () => {
 describe("formatTerminal — stdio targets", () => {
   it("does not print badge markdown for stdio (would render unknown)", () => {
     const output = formatTerminal(makeReport({ url: "stdio:node ./server.js" }));
-    expect(output).not.toContain("Badge markdown:");
+    expect(output).not.toContain("[![MCP Compliant]");
     expect(output).toContain("--output");
   });
 
   it("still prints badge markdown for HTTP targets", () => {
     const output = formatTerminal(makeReport());
-    expect(output).toContain("Badge markdown:");
+    expect(output).toContain("[![MCP Compliant]");
   });
 });
