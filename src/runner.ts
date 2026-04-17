@@ -211,6 +211,18 @@ export interface RunOptions {
   headers?: Record<string, string>;
   /** Request timeout in milliseconds (default: 15000) */
   timeout?: number;
+  /**
+   * Deadline for the initial `initialize` handshake + `initialized`
+   * notification, in milliseconds. Kept separate from `timeout` because
+   * cold-started stdio servers — especially `npx @pkg ...` targets where
+   * npm has to resolve and fetch the package before the MCP server
+   * starts — can take tens of seconds to produce their first response,
+   * while steady-state requests complete in milliseconds. Default is
+   * `max(timeout, 60000)` so users who bump `--timeout` keep that value
+   * and users on defaults get 60s for startup. Does not apply to any
+   * per-test requests past the handshake.
+   */
+  startupTimeout?: number;
   /** Number of retries for failed tests (default: 0) */
   retries?: number;
   /** Only run tests matching these category names or test IDs */
@@ -333,6 +345,11 @@ export async function runComplianceSuite(
     // Use high start offset for the main ID counter to avoid collision with transport test hardcoded IDs
     const nextId = createIdCounter(1000);
     const timeout = options.timeout || 15000;
+    // Startup budget covers initialize + initialized notification. Cold
+    // `npx @pkg serve` targets can take 20-40s to resolve and exec the
+    // package before the MCP loop runs; a 15s request timeout would fire
+    // before the first byte. Default to max(timeout, 60000).
+    const startupTimeout = options.startupTimeout ?? Math.max(timeout, 60000);
     const retries = options.retries || 0;
 
     // Session state — kept as locals for backwards-compat with existing
@@ -682,21 +699,32 @@ export async function runComplianceSuite(
     // ── 2. LIFECYCLE SETUP (always runs) ─────────────────────────────
 
     let initRes: any = null;
+    const initStart = Date.now();
     try {
       // Declare all three client capabilities so servers see us as a
       // fully-capable client. Servers that break on unknown or
       // unexpected client capabilities (they shouldn't — spec is
       // forward-compatible) will fail the lifecycle-*-capability
       // tests below.
-      initRes = await rpc("initialize", {
-        protocolVersion: SPEC_VERSION,
-        capabilities: {
-          sampling: {},
-          roots: { listChanged: true },
-          elicitation: {},
+      //
+      // The handshake uses `startupTimeout` (not `timeout`) to give
+      // slow-starting stdio servers room. See RunOptions.startupTimeout.
+      initRes = await mcpRequest(
+        backendUrl,
+        "initialize",
+        {
+          protocolVersion: SPEC_VERSION,
+          capabilities: {
+            sampling: {},
+            roots: { listChanged: true },
+            elicitation: {},
+          },
+          clientInfo: { name: "mcp-compliance", version: TOOL_VERSION },
         },
-        clientInfo: { name: "mcp-compliance", version: TOOL_VERSION },
-      });
+        nextId,
+        buildHeaders(),
+        startupTimeout,
+      );
       const result = initRes?.body?.result;
       if (result) {
         serverInfo.protocolVersion = result.protocolVersion || null;
@@ -717,9 +745,23 @@ export async function runComplianceSuite(
       // Init failed — lifecycle tests will report the failure
     }
 
-    // Send initialized notification (always, for session setup)
+    // Warn if initialize crossed the per-request timeout. The server
+    // answered in the end (we got here), but steady-state tests will
+    // re-use `timeout` and may start failing at the same rate the
+    // handshake was almost killed at. Nudge users toward `--timeout`
+    // so subsequent tests don't flake.
+    const initElapsed = Date.now() - initStart;
+    if (initRes && initElapsed > timeout) {
+      warnings.push(
+        `Initialize handshake took ${initElapsed}ms — longer than --timeout ${timeout}ms. Per-test requests use --timeout, so slow servers may flake. Consider raising --timeout.`,
+      );
+    }
+
+    // Send initialized notification (always, for session setup). Shares
+    // the startup budget — some servers don't write their prompt to
+    // stdout until this lands.
     try {
-      await mcpNotification(backendUrl, "notifications/initialized", undefined, buildHeaders(), timeout);
+      await mcpNotification(backendUrl, "notifications/initialized", undefined, buildHeaders(), startupTimeout);
     } catch {}
 
     // Capability flags computed once post-init. Some later-section tests

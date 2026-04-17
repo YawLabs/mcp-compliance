@@ -62,6 +62,7 @@ describe("timeout handling", () => {
     const start = Date.now();
     const report = await runComplianceSuite(hangingUrl, {
       timeout: 1000,
+      startupTimeout: 1000,
       preflightTimeout: 1000,
       only: ["transport-post"],
     });
@@ -76,6 +77,7 @@ describe("timeout handling", () => {
   it("preflight warning triggers for hanging server", async () => {
     const report = await runComplianceSuite(hangingUrl, {
       timeout: 1000,
+      startupTimeout: 1000,
       preflightTimeout: 500,
       only: ["transport-post"],
     });
@@ -86,6 +88,7 @@ describe("timeout handling", () => {
     const start = Date.now();
     const report = await runComplianceSuite(hangingUrl, {
       timeout: 2000,
+      startupTimeout: 2000,
       preflightTimeout: 200,
       only: ["transport-post"],
     });
@@ -112,10 +115,44 @@ describe("timeout handling", () => {
   it("slow server times out with short timeout", async () => {
     const report = await runComplianceSuite(slowUrl, {
       timeout: 500,
+      startupTimeout: 500,
       preflightTimeout: 500,
       only: ["transport-post"],
     });
     expect(report.tests).toHaveLength(1);
     expect(report.tests[0].passed).toBe(false);
+  }, 10000);
+
+  it("startupTimeout defaults higher than timeout to absorb slow cold starts", async () => {
+    // slowServer responds after 3s. A 500ms per-request timeout would
+    // normally fail the handshake, but the default startupTimeout is
+    // max(timeout, 60000) — so the handshake gets to wait 60s. The
+    // initialize does land successfully and an "initialize took longer
+    // than --timeout" warning should be emitted.
+    const report = await runComplianceSuite(slowUrl, {
+      timeout: 500,
+      preflightTimeout: 5000,
+      only: ["transport-post", "lifecycle-init"],
+    });
+    // lifecycle-init saw a valid JSON-RPC response (slowServer returns
+    // an error body — enough to advance past the handshake); the
+    // warning about the per-request timeout mismatch should fire.
+    expect(report.warnings.some((w) => w.includes("longer than --timeout"))).toBe(true);
+  }, 15000);
+
+  it("startupTimeout can be set shorter than default for fast-fail scenarios", async () => {
+    // Explicit low startupTimeout makes the handshake fail fast instead
+    // of waiting the default 60s. Regression-guard for the --startup-timeout
+    // CLI path.
+    const start = Date.now();
+    const report = await runComplianceSuite(hangingUrl, {
+      timeout: 500,
+      startupTimeout: 500,
+      preflightTimeout: 500,
+      only: ["lifecycle-init"],
+    });
+    const elapsed = Date.now() - start;
+    expect(report.tests[0].passed).toBe(false);
+    expect(elapsed).toBeLessThan(5000);
   }, 10000);
 });

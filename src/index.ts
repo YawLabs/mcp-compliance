@@ -274,8 +274,12 @@ program
   .option("--cwd <dir>", "Working directory for stdio command")
   .option(
     "--timeout <ms>",
-    "Request timeout in milliseconds (bump to 30000+ for stdio servers with slow startup)",
+    "Per-request timeout in milliseconds (applies to every test request after the initial handshake)",
     "15000",
+  )
+  .option(
+    "--startup-timeout <ms>",
+    "Deadline for the initial initialize handshake (default: max(--timeout, 60000); covers cold `npx` cache fetches before a stdio server starts)",
   )
   .option("--no-color", "Disable colored output (also honors NO_COLOR env var)")
   .option("--watch", "Re-run tests when files in the cwd change (stdio targets only)")
@@ -318,6 +322,7 @@ program
         envFile?: string;
         cwd?: string;
         timeout: string;
+        startupTimeout?: string;
         preflightTimeout?: string;
         retries: string;
         only?: string[];
@@ -378,6 +383,9 @@ program
 
           const report = await runComplianceSuite(transportTarget, {
             timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
+            startupTimeout: opts.startupTimeout
+              ? parsePositiveInt(opts.startupTimeout, "--startup-timeout", 1)
+              : config?.startupTimeout,
             preflightTimeout: opts.preflightTimeout
               ? parsePositiveInt(opts.preflightTimeout, "--preflight-timeout", 1)
               : config?.preflightTimeout,

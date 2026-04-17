@@ -9,6 +9,7 @@ import type { TransportTarget } from "./types.js";
 export interface ComplianceConfig {
   target?: TransportTarget;
   timeout?: number;
+  startupTimeout?: number;
   preflightTimeout?: number;
   retries?: number;
   only?: string[];
@@ -68,6 +69,7 @@ function validate(raw: unknown, source: string): ComplianceConfig {
   const allowed = new Set([
     "target",
     "timeout",
+    "startupTimeout",
     "preflightTimeout",
     "retries",
     "only",
