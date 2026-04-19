@@ -7,6 +7,23 @@ Pre-1.0 releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 loosely — breaking changes can still land in a minor bump, but we'll call them
 out explicitly here.
 
+## [0.14.1] — 2026-04-19
+
+- **Fix: bare invocation double-started the stdio server.** 0.14.0 added a
+  bare-invocation path in `src/index.ts` that boots the MCP server when no
+  subcommand is given, but `src/mcp/server.ts` still carried a legacy
+  self-bootstrap block meant for `node dist/mcp/server.js`. Under tsup
+  bundling, `import.meta.url` in `server.ts` gets rewritten to the bundle
+  (`dist/index.js`), so `isInvokedDirectly()` returned true and a *second*
+  server instance attached to the same stdin/stdout — two readers racing
+  the same JSON-RPC stream, responses duplicated, initialize handshake
+  corrupted. External symptom: `npx -y @yawlabs/mcp-compliance` graded
+  servers as F when pointed at itself via the catalog. Fix: `isInvokedDirectly()`
+  now additionally verifies the module's own basename is `mcp/server.{js,ts}`,
+  so the self-bootstrap fires only for the standalone `dist/mcp/server.js`
+  entry (used by the dogfood integration test) and `tsx src/mcp/server.ts`
+  during dev — never from inside the CLI bundle.
+
 ## [0.14.0] — 2026-04-19
 
 - **Bare invocation now starts the MCP server.** `npx -y @yawlabs/mcp-compliance`
@@ -207,6 +224,8 @@ scaffolding for the repo.
 
 - Initial release: MCP compliance tester CLI and MCP server.
 
+[0.14.1]: https://github.com/YawLabs/mcp-compliance/releases/tag/v0.14.1
+[0.14.0]: https://github.com/YawLabs/mcp-compliance/releases/tag/v0.14.0
 [0.13.0]: https://github.com/YawLabs/mcp-compliance/releases/tag/v0.13.0
 [0.12.2]: https://github.com/YawLabs/mcp-compliance/releases/tag/v0.12.2
 [0.12.1]: https://github.com/YawLabs/mcp-compliance/releases/tag/v0.12.1

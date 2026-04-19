@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -48,13 +48,23 @@ export async function startServer(): Promise<void> {
 
 // Direct execution support: when `node .../mcp/server.js` is invoked
 // (or tsx during dev), boot the stdio server. We compare realpaths so
-// symlinked node_modules layouts and bundled installs still match — the
-// previous endsWith() check broke under any wrapper path.
+// symlinked node_modules layouts still match. We ALSO check the file's
+// own basename — when tsup bundles this module into `dist/index.js`,
+// `import.meta.url` is rewritten to point at the bundle, which would
+// otherwise make this block fire a second time on top of the CLI's own
+// bare-invocation path (src/index.ts), double-starting the server and
+// corrupting stdio. Gating on `mcp/server.{js,ts}` scopes this boot to
+// the standalone `dist/mcp/server.js` entry (used by the dogfood
+// integration test) and `tsx src/mcp/server.ts` during dev.
 function isInvokedDirectly(): boolean {
   const argv1 = process.argv[1];
   if (!argv1) return false;
   try {
-    return realpathSync(argv1) === realpathSync(fileURLToPath(import.meta.url));
+    const selfPath = realpathSync(fileURLToPath(import.meta.url));
+    if (realpathSync(argv1) !== selfPath) return false;
+    const file = basename(selfPath);
+    const parent = basename(dirname(selfPath));
+    return parent === "mcp" && (file === "server.js" || file === "server.ts");
   } catch {
     return false;
   }
