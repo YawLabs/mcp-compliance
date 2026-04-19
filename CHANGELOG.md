@@ -7,6 +7,20 @@ Pre-1.0 releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 loosely — breaking changes can still land in a minor bump, but we'll call them
 out explicitly here.
 
+## [0.14.0] — 2026-04-19
+
+- **Bare invocation now starts the MCP server.** `npx -y @yawlabs/mcp-compliance`
+  (no args) previously printed a help screen and exited — surprising for the
+  most common install shape where the user adds the package via `claude mcp
+  add`, an MCP catalog entry, or hand-copying the package name from npm and
+  expects an MCP server. Now it boots the stdio MCP server directly. The `mcp`
+  subcommand still works as an alias. Explicit CLI subcommands (`test`,
+  `badge`, `benchmark`, `diff`, `init`, `unpublish`, `help`, `--help`,
+  `--version`) are unchanged.
+  - Behavior change: if you had a script running bare `mcp-compliance`
+    expecting the help screen, switch to `mcp-compliance help` or
+    `mcp-compliance --help`.
+
 ## [0.13.3] — 2026-04-16
 
 - **Cross-platform stdio fix:** when a stdio target arrives as a single

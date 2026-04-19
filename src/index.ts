@@ -873,10 +873,17 @@ program
     await startServer();
   });
 
-// No subcommand? Print help instead of silently exiting.
+// No subcommand? Start the MCP server on stdio. This is the most common
+// install shape — `claude mcp add`, MCP catalog entries, hand-copying the
+// package name from npm — where the user expects the bare package to act
+// as an MCP server, not a CLI help screen. CLI subcommands (test, badge,
+// benchmark, diff, init, unpublish) still work when specified explicitly;
+// `mcp` remains available as an alias for back-compat.
 if (process.argv.length <= 2) {
-  program.outputHelp();
-  process.exit(0);
+  startServer().catch((err: unknown) => {
+    console.error(err);
+    process.exit(1);
+  });
+} else {
+  program.parse();
 }
-
-program.parse();
