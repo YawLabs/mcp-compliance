@@ -55,7 +55,7 @@ jobs:
         continue-on-error: true
       - name: Upload SBOM
         if: matrix.os == 'ubuntu-latest' && matrix.node-version == '22'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: sbom.cdx.json
