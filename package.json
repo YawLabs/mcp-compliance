@@ -47,7 +47,7 @@
     "zod": "^3.24.4"
   },
   "devDependencies": {
-    "@biomejs/biome": "^1.9.4",
+    "@biomejs/biome": "^2.4.12",
     "@types/node": "^25.5.2",
     "ajv": "^8.18.0",
     "ajv-formats": "^3.0.1",
