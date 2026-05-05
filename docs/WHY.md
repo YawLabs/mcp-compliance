@@ -38,7 +38,7 @@ These aren't obscure corner cases. They're the top failures we've seen running c
 
 **Shareable badges.** `mcp-compliance badge <url>` publishes to [mcp.hosting](https://mcp.hosting) and gives you markdown for your README. Badges update live — whoever runs the test most recently, on any CI, any machine, updates the public badge.
 
-**Graded scoring.** Not a binary pass/fail — an A–F grade weighted 70% on required tests, 30% on optional. One number that says "how compliant is this server" without reducing a 85-test result to a single bit.
+**Graded scoring.** Not a binary pass/fail — an A–F grade weighted 70% on required tests, 30% on optional. One number that says "how compliant is this server" without reducing an 88-test result to a single bit.
 
 ## Who this is for
 
