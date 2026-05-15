@@ -1,22 +1,25 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to release (e.g. 0.4.0)"
-        required: true
-        type: string
+  push:
+    tags:
+      - 'v*'
+
+# Serialize all release runs. Tags rarely arrive back-to-back, but when they
+# do, two parallel publish jobs would race on npm and one would fail with
+# "cannot publish over previously published version". The group key is a
+# hardcoded literal (not `${{ github.workflow }}` or `release-${{ github.ref }}`)
+# so different tags share a single queue and a future rename of the workflow
+# `name:` field can't silently fragment the queue across the rename window.
+# cancel-in-progress is false so a queued run waits its turn instead of being
+# killed: losing a tag's release event is worse than waiting a minute.
+concurrency:
+  group: release-npm
+  cancel-in-progress: false
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    # Serialize releases — two concurrent dispatches would race on the
-    # version bump commit and the `npm publish` call, one of which would
-    # fail halfway through and leave the tag ≠ npm state inconsistent.
-    concurrency:
-      group: release
-      cancel-in-progress: false
     permissions:
       contents: write
       id-token: write
@@ -24,7 +27,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-node@v6
         with:
@@ -33,33 +35,28 @@ jobs:
 
       - run: npm ci
 
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
+      # The workstation pushed the bump commit + annotated tag before this run
+      # fired, so release.sh in CI mode skips bump/commit/tag/push and goes
+      # straight to publish + GitHub release + verify. Version is derived from
+      # $GITHUB_REF_NAME (e.g. "v0.14.2" -> "0.14.2") inside release.sh.
       - name: Release
-        run: ./release.sh ${{ inputs.version }}
+        run: bash release.sh
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CI: true
 
       # Publish to the Official MCP Registry (registry.modelcontextprotocol.io)
-      # so downstream registries (Glama, PulseMCP, mcpservers.org, etc.) that
-      # auto-source from it pick this release up. Uses GitHub OIDC: the runner
-      # is inside the YawLabs org, GitHub mints a token whose `repository_owner`
-      # claim is "YawLabs", and the registry grants publish permission on the
-      # `io.github.YawLabs/*` namespace from that claim alone (no pre-
-      # registration with the registry needed -- the auth is purely OIDC).
+      # via GitHub OIDC. The `id-token: write` permission already enabled for
+      # npm provenance covers the registry auth too -- no MCP_* secret needed.
       - name: Install mcp-publisher
         run: |
           curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
             | tar xz mcp-publisher
 
-      - name: Sync server.json version to the released version
+      - name: Sync server.json version to the pushed tag
         run: |
-          VERSION="${{ inputs.version }}"
+          VERSION="${GITHUB_REF_NAME#v}"
           jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
           mv server.tmp server.json
 
