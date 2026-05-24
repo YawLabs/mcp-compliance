@@ -32,20 +32,20 @@ This tool solves that:
 **Remote HTTP server:**
 
 ```bash
-npx @yawlabs/mcp-compliance test https://my-server.com/mcp
+npx @yawlabs/mcp-compliance@latest test https://my-server.com/mcp
 ```
 
 **Local stdio server** (the vast majority of MCP servers on npm):
 
 ```bash
 # Pass the command directly, Inspector-style
-npx @yawlabs/mcp-compliance test npx @modelcontextprotocol/server-filesystem /tmp
+npx @yawlabs/mcp-compliance@latest test npx @modelcontextprotocol/server-filesystem /tmp
 
 # Or a local build
-npx @yawlabs/mcp-compliance test node ./dist/server.js
+npx @yawlabs/mcp-compliance@latest test node ./dist/server.js
 
 # With env vars
-npx @yawlabs/mcp-compliance test -E GITHUB_TOKEN=$GITHUB_TOKEN -- npx @modelcontextprotocol/server-github
+npx @yawlabs/mcp-compliance@latest test -E GITHUB_TOKEN=$GITHUB_TOKEN -- npx @modelcontextprotocol/server-github
 ```
 
 **Install globally:**
@@ -421,27 +421,27 @@ Required tests are worth 70% of the score, optional tests 30%. See the [full sco
 ```yaml
 # GitHub Actions example
 - name: MCP Compliance Check
-  run: npx @yawlabs/mcp-compliance test ${{ env.MCP_SERVER_URL }} --strict
+  run: npx @yawlabs/mcp-compliance@latest test ${{ env.MCP_SERVER_URL }} --strict
 ```
 
 ```yaml
 # With JSON output for parsing
 - name: MCP Compliance Check
   run: |
-    npx @yawlabs/mcp-compliance test ${{ env.MCP_SERVER_URL }} --format json > compliance.json
+    npx @yawlabs/mcp-compliance@latest test ${{ env.MCP_SERVER_URL }} --format json > compliance.json
     cat compliance.json | jq '.grade'
 ```
 
 ```yaml
 # With retries for flaky network conditions
 - name: MCP Compliance Check
-  run: npx @yawlabs/mcp-compliance test ${{ env.MCP_SERVER_URL }} --strict --retries 2 --timeout 30000
+  run: npx @yawlabs/mcp-compliance@latest test ${{ env.MCP_SERVER_URL }} --strict --retries 2 --timeout 30000
 ```
 
 ```yaml
 # SARIF output for GitHub Code Scanning
 - name: MCP Compliance Check
-  run: npx @yawlabs/mcp-compliance test ${{ env.MCP_SERVER_URL }} --format sarif > compliance.sarif
+  run: npx @yawlabs/mcp-compliance@latest test ${{ env.MCP_SERVER_URL }} --format sarif > compliance.sarif
 - name: Upload SARIF
   uses: github/codeql-action/upload-sarif@v3
   with:
@@ -457,7 +457,7 @@ This package also exposes an MCP server with 3 tools that can be used from Claud
 **Claude Code (one-liner):**
 
 ```bash
-claude mcp add mcp-compliance -- npx -y @yawlabs/mcp-compliance mcp
+claude mcp add mcp-compliance -- npx -y @yawlabs/mcp-compliance@latest mcp
 ```
 
 **Or create `.mcp.json` in your project root:**
@@ -469,7 +469,7 @@ macOS / Linux / WSL:
   "mcpServers": {
     "mcp-compliance": {
       "command": "npx",
-      "args": ["-y", "@yawlabs/mcp-compliance", "mcp"]
+      "args": ["-y", "@yawlabs/mcp-compliance@latest", "mcp"]
     }
   }
 }
@@ -482,7 +482,7 @@ Windows:
   "mcpServers": {
     "mcp-compliance": {
       "command": "cmd",
-      "args": ["/c", "npx", "-y", "@yawlabs/mcp-compliance", "mcp"]
+      "args": ["/c", "npx", "-y", "@yawlabs/mcp-compliance@latest", "mcp"]
     }
   }
 }
