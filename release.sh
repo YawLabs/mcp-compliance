@@ -75,8 +75,8 @@ if [ "$IS_CI" != "true" ]; then
   npm whoami >/dev/null 2>&1     || fail "npm is not authenticated. Run: npm login --auth-type=web"
 
   CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-  if [ "$CURRENT_BRANCH" != "master" ]; then
-    fail "Must release from 'master' branch (currently on '$CURRENT_BRANCH')"
+  if [ "$CURRENT_BRANCH" != "main" ]; then
+    fail "Must release from 'main' branch (currently on '$CURRENT_BRANCH')"
   fi
 fi
 
@@ -98,7 +98,7 @@ if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
   echo "  1. Test and lint"
   echo "  2. Bump version in package.json"
-  echo "  3. Commit, tag, and push to origin/master"
+  echo "  3. Commit, tag, and push to origin/main"
   echo "  4. Publish to npm"
   echo "  5. Create GitHub release"
   echo "  6. Verify"
@@ -133,7 +133,7 @@ elif [ "$IS_CI" = "true" ]; then
   # committing the version bump -- bumping here would publish the right
   # version but the orphan commit can't be pushed back through branch
   # protection (signature requirement). Fail loudly instead.
-  fail "package.json is at v${CURRENT_VERSION} but tag is v${VERSION}. Tag without prior version bump on master -- refusing to publish a version that disagrees with the source."
+  fail "package.json is at v${CURRENT_VERSION} but tag is v${VERSION}. Tag without prior version bump on main -- refusing to publish a version that disagrees with the source."
 else
   npm version "$VERSION" --no-git-tag-version
   info "Version bumped"
@@ -164,8 +164,8 @@ else
     info "Tag v${VERSION} created"
   fi
 
-  git push origin master --follow-tags
-  info "Pushed master + tags to origin"
+  git push origin main --follow-tags
+  info "Pushed main + tags to origin"
 fi
 
 # =============================================================================

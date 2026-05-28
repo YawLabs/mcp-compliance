@@ -55,15 +55,15 @@ One command (from [the `mcp-compliance` repo](https://github.com/YawLabs/mcp-com
 node --import tsx scripts/run-top-servers.ts
 ```
 
-The script lives at [`scripts/run-top-servers.ts`](https://github.com/YawLabs/mcp-compliance/blob/master/scripts/run-top-servers.ts). It's a curated list — not an npm-registry crawler — because we want to be deliberate about what we're running and blocking on credentials/setup for every server. Adding a server is a 5-line PR. Anyone can run this; it doesn't touch any network resources beyond `npm install` for each server and the server's own behavior.
+The script lives at [`scripts/run-top-servers.ts`](https://github.com/YawLabs/mcp-compliance/blob/main/scripts/run-top-servers.ts). It's a curated list — not an npm-registry crawler — because we want to be deliberate about what we're running and blocking on credentials/setup for every server. Adding a server is a 5-line PR. Anyone can run this; it doesn't touch any network resources beyond `npm install` for each server and the server's own behavior.
 
-Raw data is in [`data/top-servers-results.json`](https://github.com/YawLabs/mcp-compliance/blob/master/data/top-servers-results.json) and a human-readable table at [`data/top-servers-results.md`](https://github.com/YawLabs/mcp-compliance/blob/master/data/top-servers-results.md). Both are committed to the repo and update when the script is rerun.
+Raw data is in [`data/top-servers-results.json`](https://github.com/YawLabs/mcp-compliance/blob/main/data/top-servers-results.json) and a human-readable table at [`data/top-servers-results.md`](https://github.com/YawLabs/mcp-compliance/blob/main/data/top-servers-results.md). Both are committed to the repo and update when the script is rerun.
 
 ## What comes next
 
 - **Quarterly reruns**. The MCP spec evolves (2025-11-25 → eventually 2026-something), reference servers get updates. This isn't a one-time benchmark.
 - **uvx / PyPI transport**. Today the CLI spawns Node commands. Adding uvx support unlocks the Python half of the reference ecosystem without changing the test suite itself.
 - **Community leaderboard**. The backend at [mcp.hosting](https://mcp.hosting) has the data model; the dashboard `/explore/compliance` route is next.
-- **Spec PRs**. We've drafted clarifications for 5 ambiguous corners the test suite had to guess at. They're at [`docs/spec-prs/`](https://github.com/YawLabs/mcp-compliance/tree/master/docs/spec-prs) in the repo. Eventually, those go upstream.
+- **Spec PRs**. We've drafted clarifications for 5 ambiguous corners the test suite had to guess at. They're at [`docs/spec-prs/`](https://github.com/YawLabs/mcp-compliance/tree/main/docs/spec-prs) in the repo. Eventually, those go upstream.
 
 The compliance suite itself is at [88 tests across 8 categories](https://github.com/YawLabs/mcp-compliance) (MIT-licensed). It runs locally, on CI, or against the hosted badge service. If you ship an MCP server on npm, running it takes 30 seconds and tells you exactly where you stand against the spec.
