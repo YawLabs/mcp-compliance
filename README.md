@@ -9,9 +9,9 @@
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
-[![Add to mcp.hosting](https://mcp.hosting/install-button.svg)](https://mcp.hosting/install?name=mcp-compliance&command=npx&args=-y%2C%40yawlabs%2Fmcp-compliance&description=Test%20any%20MCP%20server%20against%20the%20spec%20-%2088-test%20suite%20with%20letter-grade%20scoring&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fmcp-compliance)
+[![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](yaw://install?name=mcp-compliance&command=npx&args=-y%2C%40yawlabs%2Fmcp-compliance&description=Test%20any%20MCP%20server%20against%20the%20spec%20-%2088-test%20suite%20with%20letter-grade%20scoring&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fmcp-compliance)
 
-One click adds this to your [mcp.hosting](https://mcp.hosting) account so it syncs to every MCP client you use. Or install manually below.
+One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
 
 ## Why this tool?
 
