@@ -20,7 +20,7 @@
   "main": "./dist/runner.js",
   "types": "./dist/runner.d.ts",
   "bin": {
-    "mcp-compliance": "./dist/index.js"
+    "mcp-compliance": "dist/index.js"
   },
   "files": [
     "dist",
