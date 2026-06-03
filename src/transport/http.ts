@@ -62,10 +62,24 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
     body: string | undefined,
     extraHeaders: Record<string, string>,
     timeout: number,
+    omitUserHeaders?: string[],
   ) {
+    const base = sessionHeaders();
+    // Strip any user-supplied headers the caller asked to omit (matched
+    // case-insensitively). This is what lets the auth-stripping security
+    // tests genuinely send a request without Authorization — otherwise
+    // sessionHeaders() re-injects the configured user header and the
+    // "stripped" request still carries auth. extraHeaders is applied
+    // AFTER stripping so a malformed/replacement value can be supplied.
+    if (omitUserHeaders && omitUserHeaders.length > 0) {
+      const drop = new Set(omitUserHeaders.map((h) => h.toLowerCase()));
+      for (const key of Object.keys(base)) {
+        if (drop.has(key.toLowerCase())) delete base[key];
+      }
+    }
     const headers: Record<string, string> = {
       Accept: "application/json, text/event-stream",
-      ...sessionHeaders(),
+      ...base,
       ...extraHeaders,
     };
     if (body !== undefined && !("Content-Type" in headers) && !("content-type" in headers)) {
@@ -91,7 +105,7 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
     async request(method, params, nextId, init): Promise<TransportResponse> {
       const id = nextId();
       const body = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} });
-      const raw = await doRawRequest("POST", body, init.headers ?? {}, init.timeout);
+      const raw = await doRawRequest("POST", body, init.headers ?? {}, init.timeout, init.omitUserHeaders);
       const contentType = (raw.headers["content-type"] || "").toLowerCase();
 
       let parsed: unknown;
@@ -123,7 +137,7 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
     },
     async notify(method, params, init): Promise<TransportNotifyResult> {
       const body = JSON.stringify({ jsonrpc: "2.0", method, ...(params ? { params } : {}) });
-      const raw = await doRawRequest("POST", body, init.headers ?? {}, init.timeout);
+      const raw = await doRawRequest("POST", body, init.headers ?? {}, init.timeout, init.omitUserHeaders);
       return { statusCode: raw.statusCode, headers: raw.headers };
     },
     async close() {

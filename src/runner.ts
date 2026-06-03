@@ -376,10 +376,12 @@ export async function runComplianceSuite(
       idCounter: () => number,
       extraHeaders: Record<string, string> | undefined,
       timeoutMs: number,
+      omitUserHeaders?: string[],
     ): Promise<{ statusCode: number; body: any; headers: Record<string, string>; requestId: number }> {
       const res = await transport.request(method, params, idCounter, {
         timeout: timeoutMs,
         headers: extraHeaders,
+        omitUserHeaders,
       });
       return {
         statusCode: res.statusCode ?? 200,
@@ -2336,11 +2338,17 @@ export async function runComplianceSuite(
             details: "Server does not require auth (no --auth provided and server accepted unauthenticated requests)",
           };
         }
-        // Re-send initialize without auth header
+        // Re-send without the Authorization header. The transport
+        // re-injects configured user headers via sessionHeaders(), so we
+        // must explicitly omit Authorization for this one request —
+        // otherwise the "unauthenticated" probe still carries auth and
+        // the test false-passes against an auth-requiring server.
         const noAuthHeaders: Record<string, string> = {};
         if (sessionId) noAuthHeaders["mcp-session-id"] = sessionId;
         try {
-          const res = await mcpRequest(backendUrl, "ping", undefined, nextId, noAuthHeaders, timeout);
+          const res = await mcpRequest(backendUrl, "ping", undefined, nextId, noAuthHeaders, timeout, [
+            "authorization",
+          ]);
           if (res.statusCode === 401 || res.statusCode === 403) {
             return { passed: true, details: `HTTP ${res.statusCode} (unauthenticated request rejected)` };
           }
@@ -2361,11 +2369,14 @@ export async function runComplianceSuite(
         if (!hasAuth) {
           return { passed: true, details: "Skipped: server does not require auth" };
         }
-        // Send request without auth and check for WWW-Authenticate header on 401
+        // Send request without auth and check for WWW-Authenticate header on 401.
+        // Omit Authorization for this request (see security-auth-required).
         const noAuthHeaders: Record<string, string> = {};
         if (sessionId) noAuthHeaders["mcp-session-id"] = sessionId;
         try {
-          const res = await mcpRequest(backendUrl, "ping", undefined, nextId, noAuthHeaders, timeout);
+          const res = await mcpRequest(backendUrl, "ping", undefined, nextId, noAuthHeaders, timeout, [
+            "authorization",
+          ]);
           if (res.statusCode === 401) {
             const wwwAuth = res.headers["www-authenticate"];
             if (wwwAuth) {
@@ -2402,7 +2413,13 @@ export async function runComplianceSuite(
         };
         if (sessionId) malformedHeaders["mcp-session-id"] = sessionId;
         try {
-          const res = await mcpRequest(backendUrl, "ping", undefined, nextId, malformedHeaders, timeout);
+          // Omit the configured (valid) Authorization first, then let the
+          // malformed value in malformedHeaders take its place — without the
+          // omit, the valid user header would survive the case-insensitive
+          // merge and the server would accept the request.
+          const res = await mcpRequest(backendUrl, "ping", undefined, nextId, malformedHeaders, timeout, [
+            "authorization",
+          ]);
           if (res.statusCode === 401 || res.statusCode === 403) {
             return { passed: true, details: `HTTP ${res.statusCode} (malformed auth rejected)` };
           }
@@ -2495,12 +2512,16 @@ export async function runComplianceSuite(
         if (!sessionId) {
           return { passed: true, details: "Skipped: server does not issue session IDs" };
         }
-        // Send request with session ID but NO auth
+        // Send request with session ID but NO auth. Omit Authorization so
+        // the session-id is the ONLY credential present — otherwise the
+        // re-injected user auth would make this probe meaningless.
         const sessionOnlyHeaders: Record<string, string> = {
           "mcp-session-id": sessionId,
         };
         try {
-          const res = await mcpRequest(backendUrl, "ping", undefined, nextId, sessionOnlyHeaders, timeout);
+          const res = await mcpRequest(backendUrl, "ping", undefined, nextId, sessionOnlyHeaders, timeout, [
+            "authorization",
+          ]);
           if (res.statusCode === 401 || res.statusCode === 403) {
             return { passed: true, details: `HTTP ${res.statusCode} (session ID alone not sufficient for auth)` };
           }

@@ -111,6 +111,64 @@ describe("HttpTransport", () => {
     expect(lastRequest?.headers["mcp-session-id"]).toBe("sess-xyz");
   });
 
+  it("omitUserHeaders drops a configured user header for one request", async () => {
+    // Regression for the auth-stripping false-pass: sessionHeaders()
+    // re-injects every configured user header (e.g. Authorization) on
+    // every request, so leaving it out of `headers` is NOT enough — the
+    // request still carries auth. omitUserHeaders must genuinely remove it.
+    responder = () => ({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }),
+    });
+    const t = createHttpTransport({ url: serverUrl, headers: { Authorization: "Bearer secret" } });
+    t.setSessionId("sess-omit");
+    await t.request("ping", undefined, () => 1, { timeout: 5000, omitUserHeaders: ["authorization"] });
+    const captured = lastRequest;
+    expect(captured).not.toBeNull();
+    // The stripped request reaches the server with NO Authorization...
+    expect(captured?.headers.authorization).toBeUndefined();
+    // ...but unrelated session headers still flow through.
+    expect(captured?.headers["mcp-session-id"]).toBe("sess-omit");
+  });
+
+  it("omitUserHeaders matches the user header name case-insensitively", async () => {
+    // The user may have configured a lowercase `authorization`; the test
+    // omits `"authorization"`. Stripping must be case-insensitive or the
+    // header survives and the unauthenticated probe false-passes.
+    const t = createHttpTransport({ url: serverUrl, headers: { authorization: "Bearer secret" } });
+    await t.request("ping", undefined, () => 1, { timeout: 5000, omitUserHeaders: ["Authorization"] });
+    const captured = lastRequest;
+    expect(captured).not.toBeNull();
+    expect(captured?.headers.authorization).toBeUndefined();
+  });
+
+  it("extraHeaders replaces an omitted user header (malformed-auth path)", async () => {
+    // The malformed-auth test omits the valid Authorization, then supplies
+    // a garbage one via extraHeaders. The server must see ONLY the garbage
+    // value, never the configured-valid one.
+    const t = createHttpTransport({ url: serverUrl, headers: { Authorization: "Bearer valid-token" } });
+    await t.request("ping", undefined, () => 1, {
+      timeout: 5000,
+      headers: { Authorization: "Bearer GARBAGE" },
+      omitUserHeaders: ["authorization"],
+    });
+    const captured = lastRequest;
+    expect(captured).not.toBeNull();
+    expect(captured?.headers.authorization).toBe("Bearer GARBAGE");
+  });
+
+  it("without omitUserHeaders the configured auth header is still sent (no regression)", async () => {
+    // Guards the default path: the fix must not strip auth from ordinary
+    // requests. This is the behavior the suite relies on for every
+    // authenticated request that is NOT an auth-stripping probe.
+    const t = createHttpTransport({ url: serverUrl, headers: { Authorization: "Bearer keep-me" } });
+    await t.request("ping", undefined, () => 1, { timeout: 5000 });
+    const captured = lastRequest;
+    expect(captured).not.toBeNull();
+    expect(captured?.headers.authorization).toBe("Bearer keep-me");
+  });
+
   it("notify() sends a JSON-RPC notification without id", async () => {
     const t = createHttpTransport({ url: serverUrl });
     await t.notify("notifications/initialized", undefined, { timeout: 5000 });

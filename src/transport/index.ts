@@ -15,6 +15,17 @@ export interface TransportRequestInit {
   timeout: number;
   /** HTTP only: extra headers for this specific request */
   headers?: Record<string, string>;
+  /**
+   * HTTP only: names of user-supplied headers to OMIT from this single
+   * request, matched case-insensitively. Without this, the transport
+   * re-injects every configured user header (e.g. Authorization) on
+   * every request via sessionHeaders(), so a test cannot actually send
+   * an unauthenticated request just by leaving the header out of
+   * `headers`. The auth-stripping security tests use this to genuinely
+   * drop (or, combined with `headers`, replace) the Authorization
+   * header. Ignored by stdio.
+   */
+  omitUserHeaders?: string[];
 }
 
 export interface TransportResponse {
