@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { urlHash } from "./badge.js";
 
 const STORE_DIR = join(homedir(), ".mcp-compliance");
 const STORE_PATH = join(STORE_DIR, "tokens.json");
@@ -15,9 +15,10 @@ export interface TokenEntry {
 type Store = Record<string, TokenEntry>;
 
 export function hashUrl(url: string): string {
-  // Must match mcp-hosting's hash width (24 hex = 96 bits). Older v0.9.0
-  // installs used 12 chars; the server accepts both for read/delete.
-  return createHash("sha256").update(url).digest("hex").slice(0, 24);
+  // Delegates to the canonical urlHash (badge.ts): SHA-256 truncated to
+  // 24 hex (96 bits), matching mcp-hosting. Older v0.9.0 installs used 12
+  // chars; the server accepts both for read/delete.
+  return urlHash(url);
 }
 
 function readStore(): Store {

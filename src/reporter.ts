@@ -243,7 +243,6 @@ export function formatSarif(report: ComplianceReport): string {
             physicalLocation: {
               artifactLocation: {
                 uri: report.url,
-                uriBaseId: "MCP_SERVER",
               },
             },
           },

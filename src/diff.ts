@@ -103,7 +103,9 @@ export function diffReports(baseline: ComplianceReport, current: ComplianceRepor
 
 export function formatDiff(summary: DiffSummary): string {
   const lines: string[] = [];
-  const arrow = summary.baselineGrade === summary.currentGrade ? "→" : "→";
+  let arrow = "→";
+  if (summary.currentScore > summary.baselineScore) arrow = "↑";
+  else if (summary.currentScore < summary.baselineScore) arrow = "↓";
   lines.push(
     `Grade ${summary.baselineGrade} (${summary.baselineScore}%) ${arrow} ${summary.currentGrade} (${summary.currentScore}%)`,
   );
