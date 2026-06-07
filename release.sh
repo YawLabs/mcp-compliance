@@ -385,18 +385,25 @@ else
     chmod +x "$MP" 2>/dev/null || true
   fi
 
-  # OIDC auth (used by the old release.yml) only works inside Actions; locally
-  # we use a GitHub PAT via `login github -token <PAT>`. The PAT needs read:org
-  # for YawLabs so the registry can verify org membership for the
-  # io.github.YawLabs/* namespace.
-  # Fall back to gh CLI's session token if MCP_REGISTRY_TOKEN is unset --
-  # gh auth login (admin:org or read:org scope) covers the namespace claim.
-  : "${MCP_REGISTRY_TOKEN:=$(gh auth token 2>/dev/null || true)}"
-  if [ -z "${MCP_REGISTRY_TOKEN:-}" ]; then
-    fail "MCP_REGISTRY_TOKEN unset -- set it to a GitHub PAT with read:org for YawLabs (or run '$MP login github' once interactively to cache the session)."
+  # Auth differs by mode:
+  #   CI    -> GitHub OIDC. The job's `id-token: write` permission (already
+  #            needed for npm provenance) covers the registry's namespace
+  #            claim too -- no MCP_* secret required.
+  #   local -> GitHub PAT via `login github -token <PAT>`. The PAT needs
+  #            read:org for YawLabs so the registry can verify org membership
+  #            for the io.github.YawLabs/* namespace. Falls back to the gh CLI
+  #            session token (gh auth login with admin:org/read:org scope).
+  if [ "$IS_CI" = "true" ]; then
+    "$MP" login github-oidc >/dev/null 2>&1 \
+      || fail "mcp-publisher OIDC login failed -- ensure the release job has 'permissions: id-token: write'."
+  else
+    : "${MCP_REGISTRY_TOKEN:=$(gh auth token 2>/dev/null || true)}"
+    if [ -z "${MCP_REGISTRY_TOKEN:-}" ]; then
+      fail "MCP_REGISTRY_TOKEN unset -- set it to a GitHub PAT with read:org for YawLabs (or run '$MP login github' once interactively to cache the session)."
+    fi
+    "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null 2>&1 \
+      || fail "mcp-publisher login failed -- check MCP_REGISTRY_TOKEN scopes (needs read:org for YawLabs)"
   fi
-  "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null 2>&1 \
-    || fail "mcp-publisher login failed -- check MCP_REGISTRY_TOKEN scopes (needs read:org for YawLabs)"
   "$MP" publish \
     || fail "mcp-publisher publish failed -- npm + GitHub release succeeded, but the MCP Registry did not. Retry the step (re-run the script) once the cause is identified."
   info "Published to MCP Registry"
