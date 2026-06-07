@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.YawLabs/mcp-compliance",
   "description": "CLI tool and MCP server that tests MCP servers for spec compliance",
-  "version": "0.14.4",
+  "version": "0.15.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@yawlabs/mcp-compliance",
-      "version": "0.14.4",
+      "version": "0.15.0",
       "transport": {
         "type": "stdio"
       }
