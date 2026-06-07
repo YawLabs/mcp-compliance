@@ -10,7 +10,7 @@ import { request } from "undici";
 import { generateBadge } from "./badge.js";
 import { computeScore } from "./grader.js";
 import { readPackageVersion } from "./pkg-version.js";
-import { createHttpTransport, type HttpTransport } from "./transport/http.js";
+import { createHttpTransport } from "./transport/http.js";
 import type { Transport } from "./transport/index.js";
 import { createStdioTransport } from "./transport/stdio.js";
 import type { ComplianceReport, TestDefinition, TestResult, TransportTarget } from "./types.js";
@@ -2353,7 +2353,7 @@ export async function runComplianceSuite(
             return { passed: true, details: `HTTP ${res.statusCode} (unauthenticated request rejected)` };
           }
           return { passed: false, details: `HTTP ${res.statusCode} — server accepted unauthenticated request` };
-        } catch (err: unknown) {
+        } catch (_err: unknown) {
           return { passed: true, details: "Connection rejected (acceptable)" };
         }
       },
@@ -2424,7 +2424,7 @@ export async function runComplianceSuite(
             return { passed: true, details: `HTTP ${res.statusCode} (malformed auth rejected)` };
           }
           return { passed: false, details: `HTTP ${res.statusCode} — server accepted malformed auth token` };
-        } catch (err: unknown) {
+        } catch (_err: unknown) {
           return { passed: true, details: "Connection rejected (acceptable)" };
         }
       },
@@ -3002,7 +3002,7 @@ export async function runComplianceSuite(
         if (!toolsListOk) return { passed: true, details: "Skipped: tools/list not available" };
         const tools = cachedToolsList ?? [];
         if (tools.length === 0) return { passed: true, details: "No tools to validate" };
-        const missing = tools.filter((t: any) => !t.inputSchema || t.inputSchema.type !== "object");
+        const missing = tools.filter((t: any) => t.inputSchema?.type !== "object");
         if (missing.length > 0) {
           return {
             passed: false,

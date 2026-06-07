@@ -9,7 +9,7 @@ import { createInterface } from "node:readline";
 
 const rl = createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY });
 
-let initialized = false;
+let _initialized = false;
 
 function send(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -35,7 +35,7 @@ rl.on("line", (line) => {
 
   switch (msg.method) {
     case "initialize":
-      initialized = true;
+      _initialized = true;
       send({
         jsonrpc: "2.0",
         id: msg.id,

@@ -684,7 +684,8 @@ program
   .command("unpublish")
   .description("Remove a previously-published compliance report from mcp.hosting")
   .argument("<url>", "MCP server URL whose report should be removed")
-  .action(async (url: string) => {
+  .option("-y, --yes", "Skip the confirmation prompt (for automation)")
+  .action(async (url: string, opts: { yes?: boolean }) => {
     try {
       const stored = getTokenForUrl(url);
       if (!stored) {
@@ -695,6 +696,16 @@ program
           ),
         );
         return; // exit 0 — this isn't a failure
+      }
+      // Removing a published report is an irreversible remote delete; confirm
+      // unless --yes was passed. promptYesNo returns false on a non-TTY, so an
+      // unattended run without --yes aborts rather than deleting silently.
+      if (!opts.yes) {
+        const ok = await promptYesNo(chalk.yellow(`Remove the published report for ${url}? This cannot be undone.`));
+        if (!ok) {
+          console.error(chalk.dim("\nAborted. Re-run with --yes to skip this prompt.\n"));
+          return;
+        }
       }
       await unpublishReport(stored.hash, stored.entry.deleteToken);
       removeStoredToken(stored.hash);

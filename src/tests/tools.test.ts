@@ -48,7 +48,7 @@ describe("registerTools", () => {
   it("all tools have readOnlyHint annotation", () => {
     const { server, tools } = createMockServer();
     registerTools(server);
-    for (const [name, tool] of Object.entries(tools)) {
+    for (const [_name, tool] of Object.entries(tools)) {
       expect(tool.annotations.readOnlyHint).toBe(true);
     }
   });
@@ -56,7 +56,7 @@ describe("registerTools", () => {
   it("all tools have destructiveHint=false annotation", () => {
     const { server, tools } = createMockServer();
     registerTools(server);
-    for (const [name, tool] of Object.entries(tools)) {
+    for (const [_name, tool] of Object.entries(tools)) {
       expect(tool.annotations.destructiveHint).toBe(false);
     }
   });
@@ -64,7 +64,7 @@ describe("registerTools", () => {
   it("all tools have idempotentHint=true annotation", () => {
     const { server, tools } = createMockServer();
     registerTools(server);
-    for (const [name, tool] of Object.entries(tools)) {
+    for (const [_name, tool] of Object.entries(tools)) {
       expect(tool.annotations.idempotentHint).toBe(true);
     }
   });
@@ -72,7 +72,7 @@ describe("registerTools", () => {
   it("all tools have title annotation", () => {
     const { server, tools } = createMockServer();
     registerTools(server);
-    for (const [name, tool] of Object.entries(tools)) {
+    for (const [_name, tool] of Object.entries(tools)) {
       expect(typeof tool.annotations.title).toBe("string");
       expect(tool.annotations.title.length).toBeGreaterThan(0);
     }
