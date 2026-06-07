@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { SPEC_BASE, runComplianceSuite } from "../runner.js";
+import { runComplianceSuite, SPEC_BASE } from "../runner.js";
 import { TEST_DEFINITIONS } from "../types.js";
 
 /**

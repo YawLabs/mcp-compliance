@@ -1,12 +1,12 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import addFormats from "ajv-formats";
 import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
 import { describe, expect, it } from "vitest";
 import { generateBadge } from "../badge.js";
-import { REPORT_SCHEMA_VERSION } from "../types.js";
 import type { ComplianceReport } from "../types.js";
+import { REPORT_SCHEMA_VERSION } from "../types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const schemaPath = resolve(__dirname, "../../schemas/report.v1.json");

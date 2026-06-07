@@ -1,4 +1,4 @@
-import { type Server, createServer } from "node:http";
+import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runComplianceSuite } from "../runner.js";
 
