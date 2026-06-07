@@ -160,6 +160,11 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
       pending.delete(msg.id);
       p.resolve({ body: parsed, requestId: msg.id });
     }
+    // Only numeric ids are matched: the runner and benchmark allocate ids
+    // via numeric counters for stdio and `pending` is keyed by number. A
+    // server echoing a string id would time out here rather than resolve —
+    // but the suite never sends string ids over stdio (lifecycle-string-id
+    // is HTTP-only via STDIO_INCOMPATIBLE_IDS in runner.ts).
     // Notifications (no id) and unmatched ids are dropped.
   }
 
@@ -258,22 +263,35 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
       try {
         child.stdin?.end();
       } catch {}
-      // Grace period, then force-kill.
+      // Kill the whole process tree, not just the direct child. On Windows
+      // the child is spawned via a shell (shell:true, for .cmd/.bat shims
+      // like npx), so child.kill() would only reach cmd.exe and orphan the
+      // real server (the node/npx grandchild); `taskkill /t` walks the tree.
+      // On POSIX we spawn with shell:false, so signalling the child directly
+      // is sufficient.
+      const treeKill = (force: boolean) => {
+        if (isWindows && child.pid !== undefined) {
+          try {
+            spawn("taskkill", ["/pid", String(child.pid), "/t", ...(force ? ["/f"] : [])], { stdio: "ignore" });
+          } catch {}
+        } else {
+          try {
+            child.kill(force ? "SIGKILL" : "SIGTERM");
+          } catch {}
+        }
+      };
+      // Grace period, then force-kill the tree.
       const gracePeriodMs = 2000;
       await new Promise<void>((resolve) => {
         const timer = setTimeout(() => {
-          try {
-            child.kill("SIGKILL");
-          } catch {}
+          treeKill(true);
           resolve();
         }, gracePeriodMs);
         child.once("exit", () => {
           clearTimeout(timer);
           resolve();
         });
-        try {
-          child.kill(isWindows ? undefined : "SIGTERM");
-        } catch {}
+        treeKill(false);
       });
       rejectAllPending(new Error("stdio transport: closed"));
     },

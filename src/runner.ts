@@ -1,4 +1,3 @@
-import { createRequire } from "node:module";
 import { request } from "undici";
 // Intentional dual-layer HTTP: this `request` import is used only by
 // wire-level transport tests that need raw status codes, headers, and
@@ -10,6 +9,7 @@ import { request } from "undici";
 // rawPost already exposes what you need.
 import { generateBadge } from "./badge.js";
 import { computeScore } from "./grader.js";
+import { readPackageVersion } from "./pkg-version.js";
 import { type HttpTransport, createHttpTransport } from "./transport/http.js";
 import type { Transport } from "./transport/index.js";
 import { createStdioTransport } from "./transport/stdio.js";
@@ -23,8 +23,7 @@ export { generateBadge, urlHash } from "./badge.js";
 
 const TEST_DEFINITIONS_MAP = new Map(TEST_DEFINITIONS.map((t) => [t.id, t]));
 
-const _require = createRequire(import.meta.url);
-const { version: TOOL_VERSION } = _require("../package.json");
+const TOOL_VERSION = readPackageVersion(import.meta.url);
 
 export const SPEC_VERSION = "2025-11-25";
 export const SPEC_BASE = `https://modelcontextprotocol.io/specification/${SPEC_VERSION}`;
@@ -2406,7 +2405,7 @@ export async function runComplianceSuite(
       "basic/authorization",
       async () => {
         if (!hasAuth) {
-          return { passed: false, details: "Skipped: server does not require auth" };
+          return { passed: true, details: "Skipped: server does not require auth" };
         }
         const malformedHeaders: Record<string, string> = {
           Authorization: "Bearer INVALID_GARBAGE_TOKEN_!@#$%^&*()",
@@ -2970,9 +2969,14 @@ export async function runComplianceSuite(
           return { passed: true, details: "No tools available to test (skipped)" };
         }
         try {
+          // Build arguments via JSON.parse so "__proto__" lands as a real own
+          // enumerable property: the `__proto__:` object-literal form sets the
+          // prototype instead, and JSON.stringify would drop it, so the
+          // pollution payload would never reach the wire.
+          const maliciousArgs = JSON.parse('{"__injected_param__":"malicious_value","__proto__":{"admin":true}}');
           const res = await rpc("tools/call", {
             name: toolNames[0],
-            arguments: { __injected_param__: "malicious_value", __proto__: { admin: true } },
+            arguments: maliciousArgs,
           });
           const error = res.body?.error;
           if (error) {

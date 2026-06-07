@@ -225,8 +225,12 @@ function isPrivateHost(urlStr: string): boolean {
     if (a === 192 && b === 168) return true;
     if (a === 0) return true;
   }
-  if (host === "::1" || host === "[::1]") return true;
-  if (host.startsWith("fe80:") || host.startsWith("fc") || host.startsWith("fd")) return true;
+  // Strip the brackets URL.hostname keeps on IPv6 literals ("[::1]").
+  const v6 = host.replace(/^\[|\]$/g, "");
+  if (v6 === "::1") return true;
+  // Link-local (fe80::/10) and unique-local (fc00::/7). Gate on a colon so a
+  // hostname like "fcfoo.com" isn't mistaken for an fc00:: address.
+  if (v6.includes(":") && (v6.startsWith("fe80:") || v6.startsWith("fc") || v6.startsWith("fd"))) return true;
   return false;
 }
 
@@ -254,9 +258,14 @@ program
   )
   .argument("[extraArgs...]", "Additional args passed to the stdio command")
   .addOption(
-    new Option("--format <format>", "Output format")
-      .choices(["terminal", "json", "sarif", "github", "markdown", "html"])
-      .default("terminal"),
+    new Option("--format <format>", "Output format (default: terminal, or `format` in config)").choices([
+      "terminal",
+      "json",
+      "sarif",
+      "github",
+      "markdown",
+      "html",
+    ]),
   )
   .option("--config <path>", "Load options from a config file (default: mcp-compliance.config.json in cwd)")
   .option("--output <file>", "Write a local SVG badge to the given path after the run (works with any transport)")
@@ -289,8 +298,7 @@ program
   .option("--cwd <dir>", "Working directory for stdio command")
   .option(
     "--timeout <ms>",
-    "Per-request timeout in milliseconds (applies to every test request after the initial handshake)",
-    "15000",
+    "Per-request timeout in ms after the initial handshake (default: 15000, or `timeout` in config)",
   )
   .option(
     "--startup-timeout <ms>",
@@ -304,7 +312,7 @@ program
     "1",
   )
   .option("--preflight-timeout <ms>", "Preflight connectivity check timeout in milliseconds")
-  .option("--retries <n>", "Number of retries for failed tests", "0")
+  .option("--retries <n>", "Number of retries for failed tests (default: 0, or `retries` in config)")
   .option(
     "--only <items>",
     'Only run matching categories or test IDs, comma-separated (e.g., "transport,lifecycle" or "transport-post,lifecycle-init")',
@@ -328,7 +336,7 @@ program
         color?: boolean;
         watch?: boolean;
         concurrency: string;
-        format: string;
+        format?: string;
         strict?: boolean;
         minGrade?: "A" | "B" | "C" | "D" | "F";
         header: Record<string, string>;
@@ -336,10 +344,10 @@ program
         env: Record<string, string>;
         envFile?: string;
         cwd?: string;
-        timeout: string;
+        timeout?: string;
         startupTimeout?: string;
         preflightTimeout?: string;
-        retries: string;
+        retries?: string;
         only?: string[];
         skip?: string[];
         verbose?: boolean;
@@ -390,6 +398,15 @@ program
         const skip = opts.skip ?? config?.skip;
         const verbose = opts.verbose ?? config?.verbose;
         const strict = opts.strict ?? config?.strict;
+        // --timeout/--retries/--format carry no Commander default (see option
+        // defs), so an omitted flag is `undefined` here and falls through to
+        // the config file, then a built-in default. Previously their Commander
+        // defaults shadowed the config values entirely.
+        opts.format = opts.format ?? config?.format ?? "terminal";
+        let timeout = config?.timeout ?? 15000;
+        if (opts.timeout !== undefined) timeout = parsePositiveInt(opts.timeout, "--timeout", 1);
+        let retries = config?.retries ?? 0;
+        if (opts.retries !== undefined) retries = parsePositiveInt(opts.retries, "--retries");
 
         async function runOnce() {
           if (opts.format === "terminal") {
@@ -397,14 +414,14 @@ program
           }
 
           const report = await runComplianceSuite(transportTarget, {
-            timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
+            timeout,
             startupTimeout: opts.startupTimeout
               ? parsePositiveInt(opts.startupTimeout, "--startup-timeout", 1)
               : config?.startupTimeout,
             preflightTimeout: opts.preflightTimeout
               ? parsePositiveInt(opts.preflightTimeout, "--preflight-timeout", 1)
               : config?.preflightTimeout,
-            retries: parsePositiveInt(opts.retries, "--retries"),
+            retries,
             concurrency: parsePositiveInt(opts.concurrency, "--concurrency", 1),
             only,
             skip,
@@ -550,7 +567,7 @@ program
   .option("-E, --env <var>", 'Set env var for stdio command ("KEY=VALUE", repeatable)', parseEnvVar, {})
   .option("--env-file <path>", "Load env vars from file (stdio only)")
   .option("--cwd <dir>", "Working directory for stdio command")
-  .option("--timeout <ms>", "Request timeout in milliseconds", "15000")
+  .option("--timeout <ms>", "Request timeout in milliseconds (default: 15000, or `timeout` in config)")
   .option("--no-publish", "Do not publish the report to mcp.hosting")
   .option("--output <file>", "Write a local SVG badge to the given path (works for any transport)")
   .option("--no-color", "Disable colored output (also honors NO_COLOR env var)")
@@ -566,7 +583,7 @@ program
         env: Record<string, string>;
         envFile?: string;
         cwd?: string;
-        timeout: string;
+        timeout?: string;
         publish: boolean;
         output?: string;
       },
@@ -605,8 +622,10 @@ program
 
         console.log(chalk.dim(`\nTesting ${describeTarget(transportTarget)}...\n`));
 
+        let badgeTimeout = config?.timeout ?? 15000;
+        if (opts.timeout !== undefined) badgeTimeout = parsePositiveInt(opts.timeout, "--timeout", 1);
         const report = await runComplianceSuite(transportTarget, {
-          timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
+          timeout: badgeTimeout,
         });
 
         let markdown = report.badge.markdown;
