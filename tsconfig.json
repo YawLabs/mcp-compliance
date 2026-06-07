@@ -1,5 +1,9 @@
 {
   "compilerOptions": {
+    // tsup's DTS bundler injects a (now-deprecated) `baseUrl`, which TS 6
+    // flags as TS5101. Silence it the compiler-sanctioned way until TS 7
+    // removes the option (and tsup stops injecting it).
+    "ignoreDeprecations": "6.0",
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
