@@ -1,7 +1,7 @@
 import chalk from "chalk";
 import { SPEC_BASE } from "./runner.js";
-import { TEST_DEFINITIONS } from "./types.js";
 import type { ComplianceReport, Grade, TestResult } from "./types.js";
+import { TEST_DEFINITIONS } from "./types.js";
 
 const CATEGORY_LABELS: Record<string, string> = {
   transport: "Transport",

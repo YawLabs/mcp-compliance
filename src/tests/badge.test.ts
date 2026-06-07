@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { renderBadgeSvg } from "../badge-svg.js";
 import { generateBadge } from "../badge.js";
+import { renderBadgeSvg } from "../badge-svg.js";
 
 function expectedHash(url: string): string {
   return createHash("sha256").update(url).digest("hex").slice(0, 24);

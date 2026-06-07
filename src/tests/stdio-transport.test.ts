@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { type StdioTransport, createStdioTransport } from "../transport/stdio.js";
+import { createStdioTransport, type StdioTransport } from "../transport/stdio.js";
 
 const fixturePath = fileURLToPath(new URL("./fixtures/echo-server.mjs", import.meta.url));
 

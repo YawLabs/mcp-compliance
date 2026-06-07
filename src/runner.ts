@@ -10,16 +10,16 @@ import { request } from "undici";
 import { generateBadge } from "./badge.js";
 import { computeScore } from "./grader.js";
 import { readPackageVersion } from "./pkg-version.js";
-import { type HttpTransport, createHttpTransport } from "./transport/http.js";
+import { createHttpTransport, type HttpTransport } from "./transport/http.js";
 import type { Transport } from "./transport/index.js";
 import { createStdioTransport } from "./transport/stdio.js";
 import type { ComplianceReport, TestDefinition, TestResult, TransportTarget } from "./types.js";
 import { REPORT_SCHEMA_VERSION, TEST_DEFINITIONS } from "./types.js";
 
-export type { TestResult, ComplianceReport } from "./types.js";
-export { TEST_DEFINITIONS } from "./types.js";
-export { computeGrade, computeScore } from "./grader.js";
 export { generateBadge, urlHash } from "./badge.js";
+export { computeGrade, computeScore } from "./grader.js";
+export type { ComplianceReport, TestResult } from "./types.js";
+export { TEST_DEFINITIONS } from "./types.js";
 
 const TEST_DEFINITIONS_MAP = new Map(TEST_DEFINITIONS.map((t) => [t.id, t]));
 
@@ -110,6 +110,7 @@ export function dedupAndCapWarnings(warnings: readonly string[], max: number): s
  * @internal Exported for testing.
  */
 export { parseSSEResponse } from "./sse.js";
+
 import { parseSSEResponse } from "./sse.js";
 
 /**
@@ -1575,7 +1576,7 @@ export async function runComplianceSuite(
             issues.push("Tool missing name");
             continue;
           }
-          if (tool.name.length > 128 || !/^[A-Za-z0-9_.\-]+$/.test(tool.name)) {
+          if (tool.name.length > 128 || !/^[A-Za-z0-9_.-]+$/.test(tool.name)) {
             issues.push(`${tool.name}: name format invalid`);
           }
           if (!tool.description) warnings.push(`Tool "${tool.name}" missing description`);

@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { TEST_DEFINITIONS } from "../types.js";
 import type { TestCategory, TestDefinition } from "../types.js";
+import { TEST_DEFINITIONS } from "../types.js";
 
 const VALID_CATEGORIES: TestCategory[] = [
   "transport",

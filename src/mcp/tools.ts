@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { SPEC_BASE, runComplianceSuite } from "../runner.js";
+import { runComplianceSuite, SPEC_BASE } from "../runner.js";
 import { TEST_DEFINITIONS } from "../types.js";
 
 /**
@@ -14,7 +14,7 @@ export function registerTools(server: McpServer) {
       url: z.string().url().describe("The MCP server URL to test (must be HTTP or HTTPS)"),
       auth: z.string().optional().describe('Authorization header value (e.g., "Bearer tok123")'),
       headers: z
-        .record(z.string())
+        .record(z.string(), z.string())
         .optional()
         .describe('Additional headers to include on all requests (e.g., {"X-Api-Key": "abc"})'),
       timeout: z
@@ -97,7 +97,7 @@ export function registerTools(server: McpServer) {
     {
       url: z.string().url().describe("The MCP server URL to test"),
       auth: z.string().optional().describe('Authorization header value (e.g., "Bearer tok123")'),
-      headers: z.record(z.string()).optional().describe("Additional headers to include on all requests"),
+      headers: z.record(z.string(), z.string()).optional().describe("Additional headers to include on all requests"),
       timeout: z
         .number()
         .int()
