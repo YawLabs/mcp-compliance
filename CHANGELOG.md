@@ -7,6 +7,17 @@ Pre-1.0 releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 loosely — breaking changes can still land in a minor bump, but we'll call them
 out explicitly here.
 
+## [0.16.0] — 2026-06-10
+
+- **Breaking: removed the hosted badge/publish feature.** `mcp.hosting` (the
+  hosted report/badge service) is retired, so the `badge` and `unpublish`
+  commands, the `--publish` flow, the `mcp_compliance_badge` MCP tool, and the
+  GitHub Action's `publish` input / `report-url` output are gone. Reports are
+  now pure-local — use `mcp-compliance test --output badge.svg` for a local SVG
+  badge. The report `badge` block is retained but always empty (deprecated; to
+  be removed in schema v2).
+- Repointed the report schema `$id` and the package homepage off `mcp.hosting`.
+
 ## [0.14.1] — 2026-04-19
 
 - **Fix: bare invocation double-started the stdio server.** 0.14.0 added a

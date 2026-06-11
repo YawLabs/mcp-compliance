@@ -117,9 +117,9 @@ describe("formatTerminal", () => {
     expect(output).toContain("tool_b");
   });
 
-  it("includes badge markdown", () => {
+  it("includes the local-badge hint", () => {
     const output = formatTerminal(makeReport());
-    expect(output).toContain("[![MCP Compliant]");
+    expect(output).toContain("--output");
   });
 
   it("shows warnings when present", () => {
@@ -472,27 +472,16 @@ describe("formatMarkdown", () => {
     expect(output).not.toContain("## Failed tests");
   });
 
-  it("includes the badge section for HTTP targets", () => {
+  it("no longer emits a hosted badge section", () => {
     const output = formatMarkdown(makeReport());
-    expect(output).toContain("## Badge");
-    expect(output).toContain("MCP Compliant");
-  });
-
-  it("omits the badge section for stdio targets (no public URL)", () => {
-    const output = formatMarkdown(makeReport({ url: "stdio:node ./server.js" }));
     expect(output).not.toContain("## Badge");
   });
 });
 
 describe("formatTerminal — stdio targets", () => {
-  it("does not print badge markdown for stdio (would render unknown)", () => {
+  it("prints the local-badge hint, not dead hosted markdown", () => {
     const output = formatTerminal(makeReport({ url: "stdio:node ./server.js" }));
     expect(output).not.toContain("[![MCP Compliant]");
     expect(output).toContain("--output");
-  });
-
-  it("still prints badge markdown for HTTP targets", () => {
-    const output = formatTerminal(makeReport());
-    expect(output).toContain("[![MCP Compliant]");
   });
 });

@@ -108,17 +108,6 @@ describe("runComplianceSuite — report structure", () => {
     expect(report.badge).toBeDefined();
   }, 15000);
 
-  it("badge contains valid URLs", async () => {
-    const report = await runComplianceSuite(DEAD_URL, {
-      only: ["transport-post"],
-      timeout: 2000,
-    });
-    expect(report.badge.imageUrl).toContain("mcp.hosting");
-    expect(report.badge.reportUrl).toContain("mcp.hosting");
-    expect(report.badge.markdown).toContain("[![MCP Compliant]");
-    expect(report.badge.html).toContain("<a href=");
-  }, 15000);
-
   it("each test has required fields", async () => {
     const report = await runComplianceSuite(DEAD_URL, {
       only: ["transport-post", "transport-content-type"],
@@ -190,12 +179,6 @@ describe("runComplianceSuite — exports", () => {
     expect(typeof computeScore).toBe("function");
   });
 
-  it("exports generateBadge", async () => {
-    const { generateBadge } = await import("../runner.js");
-    const badge = generateBadge("https://example.com/mcp");
-    expect(badge.imageUrl).toContain("mcp.hosting");
-    expect(badge.markdown).toContain("MCP Compliant");
-  });
 });
 
 describe("previewTests", () => {

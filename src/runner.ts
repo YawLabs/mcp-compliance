@@ -7,7 +7,6 @@ import { request } from "undici";
 // share the same code path. If you find yourself reaching for `request`
 // below the lifecycle gate, first check whether Transport.rawRequest /
 // rawPost already exposes what you need.
-import { generateBadge } from "./badge.js";
 import { computeScore } from "./grader.js";
 import { readPackageVersion } from "./pkg-version.js";
 import { createHttpTransport } from "./transport/http.js";
@@ -16,7 +15,6 @@ import { createStdioTransport } from "./transport/stdio.js";
 import type { ComplianceReport, TestDefinition, TestResult, TransportTarget } from "./types.js";
 import { REPORT_SCHEMA_VERSION, TEST_DEFINITIONS } from "./types.js";
 
-export { generateBadge, urlHash } from "./badge.js";
 export { computeGrade, computeScore } from "./grader.js";
 export type { ComplianceReport, TestResult } from "./types.js";
 export { TEST_DEFINITIONS } from "./types.js";
@@ -3413,12 +3411,10 @@ export async function runComplianceSuite(
     // ── Compute score ────────────────────────────────────────────────
 
     const { score, grade, overall, summary, categories } = computeScore(tests);
-    // Stdio targets aren't published to mcp.hosting, so any badge URL we emit
-    // would resolve to an "unknown" fallback. Blank the fields so consumers
-    // (JSON pipelines, README snippets) don't copy dead links.
-    const badge = displayUrl.startsWith("stdio:")
-      ? { imageUrl: "", reportUrl: "", markdown: "", html: "" }
-      : generateBadge(displayUrl);
+    // Badge URLs are retired (the mcp.hosting renderer is gone); the field is
+    // kept empty for report-schema back-compat. Use `--output <file>.svg` for
+    // a local badge image instead.
+    const badge = { imageUrl: "", reportUrl: "", markdown: "", html: "" };
 
     return {
       schemaVersion: REPORT_SCHEMA_VERSION,

@@ -42,9 +42,9 @@ maybeDescribe("integration (dogfood) — mcp-compliance tests its own MCP server
     // least some optional ones did too.
     expect(["A", "B"]).toContain(report.grade);
 
-    // The dogfood surfaces all 3 declared tools.
-    expect(report.toolCount).toBe(3);
-    expect(report.toolNames.sort()).toEqual(["mcp_compliance_badge", "mcp_compliance_explain", "mcp_compliance_test"]);
+    // The dogfood surfaces both declared tools.
+    expect(report.toolCount).toBe(2);
+    expect(report.toolNames.sort()).toEqual(["mcp_compliance_explain", "mcp_compliance_test"]);
 
     // Stdio-specific tests must have run and passed against our own server.
     const byId = new Map(report.tests.map((t) => [t.id, t]));

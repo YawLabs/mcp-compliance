@@ -24,8 +24,8 @@ export type Overall = "pass" | "partial" | "fail";
 
 /**
  * Version of the ComplianceReport JSON schema. Incremented on breaking
- * changes to the report shape. Downstream consumers (mcp.hosting report
- * renderer, third-party dashboards) pin against this.
+ * changes to the report shape. Downstream consumers (Yaw MCP, third-party
+ * dashboards) pin against this.
  *
  * See schemas/report.v1.json for the authoritative schema definition.
  */
@@ -63,6 +63,11 @@ export interface ComplianceReport {
   resourceNames: string[];
   promptCount: number;
   promptNames: string[];
+  /**
+   * @deprecated The hosted badge renderer (mcp.hosting) is retired; these
+   * fields are always empty and will be removed in schema v2. For a local
+   * badge image, use the CLI's `--output <file>.svg`.
+   */
   badge: {
     imageUrl: string;
     reportUrl: string;

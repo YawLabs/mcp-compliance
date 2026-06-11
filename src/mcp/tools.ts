@@ -92,65 +92,6 @@ export function registerTools(server: McpServer) {
   );
 
   server.tool(
-    "mcp_compliance_badge",
-    "Get the badge markdown embed code for an MCP server. Runs the compliance test suite first to determine the grade.",
-    {
-      url: z.string().url().describe("The MCP server URL to test"),
-      auth: z.string().optional().describe('Authorization header value (e.g., "Bearer tok123")'),
-      headers: z.record(z.string(), z.string()).optional().describe("Additional headers to include on all requests"),
-      timeout: z
-        .number()
-        .int()
-        .min(1)
-        .max(300000)
-        .optional()
-        .describe("Request timeout in milliseconds (default: 15000, max: 300000)"),
-    },
-    {
-      title: "Get Compliance Badge",
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: true,
-    },
-    async ({ url, auth, headers: extraHeaders, timeout }) => {
-      try {
-        const headers: Record<string, string> = { ...extraHeaders };
-        if (auth) headers.Authorization = auth;
-
-        const report = await runComplianceSuite(url, {
-          headers: Object.keys(headers).length > 0 ? headers : undefined,
-          timeout,
-        });
-        const badge = report.badge;
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: [
-                `Grade: ${report.grade} (${report.score}%)`,
-                "",
-                "Markdown:",
-                badge.markdown,
-                "",
-                "HTML:",
-                badge.html,
-              ].join("\n"),
-            },
-          ],
-        };
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        return {
-          content: [{ type: "text" as const, text: `Error: ${message}` }],
-          isError: true,
-        };
-      }
-    },
-  );
-
-  server.tool(
     "mcp_compliance_explain",
     "Explain what a specific compliance test ID checks and why it matters.",
     {

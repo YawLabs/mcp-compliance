@@ -27,10 +27,6 @@ inputs:
   output:
     description: 'Write a local SVG badge to this path (e.g. badge.svg)'
     required: false
-  publish:
-    description: 'Publish the report to mcp.hosting (HTTP targets only)'
-    required: false
-    default: 'false'
   auth:
     description: 'Authorization header value, e.g. "Bearer xxx" (HTTP only)'
     required: false
@@ -65,9 +61,6 @@ outputs:
   failed:
     description: 'Number of failing tests'
     value: ${{ steps.run.outputs.failed }}
-  report-url:
-    description: 'Public report URL on mcp.hosting (only set when publish=true and target is HTTP)'
-    value: ${{ steps.run.outputs.report-url }}
 
 runs:
   using: 'composite'
@@ -87,7 +80,6 @@ runs:
         MCP_STRICT: ${{ inputs.strict }}
         MCP_MIN_GRADE: ${{ inputs.min-grade }}
         MCP_OUTPUT: ${{ inputs.output }}
-        MCP_PUBLISH: ${{ inputs.publish }}
         MCP_AUTH: ${{ inputs.auth }}
         MCP_ENV_FILE: ${{ inputs.env-file }}
         MCP_TIMEOUT: ${{ inputs.timeout }}
@@ -125,11 +117,7 @@ runs:
         [[ -n "$MCP_ONLY" ]] && cmd_common+=("--only" "$MCP_ONLY")
         [[ -n "$MCP_SKIP" ]] && cmd_common+=("--skip" "$MCP_SKIP")
 
-        # Choose between `test` (default) and `badge` (when publishing)
         subcommand="test"
-        if [[ "$MCP_PUBLISH" == "true" && "$MCP_TARGET" =~ ^https?:// ]]; then
-          subcommand="badge"
-        fi
 
         # Pin to the requested version
         pkg="@yawlabs/mcp-compliance@$MCP_VERSION"
@@ -168,14 +156,12 @@ runs:
         score=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).score)}catch(e){console.log(0)}")
         passed=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).summary.passed)}catch(e){console.log(0)}")
         failed=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).summary.failed)}catch(e){console.log(0)}")
-        report_url=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).badge.reportUrl||'')}catch(e){console.log('')}")
 
         {
           echo "grade=$grade"
           echo "score=$score"
           echo "passed=$passed"
           echo "failed=$failed"
-          echo "report-url=$report_url"
         } >> "$GITHUB_OUTPUT"
 
         # User-visible run in the requested format.

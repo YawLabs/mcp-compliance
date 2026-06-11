@@ -222,37 +222,13 @@ Check in a `mcp-compliance.config.json` so CI and your dev loop can run `mcp-com
 
 Precedence: CLI flags > config file > defaults. Any field can be overridden on the command line.
 
-### Publish a shareable badge (HTTP only)
+### Local SVG badge
+
+Write a local SVG reflecting the real grade and commit it to your repo:
 
 ```bash
-mcp-compliance badge https://my-server.com/mcp
-```
-
-Runs the compliance suite, publishes the report to [mcp.hosting](https://mcp.hosting), and prints the markdown embed for your README. The badge image reflects the real grade (A–F) and links to the full report.
-
-| Option | Description |
-|--------|-------------|
-| `-H, --header <header>` | Add header to all requests, format `"Key: Value"` (repeatable) |
-| `--auth <token>` | Shorthand for `-H "Authorization: <token>"` |
-| `--timeout <ms>` | Request timeout in milliseconds (default: `15000`) |
-| `--no-publish` | Skip publishing; print a local badge markdown only |
-| `--output <file>` | Also write a local SVG badge to the given path |
-
-Reports are kept for 90 days from last submission; resubmitting the same URL overwrites the previous report. Auth headers are stripped client-side before upload. Private/loopback URLs (`localhost`, `127.0.0.1`, `192.168.*`, etc.) trigger an interactive confirmation before publishing, and are rejected by the server in any case.
-
-A delete token is returned at publish time and stored at `~/.mcp-compliance/tokens.json` (mode `0600`). Use it to take a report down:
-
-```bash
-mcp-compliance unpublish https://my-server.com/mcp
-```
-
-### Local SVG badge (any transport)
-
-Stdio servers can't be published (no public URL to key on), but you can commit a local SVG reflecting the real grade:
-
-```bash
+mcp-compliance test https://my-server.com/mcp --output badge.svg
 mcp-compliance test node ./dist/server.js --output badge.svg
-mcp-compliance badge npx -y @modelcontextprotocol/server-filesystem /tmp --output badge.svg
 ```
 
 Then embed it in your README:
@@ -260,8 +236,6 @@ Then embed it in your README:
 ```markdown
 ![MCP Compliance](./badge.svg)
 ```
-
-The `test` command never publishes — use it for CI, debugging, and local iteration. `badge` is the only command that publishes to mcp.hosting.
 
 ## What the 88 tests check
 
@@ -495,7 +469,6 @@ Restart your MCP client and approve the server when prompted.
 ### Tools
 
 - **mcp_compliance_test** — Run the full 88-test suite against a URL or stdio command. Supports auth, custom headers, env vars, timeout, retries, and category/test filtering. Returns grade, score, and detailed results.
-- **mcp_compliance_badge** — Get the badge markdown/HTML for a server. Supports auth and custom headers.
 - **mcp_compliance_explain** — Explain what a specific test ID checks and why it matters.
 
 All tools have [MCP tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#annotations) (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP clients can skip confirmation dialogs for safe operations.
@@ -560,11 +533,8 @@ The testing methodology is published openly so the grading is auditable:
 - **[Why `mcp-compliance`](./docs/WHY.md)** — the problem, existing alternatives, what this tool does differently
 - **[Fixing common failures](./docs/FIXES.md)** — recipes for the most frequent test failures with code snippets
 - **[Spec version migration policy](./docs/SPEC_VERSION_MIGRATION.md)** — how this tool evolves with MCP spec releases
-- **[mcp.hosting external API](./docs/EXT_API.md)** — public submit/retrieve/badge/delete endpoints used by `mcp-compliance badge` and any custom integrations
-- **[Enterprise tier (draft)](./docs/ENTERPRISE.md)** — paid tier structure for organizations with scheduled/private/audit-track compliance needs
 - **[Performance deep-dive](./docs/PERFORMANCE.md)** — why the suite is sequential and what parallel execution would cost
 - **[Spec PR drafts](./docs/spec-prs/)** — our proposed MCP spec clarifications for ambiguous cases we've hit
-- **[mcp.hosting integration spec](./docs/mcp-hosting-integration.md)** — the contract between this engine and the mcp.hosting platform: URL surfaces, data flow, storage model, badge API, leaderboard, router integration
 
 The methodology is not an authoritative conformance standard — it's one tool's choices, published so they can be inspected, adopted, or forked. The [official MCP specification](https://modelcontextprotocol.io/specification/2025-11-25) defines what servers must do; this document describes how `@yawlabs/mcp-compliance` verifies it.
 
@@ -596,7 +566,6 @@ npm test
 
 ## Links
 
-- [mcp.hosting](https://mcp.hosting) — Hosted MCP server infrastructure
 - [MCP Specification](https://modelcontextprotocol.io/specification/2025-11-25)
 - [Testing methodology](./COMPLIANCE_RUBRIC.md)
 - [Yaw Labs](https://yaw.sh)

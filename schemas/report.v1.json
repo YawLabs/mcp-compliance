@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://mcp.hosting/schemas/compliance/report.v1.json",
+  "$id": "https://yaw.sh/schemas/mcp-compliance/report.v1.json",
   "title": "MCP Compliance Report",
-  "description": "Structured output of the mcp-compliance test suite. Stable, versioned contract — increment schemaVersion on breaking changes. Consumed by mcp.hosting and third-party dashboards.",
+  "description": "Structured output of the mcp-compliance test suite. Stable, versioned contract — increment schemaVersion on breaking changes. Consumed by Yaw MCP and third-party dashboards.",
   "type": "object",
   "required": [
     "schemaVersion",
@@ -120,8 +120,8 @@
       "type": "object",
       "required": ["imageUrl", "reportUrl", "markdown", "html"],
       "properties": {
-        "imageUrl": { "type": "string", "format": "uri" },
-        "reportUrl": { "type": "string", "format": "uri" },
+        "imageUrl": { "type": "string" },
+        "reportUrl": { "type": "string" },
         "markdown": { "type": "string" },
         "html": { "type": "string" }
       },

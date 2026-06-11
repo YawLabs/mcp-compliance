@@ -4,7 +4,6 @@ import { fileURLToPath } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { describe, expect, it } from "vitest";
-import { generateBadge } from "../badge.js";
 import type { ComplianceReport } from "../types.js";
 import { REPORT_SCHEMA_VERSION } from "../types.js";
 
@@ -56,7 +55,7 @@ function sampleReport(): ComplianceReport {
     resourceNames: [],
     promptCount: 0,
     promptNames: [],
-    badge: generateBadge("https://example.com/mcp"),
+    badge: { imageUrl: "", reportUrl: "", markdown: "", html: "" },
   };
 }
 

@@ -50,7 +50,7 @@ npm test
 
 ## Report schema discipline
 
-The JSON output of `runComplianceSuite()` is a **stable, versioned contract** consumed by downstream renderers (mcp.hosting, third-party dashboards). Every report carries a top-level `schemaVersion` field, defined by `REPORT_SCHEMA_VERSION` in `src/types.ts`, and is described by `schemas/report.v1.json`.
+The JSON output of `runComplianceSuite()` is a **stable, versioned contract** consumed by downstream renderers (Yaw MCP, third-party dashboards). Every report carries a top-level `schemaVersion` field, defined by `REPORT_SCHEMA_VERSION` in `src/types.ts`, and is described by `schemas/report.v1.json`.
 
 When changing the `ComplianceReport` type:
 

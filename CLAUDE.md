@@ -4,14 +4,13 @@ MCP server compliance testing tool. Tests any Streamable HTTP or stdio MCP serve
 
 ## Architecture
 
-- `src/index.ts` — CLI entry point (Commander.js). Subcommands: `test`, `badge`, `mcp`.
-- `src/runner.ts` — Core test engine. Runs all 88 tests (transport-gated: HTTP tests skipped against stdio servers and vice-versa). Default is sequential; tests flagged `parallelSafe: true` in `TEST_DEFINITIONS` can run concurrently when `concurrency > 1` is passed to `runComplianceSuite()`. Exports `runComplianceSuite()`, `SPEC_VERSION`, `SPEC_BASE`, `TEST_DEFINITIONS`, `computeGrade()`, `computeScore()`, `generateBadge()`, `parseSSEResponse()`, `previewTests()`, and `urlHash()`. Includes preflight connectivity check.
+- `src/index.ts` — CLI entry point (Commander.js). Subcommands: `test`, `benchmark`, `diff`, `init`, `mcp`.
+- `src/runner.ts` — Core test engine. Runs all 88 tests (transport-gated: HTTP tests skipped against stdio servers and vice-versa). Default is sequential; tests flagged `parallelSafe: true` in `TEST_DEFINITIONS` can run concurrently when `concurrency > 1` is passed to `runComplianceSuite()`. Exports `runComplianceSuite()`, `SPEC_VERSION`, `SPEC_BASE`, `TEST_DEFINITIONS`, `computeGrade()`, `computeScore()`, `parseSSEResponse()`, and `previewTests()`. Includes preflight connectivity check.
 - `src/types.ts` — TypeScript interfaces + `TEST_DEFINITIONS` array (all 88 test metadata).
 - `src/grader.ts` — Scoring algorithm: required tests 70%, optional 30%. Grade thresholds: A>=90, B>=75, C>=60, D>=40, F<40.
 - `src/reporter.ts` — Terminal (chalk), JSON, and SARIF formatters. SARIF includes server context in invocations.
-- `src/badge.ts` — Badge URL generation via mcp.hosting.
 - `src/mcp/server.ts` — MCP server entry point. Exports `createComplianceServer()` and `startServer()`.
-- `src/mcp/tools.ts` — 3 MCP tools: test, badge, explain. All have annotations.
+- `src/mcp/tools.ts` — 2 MCP tools: test, explain. All have annotations.
 
 ## Build
 

@@ -18,10 +18,10 @@ function createMockServer() {
 }
 
 describe("registerTools", () => {
-  it("registers exactly 3 tools", () => {
+  it("registers exactly 2 tools", () => {
     const { server, tools } = createMockServer();
     registerTools(server);
-    expect(Object.keys(tools)).toHaveLength(3);
+    expect(Object.keys(tools)).toHaveLength(2);
   });
 
   it("registers mcp_compliance_test tool", () => {
@@ -29,13 +29,6 @@ describe("registerTools", () => {
     registerTools(server);
     expect(tools.mcp_compliance_test).toBeDefined();
     expect(tools.mcp_compliance_test.description).toContain("compliance test suite");
-  });
-
-  it("registers mcp_compliance_badge tool", () => {
-    const { server, tools } = createMockServer();
-    registerTools(server);
-    expect(tools.mcp_compliance_badge).toBeDefined();
-    expect(tools.mcp_compliance_badge.description).toContain("badge");
   });
 
   it("registers mcp_compliance_explain tool", () => {

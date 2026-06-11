@@ -2,6 +2,10 @@
 
 Status: **draft for internal review**. Not published. Pricing and limits are placeholders pending market validation.
 
+> **STALE (2026-06).** The `mcp.hosting` hosted badge/report funnel this doc is
+> built on is retired (folded into Yaw MCP in Yaw Terminal). The funnel model
+> below needs a rewrite around Yaw MCP / a2a.hosting before it's actionable.
+
 ## Positioning
 
 The free `mcp-compliance` CLI + free mcp.hosting badge/report pages are the funnel. They're genuinely free and always will be — MIT license, no telemetry by default, no feature gates.
