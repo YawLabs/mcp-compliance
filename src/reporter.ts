@@ -368,7 +368,6 @@ export function formatMarkdown(report: ComplianceReport): string {
     lines.push("");
   }
 
-
   return lines.join("\n");
 }
 
@@ -395,7 +394,6 @@ export function formatHtml(report: ComplianceReport): string {
   const grouped = new Map<string, TestResult[]>();
   for (const cat of CATEGORY_ORDER) grouped.set(cat, []);
   for (const t of report.tests) grouped.get(t.category)?.push(t);
-
 
   return `<!doctype html>
 <html lang="en">

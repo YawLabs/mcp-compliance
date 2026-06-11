@@ -7,7 +7,7 @@ Pre-1.0 releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 loosely — breaking changes can still land in a minor bump, but we'll call them
 out explicitly here.
 
-## [0.16.0] — 2026-06-10
+## [0.16.1] — 2026-06-11
 
 - **Breaking: removed the hosted badge/publish feature.** `mcp.hosting` (the
   hosted report/badge service) is retired, so the `badge` and `unpublish`

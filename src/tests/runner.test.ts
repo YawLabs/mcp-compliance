@@ -178,7 +178,6 @@ describe("runComplianceSuite — exports", () => {
     const { computeScore } = await import("../runner.js");
     expect(typeof computeScore).toBe("function");
   });
-
 });
 
 describe("previewTests", () => {
