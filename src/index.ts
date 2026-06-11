@@ -13,8 +13,16 @@ import { previewTests, runComplianceSuite } from "./runner.js";
 import { splitStdioTarget } from "./stdio-split.js";
 import type { TransportTarget } from "./types.js";
 
-const require = createRequire(import.meta.url);
-const { version } = require("../package.json");
+// `__VERSION__` is injected by esbuild's `--define` at single-binary (SEA)
+// build time; esbuild dead-code-eliminates the else branch under the define.
+// Under tsx/dist it's undefined, so we fall back to the package.json read.
+// In the CJS bundle `import.meta.url` is empty, so `createRequire(undefined)`
+// throws — the typeof guard keeps that call out of the bundled binary.
+declare const __VERSION__: string | undefined;
+const version =
+  typeof __VERSION__ === "string" && __VERSION__
+    ? __VERSION__
+    : createRequire(import.meta.url)("../package.json").version;
 
 function parseHeaderArg(value: string, prev: Record<string, string>): Record<string, string> {
   const idx = value.indexOf(":");
