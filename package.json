@@ -52,9 +52,10 @@
     "@types/node": "^25.5.2",
     "ajv": "^8.18.0",
     "ajv-formats": "^3.0.1",
+    "esbuild": "^0.28.1",
     "postject": "^1.0.0-alpha.6",
-    "tsup": "^8.4.0",
-    "tsx": "^4.21.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.22.4",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"
   },
