@@ -27,6 +27,11 @@ updates:
         update-types:
           - minor
           - patch
+      # Batch ALL security advisories into one PR instead of one-per-advisory.
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
     ignore:
       # Node type stubs track the runtime Node version we target, which is
       # driven by package.json#engines, not by Dependabot.
