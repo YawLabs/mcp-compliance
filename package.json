@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/mcp-compliance",
-  "version": "0.16.2",
+  "version": "0.16.3",
   "mcpName": "io.github.YawLabs/mcp-compliance",
   "description": "CLI tool and MCP server that tests MCP servers for spec compliance",
   "license": "MIT",
@@ -61,9 +61,6 @@
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"
-  },
-  "overrides": {
-    "esbuild": "^0.28.1"
   },
   "engines": {
     "node": ">=20"
