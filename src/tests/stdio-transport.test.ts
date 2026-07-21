@@ -72,11 +72,14 @@ describe("StdioTransport", () => {
   it("times out if a method never responds", async () => {
     const t = spawn();
     const nextId = createIdCounter(300);
-    // 1500ms not 200ms: child-process spawn + first roundtrip can exceed
-    // 200ms when the test runner is under load (15 suites in parallel),
-    // and this test asserts the *response* path, not the timeout path.
+    // 5000ms, matching every other response-path request in this file. This
+    // asserts the *response* path, not the timeout path, so the budget only has
+    // to be generous enough to never fire: a child-process spawn plus first
+    // roundtrip blows past a tight budget whenever the runner is loaded (15
+    // suites in parallel on a slow box), which made 1500ms -- itself already a
+    // bump up from 200ms -- flake in full-suite runs while passing in isolation.
     await expect(
-      t.request("unknown/method/that/errors-with-a-real-response", undefined, nextId, { timeout: 1500 }),
+      t.request("unknown/method/that/errors-with-a-real-response", undefined, nextId, { timeout: 5000 }),
     ).resolves.toBeDefined(); // fixture replies with JSON-RPC error, counts as a response
   });
 
