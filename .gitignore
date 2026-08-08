@@ -3,6 +3,12 @@ dist/
 *.tgz
 .env
 .claude/
-bin/
+# Built standalone binaries land in bin/<platform>-<arch>/ and must stay out of
+# git. The oam runtime launcher lives here too and IS source, so the rule is
+# written as bin/* rather than bin/ -- git cannot re-include a file whose parent
+# DIRECTORY is excluded, so a bare `bin/` would make the negation below a no-op
+# and the launcher would silently never ship.
+bin/*
+!bin/mcp-compliance.mjs
 build-tmp/
 dist-release/
