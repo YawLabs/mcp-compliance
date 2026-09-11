@@ -1,8 +1,8 @@
-import { writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createStdioTransport, type StdioTransport } from "../transport/stdio.js";
 
 const fixturePath = fileURLToPath(new URL("./fixtures/echo-server.mjs", import.meta.url));
@@ -14,10 +14,13 @@ function createIdCounter(start = 0): () => number {
 
 describe("StdioTransport", () => {
   let openTransports: StdioTransport[] = [];
+  let tempFiles: string[] = [];
 
   afterEach(async () => {
     await Promise.all(openTransports.map((t) => t.close()));
     openTransports = [];
+    for (const f of tempFiles) rmSync(f, { force: true });
+    tempFiles = [];
   });
 
   function spawn(): StdioTransport {
@@ -118,26 +121,43 @@ describe("StdioTransport", () => {
 
   it("surfaces a diagnosable stderr message when stdout buffer overflows without a newline", async () => {
     // Spawn a child that spews junk bytes without a newline past the
-    // configured cap, then sleeps past the request timeout. The overflow
-    // should leave a diagnostic line in stderrTail() so the caller can
-    // tell this apart from a generic timeout. We write the script to a
-    // temp file because passing a multi-line `-e` script through
-    // cmd.exe (used on Windows when shell:true) is unreliable.
+    // configured cap, then stays alive without ever answering. The overflow
+    // should leave a diagnostic line in stderrTail() so the caller can tell
+    // this apart from a generic timeout. We write the script to a temp file
+    // because passing a multi-line `-e` script through cmd.exe (used on
+    // Windows when shell:true) is unreliable.
     const script = [
       'const big = "X".repeat(200 * 1024);',
       "for (let i = 0; i < 4; i++) process.stdout.write(big);",
-      "setTimeout(() => {}, 2000);",
+      // Outlive the request below so it settles by timeout, not by exit;
+      // afterEach close() tears the child down.
+      "setTimeout(() => {}, 30000);",
     ].join("\n");
     const scriptPath = join(tmpdir(), `mcp-compliance-overflow-${process.pid}-${Date.now()}.mjs`);
     writeFileSync(scriptPath, script, "utf8");
+    tempFiles.push(scriptPath);
     const t = createStdioTransport({
       command: process.execPath,
       args: [scriptPath],
       stdoutBufferSize: 512 * 1024,
     });
     openTransports.push(t);
+    // Wait on the diagnostic itself instead of racing it against a fixed
+    // request timeout. The overflow cannot happen before the child has
+    // started writing, and spawn-to-first-stdout-chunk measured 0.3-2.6s on a
+    // Windows ARM64 host (the high end under load) -- so a 500ms request often
+    // timed out before a single byte arrived, and stderrTail() was still empty
+    // when it was read.
+    await vi.waitFor(() => expect(t.stderrTail()).toMatch(/stdout buffer exceeded 524288 bytes without a newline/), {
+      timeout: 10000,
+      interval: 10,
+    });
+    // The caller-visible symptom is still a timeout (the server never answers),
+    // but the error carries the diagnostic -- which is what tells it apart
+    // from a generic unresponsive server.
     const nextId = createIdCounter(500);
-    await expect(t.request("ping", undefined, nextId, { timeout: 500 })).rejects.toThrow();
-    expect(t.stderrTail()).toMatch(/stdout buffer exceeded/);
+    const failure = t.request("ping", undefined, nextId, { timeout: 500 });
+    await expect(failure).rejects.toThrow(/request timed out after 500ms/);
+    await expect(failure).rejects.toThrow(/stdout buffer exceeded/);
   });
 });
