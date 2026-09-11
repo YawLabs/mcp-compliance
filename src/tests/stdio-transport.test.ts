@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,10 +14,13 @@ function createIdCounter(start = 0): () => number {
 
 describe("StdioTransport", () => {
   let openTransports: StdioTransport[] = [];
+  let tempFiles: string[] = [];
 
   afterEach(async () => {
     await Promise.all(openTransports.map((t) => t.close()));
     openTransports = [];
+    for (const f of tempFiles) rmSync(f, { force: true });
+    tempFiles = [];
   });
 
   function spawn(): StdioTransport {
@@ -132,6 +135,7 @@ describe("StdioTransport", () => {
     ].join("\n");
     const scriptPath = join(tmpdir(), `mcp-compliance-overflow-${process.pid}-${Date.now()}.mjs`);
     writeFileSync(scriptPath, script, "utf8");
+    tempFiles.push(scriptPath);
     const t = createStdioTransport({
       command: process.execPath,
       args: [scriptPath],
@@ -140,9 +144,10 @@ describe("StdioTransport", () => {
     openTransports.push(t);
     // Wait on the diagnostic itself instead of racing it against a fixed
     // request timeout. The overflow cannot happen before the child has
-    // started writing, and spawn-to-first-stdout-chunk measured 0.3-1.3s on a
-    // Windows ARM64 host -- so a 500ms request often timed out before a single
-    // byte arrived, and stderrTail() was still empty when it was read.
+    // started writing, and spawn-to-first-stdout-chunk measured 0.3-2.6s on a
+    // Windows ARM64 host (the high end under load) -- so a 500ms request often
+    // timed out before a single byte arrived, and stderrTail() was still empty
+    // when it was read.
     await vi.waitFor(() => expect(t.stderrTail()).toMatch(/stdout buffer exceeded 524288 bytes without a newline/), {
       timeout: 10000,
       interval: 10,
