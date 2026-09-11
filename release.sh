@@ -48,9 +48,27 @@ warn() { echo -e "${YELLOW}  ! $1${NC}"; }
 fail() { echo -e "${RED}  x $1${NC}"; exit 1; }
 
 # SKIP_LINT=1 escape hatch -- wraps `npm`/`pnpm` so lint-related runs are
-# no-ops. Workaround for the MINGW64-ARM64 npm-run-script wrapper that
-# segfaults on exit-cleanup (platform-windows.md). Apply only when the
-# lint runner is broken on the host; CI catches lint regressions anyway.
+# no-ops.
+#
+# THIS SHOULD NOW BE UNNECESSARY, and reaching for it is a signal something
+# regressed. `npm run lint` routes through scripts/lint.mjs, which picks a
+# biome binary that works on the host -- including Windows ARM64, where the
+# native arm64 build segfaults and the wrapper provisions the x64 build to run
+# under emulation instead. Verified: `npm run lint` exits 0 on that host.
+#
+# The earlier text here blamed "the MINGW64-ARM64 npm-run-script wrapper" and
+# justified skipping with "CI catches lint regressions anyway". Both were wrong.
+# `npm run` is fine on that host; the SIGSEGV comes from
+# `@biomejs/cli-win32-arm64/biome.exe` itself, reproducible by invoking that
+# binary directly with no npm in the picture. And this repo has NO CI -- its
+# workflows were removed in fe1185a and Actions is disabled on the repository
+# -- so nothing downstream re-checks formatting. Skipping the lint step means
+# the release is published unlinted, full stop.
+#
+# So: only set SKIP_LINT=1 if scripts/lint.mjs cannot produce a result at all,
+# and treat that as a bug to fix rather than a step to routinely skip. Step 1
+# runs `npm run lint || fail`, so a crashed linter already stops the release --
+# there is no "lint is UNVERIFIED, carry on" path here, and none should be added.
 if [ "${SKIP_LINT:-}" = "1" ]; then
   npm() {
     if [ "$1" = "run" ] && [[ "$2" == lint* ]]; then
