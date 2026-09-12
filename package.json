@@ -2,7 +2,7 @@
   "name": "@yawlabs/mcp-compliance",
   "version": "0.17.1",
   "mcpName": "io.github.YawLabs/mcp-compliance",
-  "description": "CLI tool and MCP server that tests MCP servers for spec compliance",
+  "description": "MCP compliance testing: 88-test spec suite for any MCP server over HTTP or stdio, with A-F grading, a CLI, an MCP server, and CI output.",
   "license": "MIT",
   "author": "Yaw Labs <contact@yaw.sh> (https://yaw.sh)",
   "type": "module",
@@ -69,13 +69,22 @@
   "keywords": [
     "mcp",
     "model-context-protocol",
+    "mcp-server",
+    "mcp-testing",
     "compliance",
     "testing",
-    "cli",
-    "mcp-server",
+    "test-suite",
     "spec",
     "validation",
     "json-rpc",
+    "cli",
+    "ci",
+    "github-actions",
+    "sarif",
+    "security",
+    "stdio",
+    "claude-code",
+    "cursor",
     "ai"
   ],
   "repository": {
@@ -85,5 +94,5 @@
   "bugs": {
     "url": "https://github.com/YawLabs/mcp-compliance/issues"
   },
-  "homepage": "https://github.com/YawLabs/mcp-compliance"
+  "homepage": "https://yaw.sh/mcp-servers/mcp-compliance/"
 }
