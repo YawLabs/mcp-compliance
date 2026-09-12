@@ -6,7 +6,7 @@
  * Everywhere except Windows ARM64 this is a thin passthrough to the platform
  * binary npm installed. It exists because SOME biome releases ship a native
  * `@biomejs/cli-win32-arm64` build that crashes instead of running. Measured
- * on a Windows 11 ARM64 host: 2.5.4 exits 139 on every invocation path
+ * on a Windows 11 ARM64 host: 2.5.4 exits 139 on every CHECK-shaped run (it answers --version fine)
  * (`npm run lint`, the `.bin/biome` shim, `npx biome`, and the .exe invoked
  * directly), while 2.4.16 and 2.5.13 run correctly there and report real
  * findings. The defect is per-RELEASE, not a permanent property of the
