@@ -18,6 +18,22 @@
  * so the launcher is slower than either runtime alone. To skip it, point at oam
  * directly: `oam run <abs>/dist/index.js -- <args>`.
  *
+ * ALREADY RUNNING ON OAM
+ * A host can resolve this package's `bin` and launch `oam run <this file>`
+ * instead of `node <this file>` -- Yaw MCP does, and so does oam's sidecar
+ * regression matrix. This launcher used to discover oam and spawn it anyway,
+ * so one server cost two runtime boots: measured on Windows, oam.exe with a
+ * NESTED oam.exe + conhost.exe underneath it. Now, when `process.versions.oam`
+ * clears the same MINIMUM OAM VERSION a discovered binary has to, the CLI is
+ * imported into THIS process exactly as the Node fallback is -- no discovery,
+ * no `oam --version` probe, no second oam. OAM_BIN is a discovery input, so it
+ * is not consulted on that path: the host has already chosen which oam runs.
+ *
+ * Nothing is lost by skipping the spawn, because there is no sandbox to apply
+ * (see below) and the floor is the same one: a host oam that clears it has the
+ * same `child_process` a discovered one would. A host oam BELOW the floor gets
+ * no shortcut: it takes the discovery path exactly as it always did.
+ *
  * NO SANDBOX HERE -- DELIBERATELY
  * oam 0.9.0's `--permission` is real hardening, but this tool cannot use it.
  * Its entire job is to spawn an arbitrary MCP server command supplied by the
@@ -50,6 +66,7 @@
  *
  * SELECTION
  *   MCP_COMPLIANCE_RUNTIME=oam    require oam; fail loudly if it is missing
+ *                                 (already running on oam satisfies it)
  *   MCP_COMPLIANCE_RUNTIME=node   never use oam
  *   MCP_COMPLIANCE_RUNTIME=auto   prefer oam, silently fall back (default)
  *   OAM_BIN=/path/to/oam          explicit binary, checked before any discovery
@@ -109,17 +126,27 @@ function findOam() {
 }
 
 /**
- * `oam --version` -> [major, minor, patch], or null when it cannot be read.
+ * Version text -> [major, minor, patch], or null when it holds no version.
  * A pre-release suffix (0.9.0-rc.1) truncates to its base version.
+ *
+ * Shared by the two places a version is read -- a discovered binary's
+ * `oam --version` output ("oam 0.15.1") and the host's own
+ * `process.versions.oam` ("0.15.1") -- so they cannot disagree about what a
+ * version string means, or which floor it has to clear.
  */
+function parseVersion(text) {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(text);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/** `oam --version` -> [major, minor, patch], or null when it cannot be read. */
 function oamVersion(cmd) {
   try {
     const out = execFileSync(cmd, ["--version"], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
     });
-    const m = /(\d+)\.(\d+)\.(\d+)/.exec(out);
-    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+    return parseVersion(out);
   } catch {
     // Not executable, wrong arch, or deleted since the stat. Caller degrades.
     return null;
@@ -134,6 +161,27 @@ function atLeast(v, min) {
     if (v[i] < min[i]) return false;
   }
   return true;
+}
+
+/**
+ * Where the CLI runs, decided BEFORE any discovery:
+ *   "in-process"  import it into THIS process
+ *   "discover"    find an oam binary, gate its version, spawn it -- or fall
+ *                 back to Node in-process when that fails
+ *
+ * `hostOam` is `process.versions.oam`: oam's own key, absent on Node, so on
+ * Node every mode but `node` is the discovery path it always was. There is no
+ * sandbox input because this launcher offers none (see NO SANDBOX HERE above),
+ * so nothing a spawn could carry is lost by staying in-process. The floor is
+ * OAM_MIN itself, not a parameter, so a host oam and a discovered one can never
+ * be held to different minimums.
+ *
+ * Pure on purpose: every input is passed in, so the whole decision is testable
+ * without booting a runtime.
+ */
+function runtimePlan({ mode, hostOam }) {
+  if (mode === "node") return "in-process";
+  return atLeast(parseVersion(hostOam ?? ""), OAM_MIN) ? "in-process" : "discover";
 }
 
 /**
@@ -188,8 +236,9 @@ async function runInProcess() {
 }
 
 const mode = (process.env.MCP_COMPLIANCE_RUNTIME ?? "auto").toLowerCase();
+const plan = runtimePlan({ mode, hostOam: process.versions.oam });
 
-if (mode === "node") {
+if (plan === "in-process") {
   await runInProcess();
 } else {
   const oam = findOam();
