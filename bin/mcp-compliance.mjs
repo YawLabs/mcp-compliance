@@ -28,9 +28,13 @@
  * and 0.15.2 on PATH, the launcher bound to 0.9.0 because installed locations
  * are searched first.
  *
- * An OAM_BIN that does not exist, is below the floor, or will not run is named
- * on stderr and discovery carries on. It used to end the search: a typo in
- * OAM_BIN meant Node, with no hint why.
+ * Whenever the launcher goes looking for an oam, an OAM_BIN that does not exist,
+ * is below the floor, or will not run is named on stderr -- whether or not a
+ * usable oam turns up after it -- and discovery carries on. It used to end the
+ * search: a typo in OAM_BIN meant Node, with no hint why. Discovered binaries
+ * that were passed over, and any .cmd/.bat shim, are named only when NO usable
+ * oam is found; when one is, the launcher uses it without listing what it
+ * skipped.
  *
  * ALREADY RUNNING ON OAM
  * A host can resolve this package's `bin` and launch `oam run <this file>`
@@ -154,8 +158,8 @@ function pathKey(p) {
  * run a .cmd/.bat through execFile/spawn without `shell: true` (EINVAL, and for
  * spawn it throws SYNCHRONOUSLY rather than emitting 'error'), so walking the
  * full PATHEXT list would hand back a path this launcher cannot execute.
- * Discovery has to agree with execution. A skipped shim is still reported --
- * see findOamShim.
+ * Discovery has to agree with execution. A skipped shim is still named on
+ * stderr when no usable oam is found -- see findOamShim.
  */
 function discoverOamPaths() {
   const installed = [join(homedir(), ".oam", "bin", exe)];
@@ -284,9 +288,11 @@ async function errSync(message) {
 
 /**
  * An oam-named .cmd/.bat on PATH: a real install in a shape this launcher
- * cannot spawn. Reported rather than ignored, because "no oam binary was found"
- * reads as "install oam" -- the one thing that will not help. Windows only;
- * there is no such shim concept on POSIX.
+ * cannot spawn. Looked for only when no usable oam was found, and then reported
+ * rather than ignored, because "no usable oam was found" alone reads as "install
+ * oam" -- the one thing that will not help. When a usable oam IS found, a shim
+ * beside it is not mentioned. Windows only; there is no such shim concept on
+ * POSIX.
  */
 function findOamShim() {
   if (!isWin) return null;
@@ -403,21 +409,27 @@ async function launchChild(cmd, args, onLaunchFailed) {
     return;
   }
 
-  if (piped) {
-    process.stdin.pipe(child.stdin);
-    child.stdout.pipe(process.stdout);
-    child.stderr.pipe(process.stderr);
-    // A child that exits before reading everything closes its stdin; the
-    // resulting EPIPE is not worth crashing over.
-    child.stdin.on("error", () => {});
-  }
-
-  // If the runtime cannot be executed at all (deleted between the stat and the
-  // spawn, wrong arch, permission), fall back rather than failing outright.
-  // `spawned` guards against falling back AFTER the child has begun running.
+  // If the runtime cannot be executed at all (deleted between the version probe
+  // and the spawn, wrong arch, permission), fall back rather than failing
+  // outright. `spawned` guards against falling back AFTER the child has begun
+  // running.
+  //
+  // Everything that assumes a live child waits for 'spawn'. A failed spawn
+  // still emits 'close' (after 'error', with the negative errno as its code), so
+  // an unguarded close handler would process.exit() out from under the fallback
+  // onLaunchFailed has just started: measured on a posed oam host, the launcher
+  // exited with the ENOENT errno and nothing ran. Piping and signal forwarding
+  // wait too, so a child that never ran is never handed the host's stdin or its
+  // signals; until 'spawn', process.stdin has no reader and stays paused.
   let spawned = false;
   child.on("spawn", () => {
     spawned = true;
+    if (piped) {
+      process.stdin.pipe(child.stdin);
+      child.stdout.pipe(process.stdout);
+      child.stderr.pipe(process.stderr);
+    }
+    forwardSignals();
   });
   child.on("error", (err) => {
     if (spawned) return;
@@ -425,6 +437,9 @@ async function launchChild(cmd, args, onLaunchFailed) {
     // fallback would otherwise escape as an unhandled rejection.
     onLaunchFailed(err).catch(fallbackFailed);
   });
+  // A child that exits before reading everything closes its stdin; the
+  // resulting EPIPE is not worth crashing over. Null when stdio is inherited.
+  child.stdin?.on("error", () => {});
 
   // Forward termination so the server's own shutdown path runs in the child
   // rather than the child being orphaned.
@@ -454,25 +469,29 @@ async function launchChild(cmd, args, onLaunchFailed) {
   // child, so on Windows the timer below is the only kill we issue.
   const ESCALATE_AFTER_MS = 2000;
   let escalation = null;
-  for (const sig of ["SIGINT", "SIGTERM"]) {
-    process.on(sig, () => {
-      // No try/catch: kill() on an already-exited child returns false, it does
-      // not throw. It throws only for a signal the platform does not know,
-      // which SIGINT/SIGTERM/SIGKILL never are.
-      if (!isWin) child.kill(sig);
-      if (escalation) return; // already counting down; further signals are noise
-      escalation = setTimeout(() => {
-        // Still here after its grace window. Stop waiting on it.
-        child.kill("SIGKILL");
-        process.exit(128 + (constants.signals[sig] ?? 15));
-      }, ESCALATE_AFTER_MS);
-    });
+  function forwardSignals() {
+    for (const sig of ["SIGINT", "SIGTERM"]) {
+      process.on(sig, () => {
+        // No try/catch: kill() on an already-exited child returns false, it does
+        // not throw. It throws only for a signal the platform does not know,
+        // which SIGINT/SIGTERM/SIGKILL never are.
+        if (!isWin) child.kill(sig);
+        if (escalation) return; // already counting down; further signals are noise
+        escalation = setTimeout(() => {
+          // Still here after its grace window. Stop waiting on it.
+          child.kill("SIGKILL");
+          process.exit(128 + (constants.signals[sig] ?? 15));
+        }, ESCALATE_AFTER_MS);
+      });
+    }
   }
 
   // Piped: wait for 'close', so the child's last stdout bytes -- a JSON or
   // SARIF report, say -- are copied out before this process exits. Inherited:
-  // 'exit' is enough, the fds were never ours to drain.
+  // 'exit' is enough, the fds were never ours to drain. Either way, only for a
+  // child that actually ran -- see the 'spawn' handler above.
   child.on(piped ? "close" : "exit", (code, signal) => {
+    if (!spawned) return;
     if (escalation) clearTimeout(escalation);
     // Mirror the child's fate: a signal death becomes 128+n so callers see a
     // conventional shell exit status rather than a bare 0. This tool's exit
@@ -510,13 +529,18 @@ async function handOffToNode(reason) {
   });
 }
 
-/** No usable oam, under a mode that allows Node. */
-async function fallBackToNode(hostOam) {
+/**
+ * No usable oam, under a mode that allows Node. `oamFailed` is true when a
+ * usable oam WAS chosen but would not start: the caller has already said so on
+ * stderr, and the handoff note must not then claim that none was found.
+ */
+async function fallBackToNode(hostOam, oamFailed = false) {
   if (hostOam === undefined) {
     await runInProcess();
     return;
   }
-  await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and no newer oam was found`);
+  const tooOld = `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}`;
+  await handOffToNode(oamFailed ? tooOld : `${tooOld}, and no newer oam was found`);
 }
 
 const mode = (process.env.MCP_COMPLIANCE_RUNTIME ?? "auto").toLowerCase();
@@ -546,7 +570,7 @@ if (plan === "in-process") {
       await errSync(
         `mcp-compliance: failed to launch oam at ${chosen.path} (${err?.message ?? err}); using Node instead.\n`,
       );
-      await fallBackToNode(hostOam);
+      await fallBackToNode(hostOam, true);
     });
   } else {
     const shim = findOamShim();

@@ -164,7 +164,11 @@ type LauncherRun = { stdout: string; stderr: string; code: number | null };
  * Env is a whitelist so an MCP_COMPLIANCE_* var exported by the developer's
  * shell cannot change what is being asserted.
  */
-function runLauncher(hostOam: string | undefined, extraEnv: Record<string, string> = {}): Promise<LauncherRun> {
+function runLauncher(
+  hostOam: string | undefined,
+  extraEnv: Record<string, string> = {},
+  extraPreload = "",
+): Promise<LauncherRun> {
   // Every run also reports, at exit, what the LAUNCHER process's argv[1] ended
   // up as. runInProcess points it at dist/index.js; a handoff leaves it on the
   // launcher. That is the only way to tell "ran in-process" from "handed off to
@@ -174,7 +178,7 @@ function runLauncher(hostOam: string | undefined, extraEnv: Record<string, strin
     hostOam === undefined
       ? ""
       : `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(hostOam)}, enumerable: true });`;
-  const preload = ["--import", `data:text/javascript,${encodeURIComponent(`${exitMarker}${posing}`)}`];
+  const preload = ["--import", `data:text/javascript,${encodeURIComponent(`${exitMarker}${posing}${extraPreload}`)}`];
   return new Promise((resolvePromise, reject) => {
     const child = spawn(process.execPath, [...preload, LAUNCHER, "--version"], {
       env: { PATH: process.env.PATH ?? "", OAM_BIN: process.execPath, ...extraEnv },
@@ -327,6 +331,38 @@ maybeDescribe("launcher with no usable oam", () => {
       expect(run.stdout.trim(), "nothing may run").toBe("");
       expect(run.stderr).toMatch(/^mcp-compliance: MCP_COMPLIANCE_RUNTIME=node but no Node was found on PATH\.$/m);
       expect(run.stderr).not.toMatch(/self-update/);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "still falls back when the chosen oam fails to spawn on an oam host",
+    async () => {
+      // The chosen binary passed its --version probe and then could not be
+      // spawned (deleted or replaced in between). A failed spawn emits 'error'
+      // and then 'close' with the negative errno, and on an oam host the launcher
+      // waits for 'close' -- so an unguarded close handler exited the launcher
+      // mid-fallback and nothing ran. The preload makes the FIRST spawn target a
+      // path that does not exist; the Node fallback spawns normally.
+      const failFirstSpawn = [
+        'import childProcess from "node:child_process";',
+        'import { syncBuiltinESMExports } from "node:module";',
+        "const realSpawn = childProcess.spawn;",
+        "let failed = false;",
+        "childProcess.spawn = function (cmd, args, opts) {",
+        "  if (failed) return realSpawn.call(this, cmd, args, opts);",
+        "  failed = true;",
+        '  return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
+        "};",
+        "syncBuiltinESMExports();",
+      ].join("\n");
+      const run = await runLauncher("0.9.0", isolated({ OAM_BIN: process.execPath }), failFirstSpawn);
+      expect(handedOff(run), `the Node fallback must still run: ${JSON.stringify(run)}`).toBe(true);
+      expect(run.stderr).toMatch(/^mcp-compliance: failed to launch oam at .*; using Node instead\.$/m);
+      // A newer oam WAS found -- it just would not start -- so the handoff note
+      // must not claim otherwise.
+      expect(run.stderr).not.toMatch(/no newer oam was found/);
+      expect(run.stderr).toMatch(/this process is oam 0\.9\.0, older than 0\.15\.2; running on .*node/);
     },
     TIMEOUT_MS,
   );
