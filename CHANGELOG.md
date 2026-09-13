@@ -10,6 +10,7 @@ out explicitly here.
 ## [Unreleased]
 
 ### Fixed
+- **The launcher no longer spawns a nested oam when it is already running on oam.** A host that resolves this package's `bin` and launches `oam run bin/mcp-compliance.mjs` — Yaw MCP does, and so does oam's sidecar regression matrix — got a second runtime boot, because the launcher discovered and spawned oam without asking what it was already running on (measured on Windows: `oam.exe` with a nested `oam.exe` + `conhost.exe` underneath). When `process.versions.oam` clears the same 0.9.0 floor a discovered binary must, the CLI is now imported into the current process. Nothing is lost, since this launcher applies no sandbox; a host oam below the floor keeps the discovery path.
 - **The launcher no longer dies with a raw stack trace when `spawn` fails.** Node throws synchronously rather than emitting `error` for some unexecutable targets — notably a `.cmd`/`.bat` on Windows — and the `error` listener is registered *after* the `spawn` call, so it could never observe that throw. Both failure modes now route through one handler.
 - **Windows `PATH` discovery accepts `oam.exe` only**, instead of walking every `PATHEXT` entry and returning an `oam.cmd` Node cannot execute. A skipped shim is still **named** in the diagnostic, so an npm-style install no longer reports as "no oam binary was found".
 - **A failing in-process fallback no longer escapes as an unhandled rejection.** `void runInProcess()` discarded the promise, replacing the launcher's own diagnostic with a raw stack trace.
