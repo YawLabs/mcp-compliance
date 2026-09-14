@@ -18,7 +18,7 @@ inputs:
     required: false
     default: 'github'
   spec-version:
-    description: 'MCP spec revision to grade against: "auto" (default) probes the server and picks the newest revision it speaks (2026-07-28 when it answers server/discover, else 2025-11-25); pin "2025-11-25" or "2026-07-28" to keep the suite, test ids and grade stable across server upgrades. The resolved revision is exposed as the spec-version output. Requires mcp-compliance 0.18.0 or newer (the `version` input); older CLIs reject the flag.'
+    description: 'MCP spec revision to grade against: "auto" (default) probes the server and picks the newest revision it speaks (2026-07-28 when it answers server/discover, else 2025-11-25); pin "2025-11-25" or "2026-07-28" to keep the suite, test ids and grade stable across server upgrades. The resolved revision is exposed as the spec-version output. Requires mcp-compliance 0.19.0 or newer (the `version` input); older CLIs reject the flag.'
     required: false
     default: 'auto'
   strict:

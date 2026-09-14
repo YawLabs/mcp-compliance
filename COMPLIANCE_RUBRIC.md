@@ -5,7 +5,7 @@
 **MCP Spec Compatibility:** [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) and [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28)
 **License:** [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 **Maintained by:** [Yaw Labs / mcp-compliance](https://github.com/YawLabs/mcp-compliance)
-**Implementation:** `@yawlabs/mcp-compliance` v0.18.0+
+**Implementation:** `@yawlabs/mcp-compliance` v0.19.0+
 
 ---
 

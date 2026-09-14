@@ -3,7 +3,6 @@
 [![npm version](https://img.shields.io/npm/v/@yawlabs/mcp-compliance)](https://www.npmjs.com/package/@yawlabs/mcp-compliance)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![GitHub stars](https://img.shields.io/github/stars/YawLabs/mcp-compliance)](https://github.com/YawLabs/mcp-compliance/stargazers)
-[![Follow @TokenLimitNews on X](https://img.shields.io/badge/follow-%40TokenLimitNews-000000?logo=x&logoColor=white)](https://x.com/TokenLimitNews)
 
 **Test any MCP server for spec compliance.** Two test suites — 88 tests for MCP [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) and 103 tests for MCP [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) — covering transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security. The tool probes the server and grades the newest spec revision it speaks, or you pin one with `--spec-version`. Works against **HTTP endpoints** (`https://my-server.com/mcp`) and **stdio servers** (`npx @modelcontextprotocol/server-filesystem /tmp`) alike. CLI, MCP server, and programmatic API.
 
@@ -719,7 +718,7 @@ The JSON output of the test suite is a stable, versioned contract. Every report 
 {
   "schemaVersion": "1",        // bumped on breaking changes to the report shape
   "specVersion": "2026-07-28", // MCP spec revision the run graded — the RESOLVED value ("2025-11-25" or "2026-07-28"), never "auto"
-  "toolVersion": "0.18.0",     // mcp-compliance version that produced the report
+  "toolVersion": "0.19.0",     // mcp-compliance version that produced the report
   "url": "...",
   "timestamp": "...",
   "grade": "A",
@@ -787,3 +786,5 @@ npm test
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+[![Follow @TokenLimitNews on X](https://img.shields.io/badge/follow-%40TokenLimitNews-000000?logo=x&logoColor=white)](https://x.com/TokenLimitNews)
