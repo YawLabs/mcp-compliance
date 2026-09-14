@@ -139,8 +139,9 @@ export function formatTerminal(report: ComplianceReport): string {
   if (specNote) out.push(chalk.dim(`            ${specNote}`));
   out.push("");
 
-  // Big grade block letter + side-by-side summary
-  const reqOk = report.summary.requiredPassed === report.summary.required;
+  // Big grade block letter + side-by-side summary. "0/0 required" on an
+  // empty run is nothing to attest, not a clean pass, so no check mark.
+  const reqOk = report.summary.total > 0 && report.summary.requiredPassed === report.summary.required;
   const infoRows = [
     "",
     "",
@@ -176,10 +177,13 @@ export function formatTerminal(report: ComplianceReport): string {
   const catalog = catalogVersionOf(report);
   const failed = report.tests.filter((t) => !t.passed);
   if (report.summary.total === 0) {
-    // Nothing ran: --only/--skip matched nothing in the resolved catalog
-    // (the runner's filter warning below names the miss). Grade F /
-    // FAIL is "nothing to attest"; it must not read as a clean pass.
-    out.push(`  ${chalk.yellow.bold("! No tests ran -- check --only/--skip (see warnings)")}`);
+    // Nothing ran: --only/--skip matched nothing in the resolved catalog,
+    // or only tests gated off this transport (the runner's filter warning
+    // below names the miss when it can). Grade F / FAIL is "nothing to
+    // attest"; it must not read as a clean pass.
+    out.push(
+      `  ${chalk.yellow.bold(`! No tests ran -- check --only/--skip${warnings.length > 0 ? " (see warnings)" : ""}`)}`,
+    );
     out.push("");
   } else if (failed.length > 0) {
     out.push(chalk.bold.red(`  FAILED TESTS (${failed.length})`));
@@ -363,10 +367,16 @@ function ghEscape(s: string): string {
 /**
  * Emit GitHub Actions workflow commands so test failures appear inline
  * on PRs as annotations. Required failures become ::error, optional
- * become ::warning, and a single ::notice carries the grade summary.
+ * become ::warning, every report warning becomes a ::warning titled
+ * mcp-compliance (the dual-era, pinned-mismatch, unreachable and
+ * "pass --auth" notes are otherwise invisible in CI), and a single
+ * ::notice carries the grade summary plus the resolved spec version and,
+ * under auto, how it was detected. An empty run says so instead of
+ * reading as "Grade F, 0/0 passed".
  */
 export function formatGithub(report: ComplianceReport): string {
   const lines: string[] = [];
+  const { specNote, warnings } = splitSpecNote(report);
   for (const t of report.tests) {
     if (t.passed) continue;
     const level = t.required ? "error" : "warning";
@@ -374,8 +384,15 @@ export function formatGithub(report: ComplianceReport): string {
     const message = ghEscape(t.details || "(no details)");
     lines.push(`::${level} title=${title}::${message}`);
   }
+  for (const w of warnings) {
+    lines.push(`::warning title=mcp-compliance::${ghEscape(w)}`);
+  }
   const summaryTitle = "MCP Compliance";
-  const summary = `Grade ${report.grade} (${report.score}%) — ${report.summary.passed}/${report.summary.total} passed, ${report.summary.failed} failed (${report.summary.requiredPassed}/${report.summary.required} required)`;
+  const spec = `spec ${report.specVersion || catalogVersionOf(report)}${specNote ? ` (${specNote})` : ""}`;
+  const summary =
+    report.summary.total === 0
+      ? `No tests ran -- check --only/--skip${warnings.length > 0 ? " (see warnings)" : ""}; ${spec}`
+      : `Grade ${report.grade} (${report.score}%) — ${report.summary.passed}/${report.summary.total} passed, ${report.summary.failed} failed (${report.summary.requiredPassed}/${report.summary.required} required); ${spec}`;
   lines.push(`::notice title=${ghEscape(summaryTitle)}::${ghEscape(summary)}`);
   return lines.join("\n");
 }

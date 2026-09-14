@@ -46,4 +46,36 @@ describe("integration (stdio) — runComplianceSuite against the echo fixture", 
     expect(byId.get("stdio-unicode")?.passed).toBe(true);
     expect(byId.get("stdio-unknown-method-recovers")?.passed).toBe(true);
   }, 30_000);
+
+  it("a plain echo tool passes the injection tests: reflecting the payload verbatim is not execution", async () => {
+    // The 2025-11-25 detectors used to match the payload itself coming
+    // back ("&& echo pwned" -> "pwned", "... information_schema ..." ->
+    // "information_schema") and fail an echo tool that the 2026-07-28
+    // suite passes, so a dual-era server got opposite verdicts per era.
+    // tools-list is what discovers the echo tool the injection tests target.
+    const report = await runComplianceSuite(
+      { type: "stdio", command: process.execPath, args: [fixturePath] },
+      {
+        timeout: 5000,
+        only: ["tools-list", "security-command-injection", "security-sql-injection", "security-path-traversal"],
+      },
+    );
+    const verdicts = Object.fromEntries(
+      report.tests
+        .filter((t) => t.category === "security")
+        .map((t) => [t.id, t.passed ? "pass" : `FAIL: ${t.details}`]),
+    );
+    expect(verdicts).toEqual({
+      "security-command-injection": "pass",
+      "security-sql-injection": "pass",
+      "security-path-traversal": "pass",
+    });
+    const byId = new Map(report.tests.map((t) => [t.id, t]));
+    expect(byId.get("security-command-injection")?.details).toBe(
+      "Tested 5 payloads against echo.message — no command execution detected (0 rejected, 5 returned without it)",
+    );
+    expect(byId.get("security-sql-injection")?.details).toBe(
+      "Tested 3 payloads against echo.message — no database error detected (0 rejected, 3 returned without it)",
+    );
+  }, 30_000);
 });

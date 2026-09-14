@@ -206,10 +206,23 @@ export function registerTools(server: McpServer) {
         return { content: [{ type: "text" as const, text }] };
       }
 
+      // A shared id covers the same feature in every catalog. The prose
+      // differs per revision almost everywhere (each catalog cites its
+      // own spec text), which is not a difference in what is checked;
+      // only a changed required flag or category is a real divergence
+      // worth flagging as such.
       const sections = found.map((hit) => describeDefinition([hit.version], hit.def));
+      const first = found[0].def;
+      const criteriaDiffer = found.some(
+        (hit) => hit.def.required !== first.required || hit.def.category !== first.category,
+      );
       const preface =
         found.length > 1
-          ? `"${testId}" exists in ${found.length} spec suites with different criteria; each is explained below.\n\n`
+          ? criteriaDiffer
+            ? `"${testId}" exists in ${found.length} spec suites with different criteria (${found
+                .map((hit) => `${hit.def.required ? "required" : "optional"} ${hit.def.category} in ${hit.version}`)
+                .join(", ")}); each is explained below.\n\n`
+            : `"${testId}" exists in ${found.length} spec suites with the same category and required flag; it covers the same feature, but the pass/fail criteria follow each revision. Each is shown below.\n\n`
           : "";
       return {
         content: [{ type: "text" as const, text: preface + sections.join("\n\n---\n\n") }],

@@ -1,10 +1,17 @@
 import { performance } from "node:perf_hooks";
-import { buildDiscoverProbe, detectSpecVersion } from "./detect.js";
+import {
+  buildDiscoverProbe,
+  type DetectionResult,
+  detectSpecVersion,
+  type ProbeExit,
+  probeExitOf,
+  probeExitWarning,
+} from "./detect.js";
 import { readPackageVersion } from "./pkg-version.js";
+import { spawnStdioTarget } from "./runner.js";
 import { LEGACY_SPEC_VERSION, MODERN_SPEC_VERSION, type SpecVersion, type SpecVersionOption } from "./spec.js";
 import { createHttpTransport } from "./transport/http.js";
 import type { JsonRpcId, Transport, TransportResponse } from "./transport/index.js";
-import { createStdioTransport } from "./transport/stdio.js";
 import type { TransportTarget } from "./types.js";
 
 const TOOL_VERSION = readPackageVersion(import.meta.url);
@@ -17,6 +24,16 @@ export interface BenchmarkOptions {
   /** Per-request timeout in milliseconds (default 15000). */
   timeout?: number;
   /**
+   * Budget for the server's first reply -- the era probe under `auto`
+   * and the unmeasured warm-up (the 2025-11-25 initialize handshake, or
+   * a pinned 2026-07-28 run's first server/discover) -- in milliseconds.
+   * Same default as the compliance runner, `max(timeout, 60000)`: a cold
+   * `npx` stdio server can take tens of seconds to produce its first
+   * byte, and a probe bounded by the per-request timeout would classify
+   * it as 2025-11-25 (no reply) instead of waiting for its answer.
+   */
+  startupTimeout?: number;
+  /**
    * MCP spec revision to benchmark against (default `auto`). The era
    * decides the probe: 2025-11-25 warms up with the initialize handshake
    * and measures `ping`; 2026-07-28 has no handshake, so it warms up with
@@ -28,6 +45,13 @@ export interface BenchmarkOptions {
   specVersion?: SpecVersionOption;
   /** Optional progress callback for verbose mode. */
   onProgress?: (done: number, total: number) => void;
+  /**
+   * Human-facing status lines while nothing is being measured yet --
+   * today the stdio era probe, which a 2025-11-25 server that ignores
+   * unknown methods lets sit for the whole startup timeout. The CLI
+   * prints them dim to stderr in terminal mode; not part of the result.
+   */
+  onStatus?: (message: string) => void;
 }
 
 export interface BenchmarkResult {
@@ -44,6 +68,13 @@ export interface BenchmarkResult {
    * the transport error). Absent when every probe succeeded.
    */
   firstError?: string;
+  /**
+   * What happened around the timed loop that a reader must know to
+   * interpret the numbers -- today, that the era probe killed a legacy
+   * stdio child and the samples were taken against a fresh instance.
+   * Absent when there is nothing to say.
+   */
+  warnings?: string[];
   durationMs: number;
   throughputPerSec: number;
   latencyMs: {
@@ -93,32 +124,48 @@ export async function runBenchmark(target: TransportTarget, opts: BenchmarkOptio
   const requests = opts.requests ?? 100;
   const concurrency = Math.max(1, opts.concurrency ?? 1);
   const timeout = opts.timeout ?? 15000;
+  const startupTimeout = opts.startupTimeout ?? Math.max(timeout, 60000);
   const requested: SpecVersionOption = opts.specVersion ?? "auto";
   const clientInfo = { name: "mcp-compliance-bench", version: TOOL_VERSION };
 
-  const transport: Transport =
+  // Reassigned once, and only on stdio: when the era probe kills the
+  // child (a legacy server that exits on an unknown pre-initialize
+  // request) the samples are taken against a fresh instance, exactly as
+  // the compliance runner does; `finally` closes whichever is current.
+  let transport: Transport =
     target.type === "http"
       ? createHttpTransport({ url: target.url, headers: target.headers })
-      : createStdioTransport({
-          command: target.command,
-          args: target.args,
-          env: target.env,
-          cwd: target.cwd,
-        });
+      : spawnStdioTarget(target);
 
   let idCounter = 0;
   const nextId = (): JsonRpcId => ++idCounter;
+  const warnings: string[] = [];
 
   try {
     // Resolve the era exactly the way the compliance runner does: one
-    // modern `server/discover` probe, classified by its reply. On stdio
-    // this doubles as the boot wait; on HTTP it is one extra round-trip.
+    // modern `server/discover` probe, classified by its reply, within the
+    // startup budget. On stdio this doubles as the boot wait; on HTTP it
+    // is one extra round-trip.
     let specVersion: SpecVersion;
     let probed = false;
+    let detection: DetectionResult | undefined;
+    let probeExit: ProbeExit | null = null;
     if (requested === "auto") {
-      const detection = await detectSpecVersion(transport, { nextId, timeout, clientInfo });
+      detection = await detectSpecVersion(transport, {
+        nextId,
+        timeout: startupTimeout,
+        clientInfo,
+        onStatus: opts.onStatus,
+      });
       specVersion = detection.version;
       probed = true;
+      probeExit = await probeExitOf(transport);
+      if (probeExit && target.type === "stdio") {
+        await transport.close().catch(() => {});
+        transport = spawnStdioTarget(target);
+        // The fresh instance has not been warmed up by the probe.
+        probed = false;
+      }
     } else {
       specVersion = requested;
     }
@@ -134,6 +181,9 @@ export async function runBenchmark(target: TransportTarget, opts: BenchmarkOptio
     let method: string;
     let params: unknown;
     let headers: Record<string, string> | undefined;
+    // Whether the warm-up got any reply; decides what a probe-exit
+    // warning says about the fresh instance.
+    let warmedUp = probed;
     if (specVersion === MODERN_SPEC_VERSION) {
       const probe = buildDiscoverProbe(clientInfo);
       method = "server/discover";
@@ -141,7 +191,8 @@ export async function runBenchmark(target: TransportTarget, opts: BenchmarkOptio
       headers = transport.kind === "http" ? probe.headers : undefined;
       if (!probed) {
         try {
-          await transport.request(method, params, nextId, { timeout, headers });
+          await transport.request(method, params, nextId, { timeout: startupTimeout, headers });
+          warmedUp = true;
         } catch {
           // The timed loop reports the failure with its reason; carry on.
         }
@@ -151,7 +202,7 @@ export async function runBenchmark(target: TransportTarget, opts: BenchmarkOptio
       params = undefined;
       headers = undefined;
       // Warm up: do an initialize so the server is responsive. For stdio
-      // this also makes sure the child has booted.
+      // this also makes sure the child has booted (startup budget).
       try {
         await transport.request(
           "initialize",
@@ -161,12 +212,18 @@ export async function runBenchmark(target: TransportTarget, opts: BenchmarkOptio
             clientInfo,
           },
           nextId,
-          { timeout },
+          { timeout: startupTimeout },
         );
-        await transport.notify("notifications/initialized", undefined, { timeout });
+        warmedUp = true;
+        await transport.notify("notifications/initialized", undefined, { timeout: startupTimeout });
       } catch {
         // Some servers don't require init for ping; carry on.
       }
+    }
+    if (probeExit && detection) {
+      warnings.push(
+        await probeExitWarning(probeExit, transport, { era: detection.era, answered: warmedUp, spawner: "benchmark" }),
+      );
     }
 
     const latencies: number[] = [];
@@ -231,6 +288,7 @@ export async function runBenchmark(target: TransportTarget, opts: BenchmarkOptio
       succeeded,
       failed,
       ...(firstError !== undefined ? { firstError } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
       durationMs,
       throughputPerSec: durationMs > 0 ? (requests / durationMs) * 1000 : 0,
       latencyMs: {
@@ -258,6 +316,9 @@ export function formatBenchmark(result: BenchmarkResult): string {
   lines.push(`  ${result.succeeded} succeeded · ${result.failed} failed`);
   if (result.failed > 0 && result.firstError) {
     lines.push(`  first failure: ${result.firstError}`);
+  }
+  for (const w of result.warnings ?? []) {
+    lines.push(`  warning: ${w}`);
   }
   lines.push("");
   lines.push("Latency (ms):");

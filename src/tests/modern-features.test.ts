@@ -1,3 +1,5 @@
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   checkPagination,
@@ -263,6 +265,152 @@ describe.each<Kind>(["stdio", "http"])("2026-07-28 features + schema over %s", (
       const rest = ALL_IDS.filter((id) => !id.startsWith("prompts-"));
       expect(passedIds(report, rest)).toEqual(allPass(rest));
     });
+  });
+});
+
+// ── A list call that fails: one attempt, and the reason never silent ──
+
+type StubReply = { status: number; body: unknown } | "hang";
+
+/**
+ * A minimal 2026-07-28 HTTP stub answering each POST by method; "hang"
+ * never answers (a request timeout). Records the methods it received.
+ */
+async function startListStub(
+  route: (method: string, msg: Record<string, any>) => StubReply,
+): Promise<{ url: string; sent: string[]; close(): Promise<void> }> {
+  const sent: string[] = [];
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    let text = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk: string) => {
+      text += chunk;
+    });
+    req.on("end", () => {
+      let msg: Record<string, any> = {};
+      try {
+        msg = JSON.parse(text);
+      } catch {}
+      if (msg.id === undefined) {
+        res.writeHead(202).end();
+        return;
+      }
+      sent.push(String(msg.method));
+      const reply = route(String(msg.method), msg);
+      if (reply === "hang") return;
+      res.writeHead(reply.status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(reply.body));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}/mcp`,
+    sent,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+const ok = (id: unknown, result: Record<string, unknown>): StubReply => ({
+  status: 200,
+  body: { jsonrpc: "2.0", id, result: { resultType: "complete", ttlMs: 0, cacheScope: "public", ...result } },
+});
+
+const rpcError = (id: unknown, code: number, message: string): StubReply => ({
+  status: 200,
+  body: { jsonrpc: "2.0", id, error: { code, message } },
+});
+
+/** discover with tools + prompts declared; prompts/list served; tools/list per `tools`. */
+function listRoute(tools: (msg: Record<string, any>) => StubReply) {
+  return (method: string, msg: Record<string, any>): StubReply => {
+    if (method === "server/discover") {
+      return ok(msg.id, {
+        supportedVersions: ["2026-07-28"],
+        capabilities: { tools: {}, prompts: {} },
+        _meta: { "io.modelcontextprotocol/serverInfo": { name: "list-stub", version: "0" } },
+      });
+    }
+    if (method === "tools/list") return tools(msg);
+    if (method === "prompts/list") return ok(msg.id, { prompts: [{ name: "simple", description: "d" }] });
+    return rpcError(msg.id, -32601, `Method not found: ${method}`);
+  };
+}
+
+describe("a list call that fails", () => {
+  it("tools-list-caching re-throws the cached tools/list timeout instead of paying a second one", async () => {
+    const stub = await startListStub(listRoute(() => "hang"));
+    try {
+      const report = await runModern(stub.url, { only: ["tools-list", "tools-list-caching"], timeout: 1000 });
+      const list = resultOf(report, "tools-list");
+      const caching = resultOf(report, "tools-list-caching");
+      expect(list.passed).toBe(false);
+      expect(caching.passed).toBe(false);
+      // Same error, one attempt: the second test did not wait out another timeout.
+      expect(caching.details).toBe(list.details);
+      expect(list.durationMs).toBeGreaterThanOrEqual(900);
+      expect(caching.durationMs).toBeLessThan(500);
+      expect(stub.sent.filter((m) => m === "tools/list")).toHaveLength(1);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("--only schema fails the tools checks with the recorded reason when tools-list is not in the run", async () => {
+    const stub = await startListStub(listRoute((msg) => rpcError(msg.id, -32603, "boom")));
+    try {
+      const report = await runModern(stub.url, { only: ["schema"] });
+      const reason = "tools/list failed (JSON-RPC error -32603 (boom)); no tools list to validate";
+      for (const id of ["tools-schema", "tools-annotations", "tools-title-field", "tools-output-schema"]) {
+        const r = resultOf(report, id);
+        expect(r.passed, id).toBe(false);
+        expect(r.details, id).toBe(reason);
+      }
+      // The list that worked is still validated, and fetched once.
+      expect(resultOf(report, "prompts-schema").details).toBe("All 1 prompt(s) valid");
+      expect(stub.sent.filter((m) => m === "tools/list")).toHaveLength(1);
+      expect(stub.sent.filter((m) => m === "prompts/list")).toHaveLength(1);
+      // Before the fix this run graded A / 100 with "skipped ... (see tools-list)".
+      expect(report.score).toBeLessThan(100);
+      expect(report.grade).not.toBe("A");
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("--only tools-schema names a timeout the same way", async () => {
+    const stub = await startListStub(listRoute(() => "hang"));
+    try {
+      const report = await runModern(stub.url, { only: ["tools-schema"], timeout: 1000 });
+      const r = resultOf(report, "tools-schema");
+      expect(r.passed).toBe(false);
+      expect(r.details).toMatch(/^tools\/list failed \(.+\); no tools list to validate$/);
+      expect(r.details).not.toMatch(/see tools-list/);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("when tools-list is in the run it carries the failure and the schema checks skip-pass pointing at it", async () => {
+    const stub = await startListStub(listRoute((msg) => rpcError(msg.id, -32603, "boom")));
+    try {
+      const report = await runModern(stub.url, { only: ["tools-list", "tools-schema"] });
+      expect(resultOf(report, "tools-list")).toMatchObject({
+        passed: false,
+        details: "tools/list returned JSON-RPC error -32603 (boom)",
+      });
+      expect(resultOf(report, "tools-schema")).toMatchObject({
+        passed: true,
+        details: "skipped: tools/list failed, no tools list to validate (see tools-list)",
+      });
+      expect(stub.sent.filter((m) => m === "tools/list")).toHaveLength(1);
+    } finally {
+      await stub.close();
+    }
   });
 });
 

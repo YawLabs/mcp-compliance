@@ -9,8 +9,8 @@ import { type ComplianceConfig, loadConfig, OUTPUT_FORMATS } from "./config.js";
 import { diffReports, formatDiff, hasRegressions } from "./diff.js";
 import { startServer } from "./mcp/server.js";
 import { formatGithub, formatHtml, formatJson, formatMarkdown, formatSarif, formatTerminal } from "./reporter.js";
-import { previewTests, runComplianceSuite } from "./runner.js";
-import { type SpecVersionOption, SUPPORTED_SPEC_VERSIONS } from "./spec.js";
+import { filterWarnings, previewTests, runComplianceSuite } from "./runner.js";
+import { type SpecVersion, type SpecVersionOption, SUPPORTED_SPEC_VERSIONS } from "./spec.js";
 import { splitStdioTarget } from "./stdio-split.js";
 import type { TestDefinition, TransportTarget } from "./types.js";
 
@@ -329,29 +329,40 @@ program
             only: opts.only ?? config?.only,
             skip: opts.skip ?? config?.skip,
           };
-          const printCatalog = (defs: TestDefinition[]) => {
-            for (const d of defs) {
-              const req = d.required ? chalk.yellow("required") : chalk.dim("optional");
-              console.log(`${chalk.bold(d.id.padEnd(38))} ${chalk.cyan(d.category.padEnd(10))} ${req}  ${d.name}`);
-            }
-          };
           // A preview never connects, so `auto` cannot be resolved here:
           // an explicit spec prints that one catalog, `auto` prints every
           // catalog in its own labelled section so the reader can find
           // the ids of whichever suite the live run will pick.
+          const versions: readonly SpecVersion[] = specVersion !== "auto" ? [specVersion] : SUPPORTED_SPEC_VERSIONS;
+          const catalogs = versions.map((v) => ({ version: v, defs: previewTests({ ...filters, specVersion: v }) }));
+          // One id column for everything printed: the longest 2026-07-28
+          // ids run past a fixed width and shift the columns after them.
+          const idWidth = Math.max(0, ...catalogs.flatMap((c) => c.defs.map((d) => d.id.length)));
+          const printCatalog = (version: SpecVersion, defs: TestDefinition[]) => {
+            for (const d of defs) {
+              const req = d.required ? chalk.yellow("required") : chalk.dim("optional");
+              console.log(`${chalk.bold(d.id.padEnd(idWidth))} ${chalk.cyan(d.category.padEnd(10))} ${req}  ${d.name}`);
+            }
+            // The same filter-miss warnings a live run would print: a
+            // value that names nothing in this catalog, or only tests
+            // gated off this transport, otherwise lists "0 tests" with no
+            // explanation.
+            for (const w of filterWarnings(version, transportKind, filters.only, filters.skip)) {
+              console.log(chalk.yellow(`! ${w}`));
+            }
+          };
           if (specVersion !== "auto") {
-            const defs = previewTests({ ...filters, specVersion });
-            printCatalog(defs);
+            const [{ defs }] = catalogs;
+            printCatalog(specVersion, defs);
             console.log(
               chalk.dim(`\n${defs.length} tests would run for transport=${transportKind} spec=${specVersion}`),
             );
             return;
           }
           const counts: string[] = [];
-          for (const v of SUPPORTED_SPEC_VERSIONS) {
-            const defs = previewTests({ ...filters, specVersion: v });
+          for (const { version: v, defs } of catalogs) {
             console.log(chalk.bold(`\nMCP ${v} catalog (${defs.length} tests)`));
-            printCatalog(defs);
+            printCatalog(v, defs);
             counts.push(`${defs.length} (${v})`);
           }
           console.log(
@@ -547,6 +558,10 @@ program
   .option("-r, --requests <n>", "Number of probe requests to send", "100")
   .option("-c, --concurrency <n>", "Concurrent in-flight requests", "1")
   .option("--timeout <ms>", "Per-request timeout in milliseconds", "15000")
+  .option(
+    "--startup-timeout <ms>",
+    "Budget for the server's first reply: the era probe under auto and the unmeasured warm-up (the 2025-11-25 initialize handshake, or a pinned 2026-07-28 run's first server/discover) (default: max(--timeout, 60000), or `startupTimeout` in config; covers cold `npx` cache fetches before a stdio server starts)",
+  )
   .addOption(
     new Option(
       "--spec-version <version>",
@@ -568,6 +583,7 @@ program
         requests: string;
         concurrency: string;
         timeout: string;
+        startupTimeout?: string;
         specVersion?: SpecVersionOption;
         config?: string;
         format: string;
@@ -590,7 +606,15 @@ program
           requests: parsePositiveInt(opts.requests, "--requests", 1),
           concurrency: parsePositiveInt(opts.concurrency, "--concurrency", 1),
           timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
+          startupTimeout: opts.startupTimeout
+            ? parsePositiveInt(opts.startupTimeout, "--startup-timeout", 1)
+            : config?.startupTimeout,
           specVersion: opts.specVersion ?? config?.specVersion ?? "auto",
+          // Same status line the test command prints while a silent
+          // legacy stdio server costs the whole startup timeout on the era
+          // probe: stderr, dim, terminal mode only (JSON stays clean).
+          onStatus:
+            opts.format === "terminal" ? (message) => process.stderr.write(chalk.dim(`  ${message}\n`)) : undefined,
         });
         if (opts.format === "json") {
           console.log(JSON.stringify(result, null, 2));

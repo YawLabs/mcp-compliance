@@ -40,6 +40,12 @@ export interface CheckOptions {
    * penalised for a tools test.
    */
   required?: boolean;
+  /**
+   * Overrides the run-wide `retries` for this one check. A post-hoc scan
+   * of a finished recording passes 0: its verdict cannot change on a
+   * retry, so the harness would only sleep between identical failures.
+   */
+  retries?: number;
 }
 
 export interface Harness {
@@ -144,19 +150,20 @@ export function createHarness(opts: HarnessOptions): Harness {
     required: boolean,
     specRef: string,
     fn: () => Promise<TestOutcome>,
+    attempts: number,
   ): Promise<void> {
     const start = Date.now();
     let lastResult: TestOutcome = { passed: false, details: "" };
 
-    for (let attempt = 0; attempt <= retries; attempt++) {
+    for (let attempt = 0; attempt <= attempts; attempt++) {
       try {
         lastResult = await fn();
         if (lastResult.passed) break;
-        if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+        if (attempt < attempts) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         lastResult = { passed: false, details: `Error: ${message}` };
-        if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+        if (attempt < attempts) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
       }
     }
 
@@ -175,13 +182,14 @@ export function createHarness(opts: HarnessOptions): Harness {
     opts.onTestComplete?.(result);
   }
 
-  async function test(
+  async function run(
     id: string,
     name: string,
     category: TestResult["category"],
     required: boolean,
     specRef: string,
     fn: () => Promise<TestOutcome>,
+    attempts: number,
   ): Promise<void> {
     // Abort gate: if the caller's signal has fired, drop any pending
     // parallel work and propagate the reason. We check at the top of
@@ -201,22 +209,41 @@ export function createHarness(opts: HarnessOptions): Harness {
       // Sequential path: barrier against any in-flight parallel tests
       // first, then execute synchronously.
       if (inFlight.size > 0) await drainPool();
-      await runTestFn(id, name, category, required, specRef, fn);
+      await runTestFn(id, name, category, required, specRef, fn, attempts);
       return;
     }
 
     // Parallel path: wait for a slot, then launch without awaiting.
     while (inFlight.size >= concurrency) await Promise.race(inFlight);
-    const p = runTestFn(id, name, category, required, specRef, fn).finally(() => {
+    const p = runTestFn(id, name, category, required, specRef, fn, attempts).finally(() => {
       inFlight.delete(p);
     });
     inFlight.add(p);
   }
 
+  function test(
+    id: string,
+    name: string,
+    category: TestResult["category"],
+    required: boolean,
+    specRef: string,
+    fn: () => Promise<TestOutcome>,
+  ): Promise<void> {
+    return run(id, name, category, required, specRef, fn, retries);
+  }
+
   async function check(id: string, fn: () => Promise<TestOutcome>, checkOpts: CheckOptions = {}): Promise<void> {
     const def = opts.definitions.get(id);
     if (!def) throw new Error(`Unknown test id "${id}" (not in the suite's definitions)`);
-    return test(id, def.name, def.category, checkOpts.required ?? def.required, def.specRef, fn);
+    return run(
+      id,
+      def.name,
+      def.category,
+      checkOpts.required ?? def.required,
+      def.specRef,
+      fn,
+      Math.max(0, checkOpts.retries ?? retries),
+    );
   }
 
   return {

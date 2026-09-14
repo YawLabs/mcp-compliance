@@ -15,13 +15,16 @@ export interface HttpTransport extends Transport {
   /**
    * Raw POST bypassing JSON-RPC framing. Used by HTTP-transport tests
    * that need to inspect wire-level behavior (status codes, rejected
-   * content types, batch requests, etc.).
+   * content types, batch requests, etc.). `signal` cancels the request
+   * the way `TransportRequestInit.signal` does; whichever of it and
+   * `timeout` fires first wins.
    */
   rawPost(
     body: string,
     extraHeaders: Record<string, string>,
     timeout: number,
     omitUserHeaders?: string[],
+    signal?: AbortSignal,
   ): Promise<{ statusCode: number; body: string; headers: Record<string, string> }>;
   rawRequest(
     method: "GET" | "POST" | "DELETE" | "OPTIONS",
@@ -29,6 +32,7 @@ export interface HttpTransport extends Transport {
     extraHeaders: Record<string, string>,
     timeout: number,
     omitUserHeaders?: string[],
+    signal?: AbortSignal,
   ): Promise<{ statusCode: number; body: string; headers: Record<string, string> }>;
 }
 
@@ -278,11 +282,11 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
     getProtocolVersion() {
       return protocolVersion;
     },
-    rawPost(body, extraHeaders, timeout, omitUserHeaders) {
-      return doRawRequest("POST", body, extraHeaders, timeout, omitUserHeaders);
+    rawPost(body, extraHeaders, timeout, omitUserHeaders, signal) {
+      return doRawRequest("POST", body, extraHeaders, timeout, omitUserHeaders, signal);
     },
-    rawRequest(method, body, extraHeaders, timeout, omitUserHeaders) {
-      return doRawRequest(method, body, extraHeaders, timeout, omitUserHeaders);
+    rawRequest(method, body, extraHeaders, timeout, omitUserHeaders, signal) {
+      return doRawRequest(method, body, extraHeaders, timeout, omitUserHeaders, signal);
     },
   };
 

@@ -1,5 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createModernClient } from "../modern/client.js";
+import { createRecorder } from "../recorder.js";
 import { createHttpTransport } from "../transport/http.js";
 
 interface CapturedRequest {
@@ -240,5 +242,82 @@ describe("HttpTransport", () => {
 
     // Restore default responder.
     for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+  });
+});
+
+/**
+ * Make the next request hang unanswered, so only an abort can end it;
+ * returns the function that restores the default handler. When the
+ * client aborts, its socket closes and Node tears the response down
+ * (`req`'s own 'close' fires once the body is consumed, so it cannot be
+ * the trigger); a safety timer ends a response no abort reached.
+ */
+function hangNextRequest(): () => void {
+  const origListeners = server.listeners("request");
+  server.removeAllListeners("request");
+  server.once("request", (req, res) => {
+    req.resume();
+    const timer = setTimeout(() => res.destroy(), 8000);
+    res.on("close", () => clearTimeout(timer));
+  });
+  return () => {
+    server.removeAllListeners("request");
+    for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+  };
+}
+
+describe("HttpTransport raw probes honour an abort signal", () => {
+  // The raw probes (malformed body, content type, batch, GET/DELETE) used
+  // to accept no signal at all, so an aborted run still waited out the
+  // full per-request timeout on whichever of them was in flight.
+
+  it("rawPost rejects on the caller's signal while the request is in flight, long before the timeout", async () => {
+    const restore = hangNextRequest();
+    try {
+      const t = createHttpTransport({ url: serverUrl });
+      const controller = new AbortController();
+      const started = Date.now();
+      const pending = t.rawPost("{}", {}, 10000, undefined, controller.signal);
+      setTimeout(() => controller.abort(new Error("run aborted by the user")), 50);
+      await expect(pending).rejects.toThrow(/run aborted by the user/);
+      expect(Date.now() - started).toBeLessThan(5000);
+    } finally {
+      restore();
+    }
+  });
+
+  it("rawRequest rejects at once on an already-aborted signal instead of sending the request", async () => {
+    const t = createHttpTransport({ url: serverUrl });
+    lastRequest = null;
+    await expect(
+      t.rawRequest("GET", undefined, {}, 10000, undefined, AbortSignal.abort(new Error("aborted before send"))),
+    ).rejects.toThrow(/aborted before send/);
+    expect(lastRequest).toBeNull();
+  });
+
+  it("ModernClient.raw() forwards the client's default signal (RunOptions.signal) to rawPost", async () => {
+    const restore = hangNextRequest();
+    try {
+      const transport = createHttpTransport({ url: serverUrl });
+      const controller = new AbortController();
+      let id = 1000;
+      const client = createModernClient({
+        transport,
+        recorder: createRecorder(),
+        nextId: () => id++,
+        timeout: 10000,
+        protocolVersion: "2026-07-28",
+        clientCapabilities: { elicitation: {} },
+        clientInfo: { name: "test", version: "0" },
+        signal: controller.signal,
+      });
+      const started = Date.now();
+      const pending = client.raw("{this is not valid json", { method: "server/discover" });
+      setTimeout(() => controller.abort(new Error("run aborted by the user")), 50);
+      await expect(pending).rejects.toThrow(/run aborted by the user/);
+      expect(Date.now() - started).toBeLessThan(5000);
+    } finally {
+      restore();
+    }
   });
 });

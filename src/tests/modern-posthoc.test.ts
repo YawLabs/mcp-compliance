@@ -1,12 +1,15 @@
+import { rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { describe, expect, it } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { getTestDefinitionMap } from "../definitions/index.js";
 import { createHarness } from "../harness.js";
 import { createModernClient, type ModernClient } from "../modern/client.js";
 import { createRecorder, type Recorder } from "../recorder.js";
 import { MODERN_SPEC_VERSION, specBaseFor } from "../spec.js";
 import { createModernState, type ModernState, type ModernSuiteContext } from "../suites/modern/context.js";
-import { runPostHoc } from "../suites/modern/posthoc.js";
+import { POSTHOC_IDS, runPostHoc } from "../suites/modern/posthoc.js";
 import { createHttpTransport } from "../transport/http.js";
 import type { Transport, TransportKind } from "../transport/index.js";
 import { createStdioTransport } from "../transport/stdio.js";
@@ -27,20 +30,12 @@ import { MODERN_FIXTURE, passedIds, runModern, startHttpFixture, stdioFixture } 
  *
  * Shapes the fixture cannot produce (a gateway's non-JSON-RPC 401 body,
  * a null-id -32600 at HTTP 200, a reply to a client notification that
- * arrives after the next request went out) come from a node:http stub
- * or a hand-scripted recorder, scanned by the same `runPostHoc`.
+ * arrives after the next request went out, a null-id reply to one of
+ * three overlapping requests) come from a node:http stub, a scripted
+ * stdio child, or a hand-scripted recorder, scanned by the same
+ * `runPostHoc`.
  */
 
-const POSTHOC_IDS = [
-  "transport-no-server-requests",
-  "lifecycle-log-level-gating",
-  "error-id-echo",
-  "error-retired-codes",
-  "schema-result-type",
-  "schema-no-input-required-on-lists",
-  "schema-input-required-shape",
-  "schema-wire-valid",
-];
 const ALL_PASS = Object.fromEntries(POSTHOC_IDS.map((id) => [id, "pass"]));
 /**
  * Generous: the first call on a stdio scan lands on a cold process, and
@@ -57,6 +52,8 @@ const EMPTY_STATE: ModernState = createModernState();
 interface ContextOptions {
   clientCapabilities?: Record<string, unknown>;
   state?: Partial<ModernState>;
+  /** The run-wide `--retries`, which the post-hoc checks must not honour. */
+  retries?: number;
 }
 
 function makeContext(transport: Transport, opts: ContextOptions = {}): ModernSuiteContext {
@@ -64,6 +61,7 @@ function makeContext(transport: Transport, opts: ContextOptions = {}): ModernSui
     definitions: getTestDefinitionMap(MODERN_SPEC_VERSION),
     specBase: specBaseFor(MODERN_SPEC_VERSION),
     transportKind: transport.kind,
+    retries: opts.retries,
   });
   const recorder = createRecorder();
   transport.onMessage((m, meta) => recorder.recordReceived(m, meta));
@@ -96,12 +94,16 @@ function makeContext(transport: Transport, opts: ContextOptions = {}): ModernSui
 
 type Kind = "stdio" | "http";
 
+/**
+ * The eight results keyed by id. Every scan in this file runs
+ * `runPostHoc` alone, so the harness must hold exactly POSTHOC_IDS in
+ * order: an id in the table without a check, or a check outside the
+ * table, shows up here on both the empty and the populated path.
+ */
 function collect(ctx: ModernSuiteContext): Record<string, TestResult> {
+  expect(ctx.harness.tests.map((r) => r.id)).toEqual([...POSTHOC_IDS]);
   const out: Record<string, TestResult> = {};
   for (const r of ctx.harness.tests) out[r.id] = r;
-  for (const id of POSTHOC_IDS) {
-    if (!out[id]) throw new Error(`${id} did not run`);
-  }
   return out;
 }
 
@@ -155,7 +157,7 @@ async function allTriggers(client: ModernClient) {
   await fire(client, "bogus/method");
 }
 
-function expectPassed(results: Record<string, TestResult>, ids: string[]) {
+function expectPassed(results: Record<string, TestResult>, ids: readonly string[]) {
   for (const id of ids) {
     const r = results[id] as TestResult;
     expect(r.passed, `${id}: ${r.details}`).toBe(true);
@@ -248,22 +250,22 @@ const DISCOVER_RESULT = {
 describe("2026-07-28 post-hoc tests: the real suite over the clean fixture", () => {
   it("all eight pass over stdio (full suite, no --only)", async () => {
     const report = await runModern(stdioFixture().target);
-    expect(passedIds(report, POSTHOC_IDS)).toEqual(ALL_PASS);
+    expect(passedIds(report, [...POSTHOC_IDS])).toEqual(ALL_PASS);
   });
 
   it("all eight pass over HTTP (full suite, no --only)", async () => {
     const http = await startHttpFixture();
     try {
       const report = await runModern(http.url);
-      expect(passedIds(report, POSTHOC_IDS)).toEqual(ALL_PASS);
+      expect(passedIds(report, [...POSTHOC_IDS])).toEqual(ALL_PASS);
     } finally {
       await http.stop();
     }
   });
 
   it("all eight pass with a note when nothing else ran (--only the post-hoc ids)", async () => {
-    const report = await runModern(stdioFixture().target, { only: POSTHOC_IDS });
-    expect(passedIds(report, POSTHOC_IDS)).toEqual(ALL_PASS);
+    const report = await runModern(stdioFixture().target, { only: [...POSTHOC_IDS] });
+    expect(passedIds(report, [...POSTHOC_IDS])).toEqual(ALL_PASS);
     // The lifecycle module's setup discover (outside any check) is the
     // only traffic, so every note names a count of 0 or 1.
     const details = Object.fromEntries(report.tests.map((t) => [t.id, t.details]));
@@ -516,9 +518,9 @@ describe("2026-07-28 post-hoc tests: error-id-echo and schema-wire-valid on tran
     const wire = results["schema-wire-valid"] as TestResult;
     expect(wire.passed, wire.details).toBe(true);
     expect(wire.details).toBe(
-      "no server messages to validate (2 non-JSON-RPC bodies on transport-level rejections not validated (HTTP 401 x2))",
+      "no server messages to validate (2 non-JSON-RPC bodies on HTTP error responses not validated (HTTP 401 x2))",
     );
-    expectPassed(results, POSTHOC_IDS);
+    expectPassed(results, [...POSTHOC_IDS]);
   });
 
   it("a JSON-RPC null-id error on a 401/403 is exempt from error-id-echo (the id was never read)", async () => {
@@ -528,9 +530,42 @@ describe("2026-07-28 post-hoc tests: error-id-echo and schema-wire-valid on tran
     const echo = results["error-id-echo"] as TestResult;
     expect(echo.passed, echo.details).toBe(true);
     expect(echo.details).toBe(
-      "no error responses to id-bearing requests recorded (exempt: 1 on transport-level rejections (HTTP 401/403/413/415/429))",
+      "no error responses to id-bearing requests recorded (exempt: 1 without an id on transport-level rejections (HTTP 401/403/413/415/429))",
     );
-    expectPassed(results, POSTHOC_IDS);
+    expectPassed(results, [...POSTHOC_IDS]);
+  });
+
+  it("a 429 JSON-RPC error whose id is present but retyped is an offender: the exemption covers absent ids only", async () => {
+    // The id was read (it is there, as a string) and then retyped; that is
+    // the id-echo violation, whatever the status. Before this the whole
+    // reply was exempt as a transport-level rejection.
+    const { results } = await scanRecording("http", (recorder) => {
+      recorder.recordSent({ id: 1000, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived(
+        { jsonrpc: "2.0", id: "1000", error: { code: -32000, message: "Too Many Requests" } },
+        { statusCode: 429 },
+      );
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      '1 of 1 error response did not echo the request id; first: server/discover sent id 1000, reply carried "1000"',
+    );
+  });
+
+  it("a JSON-RPC null-id error at HTTP 400 answering a well-formed request is NOT exempt (400 is an intermediary status, not an auth gate's)", async () => {
+    const { results } = await scanRecording("http", (recorder) => {
+      recorder.recordSent({ id: 1000, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived(
+        { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } },
+        { statusCode: 400 },
+      );
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      "1 of 1 error response did not echo the request id; first: server/discover sent id 1000, reply carried null",
+    );
   });
 
   it("a null-id -32600 at HTTP 200 answering a well-formed request FAILS error-id-echo (the code exempts nothing)", async () => {
@@ -578,6 +613,46 @@ describe("2026-07-28 post-hoc tests: error-id-echo and schema-wire-valid on tran
       "no error responses to id-bearing requests recorded (exempt: 1 answering raw probes or client notifications)",
     );
   });
+
+  it("intermediary bodies on a 400 or 5xx are noted, not schema violations, and a GCP-style {error:{code}} is not a JSON-RPC error", async () => {
+    // streamable-http#server-validation: an intermediary MUST answer a
+    // header-validation failure with an HTTP error such as 400 but need
+    // not produce a JSON-RPC error; a gateway's 502 body is whatever the
+    // gateway writes. The suite sends header-mutated requests through
+    // rpc(), so these land on id-bearing requests.
+    const { results } = await scanRecording("http", (recorder) => {
+      recorder.recordSent({ id: 1000, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived({ error: "Bad Request" }, { statusCode: 400 });
+      recorder.recordSent({ id: 1001, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived({ message: "Bad Gateway" }, { statusCode: 502 });
+      recorder.recordSent({ id: 1002, method: "tools/list", params: {}, meta: undefined });
+      recorder.recordReceived(
+        { error: { code: 400, message: "Missing required header", status: "INVALID_ARGUMENT" } },
+        { statusCode: 400 },
+      );
+    });
+    const wire = results["schema-wire-valid"] as TestResult;
+    expect(wire.passed, wire.details).toBe(true);
+    expect(wire.details).toBe(
+      "no server messages to validate (3 non-JSON-RPC bodies on HTTP error responses not validated (HTTP 400 x2, HTTP 502 x1))",
+    );
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed, echo.details).toBe(true);
+    expect(echo.details).toBe(
+      "no error responses to id-bearing requests recorded (exempt: 2 non-JSON-RPC error bodies not counted)",
+    );
+    expectPassed(results, [...POSTHOC_IDS]);
+  });
+
+  it("a non-JSON-RPC body at HTTP 200 is the server's own answer and still fails schema-wire-valid", async () => {
+    const { results } = await scanRecording("http", (recorder) => {
+      recorder.recordSent({ id: 1000, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived({ ok: true }, { statusCode: 200 });
+    });
+    const wire = results["schema-wire-valid"] as TestResult;
+    expect(wire.passed).toBe(false);
+    expect(wire.details).toMatch(/^1 of 1 server message violate the 2026-07-28 schema/);
+  });
 });
 
 describe("2026-07-28 post-hoc tests: timeline attribution of a reply to a client notification", () => {
@@ -623,6 +698,162 @@ describe("2026-07-28 post-hoc tests: timeline attribution of a reply to a client
   });
 });
 
+describe("2026-07-28 post-hoc tests: timeline attribution when id-bearing requests overlap", () => {
+  const discover = (id: number) => ({ jsonrpc: "2.0", id, result: DISCOVER_RESULT });
+  const nullIdError = { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
+
+  it("blames the unanswered request the stray overlapped, not the later one that got its own reply (scripted)", async () => {
+    // Three requests in flight; the server answers the second with
+    // id: null. The stray arrives before the third's reply, so the pop
+    // lands it on 1003, which is then answered by id: 1002 is the one
+    // request that never was.
+    const { results } = await scanRecording("stdio", (recorder) => {
+      recorder.recordSent({ id: 1001, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordSent({ id: 1002, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordSent({ id: 1003, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived(nullIdError);
+      recorder.recordReceived(discover(1001));
+      recorder.recordReceived(discover(1003));
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      "1 of 1 error response did not echo the request id; first: server/discover sent id 1002, reply carried null",
+    );
+  });
+
+  it("does not reach past an unanswered request to an older notification (the id-less fallback is bounded)", async () => {
+    const { results } = await scanRecording("stdio", (recorder) => {
+      recorder.recordSent({ id: undefined, method: "notifications/cancelled", params: {}, meta: undefined });
+      recorder.recordSent({ id: 1001, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordSent({ id: 1002, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived(nullIdError);
+      recorder.recordReceived(discover(1002));
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      "1 of 1 error response did not echo the request id; first: server/discover sent id 1001, reply carried null",
+    );
+  });
+
+  it("still prefers a notification sent AFTER the unanswered request (the more recent send wins)", async () => {
+    const { results } = await scanRecording("stdio", (recorder) => {
+      recorder.recordSent({ id: 1001, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordSent({ id: undefined, method: "notifications/cancelled", params: {}, meta: undefined });
+      recorder.recordSent({ id: 1002, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived(nullIdError);
+      recorder.recordReceived(discover(1002));
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed, echo.details).toBe(true);
+    expect(echo.details).toBe(
+      "no error responses to id-bearing requests recorded (exempt: 1 answering raw probes or client notifications)",
+    );
+  });
+
+  it("over real HTTP in the suite's own order (a notify, then three concurrent discovers): the null-id reply to 1002 fails error-id-echo", async () => {
+    // transport-notification-202 sends a notification (202, empty body),
+    // then transport-concurrent fires three discovers at once. The stub
+    // answers 1002 with id: null straight away and the other two after
+    // it, so the stray arrives while 1003 is still pending. Before the
+    // bounded re-attribution the stray was moved to the notification and
+    // the check PASSED.
+    const pending: { id: number; res: ServerResponse }[] = [];
+    const overlap = (_req: IncomingMessage, res: ServerResponse, body: string) => {
+      const m = JSON.parse(body) as { id?: number };
+      if (m.id === undefined) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      if (m.id === 1000) {
+        sendJson(res, 200, discover(1000));
+        return;
+      }
+      pending.push({ id: m.id, res });
+      if (pending.length < 3) return;
+      for (const p of pending) {
+        if (p.id === 1002) sendJson(p.res, 200, nullIdError);
+        else setTimeout(() => sendJson(p.res, 200, discover(p.id)), p.id === 1001 ? 80 : 160);
+      }
+    };
+    const { results } = await scanStub(overlap, async (client) => {
+      await fire(client, "server/discover");
+      await client.notify("notifications/cancelled", { requestId: 999999 });
+      await Promise.all([0, 1, 2].map(() => fire(client, "server/discover")));
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      "1 of 1 error response did not echo the request id; first: server/discover sent id 1002, reply carried null",
+    );
+  });
+});
+
+describe("2026-07-28 post-hoc tests: the cancel a stdio stream's close() writes is recorded", () => {
+  let tempFiles: string[] = [];
+  afterEach(() => {
+    for (const f of tempFiles) rmSync(f, { force: true });
+    tempFiles = [];
+  });
+
+  /**
+   * A stdio child that answers server/discover, never acknowledges
+   * subscriptions/listen, and (wrongly) answers notifications/cancelled
+   * with a null-id error -- the reply the timeline must attribute to the
+   * cancel, not to the listen request it names.
+   */
+  function cancelAnsweringChild(): string {
+    const script = [
+      'const rl = require("node:readline").createInterface({ input: process.stdin });',
+      'const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");',
+      `const discover = ${JSON.stringify(DISCOVER_RESULT)};`,
+      'rl.on("line", (line) => {',
+      "  let msg;",
+      "  try { msg = JSON.parse(line); } catch { return; }",
+      '  if (msg.method === "server/discover") send({ jsonrpc: "2.0", id: msg.id, result: discover });',
+      '  if (msg.method === "notifications/cancelled") send({ jsonrpc: "2.0", id: null, error: { code: -32602, message: "unknown request " + msg.params.requestId } });',
+      "});",
+      "setTimeout(() => {}, 30000);",
+    ].join("\n");
+    const path = join(tmpdir(), `mcp-compliance-posthoc-cancel-${process.pid}-${Date.now()}-${Math.random()}.cjs`);
+    writeFileSync(path, script, "utf8");
+    tempFiles.push(path);
+    return path;
+  }
+
+  it("attributes the reply to notifications/cancelled to that notification, not to the stream's request", async () => {
+    const transport = createStdioTransport({ command: process.execPath, args: [cancelAnsweringChild()] });
+    try {
+      const ctx = makeContext(transport);
+      await fire(ctx.client, "server/discover");
+      const stream = await ctx.client.stream("subscriptions/listen", { notifications: {} }, { timeout: 300 });
+      for await (const _ of stream.messages) {
+        // never acknowledged: the timer ends the stream
+      }
+      await stream.close(); // writes notifications/cancelled { requestId: 1001 }
+      await vi.waitFor(() => expect(ctx.recorder.received).toHaveLength(2), { timeout: 5000, interval: 10 });
+      // The transport's own cancel is logged as a sent entry, in order.
+      expect(ctx.recorder.sent.map((s) => [s.method, s.id])).toEqual([
+        ["server/discover", 1000],
+        ["subscriptions/listen", 1001],
+        ["notifications/cancelled", undefined],
+      ]);
+      expect(ctx.recorder.sent[2]?.params).toEqual({ requestId: 1001 });
+      await runPostHoc(ctx);
+      const results = collect(ctx);
+      const echo = results["error-id-echo"] as TestResult;
+      expect(echo.passed, echo.details).toBe(true);
+      expect(echo.details).toBe(
+        "no error responses to id-bearing requests recorded (exempt: 1 answering raw probes or client notifications)",
+      );
+    } finally {
+      await transport.close();
+    }
+  });
+});
+
 describe("2026-07-28 post-hoc tests: schema-input-required-shape rules", () => {
   const inputRequired = (inputRequests: Record<string, unknown>) => (recorder: Recorder) => {
     recorder.recordSent({ id: 1000, method: "tools/call", params: { name: "t", arguments: {} }, meta: undefined });
@@ -640,7 +871,58 @@ describe("2026-07-28 post-hoc tests: schema-input-required-shape rules", () => {
     const r = results["schema-input-required-shape"] as TestResult;
     expect(r.passed, r.details).toBe(true);
     expect(r.details).toBe(
-      "1 input_required result observed, every one well-formed (inputRequests/requestState present, methods allowed and declared by the client [elicitation, roots], params present where required)",
+      "1 input_required result observed, every one well-formed (inputRequests/requestState present, methods allowed and declared by the client [elicitation, roots], params present where required, elicitation modes within the declared [form])",
+    );
+  });
+
+  it("flags elicitation/create in url mode when the client declared elicitation: {} (form only)", async () => {
+    // client/elicitation#capabilities: an empty object is the
+    // backwards-compatible form-only declaration, and servers MUST NOT
+    // elicit in a mode the client did not declare. The suite declares
+    // exactly {} .
+    const { results } = await scanRecording(
+      "http",
+      inputRequired({
+        e: {
+          method: "elicitation/create",
+          params: { mode: "url", message: "Sign in", url: "https://example.com/auth", elicitationId: "e-1" },
+        },
+      }),
+    );
+    const r = results["schema-input-required-shape"] as TestResult;
+    expect(r.passed).toBe(false);
+    expect(r.details).toBe(
+      '1 of 1 input_required result violates the MRTR server requirements; first (tools/call): inputRequests.e.params.mode "url" is not an elicitation mode the client declared (form)',
+    );
+  });
+
+  it("accepts url mode once the client declared elicitation: { form: {}, url: {} }", async () => {
+    const { results } = await scanRecording(
+      "stdio",
+      inputRequired({
+        e: {
+          method: "elicitation/create",
+          params: { mode: "url", message: "Sign in", url: "https://example.com/auth", elicitationId: "e-1" },
+        },
+      }),
+      { clientCapabilities: { elicitation: { form: {}, url: {} } } },
+    );
+    const r = results["schema-input-required-shape"] as TestResult;
+    expect(r.passed, r.details).toBe(true);
+    expect(r.details).toMatch(/elicitation modes within the declared \[form, url\]\)$/);
+  });
+
+  it("treats an absent mode as form: accepted under elicitation: {}, flagged when the client declared url only", async () => {
+    const formByDefault = inputRequired({
+      e: { method: "elicitation/create", params: { message: "Your name?", requestedSchema: { type: "object" } } },
+    });
+    const accepted = await scanRecording("http", formByDefault);
+    expect(accepted.results["schema-input-required-shape"]?.passed).toBe(true);
+    const urlOnly = await scanRecording("http", formByDefault, { clientCapabilities: { elicitation: { url: {} } } });
+    const r = urlOnly.results["schema-input-required-shape"] as TestResult;
+    expect(r.passed).toBe(false);
+    expect(r.details).toMatch(
+      /inputRequests\.e\.params\.mode "form" is not an elicitation mode the client declared \(url\)$/,
     );
   });
 
@@ -734,5 +1016,45 @@ describe("2026-07-28 post-hoc tests: schema-result-type value set", () => {
       state: { capabilities: { extensions: {} } },
     });
     expect(results["schema-result-type"]?.passed).toBe(false);
+  });
+});
+
+describe("2026-07-28 post-hoc tests: no retries, one id table", () => {
+  const NOTHING = "no JSON-RPC messages were received from the server during the run, so there is nothing to scan";
+  /** Under --retries 3 the harness would sleep 1+2+3 s per failing test; a deterministic scan must not. */
+  const RETRIES = 3;
+
+  it("fails all eight on an empty recorder at once under --retries 3 (a scan cannot change on a retry)", async () => {
+    const started = Date.now();
+    const { results } = await scanRecording("http", () => {}, { retries: RETRIES });
+    expect(Date.now() - started).toBeLessThan(2000);
+    for (const id of POSTHOC_IDS) {
+      const r = results[id] as TestResult;
+      expect(r.passed, id).toBe(false);
+      expect(r.details, id).toBe(NOTHING);
+    }
+  });
+
+  it("takes no retries on a populated recording either", async () => {
+    const started = Date.now();
+    const { results } = await scanRecording(
+      "stdio",
+      (recorder) => {
+        recorder.recordSent({ id: 1000, method: "server/discover", params: {}, meta: undefined });
+        recorder.recordReceived({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "no id for you" } });
+      },
+      { retries: RETRIES },
+    );
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(results["error-id-echo"]?.passed).toBe(false);
+    expect(results["schema-result-type"]?.passed, "an unrelated check still passes").toBe(true);
+  });
+
+  it("the exported table is the catalog's eight post-hoc ids, each a known definition", () => {
+    const definitions = getTestDefinitionMap(MODERN_SPEC_VERSION);
+    for (const id of POSTHOC_IDS) expect(definitions.has(id), id).toBe(true);
+    expect(new Set(POSTHOC_IDS).size).toBe(8);
+    // collect() asserts on every scan that exactly these ids ran, in this
+    // order, on the empty and the populated path alike.
   });
 });

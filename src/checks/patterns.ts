@@ -26,6 +26,22 @@ export const INJECTION_PAYLOADS = {
 //   - bare /ENOENT|EACCES|EPERM/ — these appear in well-formed error
 //     messages ("ENOENT: no such file"), so we only flag them when they
 //     co-occur with a filesystem path below.
+
+/**
+ * Windows absolute paths (drive + 2+ segments), any drive-letter case. The
+ * samples the suites scan are JSON-serialised, so a path separator arrives
+ * as a doubled backslash (`C:\\Users\\svc`) while a lone backslash is the
+ * start of a JSON escape (`ERROR:\n  Expected string` is `R:` + `\n`, not
+ * a drive). A separator is therefore either two backslashes or one that
+ * does not begin an escape sequence; the second form keeps raw (non-JSON)
+ * bodies covered, at the cost of a raw path whose segment starts with an
+ * escape letter (`C:\temp\x` outside JSON), which stays unmatched.
+ */
+const WINDOWS_PATH_SEPARATOR = String.raw`(?:\\\\|\\(?![\\nrtbfu"/]))`;
+export const WINDOWS_PATH_PATTERN = new RegExp(
+  String.raw`[A-Za-z]:${WINDOWS_PATH_SEPARATOR}[\w\s.-]+${WINDOWS_PATH_SEPARATOR}[\w\s.-]+`,
+);
+
 export const STACK_TRACE_PATTERNS = [
   /at\s+\S+\s+\(.*:\d+:\d+\)/i, // Node.js: "at Function (file.js:10:5)"
   /Traceback\s+\(most recent/i, // Python
@@ -38,12 +54,29 @@ export const STACK_TRACE_PATTERNS = [
   /panicked\s+at\s+'/i, // Rust
   /node_modules\//, // Node.js module paths (filesystem layout leak)
   /\/usr\/local\/|\/home\/|\/root\//, // Unix absolute paths
-  // Windows absolute paths (drive + 2+ segments). The samples the suites
-  // scan are JSON-serialised, so each backslash usually arrives doubled
-  // (`C:\\Users\\svc`); `\\{1,2}` matches the raw and the escaped form.
-  /[A-Z]:\\{1,2}[\w\s.-]+\\{1,2}[\w\s.-]+/,
+  WINDOWS_PATH_PATTERN,
   /jdbc:|mysql:\/\/|postgres(?:ql)?:\/\/|mongodb(?:\+srv)?:\/\//i, // DB connection strings
 ];
+
+/**
+ * Internal hostnames (db01.corp.internal, cache.lan:6379). The suffix must
+ * be the LAST label -- lowercase, not followed by a label character or
+ * another label -- so `foo.internal-api.example.com`, `example.lan-party.com`
+ * and `settings.local.json` are not hostnames. A bare `label.suffix` is a
+ * property path as often as a host (`ctx.internal`, `settings.local`), so
+ * it needs hostname context: at least two labels before the suffix, or a
+ * preceding `//`, `@`, `getaddrinfo`/ENOTFOUND/EAI_AGAIN, or a `:port`.
+ */
+const HOST_LABEL = "[a-z0-9-]+";
+const INTERNAL_HOST_SUFFIX = "(?:internal|local|corp|lan|intranet)";
+const HOST_END = String.raw`(?![\w-]|\.\w)`;
+export const INTERNAL_HOSTNAME_PATTERN = new RegExp(
+  [
+    String.raw`\b${HOST_LABEL}(?:\.${HOST_LABEL})+\.${INTERNAL_HOST_SUFFIX}${HOST_END}`,
+    String.raw`(?<=\/\/|@|getaddrinfo |ENOTFOUND |EAI_AGAIN )${HOST_LABEL}\.${INTERNAL_HOST_SUFFIX}${HOST_END}`,
+    String.raw`\b${HOST_LABEL}\.${INTERNAL_HOST_SUFFIX}(?=:\d)`,
+  ].join("|"),
+);
 
 export const INTERNAL_IP_PATTERNS = [
   /\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
@@ -51,12 +84,13 @@ export const INTERNAL_IP_PATTERNS = [
   /\b192\.168\.\d{1,3}\.\d{1,3}\b/,
   /\b127\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
   /\b169\.254\.\d{1,3}\.\d{1,3}\b/, // IPv4 link-local, incl. the cloud metadata service
-  /\b::1\b/, // IPv6 loopback
+  // IPv6 loopback in its usual forms: `::1`, `[::1]:5432`, `::1:5432`. No
+  // hex digit or colon may precede it, so `2001:db8::1` (a public address
+  // ending in ::1) is not loopback.
+  /(?<![0-9a-f:])::1(?![0-9a-f])/i,
   /\bfe80:/i, // IPv6 link-local
   /\bf[cd][0-9a-f]{2}:/i, // IPv6 unique local (fc00::/fd00::)
-  // Internal hostnames (db01.corp.internal, cache.lan). The lookahead keeps
-  // a dotted file name such as settings.local.json from matching.
-  /\b[\w-]+\.(internal|local|corp|lan|intranet)\b(?!\.\w)/i,
+  INTERNAL_HOSTNAME_PATTERN,
 ];
 
 /**

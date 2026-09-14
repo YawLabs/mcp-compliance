@@ -1,6 +1,11 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { runComplianceSuite } from "../runner.js";
+import { MODERN_SPEC_VERSION } from "../spec.js";
 import {
   acknowledgmentProblem,
   acknowledgmentSurplus,
@@ -9,7 +14,7 @@ import {
   supportedVersionsNamedIn,
   unsupportedVersionDataProblems,
 } from "../suites/modern/lifecycle.js";
-import type { ComplianceReport, TransportTarget } from "../types.js";
+import type { ComplianceReport, TestResult, TransportTarget } from "../types.js";
 import {
   type HttpFixture,
   LEGACY_ECHO_FIXTURE,
@@ -354,8 +359,9 @@ describe("modern lifecycle over http only", () => {
 });
 
 describe("a legacy-only server pinned to 2026-07-28 (echo fixture over stdio)", () => {
+  const target: TransportTarget = { type: "stdio", command: process.execPath, args: [LEGACY_ECHO_FIXTURE] };
+
   it("fails the _meta rejection tests as not evaluable instead of crediting its blanket -32601", async () => {
-    const target: TransportTarget = { type: "stdio", command: process.execPath, args: [LEGACY_ECHO_FIXTURE] };
     const report = await runModern(target, { only: ["lifecycle-discover", ...META_REJECTION_IDS] });
     expectFailed(report, "lifecycle-discover", /JSON-RPC error -32601/);
     for (const id of META_REJECTION_IDS) {
@@ -368,6 +374,33 @@ describe("a legacy-only server pinned to 2026-07-28 (echo fixture over stdio)", 
     // No "rejected with -32601 (expected -32602)" warning either: nothing was credited.
     expect(lifecycleWarnings(report)).toEqual([]);
     expect(report.summary.requiredPassed).toBe(0);
+  });
+
+  it("fails subscriptions-listen as not evaluable too, instead of crediting the blanket rejection", async () => {
+    const report = await runModern(target, {
+      only: ["lifecycle-discover", "lifecycle-removed-methods", "lifecycle-subscriptions-listen"],
+    });
+    // A legacy server serves ping: a real "served" failure, whatever the discover state.
+    expectFailed(report, "lifecycle-removed-methods", /^ping: served \(result\)/);
+    expectFailed(
+      report,
+      "lifecycle-subscriptions-listen",
+      /^subscriptions\/listen rejected with -32601; not evaluable: the conformant server\/discover was itself rejected with -32601/,
+    );
+    // Nothing was credited, so no "rejected with X (expected -32601)" warnings either.
+    expect(lifecycleWarnings(report)).toEqual([]);
+  });
+
+  it("reports the served initialize as legacy-only, not dual-era, and warns accordingly", async () => {
+    const report = await runModern(target, { only: ["lifecycle-discover", "lifecycle-dual-era"] });
+    expectFailed(report, "lifecycle-discover", /JSON-RPC error -32601/);
+    expect(expectPassed(report, "lifecycle-dual-era").details).toBe(
+      "legacy-only: initialize answered with protocolVersion 2025-11-25 on a fresh process but server/discover was rejected; only the legacy handshake is served (see warning)",
+    );
+    expect(report.warnings.some((w) => w.startsWith("Server is dual-era"))).toBe(false);
+    expect(report.warnings).toContain(
+      "Server is legacy-only (served the 2025-11-25 initialize handshake but rejected server/discover); this run graded 2026-07-28, so most of its tests are not evaluable. Re-run with --spec-version 2025-11-25 (or auto) to grade the era it speaks.",
+    );
   });
 });
 
@@ -709,4 +742,412 @@ describe("listenFilterFor (what lifecycle-subscriptions-listen requests)", () =>
     // A boolean where an object is expected never counts as advertising anything.
     expect(listenFilterFor({ tools: true })).toEqual({ filter: {}, advertised: [] });
   });
+});
+
+// ---------------------------------------------------------------------------
+// Attribution of rejections: transport-level statuses and the security burst
+// ---------------------------------------------------------------------------
+
+/** The conformant answer to a claim-less discover: -32602 on 400. */
+const invalidParams = (id: unknown, what: string): StubReply => ({
+  status: 400,
+  body: { jsonrpc: "2.0", id, error: { code: -32602, message: `Invalid params: ${what}` } },
+});
+
+const hasProtocolVersionClaim = (msg: Record<string, any>) =>
+  typeof msg.params?._meta?.["io.modelcontextprotocol/protocolVersion"] === "string";
+
+/**
+ * A conformant modern stub: full-envelope discover served, claim-less
+ * discover -32602, initialize -32601 naming the version, everything else
+ * -32601. `gate` may intercept a request first (an intermediary).
+ */
+function conformantRoute(gate?: (method: string, msg: Record<string, any>) => StubReply | undefined): StubRoute {
+  return (method, msg) => {
+    const intercepted = gate?.(method, msg);
+    if (intercepted) return intercepted;
+    if (method === "server/discover") {
+      if (!hasProtocolVersionClaim(msg)) return invalidParams(msg.id, "_meta protocolVersion required");
+      return discoverReply(msg.id, {});
+    }
+    if (method === "initialize") {
+      return {
+        status: 404,
+        body: {
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32601, message: "Method not found: initialize. This server speaks MCP 2026-07-28" },
+        },
+      };
+    }
+    return notFound(msg.id, method);
+  };
+}
+
+describe("rejections answered by a transport-level gate are not evaluable", () => {
+  it("a bare 429 on the claim-less discover fails lifecycle-meta-required instead of passing as a rejection", async () => {
+    // A rate limiter that happens to trip on the malformed request.
+    const stub = await startModernStub(
+      conformantRoute((method, msg) =>
+        method === "server/discover" && msg.params?._meta === undefined
+          ? { status: 429, body: "rate limited" }
+          : undefined,
+      ),
+    );
+    try {
+      const report = await runModern(stub.url, {
+        only: ["lifecycle-discover", "lifecycle-meta-required", "lifecycle-meta-protocol-version-required"],
+      });
+      expectPassed(report, "lifecycle-discover");
+      expectFailed(
+        report,
+        "lifecycle-meta-required",
+        /^server\/discover without _meta: not evaluable: HTTP 429 is a transport-level rejection \(rate limiting answered before the JSON-RPC layer read the request\), so it proves nothing about the injected defect$/,
+      );
+      // The gate did not touch the other probe: still a clean -32602.
+      expect(expectPassed(report, "lifecycle-meta-protocol-version-required").details).toBe(
+        "server/discover without _meta protocolVersion: rejected with -32602 (HTTP 400)",
+      );
+      // Not credited, so no "rejected with HTTP 429 but no JSON-RPC error body" warning.
+      expect(lifecycleWarnings(report)).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("the late lifecycle block runs before the security burst, so a gateway that rate-limits the burst cannot feed it 429s", async () => {
+    // An intermediary that answers 429 for two seconds once more than 20
+    // requests land within 100 ms -- exactly what security-rate-limiting's
+    // burst of 50 concurrent discovers trips.
+    let recent: number[] = [];
+    let limitedUntil = 0;
+    const stub = await startModernStub(
+      conformantRoute(() => {
+        const now = Date.now();
+        if (now < limitedUntil) return { status: 429, body: "rate limited" };
+        recent = recent.filter((t) => now - t < 100);
+        recent.push(now);
+        if (recent.length > 20) {
+          limitedUntil = now + 2000;
+          return { status: 429, body: "rate limited" };
+        }
+        return undefined;
+      }),
+    );
+    try {
+      const report = await runModern(stub.url, {
+        only: [
+          "lifecycle-discover",
+          "lifecycle-meta-required",
+          "lifecycle-meta-protocol-version-required",
+          "lifecycle-dual-era",
+          "security-rate-limiting",
+        ],
+      });
+      // The burst itself saw the limiter.
+      expect(expectPassed(report, "security-rate-limiting").details).toMatch(/429/);
+      // The probes ran before it: clean verdicts, no 429 anywhere near them.
+      expect(expectPassed(report, "lifecycle-meta-required").details).toBe(
+        "server/discover without _meta: rejected with -32602 (HTTP 400)",
+      );
+      expect(expectPassed(report, "lifecycle-meta-protocol-version-required").details).toBe(
+        "server/discover without _meta protocolVersion: rejected with -32602 (HTTP 400)",
+      );
+      expect(expectPassed(report, "lifecycle-dual-era").details).toBe(
+        "modern-only: initialize rejected with -32601 (HTTP 404); message names supported versions",
+      );
+      expect(lifecycleWarnings(report)).toEqual([]);
+      const order = report.tests.map((t) => t.id);
+      expect(order.indexOf("lifecycle-dual-era")).toBeLessThan(order.indexOf("security-rate-limiting"));
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("a bare 429 on the legacy initialize leaves the era undetermined rather than 'modern-only'", async () => {
+    const stub = await startModernStub(
+      conformantRoute((method) => (method === "initialize" ? { status: 429, body: "rate limited" } : undefined)),
+    );
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-dual-era"] });
+      expect(expectPassed(report, "lifecycle-dual-era").details).toBe(
+        "era undetermined: initialize answered HTTP 429, a transport-level rejection (see warning)",
+      );
+      expect(lifecycleWarnings(report)).toEqual([
+        expect.stringMatching(/^lifecycle-dual-era: legacy initialize was answered HTTP 429; not evaluable: HTTP 429/),
+      ]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("a server that rejects everything (SDK v1 'Server not initialized') over HTTP", () => {
+  it("fails removed-methods and subscriptions-listen as not evaluable", async () => {
+    const stub = await startModernStub((_method, msg) => ({
+      status: 400,
+      body: { jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "Bad Request: Server not initialized" } },
+    }));
+    try {
+      const report = await runModern(stub.url, {
+        only: ["lifecycle-discover", "lifecycle-removed-methods", "lifecycle-subscriptions-listen"],
+      });
+      const reason =
+        "not evaluable: the conformant server/discover was itself rejected with -32000 (HTTP 400), so this rejection proves nothing about the injected defect";
+      expect(expectFailed(report, "lifecycle-removed-methods").details).toBe(
+        `ping -32000, logging/setLevel -32000, resources/subscribe -32000 rejected; ${reason}`,
+      );
+      expect(expectFailed(report, "lifecycle-subscriptions-listen").details).toBe(
+        `subscriptions/listen rejected with -32000 (HTTP 400); ${reason}`,
+      );
+      expect(lifecycleWarnings(report)).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("a legacy-only server pinned to 2026-07-28 over HTTP (initialize served, discover -32601)", () => {
+  it("reports legacy-only, not dual-era, and warns to re-pin", async () => {
+    const stub = await startModernStub((method, msg) => {
+      if (method === "initialize") {
+        return {
+          status: 200,
+          body: {
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: {
+              protocolVersion: "2025-11-25",
+              capabilities: {},
+              serverInfo: { name: "legacy-stub", version: "1" },
+            },
+          },
+        };
+      }
+      return notFound(msg.id, method);
+    });
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-discover", "lifecycle-dual-era"] });
+      expectFailed(report, "lifecycle-discover", /JSON-RPC error -32601/);
+      expect(expectPassed(report, "lifecycle-dual-era").details).toBe(
+        "legacy-only: initialize answered with protocolVersion 2025-11-25 but server/discover was rejected; only the legacy handshake is served (see warning)",
+      );
+      expect(report.warnings.some((w) => w.startsWith("Server is dual-era"))).toBe(false);
+      expect(report.warnings.some((w) => w.startsWith("Server is legacy-only (served the 2025-11-25 initialize"))).toBe(
+        true,
+      );
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("lifecycle-dual-era on an unreachable server", () => {
+  it("names the connection error instead of claiming a timeout", async () => {
+    // A port nothing listens on: bind one, read it back, release it.
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const { port } = probe.address() as AddressInfo;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    const report = await runModern(`http://127.0.0.1:${port}/mcp`, {
+      only: ["lifecycle-discover", "lifecycle-dual-era"],
+    });
+    expectFailed(report, "lifecycle-discover", /^server\/discover got no response \(/);
+    const dual = expectPassed(report, "lifecycle-dual-era");
+    expect(dual.details).toMatch(
+      /^legacy initialize got no response \(.*ECONNREFUSED.*\); era undetermined \(see warning\)$/,
+    );
+    expect(dual.details).not.toMatch(/within \d+ms/);
+    expect(lifecycleWarnings(report)).toEqual([
+      expect.stringMatching(/^lifecycle-dual-era: legacy initialize got no response \(.*ECONNREFUSED/),
+    ]);
+  });
+});
+
+describe("--only lifecycle: lists obtained by capability-handlers-match are reused", () => {
+  it("sends tools/list once for handlers-match + progress-token", async () => {
+    const sent: string[] = [];
+    const stub = await startModernStub((method, msg) => {
+      sent.push(method);
+      if (method === "server/discover") return discoverReply(msg.id, { tools: {} });
+      if (method === "tools/list") {
+        return {
+          status: 200,
+          body: {
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: {
+              resultType: "complete",
+              tools: [{ name: "noop", inputSchema: { type: "object" } }],
+              ttlMs: 0,
+              cacheScope: "public",
+            },
+          },
+        };
+      }
+      if (method === "tools/call") {
+        return {
+          status: 200,
+          body: {
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { resultType: "complete", content: [{ type: "text", text: "ok" }] },
+          },
+        };
+      }
+      return notFound(msg.id, method);
+    });
+    try {
+      const report = await runModern(stub.url, {
+        only: ["lifecycle-capability-handlers-match", "lifecycle-progress-token"],
+      });
+      expect(expectPassed(report, "lifecycle-capability-handlers-match").details).toMatch(/^tools: declared, 1 listed/);
+      expect(expectPassed(report, "lifecycle-progress-token").details).toMatch(/^tools\/call noop succeeded/);
+      expect(sent.filter((m) => m === "tools/list")).toHaveLength(1);
+      expect(report.toolNames).toEqual(["noop"]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The fresh-process initialize probe on stdio: exits, timeouts, aborts
+// ---------------------------------------------------------------------------
+
+/**
+ * A minimal 2026-07-28 stdio server whose behaviour on `initialize` is
+ * chosen by MINI_INITIALIZE (reject | silent | exit) and that, given
+ * MINI_LOCK, allows one instance at a time (a lock file it never
+ * releases: the second instance exits 1 at startup, like a server that
+ * takes an exclusive port or database). Written to a temp dir per file.
+ */
+const MINI_SERVER_SRC = `"use strict";
+const fs = require("node:fs");
+const readline = require("node:readline");
+const lock = process.env.MINI_LOCK;
+if (lock) {
+  try {
+    fs.writeFileSync(lock, String(process.pid), { flag: "wx" });
+  } catch {
+    fs.writeSync(2, "Error: already running (lock file held by another instance)\\n");
+    process.exit(1);
+  }
+}
+const out = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  let msg;
+  try { msg = JSON.parse(line); } catch { return; }
+  if (!msg || msg.id === undefined) return;
+  if (msg.method === "server/discover") {
+    out({ jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", supportedVersions: ["2026-07-28"],
+      capabilities: {}, ttlMs: 0, cacheScope: "public",
+      _meta: { "io.modelcontextprotocol/serverInfo": { name: "mini-server", version: "0" } } } });
+    return;
+  }
+  if (msg.method === "initialize") {
+    const mode = process.env.MINI_INITIALIZE || "reject";
+    if (mode === "silent") return;
+    if (mode === "exit") {
+      fs.writeSync(2, "Error: initialize is not supported by this server\\n");
+      process.exit(3);
+    }
+    out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found: initialize. This server speaks MCP 2026-07-28" } });
+    return;
+  }
+  out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found: " + msg.method } });
+});
+process.stdin.on("end", () => process.exit(0));
+`;
+
+describe("lifecycle-dual-era: fresh-process initialize on stdio", () => {
+  let dir: string;
+  let script: string;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "mcp-compliance-mini-"));
+    script = join(dir, "mini-server.cjs");
+    writeFileSync(script, MINI_SERVER_SRC);
+  });
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const target = (env: Record<string, string>): TransportTarget => ({
+    type: "stdio",
+    command: process.execPath,
+    args: [script],
+    env,
+  });
+
+  it("a server that exits on the request fails, naming the exit and that an idle instance stays up", async () => {
+    const report = await runModern(target({ MINI_INITIALIZE: "exit" }), { only: ["lifecycle-dual-era"] });
+    expect(expectFailed(report, "lifecycle-dual-era").details).toBe(
+      "Server exited after a legacy initialize request on a fresh process (exit code 3: Error: initialize is not supported by this server); an instance spawned with no input stays up, so the request is what it exits on",
+    );
+    expect(lifecycleWarnings(report)).toEqual([]);
+  }, 20_000);
+
+  it("a single-instance server (second instance exits at startup) passes with the era undetermined and a warning", async () => {
+    const report = await runModern(target({ MINI_LOCK: join(dir, "instance.lock") }), {
+      only: ["lifecycle-discover", "lifecycle-dual-era"],
+    });
+    // The suite's own process holds the lock and answered discover.
+    expectPassed(report, "lifecycle-discover");
+    const exit = "exit code 1: Error: already running (lock file held by another instance)";
+    expect(expectPassed(report, "lifecycle-dual-era").details).toBe(
+      `era undetermined: a second instance exits at startup alongside the suite's process (${exit}), so the legacy initialize could not be probed (see warning)`,
+    );
+    expect(lifecycleWarnings(report)).toEqual([
+      `lifecycle-dual-era: a fresh instance exited (${exit}) before answering the legacy initialize, and one spawned with no input exited too (${exit}); a server that allows one instance at a time cannot be probed alongside the suite's own process, so its era is undetermined`,
+    ]);
+  }, 20_000);
+
+  it("a server that ignores initialize is given the per-request budget, not the startup budget", async () => {
+    const report = await runModern(target({ MINI_INITIALIZE: "silent" }), {
+      only: ["lifecycle-dual-era"],
+      timeout: 1500,
+      startupTimeout: 10_000,
+    });
+    const dual = expectPassed(report, "lifecycle-dual-era");
+    const m =
+      /^No response to legacy initialize on a fresh process within (\d+)ms; era undetermined \(see warning\)$/.exec(
+        dual.details,
+      );
+    expect(m, dual.details).not.toBeNull();
+    const budget = Number(m?.[1]);
+    // The per-request timeout, stretched at most to 3x the setup discover
+    // latency (a cold node start), never the 10 s startup budget.
+    expect(budget).toBeGreaterThanOrEqual(1500);
+    expect(budget).toBeLessThan(10_000);
+    expect(dual.durationMs).toBeLessThan(8000);
+    // The warning names the budget in full instead of a clipped transport message.
+    expect(lifecycleWarnings(report)).toEqual([
+      `lifecycle-dual-era: legacy initialize got no response within ${budget}ms on a fresh process; a modern-only server SHOULD reject it with an error naming its supported versions`,
+    ]);
+  }, 20_000);
+
+  it("an abort during the fresh-process probe is not recorded as a pass", async () => {
+    const controller = new AbortController();
+    const completed: TestResult[] = [];
+    const started = Date.now();
+    const run = runComplianceSuite(target({ MINI_INITIALIZE: "silent" }), {
+      specVersion: MODERN_SPEC_VERSION,
+      only: ["lifecycle-dual-era"],
+      timeout: 5000,
+      startupTimeout: 10_000,
+      signal: controller.signal,
+      onTestComplete: (r) => completed.push(r),
+    });
+    // Past the setup discover (a cold node start), inside the initialize wait.
+    setTimeout(() => controller.abort(new Error("user abort")), 1500);
+    await expect(run).rejects.toThrow("user abort");
+    expect(Date.now() - started).toBeLessThan(5000);
+    const dual = completed.filter((r) => r.id === "lifecycle-dual-era");
+    for (const r of dual) {
+      expect(r.passed, r.details).toBe(false);
+      expect(r.details).not.toMatch(/No response to legacy initialize/);
+    }
+  }, 20_000);
 });

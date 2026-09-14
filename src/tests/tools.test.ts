@@ -297,7 +297,15 @@ describe("mcp_compliance_explain handler", () => {
     const result = await tools.mcp_compliance_explain.handler({ testId: "transport-post" });
     expect(result.isError).toBeUndefined();
     const text: string = result.content[0].text;
-    expect(text).toContain('"transport-post" exists in 2 spec suites with different criteria');
+    // Same category and required flag in both catalogs. A shared id covers
+    // the same feature but its criteria follow each revision, so explain
+    // must not claim the check is identical. "different criteria" was said
+    // of every one of the 66 shared ids.
+    expect(text).toContain(
+      '"transport-post" exists in 2 spec suites with the same category and required flag; it covers the same feature, but the pass/fail criteria follow each revision.',
+    );
+    expect(text).not.toContain("the check is the same");
+    expect(text).not.toContain("different criteria");
     expect(text).toContain("Spec version: 2025-11-25");
     expect(text).toContain("Spec version: 2026-07-28");
     expect(text).toContain(`Spec reference: ${SPEC_2025}basic/transports`);
@@ -306,6 +314,20 @@ describe("mcp_compliance_explain handler", () => {
     expect(text).toContain("Ensure your server listens for POST requests");
     expect(text).toContain("answer a well-formed server/discover with 200");
     expect(text.split("Test: transport-post")).toHaveLength(3);
+  });
+
+  it.each([
+    ["stdio-framing", "required transport in 2025-11-25, optional transport in 2026-07-28"],
+    ["error-method-code", "optional errors in 2025-11-25, required errors in 2026-07-28"],
+  ])("says 'different criteria' only when the required flag really changed: %s", async (id, flags) => {
+    const { server, tools } = createMockServer();
+    registerTools(server);
+    const result = await tools.mcp_compliance_explain.handler({ testId: id });
+    const text: string = result.content[0].text;
+    expect(text).toContain(
+      `"${id}" exists in 2 spec suites with different criteria (${flags}); each is explained below.`,
+    );
+    expect(text).not.toContain("with the same category and required flag");
   });
 
   it("reads only the requested catalog when specVersion is given", async () => {

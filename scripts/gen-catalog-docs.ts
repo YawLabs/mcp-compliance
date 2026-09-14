@@ -29,13 +29,13 @@ interface Criteria {
 
 /** Appended to every negative-probe pass criterion: the attribution guard from 4c75d38. */
 const NOT_EVALUABLE =
-  "credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable)";
+  "credited only when the conformant server/discover was served and the answer is not a transport-level status (a server that rejects everything, or a 401/403/413/415/429 from an auth gate, size limit, media-type gate or rate limiter, fails as not evaluable)";
 /** Appended to every post-hoc scan's fail criterion: an empty recording fails instead of passing vacuously. */
 const EMPTY_RECORDING =
   "Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest.";
 /** The six list-based definition checks fetch on demand. */
 const LIST_ON_DEMAND = (what: string) =>
-  `The list is fetched on demand under --only; skipped (as passed) only when ${what}/list failed.`;
+  `The list is fetched on demand under --only. When ${what}/list failed the rule skips (as passed) pointing at ${what}-list if that rule is in the run, and fails with the recorded reason when it was filtered out (--only schema).`;
 
 const C: Record<string, Criteria> = {
   // ── transport ──
@@ -86,12 +86,12 @@ const C: Record<string, Criteria> = {
   },
   "transport-header-version-required": {
     pass: `HTTP 400 for a complete server/discover body sent without the MCP-Protocol-Version header, ${NOT_EVALUABLE}; a body without error code -32020 is reported as a warning.`,
-    fail: "Any status other than 400, or a 400 from a server whose conformant server/discover was itself rejected or unanswered.",
+    fail: `Any status other than 400, or a 400 or transport-level status (401, 403, 413, 415, 429) from a server whose conformant server/discover was itself rejected or unanswered.`,
     gate: null,
   },
   "transport-header-version-mismatch": {
     pass: `HTTP 400 and a JSON-RPC error with code -32020 when the header says 2026-07-28 and _meta says 1999-01-01, ${NOT_EVALUABLE}.`,
-    fail: "A status other than 400, an error code other than -32020, a result, or a 400 from a server whose conformant server/discover was itself rejected.",
+    fail: `A status other than 400, an error code other than -32020, a result, or a 400 from a server whose conformant server/discover was itself rejected.`,
     gate: null,
   },
   "transport-header-method-required": {
@@ -105,8 +105,8 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "transport-header-name-mismatch": {
-    pass: `HTTP 400 for a resources/read of the first listed resource (else a prompts/get of the first prompt without required arguments) whose Mcp-Name header names a different object than the body, ${NOT_EVALUABLE}; a missing -32020 code is reported as a warning. The lists are fetched on demand; skipped when the server declares neither resources nor prompts, the list calls failed, or nothing listed is readable by name alone.`,
-    fail: "Any status other than 400, or a 400 from a server whose conformant server/discover was itself rejected.",
+    pass: `HTTP 400 for a resources/read of the first listed resource (else a prompts/get of the first prompt without required arguments) whose Mcp-Name header names a different object than the body, ${NOT_EVALUABLE}; a missing -32020 code is reported as a warning. The lists are fetched on demand; skipped when the server declares neither resources nor prompts or nothing listed is readable by name alone, and skipped pointing at the -list rules when every declared list call failed and those rules are in the run.`,
+    fail: `Any status other than 400, a 400 from a server whose conformant server/discover was itself rejected, or every declared list call failed while the -list rules were filtered out of the run (the recorded reasons are named).`,
     gate: null,
   },
   "transport-header-case-insensitive": {
@@ -125,8 +125,8 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "stdio-unicode": {
-    pass: "The chosen tool (one named echo, else the first with a string property named message/text/input/query, else the first tool; tools/list fetched on demand) reproduces the CJK/emoji probe byte-for-byte; or, when the tool merely does not echo its input, a server/discover whose clientInfo name carries the probe is answered with a result.",
-    fail: "The tool reply or the discover reply shows mangling (U+FFFD, a Latin-1 mis-decode, the non-ASCII characters stripped), the tool call draws -32700, or the discover carrying the probe in clientInfo is rejected or answered with a non-JSON-RPC reply.",
+    pass: `The chosen tool (one named echo, else the first with a string property named message/text/input/query, else the first tool; tools/list fetched on demand) reproduces the CJK/emoji probe byte-for-byte, or reproduces every non-ASCII piece of it somewhere in the reply (a tokenizing tool); or, when the tool merely does not echo its input, a server/discover whose clientInfo name carries the probe is answered with a result.`,
+    fail: `The tool reply or the discover reply shows mangling (U+FFFD, a Latin-1 mis-decode, the non-ASCII characters replaced by '?', or the probe's first word present with neither the CJK word nor the emoji anywhere in the reply), the tool call draws -32700, or the discover carrying the probe in clientInfo is rejected or answered with a non-JSON-RPC reply.`,
     gate: null,
   },
   "stdio-unknown-method-recovers": {
@@ -186,18 +186,18 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "lifecycle-meta-required": {
-    pass: `A server/discover with no params._meta draws a JSON-RPC error (HTTP 400 on HTTP), ${NOT_EVALUABLE}; code -32602 is expected and any other code is reported as a warning. Runs after the feature tests so a dual-era stdio server is already pinned modern.`,
-    fail: "A result is returned, on HTTP the error arrives with a status other than 400, or the conformant server/discover was itself rejected or unanswered (not evaluable).",
+    pass: `A server/discover with no params._meta draws a JSON-RPC error (HTTP 400 on HTTP), ${NOT_EVALUABLE}; code -32602 is expected and any other code is reported as a warning. Runs after the feature tests and before the security tests, so a dual-era stdio server is already pinned modern (a --only run on stdio sends the first declared list, else ping, first) and the rate-limit burst cannot have tripped an intermediary.`,
+    fail: `A result is returned, on HTTP the error arrives with a status other than 400, the conformant server/discover was itself rejected or unanswered, or the answer is a transport-level status (401, 403, 413, 415, 429) -- the last two not evaluable.`,
     gate: null,
   },
   "lifecycle-meta-protocol-version-required": {
-    pass: `A _meta without protocolVersion draws a JSON-RPC error (HTTP 400 on HTTP), ${NOT_EVALUABLE}; -32602 is expected and another code (typically -32020) is reported as a warning. Runs after the feature tests.`,
-    fail: "A result is returned, on HTTP the error arrives with a status other than 400, or the conformant server/discover was itself rejected or unanswered (not evaluable).",
+    pass: `A _meta without protocolVersion draws a JSON-RPC error (HTTP 400 on HTTP), ${NOT_EVALUABLE}; -32602 is expected and another code (typically -32020) is reported as a warning. Runs after the feature tests and before the security tests.`,
+    fail: `A result is returned, on HTTP the error arrives with a status other than 400, the conformant server/discover was itself rejected or unanswered, or the answer is a transport-level status (401, 403, 413, 415, 429) -- the last two not evaluable.`,
     gate: null,
   },
   "lifecycle-meta-client-capabilities-required": {
     pass: `A _meta without clientCapabilities draws a JSON-RPC error (HTTP 400 on HTTP), ${NOT_EVALUABLE}; -32602 is expected and another code is reported as a warning.`,
-    fail: "The request is served as if {} had been sent, on HTTP the error arrives with a status other than 400, or the conformant server/discover was itself rejected or unanswered (not evaluable).",
+    fail: `The request is served as if {} had been sent, on HTTP the error arrives with a status other than 400, the conformant server/discover was itself rejected or unanswered, or the answer is a transport-level status (401, 403, 413, 415, 429) -- the last two not evaluable.`,
     gate: null,
   },
   "lifecycle-meta-client-info-optional": {
@@ -211,13 +211,13 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "lifecycle-removed-methods": {
-    pass: "ping, logging/setLevel and resources/subscribe each draw a JSON-RPC error; -32601 (HTTP 404 on HTTP) is expected and another code or status is reported as a warning.",
-    fail: "Any of the three methods returns a result.",
+    pass: `ping, logging/setLevel and resources/subscribe each draw a JSON-RPC error (or a bare HTTP 4xx), credited only when the conformant server/discover was served; -32601 (HTTP 404 on HTTP) is expected and another code or status is reported as a warning.`,
+    fail: `Any of the three methods returns a result, gets no response, or draws neither a result nor an error; or all three are rejected by a server whose conformant server/discover was itself rejected or unanswered (not evaluable).`,
     gate: null,
   },
   "lifecycle-dual-era": {
-    pass: "On every classified outcome: a result to the legacy initialize (sent to a fresh process on stdio) is reported as dual-era, an error as modern-only; an error that names no supported version -- neither in data.supported nor as a date other than the requested 2025-11-25 in the message -- is reported as a warning, and no response passes with a warning (era undetermined).",
-    fail: "Only when a stdio server exits after the legacy initialize request; no response passes with a warning.",
+    pass: `On every classified outcome: a result to the legacy initialize (sent to a fresh process on stdio) is reported as dual-era when server/discover was served and as legacy-only (with a warning) when it was not, an error as modern-only; an error that names no supported version -- neither in data.supported nor as a date other than the requested 2025-11-25 in the message -- is reported as a warning. No response (a timeout within the probe budget, or a connection error), a transport-level status (401, 403, 413, 415, 429), and a stdio fresh process that exits alongside a second instance that exits at startup too (a single-instance server) pass with a warning as era undetermined.`,
+    fail: `Only when a stdio server exits after the legacy initialize request while a second instance spawned with no input stays up (the request is what it exits on).`,
     gate: null,
   },
   "lifecycle-capability-handlers-match": {
@@ -226,8 +226,8 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "lifecycle-subscriptions-listen": {
-    pass: "With a listChanged or subscribe capability declared, the first frame on a subscriptions/listen stream is notifications/subscriptions/acknowledged carrying _meta subscriptionId equal to the request id and a notifications object; an acknowledgment that honours a type or URI the request did not include passes with a warning. With nothing advertised, either that acknowledgment or -32601 passes.",
-    fail: "Any other frame first, a subscriptionId that differs from the request id, a missing notifications object, an error other than -32601 when nothing is advertised, no acknowledgment within the listen timeout, or a stdio server that exits before acknowledging.",
+    pass: `With a listChanged or subscribe capability declared, the first frame on a subscriptions/listen stream is notifications/subscriptions/acknowledged carrying _meta subscriptionId equal to the request id and a notifications object; an acknowledgment that honours a type or URI the request did not include passes with a warning. With nothing advertised, either that acknowledgment or -32601 passes, the rejection credited only when the conformant server/discover was served.`,
+    fail: `Any other frame first, a subscriptionId that differs from the request id, a missing notifications object, an error other than -32601 when nothing is advertised, a rejection from a server whose conformant server/discover was itself rejected (not evaluable), no acknowledgment within the listen timeout, or a stdio server that exits before acknowledging.`,
     gate: null,
   },
   "lifecycle-log-level-gating": {
@@ -246,8 +246,8 @@ const C: Record<string, Criteria> = {
     gate: "completions",
   },
   "lifecycle-progress-token": {
-    pass: "tools/call of the first tool without required arguments (tools/list fetched on demand) with _meta.progressToken completes, and every notifications/progress observed for it carries the same token with a strictly increasing progress value (no notifications at all also passes). Skipped when the server declares no tools or tools/list failed.",
-    fail: "A progress notification carrying a foreign token, a non-numeric or non-increasing progress value, or no response to the call.",
+    pass: `tools/call of the first tool without required arguments (tools/list fetched on demand) with _meta.progressToken completes, and every notifications/progress observed for it carries the same token with a strictly increasing progress value (no notifications at all also passes). Skipped when the server declares no tools, and skipped pointing at tools-list when tools/list failed and that rule is in the run.`,
+    fail: `A progress notification carrying a foreign token, a non-numeric or non-increasing progress value, no response to the call, or tools/list failed while tools-list was filtered out of the run (the recorded reason is named).`,
     gate: null,
   },
   // ── tools ──
@@ -258,7 +258,7 @@ const C: Record<string, Criteria> = {
   },
   "tools-list-caching": {
     pass: "The tools/list result carries ttlMs as an integer >= 0 and cacheScope equal to public or private.",
-    fail: "Either hint missing or invalid.",
+    fail: `Either hint missing or invalid, or the tools/list call got no response (reported once; not re-sent).`,
     gate: "tools",
   },
   "tools-list-deterministic-order": {
@@ -289,7 +289,7 @@ const C: Record<string, Criteria> = {
   },
   "resources-list-caching": {
     pass: "The resources/list result carries ttlMs as an integer >= 0 and cacheScope equal to public or private.",
-    fail: "Either hint missing or invalid.",
+    fail: `Either hint missing or invalid, or the resources/list call got no response (reported once; not re-sent).`,
     gate: "resources",
   },
   "resources-read": {
@@ -314,7 +314,7 @@ const C: Record<string, Criteria> = {
   },
   "resources-templates-caching": {
     pass: "When resources/templates/list succeeds, its result carries ttlMs as an integer >= 0 and cacheScope equal to public or private; skipped when the method is not implemented.",
-    fail: "Either hint missing or invalid on a successful result.",
+    fail: `Either hint missing or invalid on a successful result, or the resources/templates/list call got no response (reported once; not re-sent).`,
     gate: "resources",
   },
   "resources-pagination": {
@@ -330,7 +330,7 @@ const C: Record<string, Criteria> = {
   },
   "prompts-list-caching": {
     pass: "The prompts/list result carries ttlMs as an integer >= 0 and cacheScope equal to public or private.",
-    fail: "Either hint missing or invalid.",
+    fail: `Either hint missing or invalid, or the prompts/list call got no response (reported once; not re-sent).`,
     gate: "prompts",
   },
   "prompts-get": {
@@ -395,8 +395,8 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "error-id-echo": {
-    pass: "Every recorded JSON-RPC error response (an error object with a numeric code) that answers an id-bearing request carries that same id. Exempt: replies to the suite's raw probes and client notifications, and bodies on HTTP 401/403/413/415/429 transport-level rejections; non-JSON-RPC error bodies are not counted.",
-    fail: `A JSON-RPC error with a null or missing id in reply to a well-formed request, whatever the error code (-32600 and -32700 included). ${EMPTY_RECORDING}`,
+    pass: `Every recorded JSON-RPC error response (jsonrpc 2.0 with an error object carrying a numeric code) that answers an id-bearing request carries that same id; an id-less reply is attributed by timeline to the nearest earlier request that never got its own reply, or to a more recent client notification or raw probe. Exempt: replies to the suite's raw probes and client notifications, and replies without an id on HTTP 401/403/413/415/429 transport-level rejections; non-JSON-RPC error bodies (a gateway's {"error":...}) are not counted.`,
+    fail: `A JSON-RPC error with a null or missing id in reply to a well-formed request, whatever the error code (-32600 and -32700 included), or a present but wrong id whatever the HTTP status. ${EMPTY_RECORDING}`,
     gate: null,
   },
   "error-retired-codes": {
@@ -446,13 +446,13 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "schema-input-required-shape": {
-    pass: "Every observed input_required result has inputRequests and/or requestState; each inputRequests value is an object whose method is elicitation/create, sampling/createMessage or roots/list and whose client capability the suite declared (elicitation only), with a params object for elicitation/create and sampling/createMessage; requestState is a string when present. Passes vacuously when none was observed.",
-    fail: `An input_required result missing both fields, an entry with an unknown method, a method whose client capability was not declared (sampling/createMessage, roots/list), a missing params object where required, or a non-string requestState. ${EMPTY_RECORDING}`,
+    pass: `Every observed input_required result has inputRequests and/or requestState; each inputRequests value is an object whose method is elicitation/create, sampling/createMessage or roots/list and whose client capability the suite declared (elicitation only), with a params object for elicitation/create and sampling/createMessage; an elicitation/create's params.mode (form when absent) is a mode the declared elicitation capability covers (the suite's elicitation: {} is form only); requestState is a string when present. Passes vacuously when none was observed.`,
+    fail: `An input_required result missing both fields, an entry with an unknown method, a method whose client capability was not declared (sampling/createMessage, roots/list), an elicitation mode the client did not declare (url under elicitation: {}), a missing params object where required, or a non-string requestState. ${EMPTY_RECORDING}`,
     gate: null,
   },
   "schema-wire-valid": {
-    pass: "Every recorded server message validates against the vendored 2026-07-28 JSON schema for its message type; replies to raw probes and to the legacy initialize are skipped, an error's id: null is treated as omitted, and non-JSON-RPC bodies on HTTP 401/403/413/415/429 are noted rather than validated.",
-    fail: `Any other message that fails schema validation (the details list the distinct violations grouped by originating method and first schema error, with counts; the overflow goes to a warning). ${EMPTY_RECORDING}`,
+    pass: `Every recorded server message validates against the vendored 2026-07-28 JSON schema for its message type; replies to raw probes and to the legacy initialize are skipped, an error's id: null is treated as omitted, and a non-JSON-RPC body on any HTTP 4xx or 5xx (an auth gate, a header-validating intermediary, a gateway) is noted rather than validated.`,
+    fail: `Any other message that fails schema validation, including a non-JSON-RPC body served at 2xx (the details list the distinct violations grouped by originating method and first schema error, with counts; the overflow goes to a warning). ${EMPTY_RECORDING}`,
     gate: null,
   },
   // ── security ──
@@ -462,7 +462,7 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "security-www-authenticate": {
-    pass: "The 401 observed on the unauthenticated server/discover carries a WWW-Authenticate header (a challenge without resource_metadata passes with a warning). Skipped when no 401 was observed (a 403 or a served request).",
+    pass: `The 401 observed on the unauthenticated server/discover carries a WWW-Authenticate header (a challenge without resource_metadata, or whose resource_metadata is not an absolute http(s) URL, passes with a warning). Skipped when no 401 was observed (a 403 or a served request).`,
     fail: "A 401 with no WWW-Authenticate header.",
     gate: null,
   },
@@ -477,8 +477,8 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "security-oauth-metadata": {
-    pass: "In order, the resource_metadata URL from the WWW-Authenticate challenge (when present), /.well-known/oauth-protected-resource followed by the endpoint path, then the root, returns JSON with resource and a non-empty authorization_servers array (a resource that is not the MCP endpoint in canonical form passes with a warning); a legacy /.well-known/oauth-authorization-server hit passes with a warning. Runs without --auth when the unauthenticated request drew 401/403; skipped when the server requires no auth.",
-    fail: "No candidate serves the document and no legacy metadata exists, a served document lacks resource or a non-empty authorization_servers, or every candidate is unreachable.",
+    pass: `When the WWW-Authenticate challenge carries resource_metadata, that absolute URL (and only it) returns JSON with resource and a non-empty authorization_servers array; without one, /.well-known/oauth-protected-resource followed by the endpoint path, then the root, does, or a legacy /.well-known/oauth-authorization-server document exists (passes with a warning). A resource that is not the MCP endpoint in canonical form passes with a warning. Runs without --auth when the unauthenticated request drew 401/403; skipped when the server requires no auth.`,
+    fail: `An advertised resource_metadata URL that is not absolute http(s), unreachable, non-200, non-JSON, or lacks resource or a non-empty authorization_servers (a valid well-known document does not rescue it; the details name it); without a challenge URL, no candidate serves the document and no legacy metadata exists, a served document is malformed, or every candidate is unreachable; or the unauthenticated server/discover got no answer at all (server unreachable).`,
     gate: null,
   },
   "security-token-in-uri": {
@@ -497,22 +497,22 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "security-command-injection": {
-    pass: "No result from the single target -- the first tool with a string argument, read-only tools preferred, destructive tools skipped while an alternative exists, other required arguments filled with placeholders -- shows evidence of executing an injected shell payload (passwd lines, usernames, shell errors) without rejection wording or isError; the details count rejected, benign and never-reached payloads.",
+    pass: `No result from the single target -- a tool with a string argument from the safest annotation tier (readOnlyHint true, then destructiveHint false, then unannotated, then destructiveHint true; the spec defaults destructiveHint to true), a free-form argument before an enum/const/pattern one, other required arguments filled with schema-honouring placeholders -- shows evidence of executing an injected shell payload (passwd lines, id output, directory listings) without rejection wording or isError; the details count rejected, benign and never-reached payloads, and a run where no payload reached the tool passes as inconclusive with a warning.`,
     fail: "Any result containing evidence of execution that is not also a rejection.",
     gate: "tools",
   },
   "security-sql-injection": {
-    pass: "No result from the same single target contains database error text or unexpected row dumps for the SQL payloads without rejection wording or isError.",
+    pass: `No result from the same single target contains database error text or unexpected row dumps for the SQL payloads without rejection wording or isError; all never-reached passes as inconclusive with a warning.`,
     fail: "Any result containing database error text or dumped rows that is not also a rejection.",
     gate: "tools",
   },
   "security-path-traversal": {
-    pass: "No result from the target (a path-named string argument when one exists, else a URL-named one, else the shared injection target) contains file contents from outside the tool's scope for the traversal payloads without rejection wording or isError.",
+    pass: `No result from the target (a path-named string argument when one exists in the safest annotation tier, else a URL-named one, else the shared injection target) contains file contents from outside the tool's scope for the traversal payloads without rejection wording or isError; all never-reached passes as inconclusive with a warning.`,
     fail: "Any result containing out-of-scope file contents that is not also a rejection.",
     gate: "tools",
   },
   "security-ssrf-internal": {
-    pass: "No result from the target (a URL-named string argument when one exists, else a path-named one, else the shared injection target) contains cloud-metadata or internal-service content for the internal targets without rejection wording or isError.",
+    pass: `No result from the target (a URL-named string argument when one exists in the safest annotation tier, else a path-named one, else the shared injection target) contains cloud-metadata or internal-service content for the internal targets without rejection wording or isError; all never-reached passes as inconclusive with a warning.`,
     fail: "Any result containing metadata or internal-service content that is not also a rejection.",
     gate: "tools",
   },
@@ -547,18 +547,18 @@ const C: Record<string, Criteria> = {
     gate: "tools",
   },
   "security-error-no-stacktrace": {
-    pass: "No distinct error response (each scanned once) contains a stack trace, a file path (Unix or Windows, raw or JSON-escaped), a module name, a framework internal or a database connection string that is not an echo of the request.",
-    fail: "Any such leak found.",
+    pass: `No distinct error response (each scanned once) contains a stack trace, a file path (Unix, or Windows raw or JSON-escaped -- a letter and colon before a JSON escape such as an escaped newline is not a drive), a module name, a framework internal or a database connection string that is not an echo of the request; a leak repeated across responses is reported once with a count.`,
+    fail: `Any such leak found, or none of the failure probes was answered and the run recorded no server message (server unreachable).`,
     gate: null,
   },
   "security-error-no-internal-ip": {
-    pass: "No distinct error response contains a private or link-local IPv4 address (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x), an IPv6 loopback, link-local or unique-local address, or an internal hostname (*.internal, *.local, *.corp, *.lan, *.intranet) that is not an echo of the request.",
-    fail: "Any such address or hostname found.",
+    pass: `No distinct error response contains a private or link-local IPv4 address (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x), an IPv6 loopback (::1, [::1]:port, ::1:port), link-local or unique-local address, or an internal hostname (lowercase *.internal, *.local, *.corp, *.lan, *.intranet as the last label, with two or more labels before it or a preceding //, @, getaddrinfo, ENOTFOUND, EAI_AGAIN, or a :port) that is not an echo of the request.`,
+    fail: `Any such address or hostname found, or none of the failure probes was answered and the run recorded no server message (server unreachable).`,
     gate: null,
   },
   "security-rate-limiting": {
-    pass: "At least one HTTP 429 among 50 rapid tools/call requests to the first readOnlyHint tool that declares no required arguments (tools/list fetched on demand); when no such tool exists, 50 rapid server/discover requests that draw no 429 pass with a warning.",
-    fail: "No 429 in a tools/call burst, or more than 25 of the 50 responses are 5xx (whichever method was bursted).",
+    pass: `At least one HTTP 429 among 50 rapid tools/call requests to the first readOnlyHint tool that declares no required arguments (tools/list fetched on demand), or among 50 rapid server/discover requests when no such tool exists. A burst that draws no 429 passes with a warning on either path; one where every response is 401/403 is skipped as unmeasurable (pass --auth).`,
+    fail: `More than 25 of the 50 responses are 5xx (whichever method was bursted), or none of the 50 requests got a response (server unreachable).`,
     gate: null,
   },
 };
@@ -710,27 +710,27 @@ const CAT_LABEL: Record<string, string> = {
 const CAT_ORDER = ["transport", "lifecycle", "tools", "resources", "prompts", "errors", "schema", "security"];
 const CAT_INTRO: Record<string, string> = {
   transport:
-    'Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard headers plus `_meta`) rather than `ping`, so the only defect in each probe is the one under test. There is no session and no initialization handshake: every request is independent, so nothing here is "pre-init" or "post-init". 15 rules are HTTP-only (`transports: ["http"]`), 4 are stdio-only, and `transport-no-server-requests` is a post-hoc scan of the recording that runs on both transports (the design counts it with the HTTP group, hence "16 HTTP + 4 stdio"). The standard-header rejection rules are **attributable**: a 400 is credited only when the conformant `server/discover` was served, so a server that rejects everything (a legacy-only server pinned to this catalog) fails them as "not evaluable" instead of passing.',
+    'Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard headers plus `_meta`) rather than `ping`, so the only defect in each probe is the one under test. There is no session and no initialization handshake: every request is independent, so nothing here is "pre-init" or "post-init". 15 rules are HTTP-only (`transports: ["http"]`), 4 are stdio-only, and `transport-no-server-requests` is a post-hoc scan of the recording that runs on both transports (the design counts it with the HTTP group, hence "16 HTTP + 4 stdio"). The standard-header rejection rules are **attributable**: a 400 is credited only when the conformant `server/discover` was served, so a server that rejects everything (a legacy-only server pinned to this catalog) fails them as "not evaluable" instead of passing, and so does a transport-level status (401, 403, 413, 415 or 429 from an auth gate, size limit, media-type gate or rate limiter answering before the JSON-RPC layer).',
   lifecycle:
-    "Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelope. The suite validates the discover result (versions, capabilities, caching hints, serverInfo), then sends deliberately incomplete envelopes (no `_meta`, no `protocolVersion`, no `clientCapabilities`, no `clientInfo`, an unsupported version) and checks the server rejects exactly the ones the spec says it must; like the header rules, a rejection is credited only when the conformant discover was served. The two claim-less probes (`lifecycle-meta-required`, `lifecycle-meta-protocol-version-required`) run late, after the feature tests, because a dual-era stdio server that has not yet been pinned modern treats a claim-less message as a legacy opening. Three rules are post-hoc scans of the recording (`lifecycle-log-level-gating`) or informational probes (`lifecycle-dual-era`, which on stdio goes to a fresh process and runs last; `lifecycle-removed-methods`).",
+    "Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelope. The suite validates the discover result (versions, capabilities, caching hints, serverInfo), then sends deliberately incomplete envelopes (no `_meta`, no `protocolVersion`, no `clientCapabilities`, no `clientInfo`, an unsupported version) and checks the server rejects exactly the ones the spec says it must; like the header rules, a rejection is credited only when the conformant discover was served and is not a transport-level status. The late block -- `lifecycle-completions`, `lifecycle-progress-token`, the two claim-less probes (`lifecycle-meta-required`, `lifecycle-meta-protocol-version-required`) and `lifecycle-dual-era` -- runs after the feature and stdio tests and before the security tests: a dual-era stdio server that has not yet been pinned modern treats a claim-less message as a legacy opening (a `--only` run on stdio sends a pinning request first), and the security rate-limit burst would otherwise leave an intermediary answering these probes with 429. Three rules are post-hoc scans of the recording (`lifecycle-log-level-gating`) or informational probes (`lifecycle-dual-era`, which on stdio goes to a fresh process and tells a single-instance server apart from one that exits on `initialize`; `lifecycle-removed-methods`).",
   tools:
     "Only present in the report when the discover result declares the `tools` capability; every rule is then required at runtime except `tools-list-deterministic-order` and `tools-pagination`. `tools/call` may now answer with an MRTR `input_required` result instead of content. The feature tests do not check `resultType: 'complete'` themselves; the post-hoc `schema-result-type` scan does, over every result.",
   resources:
     "Only present when the `resources` capability is declared. New in this revision: caching hints on every cacheable result, and `resources-not-found`, which fails the retired `-32002` code (any code other than `-32602` passes with a warning).",
   prompts: "Only present when the `prompts` capability is declared.",
   errors:
-    'Error tests send conformant envelopes so the error under test comes from the server\'s own dispatch, not from `_meta` validation. `error-unknown-method` now expects HTTP 404 on the JSON-RPC error. Two rules are post-hoc scans of every JSON-RPC error recorded during the run; a non-JSON-RPC body on a transport-level rejection (an auth gate\'s `{"error":"invalid_token"}` on 401) is not counted.',
+    'Error tests send conformant envelopes so the error under test comes from the server\'s own dispatch, not from `_meta` validation. `error-unknown-method` now expects HTTP 404 on the JSON-RPC error. Two rules are post-hoc scans of every JSON-RPC error recorded during the run; a body that is not a jsonrpc 2.0 error (an auth gate\'s `{"error":"invalid_token"}` on 401, a gateway\'s `{"error":{"code":400,...}}`) is not counted.',
   schema:
-    "Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `tools-output-schema`, `prompts-schema`, `resources-schema`) validate the list results -- cached by the feature tests, or fetched once on demand when those did not run (`--only schema`) -- and are capability-gated. The four post-hoc rules scan every server message the Recorder captured: `resultType` on every result (`complete` or `input_required`, or an extension value only when an `extensions` capability is advertised), `input_required` only on MRTR methods, well-formed `InputRequiredResult`s whose methods the client declared support for, and full validation against the vendored 2026-07-28 JSON schema.",
+    "Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `tools-output-schema`, `prompts-schema`, `resources-schema`) validate the list results -- cached by the feature tests, or fetched once on demand when those did not run (`--only schema`) -- and are capability-gated. When a list call failed they skip pointing at the `-list` rule if it is in the run, and fail with the recorded reason when it was filtered out, so `--only schema` cannot grade A over a broken list. The four post-hoc rules scan every server message the Recorder captured: `resultType` on every result (`complete` or `input_required`, or an extension value only when an `extensions` capability is advertised), `input_required` only on MRTR methods, well-formed `InputRequiredResult`s whose methods the client declared support for, and full validation against the vendored 2026-07-28 JSON schema.",
   security:
-    "Same coverage as 2025-11-25 minus the two session-id rules (there are no sessions). Auth and transport-security probes use a conformant `server/discover` with modern headers so credentials are the only variable; `security-auth-required`, `security-www-authenticate` and `security-oauth-metadata` probe with or without `--auth`, and only `security-auth-malformed` and `security-token-in-uri` need a credential. The four injection rules share **one** target: the first tool with a string argument, read-only tools preferred, destructive tools skipped while an alternative exists, its other required arguments filled with placeholders, and `x-mcp-header` parameters mirrored into `Mcp-Param-*` headers so the request stays valid. Tool-dependent rules fetch `tools/list` on demand, so `--only security` measures the server. All rules stay optional (severity `warning`); the post-hoc scans fail rather than pass when the recording is empty.",
+    "Same coverage as 2025-11-25 minus the two session-id rules (there are no sessions). Auth and transport-security probes use a conformant `server/discover` with modern headers so credentials are the only variable; `security-auth-required`, `security-www-authenticate` and `security-oauth-metadata` probe with or without `--auth`, and only `security-auth-malformed` and `security-token-in-uri` need a credential. The four injection rules share **one** target, chosen from the safest annotation tier that has a string argument -- `readOnlyHint: true`, then `destructiveHint: false`, then unannotated tools (destructive by the spec default), then `destructiveHint: true` -- with free-form arguments before enum/const/pattern ones, the other required arguments filled with schema-honouring placeholders, and `x-mcp-header` parameters mirrored into `Mcp-Param-*` headers so the request stays valid; passed-over and live-probed tools are named in warnings, and a run in which no payload reached the tool passes as inconclusive with a warning. `security-rate-limiting` passes a quiet burst with a warning on either path and skips a burst that auth rejected. Tool-dependent rules fetch `tools/list` on demand, so `--only security` measures the server. All rules stay optional (severity `warning`); the leak scans and the rate-limit burst fail as 'server unreachable' when nothing answered.",
 };
 
 const lines: string[] = [];
 lines.push("## 3b. Test Rules -- 2026-07-28");
 lines.push("");
 lines.push(
-  "The 2026-07-28 catalog (`MODERN_TEST_DEFINITIONS` in `src/definitions/2026-07-28.ts`) has 103 rules in the same 8 categories. Spec references are relative to `https://modelcontextprotocol.io/specification/2026-07-28/`. Ids are only comparable within one catalog: an id shared with section 3 means the check is semantically identical in both eras; a check whose pass criteria changed carries a new id (for example `lifecycle-discover` replaces `lifecycle-init`, `transport-get-removed` replaces `transport-get`, `resources-not-found` is new because `-32002` is now a failure). `Default required` is the catalog default; rules marked capability-gated become required at runtime when the server declares the capability (see [section 1.2](#12-capability-driven-execution)).",
+  "The 2026-07-28 catalog (`MODERN_TEST_DEFINITIONS` in `src/definitions/2026-07-28.ts`) has 103 rules in the same 8 categories. Spec references are relative to `https://modelcontextprotocol.io/specification/2026-07-28/`. Ids are only comparable within one catalog: an id shared with section 3 covers the same feature, but its wording, pass criteria and required flag may differ between the eras (`stdio-framing` and `error-invalid-jsonrpc` are optional here and required in section 3, `error-method-code` the reverse); a check whose verdict on the same server behaviour flipped carries a new id (for example `lifecycle-discover` replaces `lifecycle-init`, `transport-get-removed` replaces `transport-get`, `resources-not-found` is new because `-32002` is now a failure). `Default required` is the catalog default; rules marked capability-gated become required at runtime when the server declares the capability (see [section 1.2](#12-capability-driven-execution)).",
 );
 lines.push("");
 lines.push(

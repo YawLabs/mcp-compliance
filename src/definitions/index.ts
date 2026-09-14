@@ -6,8 +6,9 @@ import { MODERN_TEST_DEFINITIONS } from "./2026-07-28.js";
  * Test catalogs per spec revision. The 2025-11-25 catalog is the
  * long-standing `TEST_DEFINITIONS` export in types.ts; the 2026-07-28
  * catalog lives next to this file. Ids are only comparable within one
- * catalog — a reused id means the check is semantically identical in
- * both eras, a new id means the pass criteria differ.
+ * catalog — a reused id covers the same feature, though its wording,
+ * criteria and required flag may differ between the eras; a new id means
+ * the verdict on the same server behaviour flipped.
  */
 export function getTestDefinitions(version: SpecVersion): TestDefinition[] {
   if (version === MODERN_SPEC_VERSION) return MODERN_TEST_DEFINITIONS;

@@ -405,10 +405,70 @@ describe("formatGithub", () => {
     expect(output).not.toContain("lifecycle-ping");
   });
 
-  it("always emits a ::notice summary line with grade and counts", () => {
+  it("always emits a ::notice summary line with grade, counts and the spec version", () => {
     const output = formatGithub(makeReport());
     // % is URL-encoded as %25 per GitHub Actions workflow command rules
     expect(output).toMatch(/::notice title=MCP Compliance::Grade B \(85%25\)/);
+    expect(output).toContain("(5/5 required); spec 2025-11-25");
+  });
+
+  it("emits every report warning as a ::warning titled mcp-compliance", () => {
+    // The Action defaults to this format, so without these the dual-era,
+    // pinned-mismatch, unreachable and "pass --auth" notes never reached
+    // a PR.
+    const output = formatGithub(
+      makeReport({
+        warnings: [
+          "Server is dual-era (also advertises 2025-11-25); this run graded 2026-07-28. Re-run with --spec-version 2025-11-25 to test the legacy handshake.",
+          "Server at https://example.com/mcp requires authentication\nline two",
+        ],
+      }),
+    );
+    const lines = output.split("\n");
+    expect(lines).toContain(
+      "::warning title=mcp-compliance::Server is dual-era (also advertises 2025-11-25); this run graded 2026-07-28. Re-run with --spec-version 2025-11-25 to test the legacy handshake.",
+    );
+    expect(lines).toContain(
+      "::warning title=mcp-compliance::Server at https://example.com/mcp requires authentication%0Aline two",
+    );
+    // Failure annotations keep their own titles (the test id).
+    expect(lines).toContain("::warning title=lifecycle-init::No result in response");
+  });
+
+  it("folds the auto-detection note into the ::notice instead of a ::warning", () => {
+    const output = formatGithub(
+      makeReport({
+        specVersion: "2026-07-28",
+        warnings: [
+          "Spec version auto-detected as 2026-07-28 (server/discover -> supportedVersions [2026-07-28]). Pin with --spec-version to override.",
+        ],
+      }),
+    );
+    expect(output).not.toContain("::warning title=mcp-compliance");
+    expect(output).toContain("; spec 2026-07-28 (auto-detected from server/discover: supportedVersions [2026-07-28])");
+  });
+
+  it("an empty run says no tests ran instead of Grade F 0/0", () => {
+    const empty = makeReport({
+      specVersion: "2026-07-28",
+      score: 0,
+      grade: "F",
+      overall: "fail",
+      summary: { total: 0, passed: 0, failed: 0, required: 0, requiredPassed: 0 },
+      categories: {},
+      tests: [],
+      warnings: ['Filter value(s) "lifecycle-init" match no test id or category in the 2026-07-28 catalog'],
+    });
+    const output = formatGithub(empty);
+    expect(output).toContain(
+      "::notice title=MCP Compliance::No tests ran -- check --only/--skip (see warnings); spec 2026-07-28",
+    );
+    expect(output).not.toContain("Grade F");
+    expect(output).toContain('::warning title=mcp-compliance::Filter value(s) "lifecycle-init"');
+    // Without a warning to point at, no "(see warnings)".
+    expect(formatGithub({ ...empty, warnings: [] })).toContain(
+      "::notice title=MCP Compliance::No tests ran -- check --only/--skip; spec 2026-07-28",
+    );
   });
 
   it("escapes %, \\r, and \\n in titles and messages", () => {
@@ -714,6 +774,18 @@ describe("empty run (nothing matched --only/--skip)", () => {
     expect(out).not.toContain("All tests passed");
     expect(out).toContain("WARNINGS (1)");
     expect(out).toContain('"lifecycle-init"');
+  });
+
+  it("terminal: '(see warnings)' only when there is a WARNINGS section, and 'Required 0/0' gets no check mark", () => {
+    // A valid id gated off the transport used to produce this shape with
+    // no warning at all (now the runner warns), and any other zero-test
+    // run must not point at an absent section.
+    const out = formatTerminal({ ...empty, warnings: [] });
+    expect(out).toContain("No tests ran -- check --only/--skip");
+    expect(out).not.toContain("(see warnings)");
+    expect(out).not.toContain("WARNINGS");
+    expect(out).not.toContain("0/0 ✓");
+    expect(formatTerminal(empty)).not.toContain("0/0 ✓");
   });
 
   it("terminal: a run where every test passed still says so", () => {

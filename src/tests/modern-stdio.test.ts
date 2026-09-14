@@ -394,6 +394,16 @@ describe("2026-07-28 stdio tests: scripted misbehaviour (no fixture knob exists 
       /the reply carries the probe with its CJK\/emoji characters dropped/,
     ],
     ["only the Latin-1 word surviving", "héllo", /the reply carries the probe with its CJK\/emoji characters dropped/],
+    [
+      "'?' substitution, one per code point (a legacy code page encoder)",
+      "Echo: h?llo ?? ?",
+      /the reply carries the probe with its non-ASCII characters replaced by '\?'/,
+    ],
+    [
+      "'?' substitution, one per UTF-16 unit (the .NET/Java default on Windows)",
+      "Echo: h?llo ?? ??",
+      /the reply carries the probe with its non-ASCII characters replaced by '\?'/,
+    ],
   ])("stdio-unicode fails on evidence of mangling: %s", async (_label, text, pattern) => {
     const { ctx } = unicodeFake(text);
     await runStdio(ctx);
@@ -401,6 +411,36 @@ describe("2026-07-28 stdio tests: scripted misbehaviour (no fixture knob exists 
     expect(r.passed).toBe(false);
     expect(r.details).toMatch(/^tools\/call get_time mangled the CJK\/emoji probe: /);
     expect(r.details).toMatch(pattern);
+  });
+
+  /** A search tool: the picker prefers its `query` argument, and search tools tokenize or truncate their input. */
+  const SEARCH_TOOLS: Record<string, unknown>[] = [
+    {
+      name: "search",
+      inputSchema: { type: "object", properties: { query: { type: "string" }, limit: { type: "integer" } } },
+    },
+  ];
+
+  it("stdio-unicode passes a tool that reflects every piece of the probe apart (tokenized), naming the split", async () => {
+    // "héllo" is present, so the old rule called this "CJK/emoji dropped"
+    // even though both are right there in the reply.
+    const { ctx } = unicodeFake("Tokens: héllo | 世界 | 🚀", SEARCH_TOOLS);
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-unicode");
+    expect(r.passed, r.details).toBe(true);
+    expect(r.details).toBe(
+      "tools/call search reproduced every non-ASCII piece of the CJK/emoji probe (split across the reply, not byte-for-byte)",
+    );
+  });
+
+  it("stdio-unicode does not call a truncated echo 'dropped' when the CJK word survives: the envelope probe decides", async () => {
+    const { ctx } = unicodeFake('Searched for "héllo 世界" (truncated)', SEARCH_TOOLS);
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-unicode");
+    expect(r.passed, r.details).toBe(true);
+    expect(r.details).toMatch(
+      /^tools\/call search did not echo the probe; envelope round-trip verified: server\/discover accepted a request whose clientInfo name carries CJK\/emoji/,
+    );
   });
 
   it("stdio-cancellation fails when the server answers the notification", async () => {

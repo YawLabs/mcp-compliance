@@ -484,15 +484,30 @@ describe("transport-header-name-mismatch: direct context", () => {
   it("skip-passes naming why: undeclared capabilities, failed lists, or nothing readable by name", async () => {
     const undeclared = await directContext(clean.url, { capabilities: {} }).run();
     expect(undeclared).toMatchObject({ passed: true, details: "skipped: server declares no resources or prompts" });
-    // Both lists were asked for earlier and failed: no re-fetch, honest skip.
-    const failed = await directContext(clean.url, {
+    // Both lists were asked for earlier and failed: no re-fetch. When the
+    // -list tests that report those failures are in the run, an honest skip
+    // pointing at them ...
+    const failedState = {
       resources: null,
       prompts: null,
-      listAttempts: new Set(["resources", "prompts"]),
+      listAttempts: new Set<"resources" | "prompts">(["resources", "prompts"]),
+      listFailures: { resources: "JSON-RPC error -32603 (boom)", prompts: "no result object (HTTP 500)" },
+    };
+    const reported = await directContext(clean.url, failedState, {
+      only: ["transport-header-name-mismatch", "resources-list", "prompts-list"],
     }).run();
-    expect(failed).toMatchObject({
+    expect(reported).toMatchObject({
       passed: true,
-      details: "skipped: resources/list and prompts/list failed (see resources-list, prompts-list)",
+      details:
+        "skipped: resources/list and prompts/list failed, no resource or prompt to read by name (see resources-list, prompts-list)",
+    });
+    // ... and when they are not (a --only transport run), a failure that
+    // carries the recorded reasons, since nothing else in the report would.
+    const unreported = await directContext(clean.url, failedState).run();
+    expect(unreported).toMatchObject({
+      passed: false,
+      details:
+        "resources/list failed (JSON-RPC error -32603 (boom)) and prompts/list failed (no result object (HTTP 500)); no resource or prompt to read by name",
     });
     const nothingReadable = await directContext(clean.url, {
       resources: [],
@@ -575,6 +590,33 @@ describe("modern transport suite: stub servers for knob-less branches", () => {
       expect(report.summary.requiredPassed).toBe(0);
       // Nothing was credited, so no "rejected with -32000 (expected ...)" warnings either.
       expect(report.warnings.filter((w) => /^(lifecycle|transport)-/.test(w))).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("a header-less request answered by a rate limiter (bare 429) is not evaluable, not 'the wrong status'", async () => {
+    // The gateway drops requests without MCP-Protocol-Version on the floor
+    // with a bare 429 (and would do the same to a burst); the server behind
+    // it never saw the malformed request, so nothing about its header
+    // validation was measured.
+    const stub = await startStub((req, res, body) => {
+      if (req.headers["mcp-protocol-version"] === undefined) {
+        res.writeHead(429, { "Content-Type": "text/plain" });
+        res.end("rate limited");
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(discoverResult(body));
+    });
+    try {
+      const r = await directContext(stub.url, {}, { only: ["transport-header-version-required"] }).run();
+      expect(r).toMatchObject({
+        passed: false,
+        details:
+          "not evaluable: HTTP 429 is a transport-level rejection (rate limiting answered before the JSON-RPC layer read the request), so it proves nothing about the injected defect",
+      });
+      expect(r.warnings).toEqual([]);
     } finally {
       await stub.close();
     }

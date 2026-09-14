@@ -67,18 +67,34 @@ describe("mcp-compliance test --list --spec-version", () => {
   let modernStdio: Run;
   let fromConfig: Run;
   let invalid: Run;
+  let wrongCatalog: Run;
+  let gatedOnly: Run;
 
   beforeAll(async () => {
     workDir = mkdtempSync(join(tmpdir(), "mcp-compliance-cli-"));
     const configPath = join(workDir, "pinned.json");
     writeFileSync(configPath, JSON.stringify({ specVersion: "2026-07-28" }));
-    [modern, legacy, omitted, modernStdio, fromConfig, invalid] = await Promise.all([
+    [modern, legacy, omitted, modernStdio, fromConfig, invalid, wrongCatalog, gatedOnly] = await Promise.all([
       cli(["test", "--list", "--no-color", "--spec-version", "2026-07-28"]),
       cli(["test", "--list", "--no-color", "--spec-version", "2025-11-25"]),
       cli(["test", "--list", "--no-color"]),
       cli(["test", "--list", "--no-color", "--spec-version", "2026-07-28", "--transport", "stdio"]),
       cli(["test", "--list", "--no-color", "--config", configPath]),
       cli(["test", "--list", "--no-color", "--spec-version", "1999-01-01"]),
+      // A 2025-11-25 id under auto: matches one catalog, not the other.
+      cli(["test", "--list", "--no-color", "--only", "lifecycle-init"]),
+      // A valid HTTP-only id on a stdio target.
+      cli([
+        "test",
+        "--list",
+        "--no-color",
+        "--spec-version",
+        "2025-11-25",
+        "--transport",
+        "stdio",
+        "--only",
+        "transport-post",
+      ]),
     ]);
   }, 180_000);
 
@@ -147,9 +163,65 @@ describe("mcp-compliance test --list --spec-version", () => {
     expect(invalid.stderr).toContain("1999-01-01");
     expect(invalid.stderr).toMatch(/auto, 2025-11-25, 2026-07-28/);
   });
+
+  it("pads the id column to the longest printed id, so the 40+ character 2026-07-28 ids do not shift their row", () => {
+    // Every row's category token must start at the same column.
+    const listed = rows(modern.stdout);
+    const longest = Math.max(...listed.map((line) => line.split(/\s+/)[0].length));
+    expect(longest).toBeGreaterThan(38);
+    const categoryColumn = new Set(
+      listed.map((line) => line.search(/\s(transport|lifecycle|tools|resources|prompts|errors|schema|security)\s/)),
+    );
+    expect([...categoryColumn]).toEqual([longest]);
+    // Both catalogs under auto share one width too.
+    const both = rows(omitted.stdout);
+    const widths = new Set(
+      both.map((line) => line.search(/\s(transport|lifecycle|tools|resources|prompts|errors|schema|security)\s/)),
+    );
+    expect(widths.size).toBe(1);
+  });
+
+  it("--only with an id from the other catalog prints the live run's filter-miss warning under that catalog", () => {
+    expect(wrongCatalog.code, wrongCatalog.stderr).toBe(0);
+    const out = wrongCatalog.stdout;
+    const split = out.indexOf("MCP 2026-07-28 catalog");
+    expect(ids(out.slice(0, split))).toEqual(["lifecycle-init"]);
+    expect(ids(out.slice(split))).toEqual([]);
+    expect(out.slice(0, split)).not.toContain("match no test id");
+    expect(out.slice(split)).toContain(
+      '! Filter value(s) "lifecycle-init" match no test id or category in the 2026-07-28 catalog; run --list --spec-version 2026-07-28 to see valid ids.',
+    );
+  });
+
+  it("--only with an id gated off the listed transport says so instead of a bare '0 tests would run'", () => {
+    expect(gatedOnly.code, gatedOnly.stderr).toBe(0);
+    expect(ids(gatedOnly.stdout)).toEqual([]);
+    expect(gatedOnly.stdout).toContain(
+      '! Filter value(s) "transport-post" match only tests that do not apply to a stdio target (http-only), so they select nothing here; run --list --transport stdio --spec-version 2025-11-25 to see the ids that apply.',
+    );
+    expect(gatedOnly.stdout).toContain("0 tests would run for transport=stdio spec=2025-11-25");
+  });
 });
 
 describe("mcp-compliance benchmark --spec-version", () => {
+  it("--help documents --startup-timeout with the runner's default", async () => {
+    const help = await cli(["benchmark", "--help"]);
+    expect(help.code, help.stderr).toBe(0);
+    const flat = help.stdout.replace(/\s+/g, " ");
+    expect(flat).toContain("--startup-timeout <ms> Budget for the server's first reply: the era probe under auto");
+    expect(flat).toContain("default: max(--timeout, 60000)");
+  }, 120_000);
+
+  it("terminal mode prints the era-probe status line to stderr while a silent legacy server is probed", async () => {
+    const run = await cli(["benchmark", "-r", "1", "--startup-timeout", "3000", "node", LEGACY_SILENT_FIXTURE]);
+    expect(run.code, run.stderr).toBe(0);
+    expect(run.stderr).toContain(
+      "Probing spec era (server/discover, up to 3s). A 2025-11-25 server that ignores unknown methods takes the whole startup timeout; --spec-version 2025-11-25 skips the probe.",
+    );
+    expect(run.stdout).not.toContain("Probing spec era");
+    expect(run.stdout).toContain("spec 2025-11-25, probe method ping");
+  }, 120_000);
+
   it("--format json reports the resolved specVersion and the probe method", async () => {
     // A stdio target through the CLI positional: `node <fixture>`.
     const run = await cli([

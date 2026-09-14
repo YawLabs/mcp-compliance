@@ -10,7 +10,12 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { classifyDiscoverResponse, REASON_PREFIX } from "../detect.js";
+import {
+  classifyDiscoverResponse,
+  probeAnswerShowsEra,
+  REASON_PREFIX,
+  STDIO_PROBE_STATUS_DELAY_MS,
+} from "../detect.js";
 import { runComplianceSuite } from "../runner.js";
 import { AUTO_DETECT_NOTE_PREFIX, LEGACY_SPEC_VERSION, MODERN_SPEC_VERSION } from "../spec.js";
 import type { TransportResponse } from "../transport/index.js";
@@ -60,6 +65,35 @@ function expectNoAutoNote(report: ComplianceReport) {
 /** The pinned-run "server speaks the other era" warning, if any. */
 function pinMismatch(report: ComplianceReport): string | undefined {
   return report.warnings.find((w) => w.startsWith("Server answered the 2026-07-28 server/discover probe"));
+}
+
+/**
+ * A node:http stub that answers every request with one fixed status and
+ * body -- the shapes a proxy or gateway puts in front of a server (a 502
+ * page, an HTML 200), which say nothing about the server's era.
+ */
+async function startFixedServer(
+  statusCode: number,
+  body: string,
+  contentType = "text/html",
+): Promise<{ url: string; stop(): Promise<void> }> {
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(statusCode, { "content-type": contentType });
+      res.end(body);
+    });
+  });
+  const url = await new Promise<string>((done) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      done(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+    });
+  });
+  return {
+    url,
+    stop: () => new Promise<void>((done, fail) => server.close((err) => (err ? fail(err) : done()))),
+  };
 }
 
 /**
@@ -257,11 +291,16 @@ describe("auto-detection: modern fixture", () => {
 describe("auto-detection: legacy stdio fixtures", () => {
   it("echo fixture answers the probe with -32601: legacy, reason names the code", async () => {
     const status: string[] = [];
+    const started = Date.now();
+    let answeredAfterMs = Number.POSITIVE_INFINITY;
     const report = await runComplianceSuite(legacyStdio(LEGACY_ECHO_FIXTURE), {
       timeout: 5000,
       startupTimeout: 10_000,
       only: ["lifecycle-init", "lifecycle-ping"],
       onStatus: (m) => status.push(m),
+      onTestComplete: () => {
+        answeredAfterMs = Math.min(answeredAfterMs, Date.now() - started);
+      },
     });
     expect(report.specVersion).toBe(LEGACY_SPEC_VERSION);
     expect(autoNote(report)).toMatch(
@@ -272,7 +311,11 @@ describe("auto-detection: legacy stdio fixtures", () => {
     expect(report.serverInfo.name).toBe("echo-fixture");
     expect(report.serverInfo.protocolVersion).toBe(LEGACY_SPEC_VERSION);
     // An immediate -32601 never reaches the "still probing" status line.
-    expect(status).toEqual([]);
+    // The delay counts from spawn, so on a loaded machine a slow node
+    // start can legitimately cross it; the guarantee only holds when the
+    // first test finished (probe answered) before the delay elapsed.
+    if (answeredAfterMs < STDIO_PROBE_STATUS_DELAY_MS) expect(status).toEqual([]);
+    expect(status.length).toBeLessThanOrEqual(1);
     expect(report.warnings.some((w) => w.startsWith("Server exited"))).toBe(false);
   });
 
@@ -342,6 +385,9 @@ describe("auto-detection: legacy stdio fixtures", () => {
     let dir: string;
     let script: string;
     let exitOnFirstLine: string;
+    let exitAtStartup: string;
+    let oneShotCli: string;
+    let crashOnInit: string;
 
     beforeAll(() => {
       dir = mkdtempSync(join(tmpdir(), "mcp-compliance-crash-"));
@@ -352,6 +398,28 @@ describe("auto-detection: legacy stdio fixtures", () => {
       writeFileSync(
         exitOnFirstLine,
         'process.stdin.once("data", () => { process.stderr.write("bye\\n"); process.exit(3); });\n',
+      );
+      // Exits at startup whatever it is sent: a server missing its env var.
+      exitAtStartup = join(dir, "exit-at-startup.mjs");
+      writeFileSync(
+        exitAtStartup,
+        'process.stderr.write("Error: API_KEY environment variable is required\\n"); process.exit(1);\n',
+      );
+      // A one-shot CLI passed where a server was expected: prints, exits 0.
+      oneShotCli = join(dir, "one-shot-cli.mjs");
+      writeFileSync(oneShotCli, 'process.stdout.write("usage: tool <command>\\n"); process.exit(0);\n');
+      // Throws from a 4-deep call on initialize: Node prints the source
+      // line, the Error line, then the stack frames.
+      crashOnInit = join(dir, "crash-on-init.mjs");
+      writeFileSync(
+        crashOnInit,
+        [
+          'import { createInterface } from "node:readline";',
+          "const d = () => { throw new Error('DATABASE_URL is not set'); };",
+          "const c = () => d(); const b = () => c(); const a = () => b();",
+          'createInterface({ input: process.stdin }).on("line", () => a());',
+          "",
+        ].join("\n"),
       );
     });
 
@@ -415,6 +483,68 @@ describe("auto-detection: legacy stdio fixtures", () => {
       // exit event lands; that ordering is not guaranteed, so not asserted.)
       expect(init.details).not.toContain("\n");
     }, 20_000);
+
+    it("lifecycle-init keeps the line naming the cause, not the stack frames, when a stdio child crashes on initialize", async () => {
+      const report = await runComplianceSuite(legacyStdio(crashOnInit), {
+        timeout: 5000,
+        startupTimeout: 5000,
+        specVersion: LEGACY_SPEC_VERSION,
+        only: ["lifecycle-init"],
+      });
+      const init = resultOf(report, "lifecycle-init");
+      expect(init.passed).toBe(false);
+      expect(init.details).toMatch(
+        /^Initialize request failed: server crashed with exit code 1 before completing the request/,
+      );
+      // The raw transport message ends in 800 chars of stderr that is
+      // mostly "    at ..." frames, which used to push the Error line out
+      // of the 400-char clip. summarizeStderr keeps the cause.
+      expect(init.details).toContain("last stderr:");
+      expect(init.details).toContain("Error: DATABASE_URL is not set");
+      expect(init.details).not.toMatch(/\bat\s+\S+\s*\(/);
+      expect(init.details).not.toContain("\n");
+    }, 20_000);
+
+    it.each([
+      ["a server that exits at startup (missing env var, code 1)", () => exitAtStartup, "code 1"],
+      ["a one-shot CLI that exits 0", () => oneShotCli, "code 0"],
+    ])(
+      "auto: %s is not blamed on the probe and gets no pin advice",
+      async (_label, path, code) => {
+        // Both die on the probe AND on the fresh instance's initialize, so
+        // pinning 2025-11-25 would change nothing; the old warning said the
+        // server "must tolerate unknown pre-initialize requests" and sent
+        // the user to pin.
+        const report = await runComplianceSuite(legacyStdio(path()), {
+          timeout: 5000,
+          startupTimeout: 10_000,
+          only: ["lifecycle-init"],
+        });
+        expect(report.specVersion).toBe(LEGACY_SPEC_VERSION);
+        const exited = report.warnings.find((w) => w.startsWith("Server exited"));
+        expect(exited, JSON.stringify(report.warnings, null, 2)).toBeDefined();
+        expect(exited).toContain(`Server exited (${code}) before answering the 2026-07-28 era probe (server/discover)`);
+        expect(exited).toContain(`exited at startup as well (${code}) before answering initialize`);
+        expect(exited).toContain("the server exits at startup regardless of the probe");
+        expect(exited).not.toContain("pin --spec-version");
+        expect(exited).not.toContain("must tolerate unknown pre-initialize requests");
+        const init = resultOf(report, "lifecycle-init");
+        expect(init.passed).toBe(false);
+        expect(init.details).toMatch(/^Initialize request failed: /);
+      },
+      20_000,
+    );
+
+    it("auto: the missing-env-var server's stderr is quoted in the startup-exit warning", async () => {
+      const report = await runComplianceSuite(legacyStdio(exitAtStartup), {
+        timeout: 5000,
+        startupTimeout: 10_000,
+        only: ["lifecycle-init"],
+      });
+      const exited = report.warnings.find((w) => w.startsWith("Server exited"));
+      expect(exited).toContain("last stderr: Error: API_KEY environment variable is required");
+      expect(exited).toContain("Check the command, its arguments and its environment.");
+    }, 20_000);
   });
 
   it("pinned 2026-07-28 against the echo fixture: the modern suite runs and discover fails", async () => {
@@ -431,9 +561,10 @@ describe("auto-detection: legacy stdio fixtures", () => {
     expect(discover.passed, discover.details).toBe(false);
     expect(discover.details).toMatch(/-32601/);
     expect(report.serverInfo.protocolVersion).toBeNull();
-    // The late initialize probe sees the legacy handshake served.
+    // The late initialize probe sees the legacy handshake served; with
+    // server/discover rejected the server is legacy-only, not dual-era.
     expect(resultOf(report, "lifecycle-dual-era").details).toMatch(
-      /^dual-era: initialize answered with protocolVersion/,
+      /^legacy-only: initialize answered with protocolVersion/,
     );
   });
 });
@@ -519,6 +650,247 @@ describe("auto-detection: unreachable server", () => {
     expect(report.tests[0].passed).toBe(false);
     expect(report.overall).toBe("fail");
   }, 15_000);
+});
+
+describe("pinned 2025-11-25 against a dual-era server", () => {
+  let http: HttpFixture;
+
+  beforeAll(async () => {
+    http = await startHttpFixture({ breaks: ["initialize-ok"] });
+  });
+
+  afterAll(async () => {
+    await http.stop();
+  });
+
+  it("says the run grades the legacy side instead of sending the user back to 2026-07-28", async () => {
+    // auto grades a dual-era server as 2026-07-28 and tells the user to
+    // re-run pinned to 2025-11-25; that pinned run then used to answer
+    // "the server spoke 2026-07-28, re-run with 2026-07-28 (or auto)",
+    // because the mismatch check never looked at supportedVersions.
+    const report = await runComplianceSuite(http.target, {
+      timeout: 5000,
+      specVersion: LEGACY_SPEC_VERSION,
+      only: ["lifecycle-init"],
+    });
+    expect(report.specVersion).toBe(LEGACY_SPEC_VERSION);
+    expect(resultOf(report, "lifecycle-init").passed).toBe(true);
+    expect(pinMismatch(report), JSON.stringify(report.warnings)).toBeUndefined();
+    expect(report.warnings).toContain(
+      "Server is dual-era (server/discover advertised supportedVersions [2026-07-28, 2025-11-25]); this run grades its 2025-11-25 side.",
+    );
+    expect(report.warnings.some((w) => w.includes("Re-run with --spec-version 2026-07-28"))).toBe(false);
+  });
+});
+
+describe("pinned-run mismatch warning fires only on a real era signal", () => {
+  it.each([
+    ["HTTP 502 with an HTML body (an outage)", 502, "<html>Bad Gateway</html>", "text/html"],
+    ["HTTP 200 with an HTML body (a login page)", 200, "<html>Sign in</html>", "text/html"],
+    [
+      "HTTP 503 with a JSON-RPC-looking body",
+      503,
+      '{"jsonrpc":"2.0","id":0,"error":{"code":-32000,"message":"down"}}',
+      "application/json",
+    ],
+  ])(
+    "pinned 2026-07-28: %s does not suggest switching eras",
+    async (_label, status, body, ct) => {
+      const stub = await startFixedServer(status, body, ct);
+      try {
+        const report = await runComplianceSuite(stub.url, {
+          timeout: 2000,
+          specVersion: MODERN_SPEC_VERSION,
+          only: ["lifecycle-discover"],
+        });
+        expect(report.specVersion).toBe(MODERN_SPEC_VERSION);
+        expect(pinMismatch(report), JSON.stringify(report.warnings)).toBeUndefined();
+        expect(report.warnings.some((w) => w.includes("Re-run with --spec-version"))).toBe(false);
+        // The server did respond, so it is not "unreachable" either.
+        expect(report.warnings.some((w) => w.includes("unreachable"))).toBe(false);
+      } finally {
+        await stub.stop();
+      }
+    },
+    15_000,
+  );
+
+  it("pinned 2026-07-28: an HTTP 404 (an HTTP+SSE server without the endpoint) still counts as a legacy signal", async () => {
+    const stub = await startFixedServer(404, "Not Found", "text/plain");
+    try {
+      const report = await runComplianceSuite(stub.url, {
+        timeout: 2000,
+        specVersion: MODERN_SPEC_VERSION,
+        only: ["lifecycle-discover"],
+      });
+      expect(pinMismatch(report), JSON.stringify(report.warnings)).toBe(
+        "Server answered the 2026-07-28 server/discover probe with HTTP 404; this run is pinned to 2026-07-28. Re-run with --spec-version 2025-11-25 (or auto) to grade it.",
+      );
+    } finally {
+      await stub.stop();
+    }
+  }, 15_000);
+
+  it("pinned 2026-07-28: a JSON-RPC result without supportedVersions is named as such", async () => {
+    const stub = await startFixedServer(200, '{"jsonrpc":"2.0","id":0,"result":{}}', "application/json");
+    try {
+      const report = await runComplianceSuite(stub.url, {
+        timeout: 2000,
+        specVersion: MODERN_SPEC_VERSION,
+        only: ["lifecycle-discover"],
+      });
+      expect(pinMismatch(report), JSON.stringify(report.warnings)).toBe(
+        "Server answered the 2026-07-28 server/discover probe with a result without supportedVersions; this run is pinned to 2026-07-28. Re-run with --spec-version 2025-11-25 (or auto) to grade it.",
+      );
+    } finally {
+      await stub.stop();
+    }
+  }, 15_000);
+});
+
+describe("auth-gated server without --auth", () => {
+  let http: HttpFixture;
+
+  beforeAll(async () => {
+    http = await startHttpFixture({ auth: "secret" });
+  });
+
+  afterAll(async () => {
+    await http.stop();
+  });
+
+  it("auto: the first warning says auth is required and the grade is not meaningful; security-auth-required does not claim acceptance", async () => {
+    const report = await runComplianceSuite(http.target, {
+      timeout: 5000,
+      only: ["transport-post", "security-auth-required"],
+    });
+    // The 401 lands on the legacy default with the era undetermined.
+    expect(report.specVersion).toBe(LEGACY_SPEC_VERSION);
+    expect(autoNote(report)).toContain("HTTP 401 (authentication required -- pass --auth); era not determinable");
+    expect(report.warnings[0]).toBe(
+      `Server at ${http.target} requires authentication (the server/discover probe got HTTP 401) and no Authorization header was sent, so the era could not be determined and the 2025-11-25 grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`,
+    );
+    expect(resultOf(report, "transport-post").details).toBe("HTTP 401 (auth required — pass --auth)");
+    // The unauthenticated preflight WAS rejected: the old detail said the
+    // server "accepted unauthenticated requests" on the same report.
+    const auth = resultOf(report, "security-auth-required");
+    expect(auth.passed, auth.details).toBe(true);
+    expect(auth.details).toBe(
+      "HTTP 401 (unauthenticated preflight rejected; pass --auth to run the authenticated suite and the remaining auth tests)",
+    );
+    expect(auth.details).not.toContain("accepted unauthenticated");
+  }, 20_000);
+
+  it("pinned 2025-11-25 without --auth: the same first-position warning, worded for a pinned run", async () => {
+    const report = await runComplianceSuite(http.target, {
+      timeout: 5000,
+      specVersion: LEGACY_SPEC_VERSION,
+      only: ["transport-post"],
+    });
+    expect(report.warnings[0]).toBe(
+      `Server at ${http.target} requires authentication (the preflight got HTTP 401) and no Authorization header was sent, so the 2025-11-25 grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`,
+    );
+    expect(pinMismatch(report)).toBeUndefined();
+  }, 20_000);
+
+  it("with --auth: no such warning, and the server is graded in its real era", async () => {
+    const report = await runComplianceSuite(http.target, {
+      timeout: 5000,
+      headers: { Authorization: "Bearer secret" },
+      only: ["lifecycle-discover"],
+    });
+    expect(report.specVersion).toBe(MODERN_SPEC_VERSION);
+    expect(report.warnings.some((w) => w.includes("requires authentication"))).toBe(false);
+    expect(resultOf(report, "lifecycle-discover").passed).toBe(true);
+  }, 20_000);
+});
+
+describe("--only values gated off the target transport", () => {
+  it("stdio: an HTTP-only id selects nothing, and the report says so instead of pointing at absent warnings", async () => {
+    const report = await runComplianceSuite(legacyStdio(LEGACY_ECHO_FIXTURE), {
+      timeout: 5000,
+      startupTimeout: 10_000,
+      specVersion: LEGACY_SPEC_VERSION,
+      only: ["transport-post"],
+    });
+    expect(report.tests).toEqual([]);
+    // The id exists in the catalog, so the unknown-id warning must not fire...
+    expect(report.warnings.some((w) => w.includes("match no test id"))).toBe(false);
+    // ...but the transport gate does.
+    expect(report.warnings).toContain(
+      'Filter value(s) "transport-post" match only tests that do not apply to a stdio target (http-only), so they select nothing here; run --list --transport stdio --spec-version 2025-11-25 to see the ids that apply.',
+    );
+  }, 20_000);
+
+  it("a value that also matches runnable tests is not flagged", async () => {
+    const report = await runComplianceSuite(legacyStdio(LEGACY_ECHO_FIXTURE), {
+      timeout: 5000,
+      startupTimeout: 10_000,
+      specVersion: LEGACY_SPEC_VERSION,
+      only: ["lifecycle-init", "transport"],
+    });
+    // "transport" on stdio still runs the stdio-* tests.
+    expect(report.tests.map((t) => t.id)).toContain("stdio-framing");
+    expect(report.warnings.some((w) => w.includes("select nothing here"))).toBe(false);
+  }, 20_000);
+});
+
+describe("abort during the HTTP preflight", () => {
+  it("rejects with the abort reason as soon as the signal fires, not after the preflight deadline", async () => {
+    const hanging = createServer(() => {
+      // never answers
+    });
+    const url = await new Promise<string>((done) => {
+      hanging.listen(0, "127.0.0.1", () => {
+        const addr = hanging.address();
+        done(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+      });
+    });
+    try {
+      const controller = new AbortController();
+      const reason = new Error("user abort");
+      setTimeout(() => controller.abort(reason), 200);
+      const started = Date.now();
+      await expect(
+        runComplianceSuite(url, {
+          timeout: 5000,
+          preflightTimeout: 4000,
+          startupTimeout: 4000,
+          signal: controller.signal,
+        }),
+      ).rejects.toBe(reason);
+      expect(Date.now() - started).toBeLessThan(1500);
+    } finally {
+      hanging.closeAllConnections();
+      await new Promise<void>((done) => hanging.close(() => done()));
+    }
+  }, 10_000);
+});
+
+describe("probeAnswerShowsEra", () => {
+  const res = (body: unknown, statusCode?: number): TransportResponse => ({ body, requestId: 0, statusCode });
+
+  it("a JSON-RPC body is an era signal at any non-5xx status", () => {
+    expect(probeAnswerShowsEra(res({ jsonrpc: "2.0", id: 0, error: { code: -32601, message: "x" } }, 200))).toBe(true);
+    expect(probeAnswerShowsEra(res({ jsonrpc: "2.0", id: 0, error: { code: -32000, message: "x" } }, 400))).toBe(true);
+    expect(probeAnswerShowsEra(res({ jsonrpc: "2.0", id: 0, result: {} }, 200))).toBe(true);
+    // stdio replies carry no status.
+    expect(probeAnswerShowsEra(res({ error: { code: -32601 } }))).toBe(true);
+  });
+
+  it("a 4xx is an era signal even without a JSON-RPC body (404 from an HTTP+SSE server)", () => {
+    expect(probeAnswerShowsEra(res({ _raw: "Not Found" }, 404))).toBe(true);
+    expect(probeAnswerShowsEra(res({ error: "Bad Request" }, 400))).toBe(true);
+  });
+
+  it("a 5xx or a non-JSON-RPC body elsewhere is not", () => {
+    expect(probeAnswerShowsEra(res({ _raw: "<html>Bad Gateway</html>" }, 502))).toBe(false);
+    expect(probeAnswerShowsEra(res({ jsonrpc: "2.0", id: 0, error: { code: -32000 } }, 503))).toBe(false);
+    expect(probeAnswerShowsEra(res({ _raw: "<html>Sign in</html>" }, 200))).toBe(false);
+    expect(probeAnswerShowsEra(res({}, 200))).toBe(false);
+    expect(probeAnswerShowsEra(res({ error: "Bad Gateway" }, 200))).toBe(false);
+    expect(probeAnswerShowsEra(null)).toBe(false);
+  });
 });
 
 describe("classifyDiscoverResponse", () => {
@@ -615,16 +987,18 @@ describe("classifyDiscoverResponse", () => {
     expect(d.reason).toBe("server/discover -> no response, legacy");
   });
 
-  it("a result WITHOUT supportedVersions (a legacy server that answers anything with {}) is legacy", () => {
+  it("a result WITHOUT supportedVersions (a legacy server that answers anything with {}) is legacy and the reason says so", () => {
     const d = classifyDiscoverResponse(res({ jsonrpc: "2.0", id: 0, result: {} }, 200));
     expect(d.version).toBe(LEGACY_SPEC_VERSION);
     expect(d.era).toBe("legacy");
     expect(d.discover).toBeUndefined();
-    expect(d.reason).toBe("server/discover -> non-modern response, legacy");
+    expect(d.reason).toBe("server/discover -> result without supportedVersions, legacy");
   });
 
   it("a result whose supportedVersions is not an array is legacy", () => {
-    expect(classifyDiscoverResponse(res({ result: { supportedVersions: "2026-07-28" } }, 200)).era).toBe("legacy");
+    const d = classifyDiscoverResponse(res({ result: { supportedVersions: "2026-07-28" } }, 200));
+    expect(d.era).toBe("legacy");
+    expect(d.reason).toBe("server/discover -> result without supportedVersions, legacy");
   });
 
   it("an empty 200 body with no result and no error is legacy", () => {

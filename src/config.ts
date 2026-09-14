@@ -31,7 +31,7 @@ export interface ComplianceConfig {
   /**
    * MCP spec revision to test against; `auto` probes the server. Same
    * precedence as `format`: `--spec-version` on the CLI wins, then this
-   * key, then `auto`. Note that tool versions before 0.18 reject this
+   * key, then `auto`. Note that tool versions before 0.19 reject this
    * key as unknown.
    */
   specVersion?: SpecVersionOption;

@@ -107,6 +107,21 @@ function notApplicable(what: string): TestOutcome {
   return { passed: true, details: `not applicable on stdio (${what})` };
 }
 
+/**
+ * The one verdict for a probe that got no HTTP answer at all. A timeout
+ * and a connection error are told apart, and neither is mistaken for an
+ * auth refusal (a 401 is an answer) or a quiet server. With `err` the
+ * details read "<what> got no response ..."; without it, `what` is the
+ * whole clause.
+ */
+function unreachable(ctx: ModernSuiteContext, what: string, err?: unknown): TestOutcome {
+  if (err === undefined) return { passed: false, details: `server unreachable: ${what}` };
+  const reason = isTimeout(err)
+    ? `no response within ${ctx.timeout}ms`
+    : `no response (connection failed: ${clip(errorMessage(err), 60)})`;
+  return { passed: false, details: `server unreachable: ${what} got ${reason}` };
+}
+
 /** Push a warning unless the identical text is already queued (tests sharing a target share the note). */
 function warnOnce(ctx: ModernSuiteContext, text: string): void {
   if (!ctx.harness.warnings.includes(text)) ctx.harness.warnings.push(text);
@@ -190,51 +205,165 @@ function isNamedTool(tool: any): boolean {
   return !!tool && typeof tool.name === "string";
 }
 
-function isReadOnly(tool: any): boolean {
-  return tool?.annotations?.readOnlyHint === true;
+/**
+ * How a tool's annotations place it on the write-safety ladder the
+ * injection tests climb. The spec defaults are readOnlyHint false and
+ * destructiveHint TRUE, so a tool that says nothing is destructive until
+ * proven otherwise; only an explicit readOnlyHint true or destructiveHint
+ * false clears it.
+ *
+ * @internal Exported for testing.
+ */
+export type ToolSafety = "read-only" | "non-destructive" | "unannotated" | "destructive";
+
+const SAFETY_ORDER: ToolSafety[] = ["read-only", "non-destructive", "unannotated", "destructive"];
+
+export function toolSafety(tool: any): ToolSafety {
+  const annotations = tool?.annotations;
+  if (annotations?.readOnlyHint === true) return "read-only";
+  if (annotations?.destructiveHint === false) return "non-destructive";
+  if (annotations?.destructiveHint === true) return "destructive";
+  return "unannotated";
 }
 
-function isDestructive(tool: any): boolean {
-  return tool?.annotations?.destructiveHint === true;
+function isReadOnly(tool: any): boolean {
+  return toolSafety(tool) === "read-only";
 }
 
 function isHeaderMirrored(schema: any): boolean {
   return typeof schema?.["x-mcp-header"] === "string" && schema["x-mcp-header"].length > 0;
 }
 
-/** Names of a tool's string-typed arguments, in declaration order. */
-function stringParamsOf(tool: any): string[] {
-  return Object.entries(propertiesOf(tool))
-    .filter(([, schema]) => schema?.type === "string")
-    .map(([name]) => name);
+/** The first non-null JSON Schema type of a schema, inferred from its shape when `type` is absent. */
+function schemaType(schema: any): string | undefined {
+  if (!schema || typeof schema !== "object") return undefined;
+  const declared = schema.type;
+  if (Array.isArray(declared)) {
+    const first = declared.find((t: unknown) => t !== "null");
+    return typeof first === "string" ? first : declared.length > 0 ? "null" : undefined;
+  }
+  if (typeof declared === "string") return declared;
+  if (schema.properties && typeof schema.properties === "object") return "object";
+  if (schema.items !== undefined) return "array";
+  return undefined;
 }
 
-/** Every (tool, string argument) pair, in list order. */
+/** A string argument whose value space is fixed (enum/const) or shaped (pattern): a payload can never satisfy it. */
+function isConstrainedString(schema: any): boolean {
+  return (
+    (Array.isArray(schema?.enum) && schema.enum.length > 0) ||
+    (!!schema && typeof schema === "object" && "const" in schema) ||
+    typeof schema?.pattern === "string"
+  );
+}
+
+/** Names of a tool's string-typed arguments: free-form ones first (declaration order), enum/const/pattern ones last. */
+function stringParamsOf(tool: any): string[] {
+  const strings = Object.entries(propertiesOf(tool)).filter(([, schema]) => schemaType(schema) === "string");
+  return [
+    ...strings.filter(([, schema]) => !isConstrainedString(schema)),
+    ...strings.filter(([, schema]) => isConstrainedString(schema)),
+  ].map(([name]) => name);
+}
+
+/** Every (tool, string argument) pair: free-form arguments of every tool first (list order), constrained ones last. */
 function stringParams(tools: any[]): StringParam[] {
-  const out: StringParam[] = [];
+  const free: StringParam[] = [];
+  const constrained: StringParam[] = [];
   for (const tool of tools) {
     if (!isNamedTool(tool)) continue;
-    for (const param of stringParamsOf(tool)) out.push({ tool, param });
+    const props = propertiesOf(tool);
+    for (const param of stringParamsOf(tool)) {
+      (isConstrainedString(props[param]) ? constrained : free).push({ tool, param });
+    }
   }
-  return out;
+  return [...free, ...constrained];
 }
 
-/** A schema-typed placeholder for a required argument the probe is not targeting. */
-function placeholderFor(schema: any): unknown {
-  if (Array.isArray(schema?.enum) && schema.enum.length > 0) return schema.enum[0];
-  const type = Array.isArray(schema?.type) ? schema.type[0] : schema?.type;
+const MAX_PLACEHOLDER_DEPTH = 4;
+
+const FORMAT_PLACEHOLDERS: Record<string, string> = {
+  email: "test@example.com",
+  uri: "https://example.com/",
+  url: "https://example.com/",
+  "uri-reference": "https://example.com/",
+  iri: "https://example.com/",
+  hostname: "example.com",
+  ipv4: "192.0.2.1",
+  ipv6: "2001:db8::1",
+  uuid: "00000000-0000-4000-8000-000000000000",
+  date: "2024-01-01",
+  time: "00:00:00Z",
+  "date-time": "2024-01-01T00:00:00Z",
+  duration: "PT1S",
+};
+
+function numberPlaceholder(schema: any, integer: boolean): number {
+  let value = 1;
+  if (typeof schema.minimum === "number" && value < schema.minimum) value = schema.minimum;
+  if (typeof schema.exclusiveMinimum === "number" && value <= schema.exclusiveMinimum) {
+    value = schema.exclusiveMinimum + 1;
+  }
+  if (typeof schema.maximum === "number" && value > schema.maximum) value = schema.maximum;
+  if (typeof schema.exclusiveMaximum === "number" && value >= schema.exclusiveMaximum) {
+    value = schema.exclusiveMaximum - 1;
+  }
+  return integer ? Math.ceil(value) : value;
+}
+
+function stringPlaceholder(schema: any): string {
+  let value = typeof schema.format === "string" ? (FORMAT_PLACEHOLDERS[schema.format] ?? "test") : "test";
+  const min = schema.minLength;
+  if (Number.isInteger(min) && min > value.length) value = value.repeat(Math.ceil(min / value.length)).slice(0, min);
+  const max = schema.maxLength;
+  if (Number.isInteger(max) && max >= 0 && value.length > max) value = value.slice(0, max);
+  return value;
+}
+
+/**
+ * A placeholder that satisfies `schema` as far as its constraints can be
+ * read: const, enum, default and examples verbatim; the first oneOf/anyOf
+ * alternative; the first non-null type; minimum/exclusiveMinimum,
+ * minItems (repeating the items placeholder), minLength/maxLength and
+ * format on strings; nested required properties on objects. Used for a
+ * required argument the probe is not targeting, so the payload in the
+ * targeted argument reaches the handler instead of dying in validation.
+ *
+ * @internal Exported for testing.
+ */
+export function placeholderFor(schema: any, depth = 0): unknown {
+  if (!schema || typeof schema !== "object" || depth > MAX_PLACEHOLDER_DEPTH) return "test";
+  if ("const" in schema) return schema.const;
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) return schema.enum[0];
+  if ("default" in schema) return schema.default;
+  if (Array.isArray(schema.examples) && schema.examples.length > 0) return schema.examples[0];
+  for (const key of ["oneOf", "anyOf", "allOf"]) {
+    const alternatives = schema[key];
+    if (Array.isArray(alternatives) && alternatives.length > 0) return placeholderFor(alternatives[0], depth + 1);
+  }
+  const type = schemaType(schema);
   switch (type) {
     case "integer":
+      return numberPlaceholder(schema, true);
     case "number":
-      return 1;
+      return numberPlaceholder(schema, false);
     case "boolean":
       return false;
-    case "array":
-      return [];
-    case "object":
-      return {};
+    case "null":
+      return null;
+    case "array": {
+      const min = Number.isInteger(schema.minItems) && schema.minItems > 0 ? schema.minItems : 0;
+      const items = Array.isArray(schema.items) ? schema.items[0] : schema.items;
+      return Array.from({ length: min }, () => placeholderFor(items, depth + 1));
+    }
+    case "object": {
+      const props = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
+      const out: Record<string, unknown> = {};
+      for (const name of requiredOf({ inputSchema: schema })) out[name] = placeholderFor(props[name], depth + 1);
+      return out;
+    }
     default:
-      return "test";
+      return stringPlaceholder(schema);
   }
 }
 
@@ -259,54 +388,62 @@ export interface InjectionTarget {
   param: string;
   /** Placeholders for the tool's other required arguments, so the payload reaches the handler. */
   fill: Record<string, unknown>;
-  /** Destructive tools (annotations.destructiveHint true) passed over in favour of this one. */
+  /** Where the chosen tool sits on the annotation ladder. */
+  safety: ToolSafety;
+  /** Tools annotated destructiveHint true that were passed over in favour of this one. */
   skippedDestructive: string[];
-  /** True when every tool with a string argument is destructive and one had to be probed anyway. */
+  /** Unannotated tools (destructive by the spec default) passed over in favour of this one. */
+  skippedUnannotated: string[];
+  /** True when the chosen tool is destructive (annotated so, or by default) because nothing safer had a string argument. */
   destructiveProbed: boolean;
 }
 
 /**
- * Pick the one target an injection test sends its payloads to: the first
- * tool declaring a string argument, read-only tools (readOnlyHint true)
- * first, destructive ones (destructiveHint true) only when nothing else
- * qualifies. `prefer` lists argument-name patterns tried in order across
- * the candidates (a URL-ish name for SSRF, a path-ish one for traversal);
- * when none matches, the target is the first candidate's first string
- * argument -- the same target the other injection tests use.
+ * Pick the one target an injection test sends its payloads to. Tools with
+ * a string argument are tiered by annotation -- readOnlyHint true, then
+ * destructiveHint false, then unannotated (destructive by the spec
+ * default), then destructiveHint true -- and only the safest non-empty
+ * tier is searched: a read-only tool is always preferred over any tool
+ * that may write, whatever its argument names. Within the tier, `prefer`
+ * lists argument-name patterns tried in order across the tools (a URL-ish
+ * name for SSRF, a path-ish one for traversal); free-form string
+ * arguments rank before enum/const/pattern ones, which no payload can
+ * satisfy. When nothing matches, the target is the tier's first free-form
+ * string argument -- the same target the other injection tests use.
  *
  * @internal Exported for testing.
  */
 export function pickInjectionTarget(tools: any[], prefer: RegExp[] = []): InjectionTarget | null {
   const withStrings = tools.filter((t) => isNamedTool(t) && stringParamsOf(t).length > 0);
   if (withStrings.length === 0) return null;
-  const ordered = [
-    ...withStrings.filter(isReadOnly),
-    ...withStrings.filter((t) => !isReadOnly(t) && !isDestructive(t)),
-    ...withStrings.filter((t) => !isReadOnly(t) && isDestructive(t)),
-  ];
-  const safe = ordered.filter((t) => isReadOnly(t) || !isDestructive(t));
-  const usable = safe.length > 0 ? safe : ordered;
-  const skippedDestructive = safe.length > 0 ? ordered.filter((t) => !safe.includes(t)).map((t) => t.name) : [];
+  const tiers = SAFETY_ORDER.map((safety) => withStrings.filter((t) => toolSafety(t) === safety));
+  const index = tiers.findIndex((tier) => tier.length > 0);
+  const tier = tiers[index];
+  const safety = SAFETY_ORDER[index];
+  const passedOver = tiers.slice(index + 1).flat();
 
+  const pairs = stringParams(tier);
   let chosen: StringParam | undefined;
   for (const re of prefer) {
-    for (const tool of usable) {
-      const param = stringParamsOf(tool).find((p) => re.test(p));
-      if (param) {
-        chosen = { tool, param };
-        break;
-      }
-    }
+    chosen = pairs.find(({ param }) => re.test(param));
     if (chosen) break;
   }
-  chosen ??= { tool: usable[0], param: stringParamsOf(usable[0])[0] };
+  chosen ??= pairs[0];
   return {
     tool: chosen.tool,
     param: chosen.param,
     fill: requiredFill(chosen.tool, chosen.param),
-    skippedDestructive,
-    destructiveProbed: safe.length === 0,
+    safety,
+    skippedDestructive: passedOver.filter((t) => toolSafety(t) === "destructive").map((t) => t.name),
+    skippedUnannotated: passedOver.filter((t) => toolSafety(t) === "unannotated").map((t) => t.name),
+    destructiveProbed: safety === "unannotated" || safety === "destructive",
   };
+}
+
+/** "a, b, c and 4 more" for a details/warning string. */
+function nameList(names: string[], max = 6): string {
+  if (names.length <= max) return names.join(", ");
+  return `${names.slice(0, max).join(", ")} and ${names.length - max} more`;
 }
 
 /** Text a tool result exposes to the model: every text block plus structured output. */
@@ -421,23 +558,32 @@ export interface ErrorSample {
 
 /**
  * First pattern hit per sample that is not an echo of the request's own
- * params. Issues are deduplicated; at most `max` are returned.
+ * params. Issues are keyed on the leaked text itself, so one stack frame
+ * repeated across every error response is one issue (with the first
+ * sample as context and a repeat count), and the `max` cap covers
+ * distinct leaks.
  *
  * @internal Exported for testing.
  */
 export function findLeaks(samples: ErrorSample[], patterns: RegExp[], max = 3): string[] {
-  const issues = new Set<string>();
+  const leaks = new Map<string, { context: string; count: number }>();
   for (const sample of samples) {
     for (const pattern of patterns) {
       const match = pattern.exec(sample.text);
       if (!match) continue;
       if (sample.requestText.includes(match[0])) continue;
-      issues.add(`Response contains: ${clip(match[0], 60)} (matched in: ${clip(sample.text, 80)})`);
+      const seen = leaks.get(match[0]);
+      if (seen) seen.count++;
+      else leaks.set(match[0], { context: sample.text, count: 1 });
       break; // one finding per sample is enough
     }
-    if (issues.size >= max) break;
   }
-  return [...issues];
+  return [...leaks.entries()]
+    .slice(0, max)
+    .map(
+      ([leak, { context, count }]) =>
+        `Response contains: ${clip(leak, 60)} (matched in: ${clip(context, 80)}${count > 1 ? `; in ${count} responses` : ""})`,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +602,7 @@ export async function runSecurity(ctx: ModernSuiteContext): Promise<void> {
 
   // The failure probes are shared by the two information-disclosure
   // tests the same way.
-  let probes: Promise<ErrorSample[]> | null = null;
+  let probes: Promise<ErrorProbes> | null = null;
   const errorProbes = () => {
     probes ??= collectErrorProbes(ctx);
     return probes;
@@ -501,9 +647,14 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
       if (res.statusCode === 401) {
         const challenge = headerOf(res.headers, "www-authenticate");
         if (challenge) {
-          if (!/resource_metadata=/i.test(challenge)) {
+          const prm = parseResourceMetadata(challenge);
+          if (!prm.present) {
             ctx.harness.warnings.push(
               "security-www-authenticate: the WWW-Authenticate challenge carries no resource_metadata parameter; clients must fall back to the well-known Protected Resource Metadata URL.",
+            );
+          } else if (!prm.url) {
+            ctx.harness.warnings.push(
+              `security-www-authenticate: the WWW-Authenticate resource_metadata value "${clip(prm.raw, 80)}" is not an absolute http(s) URL (RFC 9728 section 5.1 requires one); clients cannot locate the Protected Resource Metadata from it.`,
             );
           }
           return { passed: true, details: `WWW-Authenticate: ${clip(challenge, 150)}` };
@@ -568,7 +719,9 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
     if (ctx.kind !== "http") return notApplicable("no OAuth");
     // The challenge on the unauthenticated discover names the metadata
     // URL clients try first; without --auth the same 401 is also what
-    // says the server is auth-protected at all.
+    // says the server is auth-protected at all. An rpc that throws got
+    // no HTTP answer of any status: that is an unreachable (or hung)
+    // server, never an auth refusal.
     let challenge: string | undefined;
     try {
       const res = await unauthenticatedDiscover();
@@ -579,9 +732,8 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
           details: `Skipped: server does not require auth (unauthenticated server/discover answered HTTP ${res.statusCode})`,
         };
       }
-    } catch {
-      if (!ctx.hasAuth)
-        return { passed: true, details: "Skipped: unauthenticated server/discover was refused (pass --auth)" };
+    } catch (err) {
+      return unreachable(ctx, "unauthenticated server/discover", err);
     }
     return checkProtectedResourceMetadata(ctx, challenge);
   });
@@ -726,82 +878,138 @@ async function getJson(url: string, timeout: number): Promise<{ status: number; 
   return { status: res.statusCode, json: parseJson(text), text };
 }
 
-/** The resource_metadata URL of a WWW-Authenticate challenge, when it carries an absolute one. */
-function resourceMetadataUrlOf(challenge: string | undefined): string | undefined {
-  if (!challenge) return undefined;
-  const m = /resource_metadata\s*=\s*(?:"([^"]*)"|([^\s,;]+))/i.exec(challenge);
-  const raw = m?.[1] ?? m?.[2];
-  if (!raw) return undefined;
+/**
+ * The resource_metadata parameter of a WWW-Authenticate challenge (RFC
+ * 9728 section 5.1): whether it is there at all, its (trimmed) value, and
+ * that value as a URL when it is an absolute http(s) one -- the only form
+ * a client can fetch. security-www-authenticate and security-oauth-metadata
+ * read the challenge through this one parser so they cannot disagree.
+ *
+ * @internal Exported for testing.
+ */
+export function parseResourceMetadata(challenge: string | undefined): {
+  present: boolean;
+  raw: string;
+  url: string | null;
+} {
+  const m = challenge ? /resource_metadata\s*=\s*(?:"([^"]*)"|([^\s,;]+))/i.exec(challenge) : null;
+  if (!m) return { present: false, raw: "", url: null };
+  const raw = (m[1] ?? m[2] ?? "").trim();
+  let url: string | null = null;
   try {
-    new URL(raw);
-    return raw;
-  } catch {
-    return undefined;
+    const u = new URL(raw);
+    if (u.protocol === "http:" || u.protocol === "https:") url = raw;
+  } catch {}
+  return { present: true, raw, url };
+}
+
+type PrmFetch =
+  | { ok: true; resource: string; authorizationServers: number }
+  | { ok: false; status: number | null; problem: string };
+
+/** One GET of a Protected Resource Metadata candidate, validated to the RFC 9728 minimum MCP needs. */
+async function fetchProtectedResourceMetadata(url: string, timeout: number): Promise<PrmFetch> {
+  let res: Awaited<ReturnType<typeof getJson>>;
+  try {
+    res = await getJson(url, timeout);
+  } catch (err) {
+    return { ok: false, status: null, problem: `is unreachable (${clip(errorMessage(err), 60)})` };
   }
+  if (res.status !== 200) return { ok: false, status: res.status, problem: `answered HTTP ${res.status}` };
+  const meta = res.json;
+  if (!meta || typeof meta !== "object") return { ok: false, status: 200, problem: "returned a non-JSON body" };
+  if (!meta.resource) return { ok: false, status: 200, problem: "is missing the required 'resource' field" };
+  if (!Array.isArray(meta.authorization_servers) || meta.authorization_servers.length === 0) {
+    return { ok: false, status: 200, problem: "is missing the 'authorization_servers' array" };
+  }
+  return { ok: true, resource: String(meta.resource), authorizationServers: meta.authorization_servers.length };
 }
 
 /**
- * RFC 9728 Protected Resource Metadata, tried in the order the spec makes
- * clients use (authorization-server-discovery#protected-resource-metadata-
- * discovery-requirements): the resource_metadata URL from the 401's
- * WWW-Authenticate challenge when present, then the endpoint-path
- * well-known URL, then the root one. The document's `resource` must be
- * the MCP endpoint (canonical form); a mismatch passes with a warning. A
- * legacy authorization-server document passes with a warning.
+ * RFC 9728 Protected Resource Metadata, located the way the spec makes
+ * clients locate it (authorization-server-discovery#protected-resource-
+ * metadata-discovery-requirements). When the 401's WWW-Authenticate
+ * challenge carries resource_metadata, clients MUST fetch that URL and
+ * nothing else, so a challenge URL that is unreachable, non-200 or
+ * malformed fails outright -- the well-known locations are consulted only
+ * to say whether a valid document exists that the challenge should point
+ * at. Without a challenge URL the well-known locations are tried in spec
+ * order: the endpoint-path variant, then the root. The document's
+ * `resource` must be the MCP endpoint (canonical form); a mismatch passes
+ * with a warning. A legacy authorization-server document passes with a
+ * warning.
  */
 async function checkProtectedResourceMetadata(ctx: ModernSuiteContext, challenge?: string): Promise<TestOutcome> {
   const parsed = new URL(ctx.backendUrl);
   const origin = `${parsed.protocol}//${parsed.host}`;
   const root = `${origin}/.well-known/oauth-protected-resource`;
   const path = parsed.pathname.replace(/\/+$/, "");
-  const candidates: Array<{ url: string; via: string | null }> = [];
-  const fromChallenge = resourceMetadataUrlOf(challenge);
-  if (fromChallenge) candidates.push({ url: fromChallenge, via: "WWW-Authenticate" });
-  if (path && path !== "/") candidates.push({ url: `${root}${path}`, via: null });
-  candidates.push({ url: root, via: null });
+  const wellKnown = path && path !== "/" ? [`${root}${path}`, root] : [root];
+  const whereOf = (url: string) => (url.startsWith(`${origin}/`) ? url.slice(origin.length) : clip(url, 80));
+
+  const found = (label: string, doc: Extract<PrmFetch, { ok: true }>): TestOutcome => {
+    let note = "";
+    if (canonicalUri(doc.resource) !== canonicalUri(ctx.backendUrl)) {
+      ctx.harness.warnings.push(
+        `security-oauth-metadata: the Protected Resource Metadata at ${label} names resource "${clip(doc.resource, 80)}", which is not the MCP endpoint ${ctx.backendUrl} in canonical form; RFC 9728 section 3.3 has clients discard metadata whose resource does not match the URL they used.`,
+      );
+      note = " (resource does not match the endpoint, see warning)";
+    }
+    return {
+      passed: true,
+      details: `Protected Resource Metadata found at ${label}: resource=${clip(doc.resource, 60)}, ${doc.authorizationServers} auth server(s)${note}`,
+    };
+  };
+
+  const prm = parseResourceMetadata(challenge);
+  if (prm.present) {
+    if (!prm.url) {
+      return {
+        passed: false,
+        details: clip(
+          `WWW-Authenticate resource_metadata "${clip(prm.raw, 80)}" is not an absolute http(s) URL (RFC 9728 section 5.1) -- clients MUST use the advertised URL and cannot fetch this one`,
+          220,
+        ),
+      };
+    }
+    const label = `${whereOf(prm.url)} (via WWW-Authenticate)`;
+    const doc = await fetchProtectedResourceMetadata(prm.url, ctx.timeout);
+    if (doc.ok) return found(label, doc);
+    // The spec sends clients to the advertised URL only, so a valid
+    // document elsewhere does not rescue the verdict -- but it is worth
+    // naming, since the fix is then one header.
+    let elsewhere = "";
+    for (const url of wellKnown) {
+      if (url === prm.url) continue;
+      const alt = await fetchProtectedResourceMetadata(url, ctx.timeout);
+      if (alt.ok) {
+        elsewhere = `; valid document at ${whereOf(url)}`;
+        break;
+      }
+    }
+    return {
+      passed: false,
+      details: clip(
+        `WWW-Authenticate resource_metadata ${whereOf(prm.url)} ${doc.problem} -- clients MUST use the advertised URL, not the well-known fallback${elsewhere}`,
+        220,
+      ),
+    };
+  }
 
   const statuses: string[] = [];
   let malformed: string | null = null;
   let reachable = false;
-  const tried = new Set<string>();
-  for (const { url, via } of candidates) {
-    if (tried.has(url)) continue;
-    tried.add(url);
-    const where = url.startsWith(`${origin}/`) ? url.slice(origin.length) : clip(url, 80);
-    const label = via ? `${where} (via ${via})` : where;
-    try {
-      const res = await getJson(url, ctx.timeout);
-      reachable = true;
-      statuses.push(`${label} -> HTTP ${res.status}`);
-      if (res.status !== 200) continue;
-      const meta = res.json;
-      if (!meta || typeof meta !== "object") {
-        malformed ??= `PRM endpoint ${label} returned non-JSON response`;
-        continue;
-      }
-      if (!meta.resource) {
-        malformed ??= `PRM response at ${label} missing required 'resource' field`;
-        continue;
-      }
-      if (!Array.isArray(meta.authorization_servers) || meta.authorization_servers.length === 0) {
-        malformed ??= `PRM response at ${label} missing 'authorization_servers' array`;
-        continue;
-      }
-      const resource = String(meta.resource);
-      let note = "";
-      if (canonicalUri(resource) !== canonicalUri(ctx.backendUrl)) {
-        ctx.harness.warnings.push(
-          `security-oauth-metadata: the Protected Resource Metadata at ${label} names resource "${clip(resource, 80)}", which is not the MCP endpoint ${ctx.backendUrl} in canonical form; RFC 9728 section 3.3 has clients discard metadata whose resource does not match the URL they used.`,
-        );
-        note = " (resource does not match the endpoint, see warning)";
-      }
-      return {
-        passed: true,
-        details: `Protected Resource Metadata found at ${label}: resource=${clip(resource, 60)}, ${meta.authorization_servers.length} auth server(s)${note}`,
-      };
-    } catch {
+  for (const url of wellKnown) {
+    const label = whereOf(url);
+    const doc = await fetchProtectedResourceMetadata(url, ctx.timeout);
+    if (doc.ok) return found(label, doc);
+    if (doc.status === null) {
       statuses.push(`${label} -> unreachable`);
+      continue;
     }
+    reachable = true;
+    statuses.push(`${label} -> HTTP ${doc.status}`);
+    if (doc.status === 200) malformed ??= `PRM document at ${label} ${doc.problem}`;
   }
   if (malformed) return { passed: false, details: clip(malformed, 200) };
   if (!reachable) return { passed: false, details: "PRM endpoint unreachable" };
@@ -832,6 +1040,7 @@ type HttpRawRequest = (
   extraHeaders: Record<string, string>,
   timeout: number,
   omitUserHeaders?: string[],
+  signal?: AbortSignal,
 ) => Promise<{ statusCode: number; body: string; headers: Record<string, string> }>;
 
 interface CorsObservation {
@@ -862,6 +1071,8 @@ async function checkCorsHeaders(ctx: ModernSuiteContext): Promise<TestOutcome> {
           "Access-Control-Request-Headers": "content-type, authorization, mcp-protocol-version, mcp-method",
         },
         Math.min(ctx.timeout, 5000),
+        undefined,
+        ctx.signal,
       );
       observations.push({
         via: "OPTIONS",
@@ -869,7 +1080,8 @@ async function checkCorsHeaders(ctx: ModernSuiteContext): Promise<TestOutcome> {
         acao: headerOf(res.headers, "access-control-allow-origin"),
         credentials: headerOf(res.headers, "access-control-allow-credentials"),
       });
-    } catch {
+    } catch (err: unknown) {
+      if (ctx.signal?.aborted) throw err;
       seen.push("OPTIONS failed");
     }
   }
@@ -975,13 +1187,23 @@ function noteInjectionScope(ctx: ModernSuiteContext, target: InjectionTarget): v
   if (target.skippedDestructive.length > 0) {
     warnOnce(
       ctx,
-      `security injection tests: skipped destructive tool(s) ${target.skippedDestructive.join(", ")} (annotations.destructiveHint true).`,
+      `security injection tests: skipped destructive tool(s) ${nameList(target.skippedDestructive)} (annotations.destructiveHint true).`,
+    );
+  }
+  if (target.skippedUnannotated.length > 0) {
+    warnOnce(
+      ctx,
+      `security injection tests: skipped ${target.skippedUnannotated.length} unannotated tool(s) ${nameList(target.skippedUnannotated)}: the spec defaults destructiveHint to true, so a tool without readOnlyHint true or destructiveHint false counts as destructive; annotate read-only tools to have them probed.`,
     );
   }
   if (target.destructiveProbed) {
+    const why =
+      target.safety === "destructive"
+        ? "annotations.destructiveHint true"
+        : "unannotated, and the spec defaults destructiveHint to true";
     warnOnce(
       ctx,
-      `security injection tests: every tool with a string argument is destructive (annotations.destructiveHint true), so ${name} was probed with live payloads; run against a disposable dataset.`,
+      `security injection tests: no tool with a string argument is annotated readOnlyHint true or destructiveHint false, so ${name} (${why}) was probed with live payloads; run against a disposable dataset, or annotate read-only tools with readOnlyHint true.`,
     );
   }
   const filled = Object.entries(target.fill);
@@ -1043,7 +1265,18 @@ async function runInjectionTest(
   }
   if (issues.length > 0) return { passed: false, details: clip(issues.join("; "), 200) };
   const counts = `${rejected} rejected, ${benign} returned without evidence of execution, ${unreached} never reached the tool (JSON-RPC or transport error)`;
-  const verdict = rejected === payloads.length ? " -- server defended" : "";
+  let verdict = "";
+  if (rejected === payloads.length) verdict = " -- server defended";
+  else if (unreached === payloads.length) {
+    // Nothing was measured: every call died before the handler. The
+    // placeholders may not satisfy the schema, or the target argument is
+    // validated away (an enum, a pattern); say so rather than pass quietly.
+    warnOnce(
+      ctx,
+      `security injection tests: no payload sent to ${where} reached the tool (every tools/call drew a JSON-RPC or transport error), so the verdict is inconclusive; check that the placeholder arguments satisfy the tool's schema, or expose a read-only tool with a free-form string argument.`,
+    );
+    verdict = " -- inconclusive (see warning)";
+  }
   return { passed: true, details: `Tested ${payloads.length} payload(s) against ${where}: ${counts}${verdict}` };
 }
 
@@ -1274,6 +1507,13 @@ async function runToolIntegrity(ctx: ModernSuiteContext) {
 
 type RpcOpts = Parameters<ModernSuiteContext["client"]["rpc"]>[2];
 
+interface ErrorProbes {
+  samples: ErrorSample[];
+  /** How many probes were sent, and how many got an answer of any shape (0 answered = unreachable). */
+  sent: number;
+  answered: number;
+}
+
 /**
  * Trigger a range of failures with conformant envelopes so the errors
  * come from the server's own handlers, not the transport layer. A
@@ -1282,8 +1522,10 @@ type RpcOpts = Parameters<ModernSuiteContext["client"]["rpc"]>[2];
  * was not JSON-RPC (a 500 page) as text; a result is not an error
  * response and is dropped.
  */
-async function collectErrorProbes(ctx: ModernSuiteContext): Promise<ErrorSample[]> {
+async function collectErrorProbes(ctx: ModernSuiteContext): Promise<ErrorProbes> {
   const samples: ErrorSample[] = [];
+  let sent = 0;
+  let answered = 0;
   const rpcProbes: Array<[string, unknown, RpcOpts?]> = [
     ["nonexistent/___crash___test___", {}],
     // Malformed _meta: a string where the envelope object belongs.
@@ -1294,8 +1536,10 @@ async function collectErrorProbes(ctx: ModernSuiteContext): Promise<ErrorSample[
     [TOOLS_LIST, { cursor: "!!!invalid-garbage-cursor-$$$" }],
   ];
   for (const [method, params, opts] of rpcProbes) {
+    sent++;
     try {
       const res = await ctx.client.rpc(method, params, opts);
+      answered++;
       const text = errorSampleText(res.body);
       if (text === null) continue;
       samples.push({ text, requestText: JSON.stringify(ctx.client.paramsFor(params, opts) ?? null) });
@@ -1304,14 +1548,16 @@ async function collectErrorProbes(ctx: ModernSuiteContext): Promise<ErrorSample[
     }
   }
   if (ctx.kind === "http") {
+    sent++;
     try {
       const res = await ctx.client.raw("{this is not valid json!!!", { method: DISCOVER });
+      answered++;
       const parsed = parseJson(res.body);
       const text = parsed === undefined ? res.body : errorSampleText(parsed);
       if (text) samples.push({ text, requestText: "" });
     } catch {}
   }
-  return samples;
+  return { samples, sent, answered };
 }
 
 /** The scannable text of a response body: the error object, a raw non-JSON body, or null for a result. */
@@ -1337,27 +1583,41 @@ function recordedErrorSamples(ctx: ModernSuiteContext): ErrorSample[] {
   return samples;
 }
 
-async function runInformationDisclosure(ctx: ModernSuiteContext, errorProbes: () => Promise<ErrorSample[]>) {
+async function runInformationDisclosure(ctx: ModernSuiteContext, errorProbes: () => Promise<ErrorProbes>) {
   const { check } = ctx.harness;
 
-  const gather = async (): Promise<ErrorSample[]> => {
+  // A scan over nothing proves nothing: when none of the failure probes
+  // got an answer of any shape and the run recorded no server message
+  // either, the server never spoke, and the verdict says so instead of
+  // "0 unique error responses checked".
+  const gather = async (): Promise<{ samples: ErrorSample[]; silent: TestOutcome | null }> => {
     const probes = await errorProbes();
+    if (probes.answered === 0 && ctx.recorder.size === 0) {
+      return {
+        samples: [],
+        silent: unreachable(
+          ctx,
+          `none of the ${probes.sent} failure probes was answered and the run recorded no server message, so there are no error responses to scan`,
+        ),
+      };
+    }
     // The probes are recorded too, in the same error-object form, so the
     // union dedupes by text: one sample per distinct response. Probe
     // samples come first because they carry the fuller request text for
     // the echo check.
     const seen = new Set<string>();
     const all: ErrorSample[] = [];
-    for (const s of [...probes, ...recordedErrorSamples(ctx)]) {
+    for (const s of [...probes.samples, ...recordedErrorSamples(ctx)]) {
       if (seen.has(s.text)) continue;
       seen.add(s.text);
       all.push(s);
     }
-    return all;
+    return { samples: all, silent: null };
   };
 
   await check("security-error-no-stacktrace", async () => {
-    const samples = await gather();
+    const { samples, silent } = await gather();
+    if (silent) return silent;
     const issues = findLeaks(samples, STACK_TRACE_PATTERNS);
     if (issues.length > 0) return { passed: false, details: clip(issues.join("; "), 200) };
     return {
@@ -1367,7 +1627,8 @@ async function runInformationDisclosure(ctx: ModernSuiteContext, errorProbes: ()
   });
 
   await check("security-error-no-internal-ip", async () => {
-    const samples = await gather();
+    const { samples, silent } = await gather();
+    if (silent) return silent;
     const issues = findLeaks(samples, INTERNAL_IP_PATTERNS, 1);
     if (issues.length > 0) {
       return { passed: false, details: clip(`Error response contains internal IP: ${issues[0]}`, 200) };
@@ -1384,9 +1645,15 @@ async function runInformationDisclosure(ctx: ModernSuiteContext, errorProbes: ()
 /**
  * The spec's MUST is on tool invocations (server/tools#security-
  * considerations), so the burst goes to a read-only tool that needs no
- * arguments when the server has one. Only when it does not is
- * `server/discover` bursted, and a quiet burst then passes with a
- * warning: discovery is cacheable and nothing requires throttling it.
+ * arguments when the server has one, and to `server/discover` otherwise.
+ * A 429 anywhere in the burst passes; a burst the server falls over on
+ * (mostly 5xx) fails. A quiet burst is graded the same way on both
+ * paths -- pass with a warning naming what was bursted -- because 50
+ * requests cannot prove the absence of a limiter (a per-minute quota
+ * above 50 never trips), and failing only the servers that annotate a
+ * read-only tool would punish the annotation. A burst that never
+ * reached a handler (every answer 401/403, or no answer at all) is
+ * inconclusive, not quiet.
  */
 async function runRateLimiting(ctx: ModernSuiteContext) {
   await ctx.harness.check("security-rate-limiting", async () => {
@@ -1415,6 +1682,9 @@ async function runRateLimiting(ctx: ModernSuiteContext) {
         details: `Rate limiting detected (429 returned within ${RATE_LIMIT_BURST} rapid ${method} requests)`,
       };
     }
+    if (statuses.every((c) => c === 0)) {
+      return unreachable(ctx, `none of the ${RATE_LIMIT_BURST} rapid ${method} requests got a response`);
+    }
     const errorCount = statuses.filter((c) => c >= 500).length;
     if (errorCount > RATE_LIMIT_BURST / 2) {
       return {
@@ -1423,12 +1693,21 @@ async function runRateLimiting(ctx: ModernSuiteContext) {
       };
     }
     const observed = [...new Set(statuses)].join(",");
+    if (statuses.every((c) => c === 401 || c === 403)) {
+      const hint = ctx.hasAuth ? " (check the configured credential)" : "; pass --auth";
+      return {
+        passed: true,
+        details: `Skipped: all ${RATE_LIMIT_BURST} rapid ${method} requests were rejected by auth (HTTP ${observed}) before reaching a handler, so rate limiting could not be measured${hint}`,
+      };
+    }
     if (!tool) {
       const why =
         tools === null
-          ? hasTools(ctx)
-            ? "tools/list unavailable"
-            : "server declares no tools"
+          ? ctx.state.discover === null
+            ? "capabilities unknown (server/discover rejected)"
+            : hasTools(ctx)
+              ? "tools/list unavailable"
+              : "server declares no tools"
           : "no read-only tool without required arguments";
       ctx.harness.warnings.push(
         `security-rate-limiting: ${why}, so only ${DISCOVER} was bursted (${RATE_LIMIT_BURST} requests, none answered 429); tool invocations, which servers MUST rate limit, could not be exercised -- rate-limit tools/call and verify it by hand.`,
@@ -1438,9 +1717,12 @@ async function runRateLimiting(ctx: ModernSuiteContext) {
         details: `${RATE_LIMIT_BURST} rapid ${DISCOVER} requests all returned ${observed}; tool invocations could not be bursted (${why}, see warning)`,
       };
     }
+    ctx.harness.warnings.push(
+      `security-rate-limiting: ${RATE_LIMIT_BURST} rapid tools/call ${tool.name} requests drew no 429 (HTTP ${observed}); servers MUST rate limit tool invocations -- apply a per-client limiter to tools/call (429 + Retry-After) and verify it by hand. The burst invoked ${tool.name} ${RATE_LIMIT_BURST} times.`,
+    );
     return {
-      passed: false,
-      details: `No rate limiting detected (${RATE_LIMIT_BURST} rapid ${method} requests all returned ${observed})`,
+      passed: true,
+      details: `No 429 within ${RATE_LIMIT_BURST} rapid ${method} requests (HTTP ${observed}); rate limiting not detected (see warning)`,
     };
   });
 }

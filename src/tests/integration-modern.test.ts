@@ -31,8 +31,12 @@ const ajv = new Ajv2020({ strict: true, allErrors: true });
 addFormats(ajv);
 const validateReport = ajv.compile(reportSchema);
 
-/** Optional checks every HTTP run on plain loopback fails regardless of the server. */
-const LOCALHOST_INHERENT = ["security-auth-required", "security-rate-limiting", "security-tls-required"];
+/**
+ * Optional checks every HTTP run on plain loopback fails regardless of the
+ * server. (security-rate-limiting is not one: a quiet burst passes with a
+ * warning in this catalog, asserted in the warnings below.)
+ */
+const LOCALHOST_INHERENT = ["security-auth-required", "security-tls-required"];
 
 const FIXTURE_TOOLS = [
   "echo",
@@ -194,15 +198,17 @@ for (const ex of EXPECTED) {
       expect(report.warnings.some((w) => w.includes("unreachable"))).toBe(false);
       expect(report.warnings.some((w) => w.startsWith("Server is dual-era"))).toBe(false);
       // The fixture's only lint: descriptions it deliberately omits, plus the
-      // oversized-input observation (it accepts a 1 MB argument).
-      expect(report.warnings.slice(1).sort()).toEqual(
-        [
-          'Template "template" missing description',
-          'Resource "static-text" missing description',
-          'Resource "static-binary" missing description',
-          "security-oversized-input: the server completed a tools/call carrying a 1 MB string argument (echo.message) instead of rejecting it; enforce a request body limit (413) or maxLength in inputSchema.",
-        ].sort(),
-      );
+      // oversized-input observation (it accepts a 1 MB argument) and, over
+      // HTTP, the quiet rate-limit burst.
+      const expected: unknown[] = [
+        'Template "template" missing description',
+        'Resource "static-text" missing description',
+        'Resource "static-binary" missing description',
+        "security-oversized-input: the server completed a tools/call carrying a 1 MB string argument (echo.message) instead of rejecting it; enforce a request body limit (413) or maxLength in inputSchema.",
+      ];
+      if (ex.kind === "http") expected.push(expect.stringMatching(/^security-rate-limiting: /));
+      expect(report.warnings.slice(1).sort()).toEqual(expect.arrayContaining(expected));
+      expect(report.warnings.slice(1)).toHaveLength(expected.length);
     });
 
     it("the informational probes describe the fixture as modern-only", () => {
@@ -211,6 +217,27 @@ for (const ex of EXPECTED) {
       );
       expect(resultOf(report, "lifecycle-progress-token").details).toMatch(/^3 notifications\/progress echoed token/);
       expect(resultOf(report, "lifecycle-subscriptions-listen").details).toMatch(/^Acknowledged subscription/);
+    });
+
+    it("runs the late lifecycle block before the security module and the post-hoc checks last", () => {
+      // The security rate-limit burst can leave an intermediary answering
+      // 429 for a while; the claim-less _meta probes and the legacy
+      // initialize probe must have run by then. Post-hoc scans the recorder
+      // after everything.
+      const order = report.tests.map((t) => t.id);
+      const firstSecurity = order.findIndex((id) => id.startsWith("security-"));
+      expect(firstSecurity).toBeGreaterThan(0);
+      for (const id of [
+        "lifecycle-completions",
+        "lifecycle-progress-token",
+        "lifecycle-meta-required",
+        "lifecycle-meta-protocol-version-required",
+        "lifecycle-dual-era",
+      ]) {
+        expect(order.indexOf(id), id).toBeLessThan(firstSecurity);
+      }
+      const posthoc = order.indexOf("schema-wire-valid");
+      expect(posthoc).toBeGreaterThan(order.lastIndexOf("security-rate-limiting"));
     });
 
     it("is deterministic across two runs (modulo timings and the string-id counter)", () => {

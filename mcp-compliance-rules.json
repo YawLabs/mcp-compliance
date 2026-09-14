@@ -820,8 +820,8 @@
       "capabilityGated": null,
       "specRef": "basic/authorization",
       "description": "Verifies the server rejects requests without an Authorization header",
-      "passCriteria": "HTTP 401 or 403 for unauthenticated request",
-      "failCriteria": "Server accepts unauthenticated request or no auth is configured"
+      "passCriteria": "HTTP 401 or 403 for an unauthenticated request: with --auth, the request re-sent without its Authorization header; without --auth, the unauthenticated preflight",
+      "failCriteria": "Server accepts an unauthenticated request (without --auth: the unauthenticated preflight was served)"
     },
     {
       "id": "security-www-authenticate",
@@ -950,7 +950,7 @@
       "capabilityGated": "tools",
       "specRef": "server/tools#calling-tools",
       "description": "Verifies tools do not execute OS command injection payloads in string parameters",
-      "passCriteria": "Injection payloads do not produce command execution output",
+      "passCriteria": "Injection payloads do not produce command execution output (output that only reflects the payload back is benign)",
       "failCriteria": "Tool output contains evidence of command execution"
     },
     {
@@ -963,7 +963,7 @@
       "capabilityGated": "tools",
       "specRef": "server/tools#calling-tools",
       "description": "Verifies tools do not expose SQL injection vulnerabilities",
-      "passCriteria": "Injection payloads do not trigger database errors or data leakage",
+      "passCriteria": "Injection payloads do not trigger database errors or data leakage (output that only reflects the payload back is benign)",
       "failCriteria": "Tool output contains SQL error messages or database metadata"
     },
     {
@@ -976,7 +976,7 @@
       "capabilityGated": "tools",
       "specRef": "server/tools#calling-tools",
       "description": "Verifies tools do not allow path traversal attacks via string parameters",
-      "passCriteria": "Traversal payloads do not return sensitive file content",
+      "passCriteria": "Traversal payloads do not return sensitive file content (output that only reflects the payload back is benign)",
       "failCriteria": "Tool output contains content from /etc/passwd or system files"
     },
     {
@@ -989,7 +989,7 @@
       "capabilityGated": "tools",
       "specRef": "server/tools#calling-tools",
       "description": "Verifies tools with URL parameters do not fetch internal/cloud metadata endpoints",
-      "passCriteria": "Internal IP payloads do not return cloud metadata or internal service data",
+      "passCriteria": "Internal IP payloads do not return cloud metadata or internal service data (output that only reflects the payload back is benign)",
       "failCriteria": "Tool output contains cloud metadata or internal network responses"
     },
     {
@@ -1338,9 +1338,9 @@
       "defaultRequired": true,
       "capabilityGated": null,
       "specRef": "basic/transports/streamable-http#protocol-version-header",
-      "description": "Sends a server/discover whose body is complete but whose MCP-Protocol-Version header is omitted. Every POST MUST carry the header, and a server that does not serve pre-2025-06-18 clients MUST reject its absence with HTTP 400 and a -32020 HeaderMismatch error. 400 is the hard requirement; a missing or different error code is reported as a warning. A 400 is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable.",
-      "passCriteria": "HTTP 400 for a complete server/discover body sent without the MCP-Protocol-Version header, credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); a body without error code -32020 is reported as a warning.",
-      "failCriteria": "Any status other than 400, or a 400 from a server whose conformant server/discover was itself rejected or unanswered.",
+      "description": "Sends a server/discover whose body is complete but whose MCP-Protocol-Version header is omitted. Every POST MUST carry the header, and a server that does not serve pre-2025-06-18 clients MUST reject its absence with HTTP 400 and a -32020 HeaderMismatch error. 400 is the hard requirement; a missing or different error code is reported as a warning. A 400 is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable, as does a transport-level answer (401, 403, 413, 415 or 429 from an auth gate, size limit, media-type gate or rate limiter).",
+      "passCriteria": "HTTP 400 for a complete server/discover body sent without the MCP-Protocol-Version header, credited only when the conformant server/discover was served and the answer is not a transport-level status (a server that rejects everything, or a 401/403/413/415/429 from an auth gate, size limit, media-type gate or rate limiter, fails as not evaluable); a body without error code -32020 is reported as a warning.",
+      "failCriteria": "Any status other than 400, or a 400 or transport-level status (401, 403, 413, 415, 429) from a server whose conformant server/discover was itself rejected or unanswered.",
       "transports": ["http"]
     },
     {
@@ -1352,8 +1352,8 @@
       "defaultRequired": true,
       "capabilityGated": null,
       "specRef": "basic/transports/streamable-http#protocol-version-header",
-      "description": "Sends MCP-Protocol-Version: 2026-07-28 with _meta protocolVersion 1999-01-01. The header value MUST match the _meta field, and on a mismatch the server MUST respond 400 Bad Request with a -32020 HeaderMismatch error; both the status and the code are checked here.",
-      "passCriteria": "HTTP 400 and a JSON-RPC error with code -32020 when the header says 2026-07-28 and _meta says 1999-01-01, credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable).",
+      "description": "Sends MCP-Protocol-Version: 2026-07-28 with _meta protocolVersion 1999-01-01. The header value MUST match the _meta field, and on a mismatch the server MUST respond 400 Bad Request with a -32020 HeaderMismatch error; both the status and the code are checked here. The 400 is credited only when the conformant server/discover was served and the answer is not a transport-level status (401, 403, 413, 415 or 429).",
+      "passCriteria": "HTTP 400 and a JSON-RPC error with code -32020 when the header says 2026-07-28 and _meta says 1999-01-01, credited only when the conformant server/discover was served and the answer is not a transport-level status (a server that rejects everything, or a 401/403/413/415/429 from an auth gate, size limit, media-type gate or rate limiter, fails as not evaluable).",
       "failCriteria": "A status other than 400, an error code other than -32020, a result, or a 400 from a server whose conformant server/discover was itself rejected.",
       "transports": ["http"]
     },
@@ -1366,8 +1366,8 @@
       "defaultRequired": true,
       "capabilityGated": null,
       "specRef": "basic/transports/streamable-http#server-validation",
-      "description": "Sends a valid server/discover body without the Mcp-Method header. Mcp-Method is REQUIRED on every request; a missing standard header is a validation failure and the server MUST answer HTTP 400 with a -32020 HeaderMismatch error. 400 is the hard requirement; the -32020 code is checked as a warning because an intermediary may reject with a bare 400. A 400 is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable.",
-      "passCriteria": "HTTP 400 for a valid server/discover body sent without the Mcp-Method header, credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); a missing or different error code is reported as a warning.",
+      "description": "Sends a valid server/discover body without the Mcp-Method header. Mcp-Method is REQUIRED on every request; a missing standard header is a validation failure and the server MUST answer HTTP 400 with a -32020 HeaderMismatch error. 400 is the hard requirement; the -32020 code is checked as a warning because an intermediary may reject with a bare 400. A 400 is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable, as does a transport-level answer (401, 403, 413, 415 or 429 from an auth gate, size limit, media-type gate or rate limiter).",
+      "passCriteria": "HTTP 400 for a valid server/discover body sent without the Mcp-Method header, credited only when the conformant server/discover was served and the answer is not a transport-level status (a server that rejects everything, or a 401/403/413/415/429 from an auth gate, size limit, media-type gate or rate limiter, fails as not evaluable); a missing or different error code is reported as a warning.",
       "failCriteria": "Any status other than 400, or a 400 from a server whose conformant server/discover was itself rejected or unanswered.",
       "transports": ["http"]
     },
@@ -1380,8 +1380,8 @@
       "defaultRequired": true,
       "capabilityGated": null,
       "specRef": "basic/transports/streamable-http#server-validation",
-      "description": "Sends a server/discover body with Mcp-Method: tools/list. A header that does not match the corresponding body value MUST be rejected with HTTP 400 and a -32020 HeaderMismatch error, because a gateway routing on the header and a server executing on the body would otherwise disagree. 400 is required; -32020 is a warning. A 400 is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable.",
-      "passCriteria": "HTTP 400 when Mcp-Method: tools/list is sent on a server/discover body, credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); a missing -32020 code is reported as a warning.",
+      "description": "Sends a server/discover body with Mcp-Method: tools/list. A header that does not match the corresponding body value MUST be rejected with HTTP 400 and a -32020 HeaderMismatch error, because a gateway routing on the header and a server executing on the body would otherwise disagree. 400 is required; -32020 is a warning. A 400 is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable, as does a transport-level answer (401, 403, 413, 415 or 429 from an auth gate, size limit, media-type gate or rate limiter).",
+      "passCriteria": "HTTP 400 when Mcp-Method: tools/list is sent on a server/discover body, credited only when the conformant server/discover was served and the answer is not a transport-level status (a server that rejects everything, or a 401/403/413/415/429 from an auth gate, size limit, media-type gate or rate limiter, fails as not evaluable); a missing -32020 code is reported as a warning.",
       "failCriteria": "Any status other than 400 (the request was routed on one value and executed on another), or a 400 from a server whose conformant server/discover was itself rejected.",
       "transports": ["http"]
     },
@@ -1394,9 +1394,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/transports/streamable-http#server-validation",
-      "description": "Sends a resources/read of the first listed resource (else a prompts/get of the first prompt without required arguments) whose Mcp-Name header names a different resource or prompt than the body. Mcp-Name is REQUIRED on tools/call, resources/read and prompts/get and MUST match params.uri or params.name after Base64 sentinel decoding, so the server MUST answer 400 + -32020; the 400 is credited only when the conformant server/discover was served. The resource and prompt lists are fetched on demand when the feature tests did not run; skipped only when the server declares neither capability, the list calls failed, or nothing listed can be read by name alone.",
-      "passCriteria": "HTTP 400 for a resources/read of the first listed resource (else a prompts/get of the first prompt without required arguments) whose Mcp-Name header names a different object than the body, credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); a missing -32020 code is reported as a warning. The lists are fetched on demand; skipped when the server declares neither resources nor prompts, the list calls failed, or nothing listed is readable by name alone.",
-      "failCriteria": "Any status other than 400, or a 400 from a server whose conformant server/discover was itself rejected.",
+      "description": "Sends a resources/read of the first listed resource (else a prompts/get of the first prompt without required arguments) whose Mcp-Name header names a different resource or prompt than the body. Mcp-Name is REQUIRED on tools/call, resources/read and prompts/get and MUST match params.uri or params.name after Base64 sentinel decoding, so the server MUST answer 400 + -32020; the 400 is credited only when the conformant server/discover was served and the answer is not a transport-level status (401, 403, 413, 415 or 429). The resource and prompt lists are fetched on demand when the feature tests did not run; skipped when the server declares neither capability or nothing listed can be read by name alone; when the list calls failed it skips pointing at the -list tests if they are in the run, and fails with the recorded reasons when they are not.",
+      "passCriteria": "HTTP 400 for a resources/read of the first listed resource (else a prompts/get of the first prompt without required arguments) whose Mcp-Name header names a different object than the body, credited only when the conformant server/discover was served and the answer is not a transport-level status (a server that rejects everything, or a 401/403/413/415/429 from an auth gate, size limit, media-type gate or rate limiter, fails as not evaluable); a missing -32020 code is reported as a warning. The lists are fetched on demand; skipped when the server declares neither resources nor prompts or nothing listed is readable by name alone, and skipped pointing at the -list rules when every declared list call failed and those rules are in the run.",
+      "failCriteria": "Any status other than 400, a 400 from a server whose conformant server/discover was itself rejected, or every declared list call failed while the -list rules were filtered out of the run (the recorded reasons are named).",
       "transports": ["http"]
     },
     {
@@ -1449,9 +1449,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/transports#messages",
-      "description": "Calls a tool with CJK and emoji characters in its string arguments -- a tool named echo, else the first tool with a string property named message, text, input or query, else the first tool (tools/list is fetched on demand) -- and passes when the reply reproduces them byte-for-byte. Fails on evidence of mangling: U+FFFD replacement characters, a Latin-1 mis-decode, the non-ASCII characters stripped, or a -32700 parse error. A tool that merely does not echo its input proves nothing, so the verdict then rests on a server/discover whose clientInfo name carries the same characters: the server parsing and answering it is the round-trip verified, and rejecting or mangling it fails. JSON-RPC messages MUST be UTF-8 encoded on every transport; this catches latin-1 or platform-default decoding of stdin.",
-      "passCriteria": "The chosen tool (one named echo, else the first with a string property named message/text/input/query, else the first tool; tools/list fetched on demand) reproduces the CJK/emoji probe byte-for-byte; or, when the tool merely does not echo its input, a server/discover whose clientInfo name carries the probe is answered with a result.",
-      "failCriteria": "The tool reply or the discover reply shows mangling (U+FFFD, a Latin-1 mis-decode, the non-ASCII characters stripped), the tool call draws -32700, or the discover carrying the probe in clientInfo is rejected or answered with a non-JSON-RPC reply.",
+      "description": "Calls a tool with CJK and emoji characters in its string arguments -- a tool named echo, else the first tool with a string property named message, text, input or query, else the first tool (tools/list is fetched on demand) -- and passes when the reply reproduces them byte-for-byte, or reproduces every non-ASCII piece of the probe somewhere in the reply (a tool that tokenizes its input). Fails on evidence of mangling: U+FFFD replacement characters, a Latin-1 mis-decode, the non-ASCII characters replaced by '?', the non-ASCII characters stripped (the probe's Latin-1 word or its ASCII skeleton present with neither the CJK word nor the emoji anywhere in the reply), or a -32700 parse error. A tool that merely does not echo its input proves nothing, so the verdict then rests on a server/discover whose clientInfo name carries the same characters: the server parsing and answering it is the round-trip verified, and rejecting or mangling it fails. JSON-RPC messages MUST be UTF-8 encoded on every transport; this catches latin-1 or platform-default decoding of stdin.",
+      "passCriteria": "The chosen tool (one named echo, else the first with a string property named message/text/input/query, else the first tool; tools/list fetched on demand) reproduces the CJK/emoji probe byte-for-byte, or reproduces every non-ASCII piece of it somewhere in the reply (a tokenizing tool); or, when the tool merely does not echo its input, a server/discover whose clientInfo name carries the probe is answered with a result.",
+      "failCriteria": "The tool reply or the discover reply shows mangling (U+FFFD, a Latin-1 mis-decode, the non-ASCII characters replaced by '?', or the probe's first word present with neither the CJK word nor the emoji anywhere in the reply), the tool call draws -32700, or the discover carrying the probe in clientInfo is rejected or answered with a non-JSON-RPC reply.",
       "transports": ["stdio"]
     },
     {
@@ -1608,9 +1608,9 @@
       "defaultRequired": true,
       "capabilityGated": null,
       "specRef": "basic/index#meta",
-      "description": "Sends server/discover with params carrying no _meta at all (on HTTP the headers are still correct). protocolVersion and clientCapabilities are required on every request, so the request is malformed and the server MUST reject it with -32602 Invalid params; on HTTP the status MUST be 400. A rejection with a different code is reported as a warning; a result fails, because the server is inferring version and capabilities from nowhere. Runs late, after the feature tests: a dual-era stdio server that is still deciding its era treats a claim-less message as a legacy opening, and by then a modern request has pinned the process. Not evaluable -- and failed -- when the conformant server/discover was itself rejected, since the rejection then proves nothing about the missing _meta.",
-      "passCriteria": "A server/discover with no params._meta draws a JSON-RPC error (HTTP 400 on HTTP), credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); code -32602 is expected and any other code is reported as a warning. Runs after the feature tests so a dual-era stdio server is already pinned modern.",
-      "failCriteria": "A result is returned, on HTTP the error arrives with a status other than 400, or the conformant server/discover was itself rejected or unanswered (not evaluable)."
+      "description": "Sends server/discover with params carrying no _meta at all (on HTTP the headers are still correct). protocolVersion and clientCapabilities are required on every request, so the request is malformed and the server MUST reject it with -32602 Invalid params; on HTTP the status MUST be 400. A rejection with a different code is reported as a warning; a result fails, because the server is inferring version and capabilities from nowhere. Runs late, after the feature tests and before the security tests: a dual-era stdio server that is still deciding its era treats a claim-less message as a legacy opening, and by then a modern request has pinned the process (a --only run that skipped the feature tests sends one first on stdio -- the first declared list, else ping); the security rate-limit burst comes afterwards so an intermediary it trips cannot answer this probe. Not evaluable -- and failed -- when the conformant server/discover was itself rejected, since the rejection then proves nothing about the missing _meta, and likewise when the answer is a transport-level status (401, 403, 413, 415 or 429: an auth gate, size limit, media-type gate or rate limiter answering before the JSON-RPC layer read the request).",
+      "passCriteria": "A server/discover with no params._meta draws a JSON-RPC error (HTTP 400 on HTTP), credited only when the conformant server/discover was served and the answer is not a transport-level status (a server that rejects everything, or a 401/403/413/415/429 from an auth gate, size limit, media-type gate or rate limiter, fails as not evaluable); code -32602 is expected and any other code is reported as a warning. Runs after the feature tests and before the security tests, so a dual-era stdio server is already pinned modern (a --only run on stdio sends the first declared list, else ping, first) and the rate-limit burst cannot have tripped an intermediary.",
+      "failCriteria": "A result is returned, on HTTP the error arrives with a status other than 400, the conformant server/discover was itself rejected or unanswered, or the answer is a transport-level status (401, 403, 413, 415, 429) -- the last two not evaluable."
     },
     {
       "id": "lifecycle-meta-protocol-version-required",
@@ -1621,9 +1621,9 @@
       "defaultRequired": true,
       "capabilityGated": null,
       "specRef": "basic/index#meta",
-      "description": "Sends server/discover whose _meta carries clientCapabilities and clientInfo but no protocolVersion (on HTTP the MCP-Protocol-Version header is present and correct). The field is required, so the server MUST answer -32602 Invalid params and, on HTTP, status 400. A rejection with another code (-32020 is the common one) passes with a warning; a result fails. Runs late, after the feature tests, for the same reason as lifecycle-meta-required. Not evaluable -- and failed -- when the conformant server/discover was itself rejected.",
-      "passCriteria": "A _meta without protocolVersion draws a JSON-RPC error (HTTP 400 on HTTP), credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); -32602 is expected and another code (typically -32020) is reported as a warning. Runs after the feature tests.",
-      "failCriteria": "A result is returned, on HTTP the error arrives with a status other than 400, or the conformant server/discover was itself rejected or unanswered (not evaluable)."
+      "description": "Sends server/discover whose _meta carries clientCapabilities and clientInfo but no protocolVersion (on HTTP the MCP-Protocol-Version header is present and correct). The field is required, so the server MUST answer -32602 Invalid params and, on HTTP, status 400. A rejection with another code (-32020 is the common one) passes with a warning; a result fails. Runs late, after the feature tests and before the security tests, for the same reasons as lifecycle-meta-required. Not evaluable -- and failed -- when the conformant server/discover was itself rejected, or when the answer is a transport-level status (401, 403, 413, 415 or 429).",
+      "passCriteria": "A _meta without protocolVersion draws a JSON-RPC error (HTTP 400 on HTTP), credited only when the conformant server/discover was served and the answer is not a transport-level status (a server that rejects everything, or a 401/403/413/415/429 from an auth gate, size limit, media-type gate or rate limiter, fails as not evaluable); -32602 is expected and another code (typically -32020) is reported as a warning. Runs after the feature tests and before the security tests.",
+      "failCriteria": "A result is returned, on HTTP the error arrives with a status other than 400, the conformant server/discover was itself rejected or unanswered, or the answer is a transport-level status (401, 403, 413, 415, 429) -- the last two not evaluable."
     },
     {
       "id": "lifecycle-meta-client-capabilities-required",
@@ -1634,9 +1634,9 @@
       "defaultRequired": true,
       "capabilityGated": null,
       "specRef": "basic/index#meta",
-      "description": "Sends server/discover whose _meta has protocolVersion and clientInfo but no clientCapabilities. Capabilities are per-request input the server MUST NOT infer from prior requests, so the field is required even when empty; the server MUST answer -32602 (HTTP 400). Serving the request as if {} had been sent fails. Not evaluable -- and failed -- when the conformant server/discover was itself rejected, since the rejection then proves nothing about the missing field.",
-      "passCriteria": "A _meta without clientCapabilities draws a JSON-RPC error (HTTP 400 on HTTP), credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); -32602 is expected and another code is reported as a warning.",
-      "failCriteria": "The request is served as if {} had been sent, on HTTP the error arrives with a status other than 400, or the conformant server/discover was itself rejected or unanswered (not evaluable)."
+      "description": "Sends server/discover whose _meta has protocolVersion and clientInfo but no clientCapabilities. Capabilities are per-request input the server MUST NOT infer from prior requests, so the field is required even when empty; the server MUST answer -32602 (HTTP 400). Serving the request as if {} had been sent fails. Not evaluable -- and failed -- when the conformant server/discover was itself rejected, since the rejection then proves nothing about the missing field. A transport-level status (401, 403, 413, 415 or 429) is not evaluable either.",
+      "passCriteria": "A _meta without clientCapabilities draws a JSON-RPC error (HTTP 400 on HTTP), credited only when the conformant server/discover was served and the answer is not a transport-level status (a server that rejects everything, or a 401/403/413/415/429 from an auth gate, size limit, media-type gate or rate limiter, fails as not evaluable); -32602 is expected and another code is reported as a warning.",
+      "failCriteria": "The request is served as if {} had been sent, on HTTP the error arrives with a status other than 400, the conformant server/discover was itself rejected or unanswered, or the answer is a transport-level status (401, 403, 413, 415, 429) -- the last two not evaluable."
     },
     {
       "id": "lifecycle-meta-client-info-optional",
@@ -1673,9 +1673,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "changelog#major-changes",
-      "description": "Sends ping, logging/setLevel and resources/subscribe with a full modern _meta. All three were removed in 2026-07-28 (there is no keepalive RPC, log level is per-request _meta, subscriptions/listen replaces resources/subscribe), so each should draw a JSON-RPC error. -32601 Method not found (with HTTP 404 on HTTP) is expected; another error code passes with a warning and a result fails.",
-      "passCriteria": "ping, logging/setLevel and resources/subscribe each draw a JSON-RPC error; -32601 (HTTP 404 on HTTP) is expected and another code or status is reported as a warning.",
-      "failCriteria": "Any of the three methods returns a result."
+      "description": "Sends ping, logging/setLevel and resources/subscribe with a full modern _meta. All three were removed in 2026-07-28 (there is no keepalive RPC, log level is per-request _meta, subscriptions/listen replaces resources/subscribe), so each should draw a JSON-RPC error. -32601 Method not found (with HTTP 404 on HTTP) is expected; another error code passes with a warning and a result fails. A rejection is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable.",
+      "passCriteria": "ping, logging/setLevel and resources/subscribe each draw a JSON-RPC error (or a bare HTTP 4xx), credited only when the conformant server/discover was served; -32601 (HTTP 404 on HTTP) is expected and another code or status is reported as a warning.",
+      "failCriteria": "Any of the three methods returns a result, gets no response, or draws neither a result nor an error; or all three are rejected by a server whose conformant server/discover was itself rejected or unanswered (not evaluable)."
     },
     {
       "id": "lifecycle-dual-era",
@@ -1686,9 +1686,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/versioning#backward-compatibility-with-initialization-based-versions",
-      "description": "Sends a legacy initialize request (2025-11-25 shape, no modern _meta, legacy headers on HTTP) and reports which era the server speaks: a result means dual-era, an error means modern-only. Both outcomes pass; the test is informational, and no response passes with a warning (era undetermined) -- the only failure is a stdio server that exits on the request. On stdio the probe goes to a fresh process, because a dual-era server selects its era from how the client opens and the suite's own process is already modern. A modern-only server SHOULD name its supported versions in the error -- in data.supported (the UnsupportedProtocolVersionError shape) or in the message -- and one that names none (a message that only echoes the rejected 2025-11-25 does not count) draws a warning. Runs last.",
-      "passCriteria": "On every classified outcome: a result to the legacy initialize (sent to a fresh process on stdio) is reported as dual-era, an error as modern-only; an error that names no supported version -- neither in data.supported nor as a date other than the requested 2025-11-25 in the message -- is reported as a warning, and no response passes with a warning (era undetermined).",
-      "failCriteria": "Only when a stdio server exits after the legacy initialize request; no response passes with a warning."
+      "description": "Sends a legacy initialize request (2025-11-25 shape, no modern _meta, legacy headers on HTTP) and reports which era the server speaks: a result alongside a served server/discover means dual-era; a result while server/discover was rejected or unanswered means legacy-only (the run graded the era the server does not speak, and a warning says so); an error means modern-only. All of those pass; the test is informational. No response (a timeout, named with its budget, or a connection error, named as such) and a transport-level status (401, 403, 413, 415 or 429) pass with a warning as era undetermined. On stdio the probe goes to a fresh process, because a dual-era server selects its era from how the client opens and the suite's own process is already modern; it waits the per-request timeout (stretched to three times the setup server/discover latency for a slow starter, never beyond --startup-timeout). If that fresh process exits unanswered, a second instance is started with no input at all: one that exits too shows a server that allows one instance at a time (a lock file, a fixed port) and cannot be probed alongside the suite's own process -- era undetermined, with the exit code and stderr in a warning; one that stays up shows the request is what the server exits on, the only failure of this test. A modern-only server SHOULD name its supported versions in the error -- in data.supported (the UnsupportedProtocolVersionError shape) or in the message -- and one that names none (a message that only echoes the rejected 2025-11-25 does not count) draws a warning. Runs after the feature tests and before the security tests.",
+      "passCriteria": "On every classified outcome: a result to the legacy initialize (sent to a fresh process on stdio) is reported as dual-era when server/discover was served and as legacy-only (with a warning) when it was not, an error as modern-only; an error that names no supported version -- neither in data.supported nor as a date other than the requested 2025-11-25 in the message -- is reported as a warning. No response (a timeout within the probe budget, or a connection error), a transport-level status (401, 403, 413, 415, 429), and a stdio fresh process that exits alongside a second instance that exits at startup too (a single-instance server) pass with a warning as era undetermined.",
+      "failCriteria": "Only when a stdio server exits after the legacy initialize request while a second instance spawned with no input stays up (the request is what it exits on)."
     },
     {
       "id": "lifecycle-capability-handlers-match",
@@ -1712,9 +1712,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/patterns/subscriptions#acknowledgment",
-      "description": "When any listChanged or subscribe capability is declared, opens a subscriptions/listen stream requesting the matching notification types and reads the first frame. It MUST be notifications/subscriptions/acknowledged carrying _meta['io.modelcontextprotocol/subscriptionId'] equal to the listen request's id and a notifications object naming the subset the server honours; no other notification may precede it. When nothing is advertised, either the acknowledgment or -32601 passes. An acknowledgment that honours a notification type or URI the request did not include passes with a warning: the server may send notifications outside the requested filter.",
-      "passCriteria": "With a listChanged or subscribe capability declared, the first frame on a subscriptions/listen stream is notifications/subscriptions/acknowledged carrying _meta subscriptionId equal to the request id and a notifications object; an acknowledgment that honours a type or URI the request did not include passes with a warning. With nothing advertised, either that acknowledgment or -32601 passes.",
-      "failCriteria": "Any other frame first, a subscriptionId that differs from the request id, a missing notifications object, an error other than -32601 when nothing is advertised, no acknowledgment within the listen timeout, or a stdio server that exits before acknowledging."
+      "description": "When any listChanged or subscribe capability is declared, opens a subscriptions/listen stream requesting the matching notification types and reads the first frame. It MUST be notifications/subscriptions/acknowledged carrying _meta['io.modelcontextprotocol/subscriptionId'] equal to the listen request's id and a notifications object naming the subset the server honours; no other notification may precede it. When nothing is advertised, either the acknowledgment or -32601 passes -- the rejection credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable. An acknowledgment that honours a notification type or URI the request did not include passes with a warning: the server may send notifications outside the requested filter.",
+      "passCriteria": "With a listChanged or subscribe capability declared, the first frame on a subscriptions/listen stream is notifications/subscriptions/acknowledged carrying _meta subscriptionId equal to the request id and a notifications object; an acknowledgment that honours a type or URI the request did not include passes with a warning. With nothing advertised, either that acknowledgment or -32601 passes, the rejection credited only when the conformant server/discover was served.",
+      "failCriteria": "Any other frame first, a subscriptionId that differs from the request id, a missing notifications object, an error other than -32601 when nothing is advertised, a rejection from a server whose conformant server/discover was itself rejected (not evaluable), no acknowledgment within the listen timeout, or a stdio server that exits before acknowledging."
     },
     {
       "id": "lifecycle-log-level-gating",
@@ -1764,9 +1764,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/patterns/progress#progress-flow",
-      "description": "Calls the first tool without required arguments (preferring one whose name or description mentions progress, else the first listed tool) with _meta.progressToken set and reads the whole response; tools/list is fetched on demand when the tools tests did not run, and the test is skipped when the server declares no tools or tools/list failed. Progress is optional, so a call with no notifications/progress passes; but any progress notification that does arrive MUST carry the same token and its progress value MUST increase with each notification. A foreign token or a non-increasing value fails.",
-      "passCriteria": "tools/call of the first tool without required arguments (tools/list fetched on demand) with _meta.progressToken completes, and every notifications/progress observed for it carries the same token with a strictly increasing progress value (no notifications at all also passes). Skipped when the server declares no tools or tools/list failed.",
-      "failCriteria": "A progress notification carrying a foreign token, a non-numeric or non-increasing progress value, or no response to the call."
+      "description": "Calls the first tool without required arguments (preferring one whose name or description mentions progress, else the first listed tool) with _meta.progressToken set and reads the whole response; tools/list is fetched on demand when the tools tests did not run, and the test is skipped when the server declares no tools; when tools/list failed it skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not. Progress is optional, so a call with no notifications/progress passes; but any progress notification that does arrive MUST carry the same token and its progress value MUST increase with each notification. A foreign token or a non-increasing value fails.",
+      "passCriteria": "tools/call of the first tool without required arguments (tools/list fetched on demand) with _meta.progressToken completes, and every notifications/progress observed for it carries the same token with a strictly increasing progress value (no notifications at all also passes). Skipped when the server declares no tools, and skipped pointing at tools-list when tools/list failed and that rule is in the run.",
+      "failCriteria": "A progress notification carrying a foreign token, a non-numeric or non-increasing progress value, no response to the call, or tools/list failed while tools-list was filtered out of the run (the recorded reason is named)."
     },
     {
       "id": "tools-list",
@@ -1790,9 +1790,9 @@
       "defaultRequired": false,
       "capabilityGated": "tools",
       "specRef": "server/utilities/caching#cacheable-results",
-      "description": "Checks that the tools/list result carries ttlMs (an integer >= 0) and cacheScope ('public' or 'private'). Servers MUST include both hints on complete tools/list results; they let clients skip re-fetching and improve prompt-cache hit rates. Required at runtime when the tools capability is declared.",
+      "description": "Checks that the tools/list result carries ttlMs (an integer >= 0) and cacheScope ('public' or 'private'). Servers MUST include both hints on complete tools/list results; they let clients skip re-fetching and improve prompt-cache hit rates. Required at runtime when the tools capability is declared. Reuses the response the -list test obtained; a list call that got no response (a timeout, a connection error) is not repeated.",
       "passCriteria": "The tools/list result carries ttlMs as an integer >= 0 and cacheScope equal to public or private.",
-      "failCriteria": "Either hint missing or invalid."
+      "failCriteria": "Either hint missing or invalid, or the tools/list call got no response (reported once; not re-sent)."
     },
     {
       "id": "tools-list-deterministic-order",
@@ -1868,9 +1868,9 @@
       "defaultRequired": false,
       "capabilityGated": "resources",
       "specRef": "server/utilities/caching#cacheable-results",
-      "description": "Checks ttlMs (an integer >= 0) and cacheScope ('public' or 'private') on the resources/list result. Both caching hints are a MUST on every complete resources/list result. Required at runtime when the resources capability is declared.",
+      "description": "Checks ttlMs (an integer >= 0) and cacheScope ('public' or 'private') on the resources/list result. Both caching hints are a MUST on every complete resources/list result. Required at runtime when the resources capability is declared. Reuses the response the -list test obtained; a list call that got no response (a timeout, a connection error) is not repeated.",
       "passCriteria": "The resources/list result carries ttlMs as an integer >= 0 and cacheScope equal to public or private.",
-      "failCriteria": "Either hint missing or invalid."
+      "failCriteria": "Either hint missing or invalid, or the resources/list call got no response (reported once; not re-sent)."
     },
     {
       "id": "resources-read",
@@ -1933,9 +1933,9 @@
       "defaultRequired": false,
       "capabilityGated": "resources",
       "specRef": "server/utilities/caching#cacheable-results",
-      "description": "When resources/templates/list succeeds, checks that the result carries ttlMs (an integer >= 0) and cacheScope. The method is on the list of operations that MUST carry caching hints; skipped when the server does not implement templates.",
+      "description": "When resources/templates/list succeeds, checks that the result carries ttlMs (an integer >= 0) and cacheScope. The method is on the list of operations that MUST carry caching hints; skipped when the server does not implement templates. Reuses the response the -list test obtained; a list call that got no response (a timeout, a connection error) is not repeated.",
       "passCriteria": "When resources/templates/list succeeds, its result carries ttlMs as an integer >= 0 and cacheScope equal to public or private; skipped when the method is not implemented.",
-      "failCriteria": "Either hint missing or invalid on a successful result."
+      "failCriteria": "Either hint missing or invalid on a successful result, or the resources/templates/list call got no response (reported once; not re-sent)."
     },
     {
       "id": "resources-pagination",
@@ -1972,9 +1972,9 @@
       "defaultRequired": false,
       "capabilityGated": "prompts",
       "specRef": "server/utilities/caching#cacheable-results",
-      "description": "Checks ttlMs (an integer >= 0) and cacheScope ('public' or 'private') on the prompts/list result. Both hints are a MUST on every complete prompts/list result. Required at runtime when the prompts capability is declared.",
+      "description": "Checks ttlMs (an integer >= 0) and cacheScope ('public' or 'private') on the prompts/list result. Both hints are a MUST on every complete prompts/list result. Required at runtime when the prompts capability is declared. Reuses the response the -list test obtained; a list call that got no response (a timeout, a connection error) is not repeated.",
       "passCriteria": "The prompts/list result carries ttlMs as an integer >= 0 and cacheScope equal to public or private.",
-      "failCriteria": "Either hint missing or invalid."
+      "failCriteria": "Either hint missing or invalid, or the prompts/list call got no response (reported once; not re-sent)."
     },
     {
       "id": "prompts-get",
@@ -2145,9 +2145,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/index#error-responses",
-      "description": "Post-hoc scan of every JSON-RPC error response (an error object with a numeric code) the server sent during the run: each one answering a request whose id was readable MUST carry that same id. Exempt: replies to the suite's raw malformed-body probes and to client notifications (there is no id to echo), and transport-level rejections answered before the JSON-RPC layer read the request (HTTP 401/403/413/415/429, whose body need not be JSON-RPC at all). A null or missing id on the reply to a well-formed request fails whatever the error code, -32600 and -32700 included.",
-      "passCriteria": "Every recorded JSON-RPC error response (an error object with a numeric code) that answers an id-bearing request carries that same id. Exempt: replies to the suite's raw probes and client notifications, and bodies on HTTP 401/403/413/415/429 transport-level rejections; non-JSON-RPC error bodies are not counted.",
-      "failCriteria": "A JSON-RPC error with a null or missing id in reply to a well-formed request, whatever the error code (-32600 and -32700 included). Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest."
+      "description": "Post-hoc scan of every JSON-RPC error response (a jsonrpc 2.0 message whose error object carries a numeric code; a gateway's {\"error\":\"...\"} or {\"error\":{\"code\":400,...}} body is not one) the server sent during the run: each one answering a request whose id was readable MUST carry that same id. A reply that echoes no id is attributed by timeline: to the most recent request sent before it that never received its own reply, or to a client notification or raw probe sent more recently than that. Exempt: replies to the suite's raw malformed-body probes and to client notifications (there is no id to echo), and a reply WITHOUT an id on a transport-level rejection answered before the JSON-RPC layer read the request (HTTP 401/403/413/415/429). A present but wrong id -- retyped, or another request's -- fails whatever the status, and a null or missing id on the reply to a well-formed request fails whatever the error code, -32600 and -32700 included.",
+      "passCriteria": "Every recorded JSON-RPC error response (jsonrpc 2.0 with an error object carrying a numeric code) that answers an id-bearing request carries that same id; an id-less reply is attributed by timeline to the nearest earlier request that never got its own reply, or to a more recent client notification or raw probe. Exempt: replies to the suite's raw probes and client notifications, and replies without an id on HTTP 401/403/413/415/429 transport-level rejections; non-JSON-RPC error bodies (a gateway's {\"error\":...}) are not counted.",
+      "failCriteria": "A JSON-RPC error with a null or missing id in reply to a well-formed request, whatever the error code (-32600 and -32700 included), or a present but wrong id whatever the HTTP status. Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest."
     },
     {
       "id": "error-retired-codes",
@@ -2171,8 +2171,8 @@
       "defaultRequired": false,
       "capabilityGated": "tools",
       "specRef": "server/tools#tool",
-      "description": "Validates every listed tool has a name (1-128 characters of [A-Za-z0-9_.-], the SHOULD-level naming rule) and an inputSchema that is a JSON Schema object with type 'object'. inputSchema MUST be a valid JSON Schema object, not null. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.",
-      "passCriteria": "Every listed tool has a name matching [A-Za-z0-9_.-]{1,128} and an inputSchema object with type 'object'. The list is fetched on demand under --only; skipped (as passed) only when tools/list failed.",
+      "description": "Validates every listed tool has a name (1-128 characters of [A-Za-z0-9_.-], the SHOULD-level naming rule) and an inputSchema that is a JSON Schema object with type 'object'. inputSchema MUST be a valid JSON Schema object, not null. The list is fetched on demand when the corresponding feature tests did not run (--only schema); when that list call failed, skipped pointing at the -list test that reports it if that test is in the run, and failed with the recorded reason (--only schema, or --skip on the -list test) when it is not.",
+      "passCriteria": "Every listed tool has a name matching [A-Za-z0-9_.-]{1,128} and an inputSchema object with type 'object'. The list is fetched on demand under --only. When tools/list failed the rule skips (as passed) pointing at tools-list if that rule is in the run, and fails with the recorded reason when it was filtered out (--only schema).",
       "failCriteria": "Any tool with a missing or malformed name, or an inputSchema that is absent, null, or not type 'object'."
     },
     {
@@ -2184,8 +2184,8 @@
       "defaultRequired": false,
       "capabilityGated": "tools",
       "specRef": "server/tools#tool",
-      "description": "If a tool carries annotations, validates that readOnlyHint, destructiveHint, idempotentHint and openWorldHint are booleans when present and that title, when present, is a string. Clients MUST treat annotations as untrusted hints, so a wrong type is a definition bug rather than a security control. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.",
-      "passCriteria": "On every tool that carries annotations, readOnlyHint, destructiveHint, idempotentHint and openWorldHint are booleans when present and title is a string when present. The list is fetched on demand under --only; skipped (as passed) only when tools/list failed.",
+      "description": "If a tool carries annotations, validates that readOnlyHint, destructiveHint, idempotentHint and openWorldHint are booleans when present and that title, when present, is a string. Clients MUST treat annotations as untrusted hints, so a wrong type is a definition bug rather than a security control. The list is fetched on demand when the corresponding feature tests did not run (--only schema); when that list call failed, skipped pointing at the -list test that reports it if that test is in the run, and failed with the recorded reason (--only schema, or --skip on the -list test) when it is not.",
+      "passCriteria": "On every tool that carries annotations, readOnlyHint, destructiveHint, idempotentHint and openWorldHint are booleans when present and title is a string when present. The list is fetched on demand under --only. When tools/list failed the rule skips (as passed) pointing at tools-list if that rule is in the run, and fails with the recorded reason when it was filtered out (--only schema).",
       "failCriteria": "Any annotation hint with a non-boolean value, or a non-string annotations.title."
     },
     {
@@ -2197,8 +2197,8 @@
       "defaultRequired": false,
       "capabilityGated": "tools",
       "specRef": "server/tools#tool",
-      "description": "Checks whether listed tools carry the optional title field, the human-readable display name clients prefer over name. A title that is present must be a string; tools without one are listed in the details but do not fail. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.",
-      "passCriteria": "Every listed tool that has a title has a string one; tools without a title are named in the details but still pass. The list is fetched on demand under --only; skipped (as passed) only when tools/list failed.",
+      "description": "Checks whether listed tools carry the optional title field, the human-readable display name clients prefer over name. A title that is present must be a string; tools without one are listed in the details but do not fail. The list is fetched on demand when the corresponding feature tests did not run (--only schema); when that list call failed, skipped pointing at the -list test that reports it if that test is in the run, and failed with the recorded reason (--only schema, or --skip on the -list test) when it is not.",
+      "passCriteria": "Every listed tool that has a title has a string one; tools without a title are named in the details but still pass. The list is fetched on demand under --only. When tools/list failed the rule skips (as passed) pointing at tools-list if that rule is in the run, and fails with the recorded reason when it was filtered out (--only schema).",
       "failCriteria": "Any tool whose title is present but not a string."
     },
     {
@@ -2210,8 +2210,8 @@
       "defaultRequired": false,
       "capabilityGated": "tools",
       "specRef": "server/tools#output-schema",
-      "description": "For tools that declare outputSchema, validates it is a JSON Schema object (a non-null object; type, $ref or a composition keyword may describe any JSON value). Unlike 2025-11-25 the root is no longer restricted to type 'object': array, string and other roots are valid because structuredContent may be any JSON value. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.",
-      "passCriteria": "Every declared outputSchema is a non-null JSON Schema object; any root type is accepted. The list is fetched on demand under --only; skipped (as passed) only when tools/list failed.",
+      "description": "For tools that declare outputSchema, validates it is a JSON Schema object (a non-null object; type, $ref or a composition keyword may describe any JSON value). Unlike 2025-11-25 the root is no longer restricted to type 'object': array, string and other roots are valid because structuredContent may be any JSON value. The list is fetched on demand when the corresponding feature tests did not run (--only schema); when that list call failed, skipped pointing at the -list test that reports it if that test is in the run, and failed with the recorded reason (--only schema, or --skip on the -list test) when it is not.",
+      "passCriteria": "Every declared outputSchema is a non-null JSON Schema object; any root type is accepted. The list is fetched on demand under --only. When tools/list failed the rule skips (as passed) pointing at tools-list if that rule is in the run, and fails with the recorded reason when it was filtered out (--only schema).",
       "failCriteria": "An outputSchema that is null, not an object, or otherwise not a JSON Schema object."
     },
     {
@@ -2223,8 +2223,8 @@
       "defaultRequired": false,
       "capabilityGated": "prompts",
       "specRef": "server/prompts#prompt",
-      "description": "Validates every listed prompt has a string name and that each entry in an arguments array has a name. Prompt arguments are matched by name in prompts/get and completion/complete, so a nameless argument is unreachable. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.",
-      "passCriteria": "Every listed prompt has a string name and every entry in its arguments array has a name. The list is fetched on demand under --only; skipped (as passed) only when prompts/list failed.",
+      "description": "Validates every listed prompt has a string name and that each entry in an arguments array has a name. Prompt arguments are matched by name in prompts/get and completion/complete, so a nameless argument is unreachable. The list is fetched on demand when the corresponding feature tests did not run (--only schema); when that list call failed, skipped pointing at the -list test that reports it if that test is in the run, and failed with the recorded reason (--only schema, or --skip on the -list test) when it is not.",
+      "passCriteria": "Every listed prompt has a string name and every entry in its arguments array has a name. The list is fetched on demand under --only. When prompts/list failed the rule skips (as passed) pointing at prompts-list if that rule is in the run, and fails with the recorded reason when it was filtered out (--only schema).",
       "failCriteria": "A prompt without a string name, or an argument without a name."
     },
     {
@@ -2236,8 +2236,8 @@
       "defaultRequired": false,
       "capabilityGated": "resources",
       "specRef": "server/resources#resource",
-      "description": "Validates every listed resource has a parseable URI and a string name. Custom URI schemes MUST conform to RFC 3986; an unparseable uri cannot be passed back to resources/read. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.",
-      "passCriteria": "Every listed resource has a parseable absolute URI and a string name. The list is fetched on demand under --only; skipped (as passed) only when resources/list failed.",
+      "description": "Validates every listed resource has a parseable URI and a string name. Custom URI schemes MUST conform to RFC 3986; an unparseable uri cannot be passed back to resources/read. The list is fetched on demand when the corresponding feature tests did not run (--only schema); when that list call failed, skipped pointing at the -list test that reports it if that test is in the run, and failed with the recorded reason (--only schema, or --skip on the -list test) when it is not.",
+      "passCriteria": "Every listed resource has a parseable absolute URI and a string name. The list is fetched on demand under --only. When resources/list failed the rule skips (as passed) pointing at resources-list if that rule is in the run, and fails with the recorded reason when it was filtered out (--only schema).",
       "failCriteria": "An unparseable uri, or a missing or non-string name."
     },
     {
@@ -2275,9 +2275,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/patterns/mrtr#server-requirements-basic-workflow",
-      "description": "Post-hoc, opportunistic check of every input_required result observed against the MRTR server requirements: it MUST include at least one of inputRequests or requestState; each inputRequests value must be an object whose method is elicitation/create, sampling/createMessage or roots/list, with a params object for elicitation/create and sampling/createMessage (ListRootsRequest.params is optional); the client capability each method needs (elicitation, sampling, roots) MUST have been declared by the client -- this suite declares only elicitation, so a sampling/createMessage or roots/list input request fails; requestState, when present, must be a string. Passes vacuously when no input_required result was seen.",
-      "passCriteria": "Every observed input_required result has inputRequests and/or requestState; each inputRequests value is an object whose method is elicitation/create, sampling/createMessage or roots/list and whose client capability the suite declared (elicitation only), with a params object for elicitation/create and sampling/createMessage; requestState is a string when present. Passes vacuously when none was observed.",
-      "failCriteria": "An input_required result missing both fields, an entry with an unknown method, a method whose client capability was not declared (sampling/createMessage, roots/list), a missing params object where required, or a non-string requestState. Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest."
+      "description": "Post-hoc, opportunistic check of every input_required result observed against the MRTR server requirements: it MUST include at least one of inputRequests or requestState; each inputRequests value must be an object whose method is elicitation/create, sampling/createMessage or roots/list, with a params object for elicitation/create and sampling/createMessage (ListRootsRequest.params is optional); the client capability each method needs (elicitation, sampling, roots) MUST have been declared by the client -- this suite declares only elicitation, so a sampling/createMessage or roots/list input request fails; an elicitation/create's params.mode (form when absent) must be a mode the client's elicitation declaration covers -- this suite declares elicitation: {}, which is form only, so a url-mode request fails; requestState, when present, must be a string. Passes vacuously when no input_required result was seen.",
+      "passCriteria": "Every observed input_required result has inputRequests and/or requestState; each inputRequests value is an object whose method is elicitation/create, sampling/createMessage or roots/list and whose client capability the suite declared (elicitation only), with a params object for elicitation/create and sampling/createMessage; an elicitation/create's params.mode (form when absent) is a mode the declared elicitation capability covers (the suite's elicitation: {} is form only); requestState is a string when present. Passes vacuously when none was observed.",
+      "failCriteria": "An input_required result missing both fields, an entry with an unknown method, a method whose client capability was not declared (sampling/createMessage, roots/list), an elicitation mode the client did not declare (url under elicitation: {}), a missing params object where required, or a non-string requestState. Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest."
     },
     {
       "id": "schema-wire-valid",
@@ -2288,9 +2288,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/index#schema",
-      "description": "Post-hoc validation of every recorded server message against the vendored 2026-07-28 JSON schema, dispatching by method for notifications, by resultType plus the originating request's method for results, and by error code for errors. Replies to the suite's raw malformed-body probes and to its legacy initialize probe are skipped, an error's id: null is treated as omitted (error-id-echo judges whether null was earned), and non-JSON-RPC bodies on transport-level rejections (HTTP 401/403/413/415/429) are noted, not validated. The TypeScript schema is the source of truth for every message; the details list the distinct violations, grouped by originating method and first schema error with a count, and overflow the rest to a warning.",
-      "passCriteria": "Every recorded server message validates against the vendored 2026-07-28 JSON schema for its message type; replies to raw probes and to the legacy initialize are skipped, an error's id: null is treated as omitted, and non-JSON-RPC bodies on HTTP 401/403/413/415/429 are noted rather than validated.",
-      "failCriteria": "Any other message that fails schema validation (the details list the distinct violations grouped by originating method and first schema error, with counts; the overflow goes to a warning). Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest."
+      "description": "Post-hoc validation of every recorded server message against the vendored 2026-07-28 JSON schema, dispatching by method for notifications, by resultType plus the originating request's method for results, and by error code for errors. Replies to the suite's raw malformed-body probes and to its legacy initialize probe are skipped, an error's id: null is treated as omitted (error-id-echo judges whether null was earned), and a non-JSON-RPC body on any HTTP 4xx or 5xx (an auth gate's 401, a header-validating intermediary's 400, a gateway's 502) is noted, not validated -- at 2xx the same body is the server's own answer and is. The TypeScript schema is the source of truth for every message; the details list the distinct violations, grouped by originating method and first schema error with a count, and overflow the rest to a warning.",
+      "passCriteria": "Every recorded server message validates against the vendored 2026-07-28 JSON schema for its message type; replies to raw probes and to the legacy initialize are skipped, an error's id: null is treated as omitted, and a non-JSON-RPC body on any HTTP 4xx or 5xx (an auth gate, a header-validating intermediary, a gateway) is noted rather than validated.",
+      "failCriteria": "Any other message that fails schema validation, including a non-JSON-RPC body served at 2xx (the details list the distinct violations grouped by originating method and first schema error, with counts; the overflow goes to a warning). Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest."
     },
     {
       "id": "security-auth-required",
@@ -2315,8 +2315,8 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/authorization/authorization-server-discovery#protected-resource-metadata-discovery-requirements",
-      "description": "When the unauthenticated server/discover yields 401 (with or without --auth), checks for a WWW-Authenticate header. Servers MUST implement one of two discovery mechanisms, and the header form (Bearer resource_metadata=\"...\") is the one clients try first; a 401 with no challenge leaves the client unable to locate the authorization server, and a challenge without resource_metadata passes with a warning. Skipped when no 401 was observed.",
-      "passCriteria": "The 401 observed on the unauthenticated server/discover carries a WWW-Authenticate header (a challenge without resource_metadata passes with a warning). Skipped when no 401 was observed (a 403 or a served request).",
+      "description": "When the unauthenticated server/discover yields 401 (with or without --auth), checks for a WWW-Authenticate header. Servers MUST implement one of two discovery mechanisms, and the header form (Bearer resource_metadata=\"...\") is the one clients try first; a 401 with no challenge leaves the client unable to locate the authorization server, and a challenge without resource_metadata, or whose resource_metadata is not an absolute http(s) URL (RFC 9728 section 5.1), passes with a warning. Skipped when no 401 was observed.",
+      "passCriteria": "The 401 observed on the unauthenticated server/discover carries a WWW-Authenticate header (a challenge without resource_metadata, or whose resource_metadata is not an absolute http(s) URL, passes with a warning). Skipped when no 401 was observed (a 403 or a served request).",
       "failCriteria": "A 401 with no WWW-Authenticate header.",
       "transports": ["http"]
     },
@@ -2357,9 +2357,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/authorization/authorization-server-discovery#authorization-server-location",
-      "description": "Locates RFC 9728 Protected Resource Metadata in the order clients must try it: the resource_metadata URL from the WWW-Authenticate challenge on the unauthenticated server/discover when present, then /.well-known/oauth-protected-resource followed by the endpoint path, then the root /.well-known/oauth-protected-resource. Validates a JSON document with resource and a non-empty authorization_servers array, and warns when resource is not the MCP endpoint URL in canonical form (RFC 9728 section 3.3). MCP servers MUST implement one of the two discovery mechanisms and the document MUST name at least one authorization server. A legacy /.well-known/oauth-authorization-server hit passes with a warning. Runs without --auth when the unauthenticated request drew 401/403; skipped when the server requires no auth.",
-      "passCriteria": "In order, the resource_metadata URL from the WWW-Authenticate challenge (when present), /.well-known/oauth-protected-resource followed by the endpoint path, then the root, returns JSON with resource and a non-empty authorization_servers array (a resource that is not the MCP endpoint in canonical form passes with a warning); a legacy /.well-known/oauth-authorization-server hit passes with a warning. Runs without --auth when the unauthenticated request drew 401/403; skipped when the server requires no auth.",
-      "failCriteria": "No candidate serves the document and no legacy metadata exists, a served document lacks resource or a non-empty authorization_servers, or every candidate is unreachable.",
+      "description": "Locates RFC 9728 Protected Resource Metadata the way clients must: when the WWW-Authenticate challenge on the unauthenticated server/discover carries resource_metadata, that URL is fetched and nothing else -- clients MUST use it, so an advertised URL that is unreachable, non-200, non-JSON, missing resource or authorization_servers, or not an absolute http(s) URL fails outright (the details say when a valid document exists at a well-known location the challenge could point at). Only without a challenge URL are the well-known locations tried in spec order: /.well-known/oauth-protected-resource followed by the endpoint path, then the root; a legacy /.well-known/oauth-authorization-server hit then passes with a warning. Validates a JSON document with resource and a non-empty authorization_servers array, and warns when resource is not the MCP endpoint URL in canonical form (RFC 9728 section 3.3). MCP servers MUST implement one of the two discovery mechanisms and the document MUST name at least one authorization server. Runs without --auth when the unauthenticated request drew 401/403; skipped when the server requires no auth; fails as 'server unreachable' when that request got no answer at all.",
+      "passCriteria": "When the WWW-Authenticate challenge carries resource_metadata, that absolute URL (and only it) returns JSON with resource and a non-empty authorization_servers array; without one, /.well-known/oauth-protected-resource followed by the endpoint path, then the root, does, or a legacy /.well-known/oauth-authorization-server document exists (passes with a warning). A resource that is not the MCP endpoint in canonical form passes with a warning. Runs without --auth when the unauthenticated request drew 401/403; skipped when the server requires no auth.",
+      "failCriteria": "An advertised resource_metadata URL that is not absolute http(s), unreachable, non-200, non-JSON, or lacks resource or a non-empty authorization_servers (a valid well-known document does not rescue it; the details name it); without a challenge URL, no candidate serves the document and no legacy metadata exists, a served document is malformed, or every candidate is unreachable; or the unauthenticated server/discover got no answer at all (server unreachable).",
       "transports": ["http"]
     },
     {
@@ -2413,8 +2413,8 @@
       "defaultRequired": false,
       "capabilityGated": "tools",
       "specRef": "server/tools#security-considerations",
-      "description": "Calls one tool with OS command-injection payloads ('; cat /etc/passwd', '$(whoami)', backticks) in one string argument: the first tool declaring a string argument, preferring tools annotated readOnlyHint and skipping tools annotated destructiveHint while an alternative exists (a warning names any skipped tool; when every candidate is destructive the first is probed and a warning says so). The tool's other required arguments are filled with schema-typed placeholders so the payload reaches the handler (also warned), and x-mcp-header parameters are mirrored into Mcp-Param-* headers so the request stays valid. Results are inspected for evidence of execution (passwd lines, usernames, shell errors) and the details count what came back: rejected (isError or rejection wording -- the only outcome counted as a defence), returned without evidence of execution, and never reached the tool (a JSON-RPC or transport error). Servers MUST validate all tool inputs; a tool that echoes the payload back unexecuted passes.",
-      "passCriteria": "No result from the single target -- the first tool with a string argument, read-only tools preferred, destructive tools skipped while an alternative exists, other required arguments filled with placeholders -- shows evidence of executing an injected shell payload (passwd lines, usernames, shell errors) without rejection wording or isError; the details count rejected, benign and never-reached payloads.",
+      "description": "Calls one tool with OS command-injection payloads ('; cat /etc/passwd', '$(whoami)', backticks) in one string argument. Tools with a string argument are tiered by annotation -- readOnlyHint true, then destructiveHint false, then unannotated, then destructiveHint true -- and only the safest non-empty tier is searched, because the spec defaults destructiveHint to true: a tool that says nothing may write, so it is a last resort. Passed-over tools are named in a warning (destructive and unannotated separately), and when the probed tool is unannotated or destructive a warning says it was hit with live payloads. Within the tier a free-form string argument is chosen over an enum/const/pattern one, which no payload can satisfy. The tool's other required arguments are filled with placeholders that honour the schema (const/enum/default/examples, the first non-null type, minimum, minItems, minLength/format, nested required) so the payload reaches the handler (also warned), and x-mcp-header parameters are mirrored into Mcp-Param-* headers so the request stays valid. Results are inspected for evidence of execution (passwd lines, id output, directory listings) and the details count what came back: rejected (isError or rejection wording -- the only outcome counted as a defence), returned without evidence of execution, and never reached the tool (a JSON-RPC or transport error). When no payload reached the tool at all the test passes as inconclusive with a warning. Servers MUST validate all tool inputs; a tool that echoes the payload back unexecuted passes.",
+      "passCriteria": "No result from the single target -- a tool with a string argument from the safest annotation tier (readOnlyHint true, then destructiveHint false, then unannotated, then destructiveHint true; the spec defaults destructiveHint to true), a free-form argument before an enum/const/pattern one, other required arguments filled with schema-honouring placeholders -- shows evidence of executing an injected shell payload (passwd lines, id output, directory listings) without rejection wording or isError; the details count rejected, benign and never-reached payloads, and a run where no payload reached the tool passes as inconclusive with a warning.",
       "failCriteria": "Any result containing evidence of execution that is not also a rejection."
     },
     {
@@ -2426,8 +2426,8 @@
       "defaultRequired": false,
       "capabilityGated": "tools",
       "specRef": "server/tools#security-considerations",
-      "description": "Calls the same single target as security-command-injection with SQL-injection payloads (' OR 1=1 --, UNION SELECT, stacked statements), other required arguments filled with placeholders and x-mcp-header parameters mirrored into headers, and inspects results for database error text or unexpected row dumps. The details count rejected, benign and never-reached outcomes; only rejections count as a defence. Servers MUST validate all tool inputs and sanitise tool outputs.",
-      "passCriteria": "No result from the same single target contains database error text or unexpected row dumps for the SQL payloads without rejection wording or isError.",
+      "description": "Calls the same single target as security-command-injection with SQL-injection payloads (' OR 1=1 --, UNION SELECT, stacked statements), other required arguments filled with schema-honouring placeholders and x-mcp-header parameters mirrored into headers, and inspects results for database error text or unexpected row dumps. The details count rejected, benign and never-reached outcomes; only rejections count as a defence, and a run in which no payload reached the tool passes as inconclusive with a warning. Servers MUST validate all tool inputs and sanitise tool outputs.",
+      "passCriteria": "No result from the same single target contains database error text or unexpected row dumps for the SQL payloads without rejection wording or isError; all never-reached passes as inconclusive with a warning.",
       "failCriteria": "Any result containing database error text or dumped rows that is not also a rejection."
     },
     {
@@ -2439,8 +2439,8 @@
       "defaultRequired": false,
       "capabilityGated": "tools",
       "specRef": "server/tools#security-considerations",
-      "description": "Calls one tool with path-traversal payloads (../../etc/passwd, ..\\\\..\\\\windows\\\\system.ini, URL-encoded variants) in one string argument, preferring an argument whose name suggests a path (path, file, dir, folder; then url, uri, href, endpoint, host) searched across the candidates in the same read-only-first, destructive-last order as security-command-injection, otherwise the shared injection target; other required arguments are filled with placeholders and x-mcp-header parameters mirrored. Inspects results for file contents outside the tool's scope and counts rejected, benign and never-reached outcomes. Servers MUST validate inputs and, for file:// resources, MUST sanitise paths to prevent directory traversal.",
-      "passCriteria": "No result from the target (a path-named string argument when one exists, else a URL-named one, else the shared injection target) contains file contents from outside the tool's scope for the traversal payloads without rejection wording or isError.",
+      "description": "Calls one tool with path-traversal payloads (../../etc/passwd, ..\\\\..\\\\windows\\\\system.ini, URL-encoded variants) in one string argument, preferring an argument whose name suggests a path (path, file, dir, folder; then url, uri, href, endpoint, host) searched across the tools of the safest annotation tier only (readOnlyHint true first; see security-command-injection) -- a non-read-only tool's path argument is never chosen while a read-only tool has any string argument, since the spec defaults destructiveHint to true -- otherwise the shared injection target. Other required arguments are filled with schema-honouring placeholders and x-mcp-header parameters mirrored. Inspects results for file contents outside the tool's scope and counts rejected, benign and never-reached outcomes (all never-reached passes as inconclusive with a warning). Servers MUST validate inputs and, for file:// resources, MUST sanitise paths to prevent directory traversal.",
+      "passCriteria": "No result from the target (a path-named string argument when one exists in the safest annotation tier, else a URL-named one, else the shared injection target) contains file contents from outside the tool's scope for the traversal payloads without rejection wording or isError; all never-reached passes as inconclusive with a warning.",
       "failCriteria": "Any result containing out-of-scope file contents that is not also a rejection."
     },
     {
@@ -2452,8 +2452,8 @@
       "defaultRequired": false,
       "capabilityGated": "tools",
       "specRef": "server/tools#security-considerations",
-      "description": "Submits internal targets (the 169.254.169.254 metadata service, 127.0.0.1, [::1], 10.0.0.1) to one string argument, preferring one whose name suggests a URL (url, uri, href, endpoint, host, link; then path, file, dir) searched across the candidates in the same read-only-first, destructive-last order as security-command-injection; when no such argument exists the shared injection target is used, so the details always name the tool.argument probed. Other required arguments are filled with placeholders and x-mcp-header parameters mirrored. Inspects results for cloud-metadata or internal-service responses and counts rejected, benign and never-reached outcomes. Servers MUST validate all tool inputs; fetching internal addresses on a caller's behalf is server-side request forgery.",
-      "passCriteria": "No result from the target (a URL-named string argument when one exists, else a path-named one, else the shared injection target) contains cloud-metadata or internal-service content for the internal targets without rejection wording or isError.",
+      "description": "Submits internal targets (the 169.254.169.254 metadata service, 127.0.0.1, [::1], 10.0.0.1) to one string argument, preferring one whose name suggests a URL (url, uri, href, endpoint, host, link; then path, file, dir) searched across the tools of the safest annotation tier only (readOnlyHint true first; see security-command-injection); when no such argument exists the shared injection target is used, so the details always name the tool.argument probed. Other required arguments are filled with schema-honouring placeholders and x-mcp-header parameters mirrored. Inspects results for cloud-metadata or internal-service responses and counts rejected, benign and never-reached outcomes (all never-reached passes as inconclusive with a warning). Servers MUST validate all tool inputs; fetching internal addresses on a caller's behalf is server-side request forgery.",
+      "passCriteria": "No result from the target (a URL-named string argument when one exists in the safest annotation tier, else a path-named one, else the shared injection target) contains cloud-metadata or internal-service content for the internal targets without rejection wording or isError; all never-reached passes as inconclusive with a warning.",
       "failCriteria": "Any result containing metadata or internal-service content that is not also a rejection."
     },
     {
@@ -2543,9 +2543,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/index#error-responses",
-      "description": "Triggers a range of failures (unknown method, malformed _meta, missing params, unknown tool, garbage cursor, and on HTTP an unparsable body) with conformant envelopes so the errors come from the server's own handlers rather than the transport layer, then scans every distinct error response the run received -- once each -- for stack traces, file paths (Unix and Windows, including the JSON-escaped form), module names, framework internals and database connection strings. Error responses MAY carry data, but internals in it map the server for an attacker.",
-      "passCriteria": "No distinct error response (each scanned once) contains a stack trace, a file path (Unix or Windows, raw or JSON-escaped), a module name, a framework internal or a database connection string that is not an echo of the request.",
-      "failCriteria": "Any such leak found."
+      "description": "Triggers a range of failures (unknown method, malformed _meta, missing params, unknown tool, garbage cursor, and on HTTP an unparsable body) with conformant envelopes so the errors come from the server's own handlers rather than the transport layer, then scans every distinct error response the run received -- once each -- for stack traces, file paths (Unix and Windows, including the JSON-escaped form; a letter and a colon followed by a JSON escape, such as ERROR: before an escaped newline, is not a drive), module names, framework internals and database connection strings. One leak repeated across responses is reported once with a repeat count. Fails as 'server unreachable' when no probe was answered and the run recorded no server message. Error responses MAY carry data, but internals in it map the server for an attacker.",
+      "passCriteria": "No distinct error response (each scanned once) contains a stack trace, a file path (Unix, or Windows raw or JSON-escaped -- a letter and colon before a JSON escape such as an escaped newline is not a drive), a module name, a framework internal or a database connection string that is not an echo of the request; a leak repeated across responses is reported once with a count.",
+      "failCriteria": "Any such leak found, or none of the failure probes was answered and the run recorded no server message (server unreachable)."
     },
     {
       "id": "security-error-no-internal-ip",
@@ -2556,9 +2556,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/index#error-responses",
-      "description": "Scans the same error responses for private and link-local IPv4 ranges (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x), IPv6 loopback, link-local and unique-local addresses, and internal hostnames (*.internal, *.local, *.corp, *.lan, *.intranet). Request bodies carry the full modern _meta so the errors originate from deeper layers such as upstream connectors, which is where addressing leaks.",
-      "passCriteria": "No distinct error response contains a private or link-local IPv4 address (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x), an IPv6 loopback, link-local or unique-local address, or an internal hostname (*.internal, *.local, *.corp, *.lan, *.intranet) that is not an echo of the request.",
-      "failCriteria": "Any such address or hostname found."
+      "description": "Scans the same error responses for private and link-local IPv4 ranges (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x), IPv6 loopback (::1, [::1]:port, ::1:port -- not a public address that merely ends in ::1), link-local and unique-local addresses, and internal hostnames (lowercase *.internal, *.local, *.corp, *.lan, *.intranet as the last label, with hostname context: two or more labels before the suffix, or a preceding //, @, getaddrinfo, ENOTFOUND or EAI_AGAIN, or a :port -- so ctx.internal, settings.local.json and api.corp-services.example.com are not flagged). Fails as 'server unreachable' when nothing was received. Request bodies carry the full modern _meta so the errors originate from deeper layers such as upstream connectors, which is where addressing leaks.",
+      "passCriteria": "No distinct error response contains a private or link-local IPv4 address (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x), an IPv6 loopback (::1, [::1]:port, ::1:port), link-local or unique-local address, or an internal hostname (lowercase *.internal, *.local, *.corp, *.lan, *.intranet as the last label, with two or more labels before it or a preceding //, @, getaddrinfo, ENOTFOUND, EAI_AGAIN, or a :port) that is not an echo of the request.",
+      "failCriteria": "Any such address or hostname found, or none of the failure probes was answered and the run recorded no server message (server unreachable)."
     },
     {
       "id": "security-rate-limiting",
@@ -2569,9 +2569,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "server/tools#security-considerations",
-      "description": "Sends a burst of 50 rapid tools/call requests to the first tool annotated readOnlyHint that declares no required arguments and checks whether the server answers any of them with HTTP 429 Too Many Requests; the details name the method bursted. Servers MUST rate limit tool invocations and SHOULD rate limit log and progress traffic; a burst that draws no 429 fails, and so does one where most responses are 5xx (the server should throttle, not fall over). When no such tool exists, server/discover is bursted instead; discovery is cacheable and nothing requires throttling it, so a quiet burst then passes with a warning that tool invocations could not be exercised.",
-      "passCriteria": "At least one HTTP 429 among 50 rapid tools/call requests to the first readOnlyHint tool that declares no required arguments (tools/list fetched on demand); when no such tool exists, 50 rapid server/discover requests that draw no 429 pass with a warning.",
-      "failCriteria": "No 429 in a tools/call burst, or more than 25 of the 50 responses are 5xx (whichever method was bursted).",
+      "description": "Sends a burst of 50 rapid tools/call requests to the first tool annotated readOnlyHint true that declares no required arguments and checks whether the server answers any of them with HTTP 429 Too Many Requests; the details name the method bursted and, for a tool, how many times it was invoked. Servers MUST rate limit tool invocations and SHOULD rate limit log and progress traffic; a 429 passes, and a burst where most responses are 5xx fails (the server should throttle, not fall over). A burst that draws no 429 passes with a warning on either path -- 50 requests cannot prove the absence of a limiter -- so annotating a tool readOnlyHint never lowers the grade. When no such tool exists, server/discover is bursted instead and the warning says tool invocations could not be exercised. Inconclusive cases are reported as such: every request rejected by auth (401/403) skips with a hint to pass --auth (or to check the credential when --auth was given), and no response at all fails as 'server unreachable'.",
+      "passCriteria": "At least one HTTP 429 among 50 rapid tools/call requests to the first readOnlyHint tool that declares no required arguments (tools/list fetched on demand), or among 50 rapid server/discover requests when no such tool exists. A burst that draws no 429 passes with a warning on either path; one where every response is 401/403 is skipped as unmeasurable (pass --auth).",
+      "failCriteria": "More than 25 of the 50 responses are 5xx (whichever method was bursted), or none of the 50 requests got a response (server unreachable).",
       "transports": ["http"]
     }
   ]

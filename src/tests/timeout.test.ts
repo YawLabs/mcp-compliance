@@ -9,11 +9,16 @@ let slowServer: Server;
 let slowUrl: string;
 
 /**
- * A 2026-07-28 server whose FIRST reply takes `firstDelayMs` (a cold
- * start); every later reply is immediate. Answers any request with a
- * conformant DiscoverResult so the era probe classifies it as modern.
+ * A server whose FIRST reply takes `firstDelayMs` (a cold start); every
+ * later reply is immediate. The modern shape answers any request with a
+ * conformant DiscoverResult so the era probe classifies it as modern; the
+ * legacy shape answers `initialize` with an InitializeResult, `ping` with
+ * {} and anything else (the probe included) with -32601.
  */
-function startSlowModernServer(firstDelayMs: number): Promise<{ server: Server; url: string; seen: () => number }> {
+function startSlowServer(
+  firstDelayMs: number,
+  era: "modern" | "legacy" = "modern",
+): Promise<{ server: Server; url: string; seen: () => number }> {
   let first = true;
   let requests = 0;
   const server = createServer((req: IncomingMessage, res) => {
@@ -25,17 +30,23 @@ function startSlowModernServer(firstDelayMs: number): Promise<{ server: Server; 
     });
     req.on("end", () => {
       let id: unknown = null;
+      let method = "";
       try {
-        id = (JSON.parse(body) as { id?: unknown }).id ?? null;
+        const msg = JSON.parse(body) as { id?: unknown; method?: unknown };
+        id = msg.id ?? null;
+        method = typeof msg.method === "string" ? msg.method : "";
       } catch {}
       const delay = first ? firstDelayMs : 0;
       first = false;
       setTimeout(() => {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id,
+        if (id === null) {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        let payload: Record<string, unknown>;
+        if (era === "modern") {
+          payload = {
             result: {
               resultType: "complete",
               supportedVersions: ["2026-07-28"],
@@ -44,8 +55,22 @@ function startSlowModernServer(firstDelayMs: number): Promise<{ server: Server; 
               cacheScope: "public",
               _meta: { "io.modelcontextprotocol/serverInfo": { name: "slow-modern", version: "1" } },
             },
-          }),
-        );
+          };
+        } else if (method === "initialize") {
+          payload = {
+            result: {
+              protocolVersion: "2025-11-25",
+              capabilities: {},
+              serverInfo: { name: "slow-legacy", version: "1" },
+            },
+          };
+        } else if (method === "ping") {
+          payload = { result: {} };
+        } else {
+          payload = { error: { code: -32601, message: `Method not found: ${method}` } };
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id, ...payload }));
       }, delay);
     });
   });
@@ -57,6 +82,8 @@ function startSlowModernServer(firstDelayMs: number): Promise<{ server: Server; 
     });
   });
 }
+
+const startSlowModernServer = (firstDelayMs: number) => startSlowServer(firstDelayMs, "modern");
 
 function closeServer(server: Server): Promise<void> {
   return new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
@@ -288,6 +315,74 @@ describe("timeout handling", () => {
       await closeServer(slow.server);
     }
   }, 20000);
+
+  it("pinned 2025-11-25: a preflight timeout the handshake then outlives is downgraded, not reported as unreachable", async () => {
+    // Pinned runs are not re-probed, so a slow cold start that misses the
+    // preflight deadline used to keep "treating it as unreachable -- every
+    // test that needs the server will fail" on a report where every test
+    // passed.
+    const slow = await startSlowServer(1500, "legacy");
+    try {
+      const report = await runComplianceSuite(slow.url, {
+        timeout: 5000,
+        preflightTimeout: 500,
+        startupTimeout: 10000,
+        specVersion: "2025-11-25",
+        only: ["lifecycle-init", "lifecycle-ping"],
+      });
+      expect(report.tests.map((t) => [t.id, t.passed])).toEqual([
+        ["lifecycle-init", true],
+        ["lifecycle-ping", true],
+      ]);
+      expect(report.serverInfo.name).toBe("slow-legacy");
+      expect(report.warnings.some((w) => w.includes("treating it as unreachable"))).toBe(false);
+      expect(report.warnings.some((w) => w.includes("every test that needs the server will fail"))).toBe(false);
+      expect(report.warnings).toContain(
+        `Server at ${slow.url} did not answer the preflight within 500ms but did answer later requests; a slow cold start needs a higher --preflight-timeout.`,
+      );
+    } finally {
+      await closeServer(slow.server);
+    }
+  }, 20000);
+
+  it("pinned 2026-07-28: the same downgrade once the suite's discover is served", async () => {
+    const slow = await startSlowServer(1500, "modern");
+    try {
+      const report = await runComplianceSuite(slow.url, {
+        timeout: 5000,
+        preflightTimeout: 500,
+        startupTimeout: 10000,
+        specVersion: "2026-07-28",
+        only: ["lifecycle-discover"],
+      });
+      expect(report.tests[0].passed, report.tests[0].details).toBe(true);
+      expect(report.warnings.some((w) => w.includes("treating it as unreachable"))).toBe(false);
+      expect(report.warnings).toContain(
+        `Server at ${slow.url} did not answer the preflight within 500ms but did answer later requests; a slow cold start needs a higher --preflight-timeout.`,
+      );
+    } finally {
+      await closeServer(slow.server);
+    }
+  }, 20000);
+
+  it("a hung server that outlived the re-probe gets a per-request-timeout handshake, not two more startup waits", async () => {
+    // Before: preflight (300) + re-probe (2000) + initialize (2000) +
+    // notifications/initialized (2000) = 6.3s before lifecycle-init.
+    // After: the handshake is bounded by `timeout` and the initialized
+    // notification is skipped when initialize got no reply at all.
+    const start = Date.now();
+    const report = await runComplianceSuite(hangingUrl, {
+      timeout: 500,
+      startupTimeout: 2000,
+      preflightTimeout: 300,
+      only: ["lifecycle-init"],
+    });
+    const elapsed = Date.now() - start;
+    expect(report.tests[0].passed).toBe(false);
+    expect(report.warnings.some((w) => w.includes("treating it as unreachable"))).toBe(true);
+    expect(elapsed).toBeGreaterThanOrEqual(2300);
+    expect(elapsed).toBeLessThan(4500);
+  }, 10000);
 
   it("startupTimeout can be set shorter than default for fast-fail scenarios", async () => {
     // Explicit low startupTimeout makes the handshake fail fast instead

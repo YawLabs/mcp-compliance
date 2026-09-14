@@ -1,8 +1,44 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type BenchmarkResult, describeProbeFailure, formatBenchmark, runBenchmark } from "../benchmark.js";
 import type { TransportTarget } from "../types.js";
-import { type HttpFixture, LEGACY_ECHO_FIXTURE, startHttpFixture, stdioFixture } from "./helpers/modern-fixture.js";
+import {
+  type HttpFixture,
+  LEGACY_ECHO_FIXTURE,
+  LEGACY_SILENT_FIXTURE,
+  startHttpFixture,
+  stdioFixture,
+} from "./helpers/modern-fixture.js";
+
+/**
+ * A legacy stdio server whose unguarded dispatcher THROWS on an unknown
+ * pre-initialize method, so the era probe kills it (the same shape
+ * detect.test.ts uses). Answers initialize / ping once up.
+ */
+const CRASH_ON_PROBE_SERVER = `
+import { createInterface } from "node:readline";
+const rl = createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY });
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.id === undefined) return;
+  switch (msg.method) {
+    case "initialize":
+      send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-11-25", capabilities: {}, serverInfo: { name: "crash-on-probe", version: "1" } } });
+      break;
+    case "ping":
+      send({ jsonrpc: "2.0", id: msg.id, result: {} });
+      break;
+    default:
+      throw new Error("unhandled method " + msg.method);
+  }
+});
+rl.on("close", () => process.exit(0));
+`;
 
 /**
  * A dual-era counting stub: answers `server/discover` with a
@@ -245,6 +281,92 @@ describe("runBenchmark warm-up (what is sent around the timed loop)", () => {
   });
 });
 
+describe("runBenchmark auto on stdio: the era probe and the child it can kill", () => {
+  let dir: string;
+  let crashOnProbe: string;
+  let exitAtStartup: string;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "mcp-compliance-bench-crash-"));
+    crashOnProbe = join(dir, "crash-on-probe.mjs");
+    writeFileSync(crashOnProbe, CRASH_ON_PROBE_SERVER);
+    exitAtStartup = join(dir, "exit-at-startup.mjs");
+    writeFileSync(
+      exitAtStartup,
+      'process.stderr.write("Error: API_KEY environment variable is required\\n"); process.exit(1);\n',
+    );
+  });
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const stdio = (path: string): TransportTarget => ({ type: "stdio", command: process.execPath, args: [path] });
+
+  it("re-spawns a legacy child the probe killed, samples the fresh instance, and says so with the pin advice", async () => {
+    // Before: every sample failed with "server crashed with exit code 1"
+    // against the dead child, throughput was reported over 0ms, and
+    // nothing said the benchmark's own probe was the cause.
+    const result = await runBenchmark(stdio(crashOnProbe), { ...OPTS, startupTimeout: 10_000 });
+    expect(result.specVersion).toBe("2025-11-25");
+    expect(result.method).toBe("ping");
+    expectAllSucceeded(result);
+    expect(result.warnings, JSON.stringify(result)).toHaveLength(1);
+    const [warning] = result.warnings ?? [];
+    expect(warning).toContain("Server exited (code 1) after the 2026-07-28 era probe (server/discover)");
+    expect(warning).toContain("last stderr:");
+    expect(warning).toContain("Error: unhandled method server/discover");
+    expect(warning).toContain("The benchmark spawned a fresh instance.");
+    expect(warning).toContain("pin --spec-version 2025-11-25 to skip the probe");
+    // formatBenchmark prints it next to the counts.
+    expect(formatBenchmark(result)).toContain(`  warning: ${warning}`);
+  }, 20_000);
+
+  it("a server that exits at startup regardless is not blamed on the probe", async () => {
+    const result = await runBenchmark(stdio(exitAtStartup), { requests: 2, timeout: 2000, startupTimeout: 5000 });
+    expect(result.failed).toBe(2);
+    expect(result.warnings).toHaveLength(1);
+    const [warning] = result.warnings ?? [];
+    expect(warning).toContain("the server exits at startup regardless of the probe");
+    expect(warning).toContain("Error: API_KEY environment variable is required");
+    expect(warning).not.toContain("pin --spec-version");
+  }, 20_000);
+
+  it("the probe is bounded by startupTimeout, not the per-request timeout", async () => {
+    // A silent legacy server ignores the probe; a 15s --timeout used to be
+    // the probe budget, so a modern server with a slower cold start would
+    // have been misclassified as 2025-11-25.
+    const started = Date.now();
+    const result = await runBenchmark(
+      { type: "stdio", command: process.execPath, args: [LEGACY_SILENT_FIXTURE] },
+      { requests: 2, timeout: 500, startupTimeout: 1500 },
+    );
+    const elapsed = Date.now() - started;
+    expect(result.specVersion).toBe("2025-11-25");
+    expect(result.succeeded).toBe(2);
+    expect(elapsed).toBeGreaterThanOrEqual(1500);
+    expect(elapsed).toBeLessThan(8000);
+  }, 20_000);
+
+  it("~2s into an unanswered probe onStatus gets the same status line the test command prints", async () => {
+    const status: string[] = [];
+    await runBenchmark(
+      { type: "stdio", command: process.execPath, args: [LEGACY_SILENT_FIXTURE] },
+      { requests: 1, timeout: 5000, startupTimeout: 3500, onStatus: (m) => status.push(m) },
+    );
+    expect(status).toEqual([
+      "Probing spec era (server/discover, up to 3.5s). A 2025-11-25 server that ignores unknown methods takes the whole startup timeout; --spec-version 2025-11-25 skips the probe.",
+    ]);
+  }, 20_000);
+
+  it("a probe answered at once produces no status line and no warning", async () => {
+    const status: string[] = [];
+    const result = await runBenchmark(legacyEchoTarget, { ...OPTS, onStatus: (m) => status.push(m) });
+    expect(status).toEqual([]);
+    expect(result.warnings).toBeUndefined();
+  });
+});
+
 describe("runBenchmark against an unreachable server", () => {
   it("falls back to 2025-11-25 and records the transport error, never a success", async () => {
     const result = await runBenchmark({ type: "http", url: "http://127.0.0.1:1/mcp" }, { requests: 2, timeout: 2000 });
@@ -306,5 +428,11 @@ describe("formatBenchmark", () => {
     const text = formatBenchmark({ ...base, succeeded: 0, failed: 3, firstError: "JSON-RPC error -32601 nope" });
     expect(text).toContain("0 succeeded");
     expect(text).toContain("first failure: JSON-RPC error -32601 nope");
+  });
+
+  it("prints each warning, and none when there are none", () => {
+    expect(formatBenchmark(base)).not.toContain("warning:");
+    const text = formatBenchmark({ ...base, warnings: ["one", "two"] });
+    expect(text).toContain("  warning: one\n  warning: two");
   });
 });

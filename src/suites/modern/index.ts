@@ -38,10 +38,14 @@ export interface ModernSuiteInput {
 /**
  * The 2026-07-28 suite. Module order matters: lifecycle establishes the
  * discover result every capability gate reads; the feature modules fill
- * the cached lists that transport/security reuse; the late lifecycle
- * probe (legacy `initialize`) runs after everything because on stdio it
- * can pin a dual-era server to legacy semantics for the rest of the
- * process; post-hoc checks scan the recorder last.
+ * the cached lists that transport/security reuse and, on stdio, pin a
+ * dual-era server modern so the late lifecycle block's claim-less `_meta`
+ * probes measure validation rather than era selection; that late block
+ * (which also holds the legacy `initialize` probe, sent to a fresh child
+ * on stdio) runs BEFORE security, whose rate-limit burst can leave an
+ * intermediary answering 429 for a while -- a bare 429 on a negative
+ * probe is not the server rejecting the defect; post-hoc checks scan the
+ * recorder last.
  */
 export async function runModernSuite(input: ModernSuiteInput): Promise<ComplianceReport> {
   const { transport, options } = input;
@@ -108,9 +112,9 @@ export async function runModernSuite(input: ModernSuiteInput): Promise<Complianc
     await runTransport(ctx);
     await runErrors(ctx);
     await runSchema(ctx);
-    await runSecurity(ctx);
     await runStdio(ctx);
     await runLifecycleLate(ctx);
+    await runSecurity(ctx);
     await harness.drainPool();
     await runPostHoc(ctx);
     await harness.drainPool();
@@ -118,14 +122,22 @@ export async function runModernSuite(input: ModernSuiteInput): Promise<Complianc
     unsubscribe();
   }
 
-  // SDK 2.0 servers advertise only modern versions in supportedVersions
-  // yet still serve the legacy initialize handshake, so key on either.
-  if (ctx.state.supportedVersions.includes(LEGACY_SPEC_VERSION) || ctx.state.legacyInitializeServed) {
-    const how = ctx.state.supportedVersions.includes(LEGACY_SPEC_VERSION)
+  // A served legacy initialize means "dual-era" only when the conformant
+  // server/discover was served too (SDK 2.0 servers advertise only modern
+  // versions in supportedVersions yet still serve the handshake, so key on
+  // either); served while discover was rejected, the server is legacy-only
+  // and this run graded the era it does not speak.
+  const advertisesLegacy = ctx.state.supportedVersions.includes(LEGACY_SPEC_VERSION);
+  if (ctx.state.discover && (advertisesLegacy || ctx.state.legacyInitializeServed)) {
+    const how = advertisesLegacy
       ? `also advertises ${LEGACY_SPEC_VERSION}`
       : "also serves the legacy initialize handshake";
     harness.warnings.push(
       `Server is dual-era (${how}); this run graded ${MODERN_SPEC_VERSION}. Re-run with --spec-version ${LEGACY_SPEC_VERSION} to test the legacy handshake.`,
+    );
+  } else if (!ctx.state.discover && ctx.state.legacyInitializeServed) {
+    harness.warnings.push(
+      `Server is legacy-only (served the ${LEGACY_SPEC_VERSION} initialize handshake but rejected server/discover); this run graded ${MODERN_SPEC_VERSION}, so most of its tests are not evaluable. Re-run with --spec-version ${LEGACY_SPEC_VERSION} (or auto) to grade the era it speaks.`,
     );
   }
   harness.finalizeWarnings();

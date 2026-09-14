@@ -13,12 +13,18 @@ import type { Transport, TransportStream } from "../../transport/index.js";
 import type { StdioTransport } from "../../transport/stdio.js";
 import {
   ensurePrompts,
+  ensureResources,
   ensureResourceTemplates,
   ensureTools,
   hasCapability,
   hasCompletions,
+  hasPrompts,
+  hasResources,
   hasTools,
+  type ListKey,
+  listUnavailable,
   type ModernSuiteContext,
+  publishList,
 } from "./context.js";
 
 /**
@@ -33,8 +39,13 @@ import {
  * pinned modern by a non-discover request treats ANY claim-less message
  * as a legacy opening and pins the whole process to legacy semantics; by
  * the time the late tests run, the feature modules have pinned it modern
- * and the probes draw the -32602 the spec requires. The initialize probe
- * runs last, on a fresh child on stdio, for the mirror-image reason.
+ * (and a `--only` run that skipped them sends one modern request first,
+ * see `ensureEraPinned`) and the probes draw the -32602 the spec
+ * requires. The initialize probe goes to a fresh child on stdio for the
+ * mirror-image reason. The whole late block runs BEFORE the security
+ * module: its rate-limit burst can leave an intermediary answering 429
+ * for a while, and a bare 429 must not be read as the server rejecting a
+ * malformed request (see `transportLevelRejection`).
  */
 
 const ACK_METHOD = "notifications/subscriptions/acknowledged";
@@ -52,6 +63,27 @@ const VENDOR_META_KEY = "com.example.compliance/probe";
  * the raw transport probes (99901+), so the recorder correlates it.
  */
 const LEGACY_INITIALIZE_ID = 1;
+/**
+ * HTTP statuses an auth gate, a size limit, a media-type gate or a rate
+ * limiter answers BEFORE the JSON-RPC layer reads the request. None of
+ * them is the server's verdict on the request body, so a negative probe
+ * that draws one measured nothing (the same list error-id-echo exempts).
+ */
+const TRANSPORT_LEVEL_STATUS: Record<number, string> = {
+  401: "an auth gate",
+  403: "an auth gate",
+  413: "a body-size limit",
+  415: "a media-type gate",
+  429: "rate limiting",
+};
+/**
+ * How long a fresh stdio child spawned WITHOUT any input is watched
+ * before "it stayed up" is concluded (lifecycle-dual-era, see
+ * `exitsAtStartup`): at least this, and at least three times as long as
+ * the child that exited took to do so.
+ */
+const IDLE_PROBE_FLOOR_MS = 2000;
+const IDLE_PROBE_POLL_MS = 50;
 
 /** Removed in 2026-07-28; each must draw a JSON-RPC error. `initialize` is probed separately (lifecycle-dual-era). */
 const REMOVED_METHOD_PROBES: Array<[string, Record<string, unknown>]> = [
@@ -152,13 +184,43 @@ export function notEvaluable(ctx: ModernSuiteContext): string | null {
 }
 
 /**
+ * Why an HTTP rejection cannot be credited to the injected defect: the
+ * status is one an auth gate, size limit, media-type gate or rate
+ * limiter answers before the JSON-RPC layer reads the request (401, 403,
+ * 413, 415, 429). A gateway that rate-limits the security burst answers
+ * every later request 429 for a while, and that says nothing about
+ * whether the server validates `_meta` or the standard headers. Null on
+ * stdio and for every other status. Read AFTER `notEvaluable`, which
+ * names the root cause when the conformant discover drew the same gate.
+ */
+export function transportLevelRejection(ctx: ModernSuiteContext, res: RpcResponse): string | null {
+  if (ctx.kind !== "http") return null;
+  const source = TRANSPORT_LEVEL_STATUS[res.statusCode];
+  if (!source) return null;
+  return `not evaluable: HTTP ${res.statusCode} is a transport-level rejection (${source} answered before the JSON-RPC layer read the request), so it proves nothing about the injected defect`;
+}
+
+/**
+ * Whether a transport error is the request deadline elapsing (undici's
+ * TimeoutError / HeadersTimeoutError names; the stdio transport's "timed
+ * out after" message) rather than a connection failure or an exit.
+ */
+function isTimeout(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  if (typeof name === "string" && /timeout/i.test(name)) return true;
+  return /\btimed out\b/i.test(messageOf(err));
+}
+
+/**
  * Shared verdict for the "request must be rejected" tests: a result
  * fails, a JSON-RPC error with `expectedCode` passes, any other code
  * passes with a warning, and on HTTP the status must be 400. A bare HTTP
  * 4xx with no JSON-RPC body (an intermediary rejecting the request) is
- * accepted with a warning: it is a rejection, just not a diagnosable one.
- * Any rejection is credited only when the conformant discover was served
- * (see `notEvaluable`).
+ * accepted with a warning: it is a rejection, just not a diagnosable one
+ * -- unless the status is a transport-level gate (401/403/413/415/429),
+ * which is not evaluable (see `transportLevelRejection`). Any rejection
+ * is credited only when the conformant discover was served (see
+ * `notEvaluable`).
  */
 async function expectRejection(
   ctx: ModernSuiteContext,
@@ -177,7 +239,7 @@ async function expectRejection(
   if (resultOf(res.body)) {
     return fail(`${what}: server returned a result${status} (expected JSON-RPC error ${expectedCode})`);
   }
-  const unattributable = notEvaluable(ctx);
+  const unattributable = notEvaluable(ctx) ?? transportLevelRejection(ctx, res);
   if (unattributable) return fail(`${what}: ${unattributable}`);
   const err = errorOf(res.body);
   if (!err) {
@@ -257,9 +319,11 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
 
   // ── Setup: the discover exchange every capability gate reads ──────
   const probe: DiscoverProbe = { res: null, error: null, result: undefined };
+  const sentAt = Date.now();
   try {
     probe.res = await client.rpc("server/discover", {}, { timeout: ctx.startupTimeout });
     probe.result = resultOf(probe.res.body);
+    ctx.state.discoverLatencyMs = Date.now() - sentAt;
   } catch (err) {
     probe.error = messageOf(err);
   }
@@ -478,6 +542,10 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
     const failures: string[] = [];
     const summary: string[] = [];
     let warned = false;
+    // A rejection is credited only when the conformant discover was served
+    // (see notEvaluable): a server that rejects everything also rejects
+    // ping, and that says nothing about whether ping was removed.
+    const unattributable = notEvaluable(ctx);
     for (const [method, params] of REMOVED_METHOD_PROBES) {
       let res: RpcResponse;
       try {
@@ -491,6 +559,10 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
         continue;
       }
       const err = errorOf(res.body);
+      if (unattributable) {
+        summary.push(`${method} ${err ? `${err.code}` : `HTTP ${res.statusCode}`}`);
+        continue;
+      }
       if (!err) {
         if (ctx.kind === "http" && res.statusCode >= 400) {
           harness.warnings.push(
@@ -517,12 +589,13 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
       summary.push(`${method} ${err.code}${ctx.kind === "http" ? `/${res.statusCode}` : ""}`);
     }
     if (failures.length > 0) return fail(failures.join("; "));
+    if (unattributable) return fail(`${summary.join(", ")} rejected; ${unattributable}`);
     return pass(`${summary.join(", ")}${warned ? " (see warnings)" : ""}`);
   });
 
   await harness.check("lifecycle-capability-handlers-match", async () => {
     if (!probe.result) return fail(`${describeProbeFailure(probe, ctx)}; capability declarations unknown`);
-    const features: Array<[string, string, string]> = [
+    const features: Array<[string, string, ListKey]> = [
       ["tools", "tools/list", "tools"],
       ["resources", "resources/list", "resources"],
       ["prompts", "prompts/list", "prompts"],
@@ -541,8 +614,12 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
       const result = resultOf(res.body);
       const err = errorOf(res.body);
       if (declared) {
-        if (result && Array.isArray(result[key]))
-          summary.push(`${cap}: declared, ${(result[key] as unknown[]).length} listed`);
+        // A declared list this check obtained is the list: publish it so a
+        // `--only lifecycle` run's later readers (progress, completions)
+        // reuse it through ensureList instead of sending it again.
+        ctx.state.listAttempts.add(key);
+        const items = publishList(ctx, key, res) ?? (Array.isArray(result?.[key]) ? (result[key] as unknown[]) : null);
+        if (items) summary.push(`${cap}: declared, ${items.length} listed`);
         else if (result) failures.push(`${cap}: declared but ${method} result has no ${key} array`);
         else failures.push(`${cap}: declared but ${method} returned ${describeResponse(res)}${statusOf(ctx, res)}`);
         continue;
@@ -654,10 +731,15 @@ async function checkSubscriptionsListen(ctx: ModernSuiteContext): Promise<TestOu
 
   const httpStatus = ctx.kind === "http" && stream.statusCode !== undefined ? ` (HTTP ${stream.statusCode})` : "";
   const err = response ? errorOf(response) : undefined;
+  // A rejection counts as "unsupported, and said so" only when the
+  // conformant discover was served (see notEvaluable): a server that
+  // rejects everything proves nothing by rejecting the listen too.
+  const unattributable = notEvaluable(ctx);
   if (err) {
     if (isAdvertised) {
       return fail(`subscriptions/listen rejected with ${err.code}${httpStatus} although ${advertisedNote}`);
     }
+    if (unattributable) return fail(`subscriptions/listen rejected with ${err.code}${httpStatus}; ${unattributable}`);
     if (err.code !== JSONRPC_ERROR_CODES.METHOD_NOT_FOUND) {
       ctx.harness.warnings.push(
         `lifecycle-subscriptions-listen: rejected with ${err.code} (expected -32601 when unsupported)`,
@@ -670,6 +752,8 @@ async function checkSubscriptionsListen(ctx: ModernSuiteContext): Promise<TestOu
     if (ctx.kind === "http" && stream.statusCode !== undefined && stream.statusCode >= 400) {
       if (isAdvertised)
         return fail(`subscriptions/listen rejected up front with HTTP ${stream.statusCode} although ${advertisedNote}`);
+      if (unattributable)
+        return fail(`subscriptions/listen rejected with HTTP ${stream.statusCode}; ${unattributable}`);
       ctx.harness.warnings.push(
         `lifecycle-subscriptions-listen: rejected with HTTP ${stream.statusCode} but no JSON-RPC error body`,
       );
@@ -823,6 +907,18 @@ function firstTemplateVariable(uriTemplate: string): string | undefined {
 }
 
 /**
+ * How long the fresh-process legacy initialize may wait. The suite's own
+ * process has already proven the server starts, so the per-request
+ * budget is the base; a pinned stdio run's setup discover was the first
+ * exchange with a cold process and bounds its start, so a slow starter
+ * gets three times that. Never more than the startup budget.
+ */
+function freshInitializeBudget(ctx: ModernSuiteContext): number {
+  const observed = ctx.state.discoverLatencyMs ?? 0;
+  return Math.min(ctx.startupTimeout, Math.max(ctx.timeout, 3 * observed));
+}
+
+/**
  * The legacy `initialize` exchange on a FRESH stdio child, recorded like
  * any other exchange. A dual-era stdio server selects its era from how the
  * client opens the process, so on the suite's already-modern process a
@@ -835,12 +931,13 @@ async function initializeOnFresh(
   fresh: Transport,
   params: Record<string, unknown>,
   opts: RpcOptions,
+  timeout: number,
 ): Promise<RpcResponse> {
   const probeClient = createModernClient({
     transport: fresh,
     recorder: ctx.recorder,
     nextId: () => LEGACY_INITIALIZE_ID,
-    timeout: ctx.startupTimeout,
+    timeout,
     protocolVersion: ctx.client.protocolVersion,
     clientCapabilities: ctx.client.clientCapabilities,
     clientInfo: ctx.client.clientInfo,
@@ -848,9 +945,101 @@ async function initializeOnFresh(
   });
   const unsubscribe = fresh.onMessage((m, meta) => ctx.recorder.recordReceived(m, meta));
   try {
-    return await probeClient.rpc("initialize", params, { ...opts, timeout: ctx.startupTimeout });
+    return await probeClient.rpc("initialize", params, { ...opts, timeout });
   } finally {
     unsubscribe();
+  }
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * The stderr a dead child left behind, summarised to the lines that name
+ * the cause: stack frames ("at ...") and bare punctuation are dropped,
+ * the last three meaningful lines are kept, ASCII-fied and clipped. The
+ * 'exit' event can land before the parent has read the pipe, so the
+ * stream gets a moment to drain first.
+ */
+async function stderrSummary(dead: StdioTransport): Promise<string> {
+  const deadline = Date.now() + 200;
+  while (!dead.stderrTail().trim() && Date.now() < deadline) await sleep(20);
+  await sleep(20);
+  const lines = dead
+    .stderrTail()
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !/^at\s/.test(l) && /[A-Za-z0-9]/.test(l))
+    .slice(-3)
+    .map((l) => l.replace(/[^\x20-\x7e]/g, "?"))
+    .join(" | ");
+  return lines.length > 120 ? `${lines.slice(0, 117)}...` : lines;
+}
+
+/** "exit code 1" / "signal-terminated" plus the stderr summary when there is one. */
+async function describeExit(dead: StdioTransport): Promise<string> {
+  const code = dead.exitCode === null ? "no exit code" : `exit code ${dead.exitCode}`;
+  const stderr = await stderrSummary(dead);
+  return stderr ? `${code}: ${stderr}` : code;
+}
+
+/**
+ * Whether a second instance of the server exits on its own: spawn one,
+ * send it NOTHING, and watch it for `graceMs`. A fresh child that died on
+ * the legacy initialize could have died for two reasons the suite cannot
+ * tell apart from that child alone -- the request killed it, or the
+ * server allows one instance at a time (a lock file, a fixed port, an
+ * exclusive database) and exits at startup while the suite's own process
+ * holds the lock. An idle instance separates them: one that stays up
+ * would have served a legacy client, so the request is what the server
+ * exits on; one that exits with no input exits regardless of the probe.
+ */
+async function exitsAtStartup(ctx: ModernSuiteContext, graceMs: number): Promise<string | null> {
+  if (!ctx.spawnFresh) return null;
+  const idle = ctx.spawnFresh() as StdioTransport;
+  try {
+    const deadline = Date.now() + graceMs;
+    while (!idle.exited && Date.now() < deadline) {
+      if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error("Aborted");
+      await sleep(IDLE_PROBE_POLL_MS);
+    }
+    return idle.exited ? await describeExit(idle) : null;
+  } finally {
+    await idle.close();
+  }
+}
+
+/**
+ * stdio only: make sure a claim-bearing, non-discover request has reached
+ * the process before the claim-less `_meta` probes are sent. The full run
+ * gets that from the feature modules; a `--only lifecycle-meta-required`
+ * run has sent nothing but the setup discover, which does not pin a
+ * dual-era server (the SDK 2.0 default keeps deciding its era until the
+ * first modern non-discover request), so its verdict would differ from
+ * the full run's. The pin request is a list the server declared (cached
+ * for later readers), else `ping` -- any valid modern request pins, and a
+ * removed method's -32601 is the cheapest answer to draw.
+ */
+async function ensureEraPinned(ctx: ModernSuiteContext): Promise<void> {
+  if (ctx.kind !== "stdio") return;
+  const pinned = ctx.recorder.sent.some(
+    (s) =>
+      s.id !== undefined &&
+      s.method !== "server/discover" &&
+      s.meta?.[META.protocolVersion] === ctx.client.protocolVersion,
+  );
+  if (pinned) return;
+  if (hasTools(ctx)) {
+    await ensureTools(ctx);
+  } else if (hasResources(ctx)) {
+    await ensureResources(ctx);
+  } else if (hasPrompts(ctx)) {
+    await ensurePrompts(ctx);
+  } else {
+    try {
+      await ctx.client.rpc("ping", {});
+    } catch {
+      // The probes that follow report their own failures.
+    }
   }
 }
 
@@ -924,10 +1113,9 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
   }
 
   await harness.check("lifecycle-progress-token", async () => {
+    if (!hasTools(ctx)) return pass("skipped: server declares no tools");
     const tools = await ensureTools(ctx);
-    if (!tools) {
-      return pass(hasTools(ctx) ? "skipped: tools/list failed (see tools-list)" : "skipped: server declares no tools");
-    }
+    if (!tools) return listUnavailable(ctx, "tools", "no tool to call with a progressToken");
     if (tools.length === 0) return pass("skipped: server lists no tools");
     const tool = pickProgressTool(tools);
     if (!tool) return pass("skipped: no listed tool has a name");
@@ -972,7 +1160,16 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
   // modules, because a dual-era stdio server that is still deciding its
   // era treats a claim-less message as a legacy opening and pins the
   // process to legacy for good; by now a non-discover modern request has
-  // pinned it modern and the probes measure the validation they target.
+  // pinned it modern (ensureEraPinned sends one when a `--only` run has
+  // not) and the probes measure the validation they target. Only when a
+  // probe is selected: the pin request is not free on a stdio server.
+  if (
+    harness.shouldRun("lifecycle-meta-required", "lifecycle") ||
+    harness.shouldRun("lifecycle-meta-protocol-version-required", "lifecycle")
+  ) {
+    await ensureEraPinned(ctx);
+  }
+
   await harness.check("lifecycle-meta-required", () =>
     expectRejection(
       ctx,
@@ -993,10 +1190,10 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
     ),
   );
 
-  // Runs LAST. On stdio the probe goes to a FRESH child: a dual-era server
-  // selects its era per process, so the suite's process (pinned modern by
-  // now) would reject an initialize that a legacy client opening a new
-  // process is served. On HTTP every request is its own opening.
+  // On stdio the probe goes to a FRESH child: a dual-era server selects
+  // its era per process, so the suite's process (pinned modern by now)
+  // would reject an initialize that a legacy client opening a new process
+  // is served. On HTTP every request is its own opening.
   await harness.check("lifecycle-dual-era", async () => {
     const legacyParams = {
       protocolVersion: LEGACY_SPEC_VERSION,
@@ -1009,40 +1206,82 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
       meta: false,
       headers: { "Mcp-Method": null, "MCP-Protocol-Version": LEGACY_SPEC_VERSION },
     };
+    const budget = ctx.kind === "stdio" ? freshInitializeBudget(ctx) : ctx.timeout;
+    const spawnedAt = Date.now();
     const fresh = ctx.kind === "stdio" ? ctx.spawnFresh?.() : undefined;
     const where = fresh ? " on a fresh process" : "";
+    const shouldName = "a modern-only server SHOULD reject it with an error naming its supported versions";
     let res: RpcResponse;
     try {
       res = fresh
-        ? await initializeOnFresh(ctx, fresh, legacyParams, opts)
-        : await client.rpc("initialize", legacyParams, opts);
+        ? await initializeOnFresh(ctx, fresh, legacyParams, opts, budget)
+        : await client.rpc("initialize", legacyParams, { ...opts, timeout: budget });
     } catch (err) {
+      // An aborted run is not a verdict: let the harness see the abort.
+      if (ctx.signal?.aborted) throw err;
       const message = messageOf(err);
       const probed = (fresh ?? ctx.transport) as StdioTransport;
       if (ctx.kind === "stdio" && probed.exited) {
-        return fail(`Server exited after a legacy initialize request${where}: ${short(message)}`);
+        const exit = await describeExit(probed);
+        // Died on the request, or died at startup because the suite's own
+        // process holds a single-instance lock? Ask an idle instance.
+        const elapsed = Date.now() - spawnedAt;
+        const grace = Math.min(ctx.startupTimeout, Math.max(IDLE_PROBE_FLOOR_MS, 3 * elapsed));
+        const idleExit = fresh ? await exitsAtStartup(ctx, grace) : null;
+        if (idleExit !== null) {
+          harness.warnings.push(
+            `lifecycle-dual-era: a fresh instance exited (${exit}) before answering the legacy initialize, and one spawned with no input exited too (${idleExit}); a server that allows one instance at a time cannot be probed alongside the suite's own process, so its era is undetermined`,
+          );
+          return pass(
+            `era undetermined: a second instance exits at startup alongside the suite's process (${idleExit}), so the legacy initialize could not be probed (see warning)`,
+          );
+        }
+        const stayedUp = fresh
+          ? "; an instance spawned with no input stays up, so the request is what it exits on"
+          : "";
+        return fail(`Server exited after a legacy initialize request${where} (${exit})${stayedUp}`);
+      }
+      if (isTimeout(err)) {
+        harness.warnings.push(
+          `lifecycle-dual-era: legacy initialize got no response within ${budget}ms${where}; ${shouldName}`,
+        );
+        return pass(`No response to legacy initialize${where} within ${budget}ms; era undetermined (see warning)`);
       }
       harness.warnings.push(
-        `lifecycle-dual-era: legacy initialize got no response (${short(message, 60)}); a modern-only server SHOULD reject it with an error naming its supported versions`,
+        `lifecycle-dual-era: legacy initialize got no response${where} (${short(message)}); ${shouldName}`,
       );
-      return pass(
-        `No response to legacy initialize${where} within ${fresh ? ctx.startupTimeout : ctx.timeout}ms; era undetermined (see warning)`,
-      );
+      return pass(`legacy initialize got no response${where} (${short(message)}); era undetermined (see warning)`);
     } finally {
       await fresh?.close();
     }
     const status = statusOf(ctx, res);
     const result = resultOf(res.body);
     if (result) {
-      // The suite-level dual-era warning keys on this: SDK 2.0 servers
-      // advertise only modern versions yet still serve the handshake.
+      if (typeof result.protocolVersion !== "string") {
+        return pass(`initialize returned a result without protocolVersion${status}${where}; era ambiguous`);
+      }
+      // The suite-level warnings key on this: SDK 2.0 servers advertise
+      // only modern versions yet still serve the handshake (dual-era); a
+      // server that served it while REJECTING the conformant discover is
+      // legacy-only and pinned to the wrong suite.
       ctx.state.legacyInitializeServed = true;
-      if (typeof result.protocolVersion === "string") {
+      if (!ctx.state.discover) {
         return pass(
-          `dual-era: initialize answered with protocolVersion ${result.protocolVersion}${where}; legacy handshake served alongside ${MODERN_SPEC_VERSION}`,
+          `legacy-only: initialize answered with protocolVersion ${result.protocolVersion}${where} but server/discover was rejected; only the legacy handshake is served (see warning)`,
         );
       }
-      return pass(`initialize returned a result without protocolVersion${status}${where}; era ambiguous`);
+      return pass(
+        `dual-era: initialize answered with protocolVersion ${result.protocolVersion}${where}; legacy handshake served alongside ${MODERN_SPEC_VERSION}`,
+      );
+    }
+    // An auth gate or rate limiter answering the probe (with or without a
+    // JSON-RPC body) is not the server's verdict on the handshake.
+    const gate = transportLevelRejection(ctx, res);
+    if (gate) {
+      harness.warnings.push(`lifecycle-dual-era: legacy initialize was answered HTTP ${res.statusCode}; ${gate}`);
+      return pass(
+        `era undetermined: initialize answered HTTP ${res.statusCode}, a transport-level rejection (see warning)`,
+      );
     }
     const err = errorOf(res.body);
     if (err) {

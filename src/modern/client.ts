@@ -77,6 +77,8 @@ export interface RawOptions {
   omitUserHeaders?: string[];
   timeout?: number;
   protocolVersion?: string;
+  /** Overrides the client's default signal (RunOptions.signal) for this probe. */
+  signal?: AbortSignal;
 }
 
 export interface ModernClient {
@@ -221,6 +223,11 @@ export function createModernClient(options: ModernClientOptions): ModernClient {
         headers,
         omitUserHeaders: opts.omitUserHeaders,
         signal: opts.signal ?? options.signal,
+        // The stdio transport's close() writes notifications/cancelled
+        // itself; log it so a reply to it is attributed to it, not to
+        // the stream's request.
+        onSent: (m) =>
+          recorder.recordSent({ id: undefined, method: m.method, params: m.params, meta: metaOfParams(m.params) }),
       });
     },
     async raw(body, opts = {}) {
@@ -234,7 +241,13 @@ export function createModernClient(options: ModernClientOptions): ModernClient {
         : { [HEADER_PROTOCOL_VERSION]: opts.protocolVersion ?? options.protocolVersion };
       const headers = applyHeaderOverrides(base, opts.headers);
       recorder.recordSent({ id: undefined, method: opts.method ?? "", params: undefined, meta: undefined, raw: body });
-      const res = await t.rawPost(body, headers, opts.timeout ?? options.timeout, opts.omitUserHeaders);
+      const res = await t.rawPost(
+        body,
+        headers,
+        opts.timeout ?? options.timeout,
+        opts.omitUserHeaders,
+        opts.signal ?? options.signal,
+      );
       // Raw responses bypass the transport's parser, so record them here.
       recordRawBody(recorder, res.body, res.headers["content-type"] || "", res.statusCode);
       return res;

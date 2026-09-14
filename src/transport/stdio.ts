@@ -388,10 +388,16 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
           // `done`. Nothing to cancel once the child is gone.
           if (cancelSent || answered || exited) return;
           cancelSent = true;
+          const cancel = { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } };
+          // Reported before the write so a recorder logs it ahead of any
+          // reply the server (wrongly) sends to it.
           try {
-            await writeLine(
-              JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }),
-            );
+            init.onSent?.(cancel);
+          } catch {
+            // A hook must never break the transport.
+          }
+          try {
+            await writeLine(JSON.stringify(cancel));
           } catch {
             // child already gone
           }

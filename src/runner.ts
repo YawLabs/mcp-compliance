@@ -10,7 +10,6 @@ import { request } from "undici";
 import {
   INJECTION_PAYLOADS,
   INTERNAL_IP_PATTERNS,
-  looksRejected,
   POISONING_PATTERNS,
   STACK_TRACE_PATTERNS,
   VALID_CONTENT_TYPES,
@@ -20,9 +19,14 @@ import {
   buildDiscoverProbe,
   classifyDiscoverResponse,
   type DetectionResult,
-  type DetectOptions,
   detectSpecVersion,
+  type ProbeExit,
+  probeAnswerShowsEra,
+  probeExitOf,
+  probeExitWarning,
   REASON_PREFIX,
+  settledStderr,
+  summarizeStderr,
 } from "./detect.js";
 import { createHarness, supportsTransportByDefinition } from "./harness.js";
 import { readPackageVersion } from "./pkg-version.js";
@@ -36,6 +40,7 @@ import {
   specBaseFor,
 } from "./spec.js";
 import { runModernSuite } from "./suites/modern/index.js";
+import { classifyInjectionOutput } from "./suites/modern/security.js";
 import { createHttpTransport } from "./transport/http.js";
 import type { Transport, TransportResponse } from "./transport/index.js";
 import { createStdioTransport, type StdioTransport } from "./transport/stdio.js";
@@ -95,69 +100,6 @@ function formatSeconds(ms: number): string {
   return ms % 1000 === 0 ? `${ms / 1000}s` : `${(ms / 1000).toFixed(1)}s`;
 }
 
-/**
- * How long the stdio era probe may sit unanswered before `onStatus`
- * tells the user what the wait is. A server that answers the probe
- * (result or error) does so in milliseconds; only a 2025-11-25 server
- * that IGNORES unknown pre-initialize methods reaches this.
- */
-const STDIO_PROBE_STATUS_DELAY_MS = 2000;
-
-/**
- * The stdio era probe with a status hook: nothing has been printed since
- * "Testing stdio:..." and the probe may take the whole startup budget,
- * so ~2s in say what is being waited on and how to skip it.
- */
-async function detectStdioEra(
-  transport: Transport,
-  opts: DetectOptions & { onStatus?: (message: string) => void },
-): Promise<DetectionResult> {
-  const timer = opts.onStatus
-    ? setTimeout(() => {
-        opts.onStatus?.(
-          `Probing spec era (server/discover, up to ${formatSeconds(opts.timeout)}). A ${LEGACY_SPEC_VERSION} server that ignores unknown methods takes the whole startup timeout; --spec-version ${LEGACY_SPEC_VERSION} skips the probe.`,
-        );
-      }, STDIO_PROBE_STATUS_DELAY_MS)
-    : null;
-  try {
-    return await detectSpecVersion(transport, opts);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-/**
- * The stderr a dead child left behind. The 'exit' event that rejected the
- * probe can land before the parent has read the pipe (a crashing Node
- * prints its stack, then exits; the two completions are not ordered), so
- * give the stream a moment to drain before quoting it.
- */
-async function settledStderr(dead: StdioTransport): Promise<string> {
-  const deadline = Date.now() + 200;
-  while (!dead.stderrTail().trim() && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  await new Promise((r) => setTimeout(r, 20));
-  return dead.stderrTail();
-}
-
-/**
- * The last few meaningful stderr lines of a stdio child, one line, for a
- * warning. Drops stack-frame lines ("    at ...") and bare punctuation so
- * the line that names the cause (e.g. "Error: unhandled method
- * server/discover") survives ahead of the frames that follow it.
- */
-function summarizeStderr(tail: string): string {
-  const lines = tail
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0 && !/^at\s/.test(l) && /[A-Za-z0-9]/.test(l));
-  return lines
-    .slice(-3)
-    .map((l) => (l.length > 160 ? `${l.slice(0, 157)}...` : l))
-    .join(" | ");
-}
-
 /** Collapse whitespace (a transport error carries a multi-line stderr tail) and cap the length for a details string. */
 function oneLine(text: string, max: number): string {
   const flat = text.replace(/\s+/g, " ").trim();
@@ -168,7 +110,68 @@ function oneLine(text: string, max: number): string {
 function describeProbeAnswer(d: DetectionResult): string {
   if (d.discover) return `a DiscoverResult (supportedVersions [${(d.supportedVersions ?? []).join(", ")}])`;
   const rest = d.reason.startsWith(REASON_PREFIX) ? d.reason.slice(REASON_PREFIX.length) : d.reason;
-  return rest.replace(/, legacy$/, "");
+  const shape = rest.replace(/, legacy$/, "");
+  return /^(JSON-RPC|HTTP|modern|no )/.test(shape) ? shape : `a ${shape}`;
+}
+
+/** Propagate a caller's abort between phases that no test() gate covers (preflight, detection, handshake). */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
+}
+
+/**
+ * Spawn the stdio child a target describes. Shared with the benchmark so
+ * both re-spawn the same way when the era probe kills a legacy child.
+ * @internal
+ */
+export function spawnStdioTarget(target: Extract<TransportTarget, { type: "stdio" }>): StdioTransport {
+  return createStdioTransport({
+    command: target.command,
+    args: target.args,
+    env: target.env,
+    cwd: target.cwd,
+    verbose: target.verbose,
+  });
+}
+
+/**
+ * Warnings for `only` / `skip` values that select nothing in a catalog:
+ * values that name no test id or category in it (ids are only meaningful
+ * within one catalog -- a legacy id such as lifecycle-init does not exist
+ * in 2026-07-28), and `only` values whose every match is gated off the
+ * target transport (transport-post on a stdio target). Without these a
+ * filtered run silently produces an empty (grade F) or partial report.
+ * Shared by the live run and `--list`.
+ * @internal
+ */
+export function filterWarnings(
+  specVersion: SpecVersion,
+  transport: "http" | "stdio",
+  only: readonly string[] | undefined,
+  skip: readonly string[] | undefined,
+): string[] {
+  const catalog = getTestDefinitionMap(specVersion);
+  const defs = [...catalog.values()];
+  const categories = new Set(defs.map((d) => d.category as string));
+  const supports = specVersion === LEGACY_SPEC_VERSION ? supportsTransport : supportsTransportByDefinition;
+  const out: string[] = [];
+  const unknown = [...(only ?? []), ...(skip ?? [])].filter((f) => !catalog.has(f) && !categories.has(f));
+  if (unknown.length > 0) {
+    out.push(
+      `Filter value(s) ${unknown.map((u) => `"${u}"`).join(", ")} match no test id or category in the ${specVersion} catalog; run --list --spec-version ${specVersion} to see valid ids.`,
+    );
+  }
+  const other = transport === "http" ? "stdio" : "http";
+  const gated = (only ?? []).filter((f) => {
+    const matches = defs.filter((d) => d.id === f || d.category === f);
+    return matches.length > 0 && matches.every((d) => !supports(d, transport));
+  });
+  if (gated.length > 0) {
+    out.push(
+      `Filter value(s) ${gated.map((g) => `"${g}"`).join(", ")} match only tests that do not apply to a ${transport} target (${other}-only), so they select nothing here; run --list --transport ${transport} --spec-version ${specVersion} to see the ids that apply.`,
+    );
+  }
+  return out;
 }
 
 /**
@@ -387,16 +390,7 @@ export async function runComplianceSuite(
   // can spawn an independent second instance for probes that must not
   // share the suite's process (a dual-era stdio server pins its era per
   // process).
-  const spawnStdio = () =>
-    resolvedTarget.type === "stdio"
-      ? createStdioTransport({
-          command: resolvedTarget.command,
-          args: resolvedTarget.args,
-          env: resolvedTarget.env,
-          cwd: resolvedTarget.cwd,
-          verbose: resolvedTarget.verbose,
-        })
-      : null;
+  const spawnStdio = () => (resolvedTarget.type === "stdio" ? spawnStdioTarget(resolvedTarget) : null);
   // Reassigned once, and only on stdio: when the era probe kills the child
   // (a legacy server that exits on an unknown pre-initialize request) the
   // suite runs against a fresh instance; `finally` closes whichever is
@@ -462,6 +456,10 @@ export async function runComplianceSuite(
     if (resolvedTarget.type === "http") {
       try {
         const probe = buildDiscoverProbe(clientInfo);
+        // The caller's abort must cancel the preflight too: on HTTP it is
+        // the era probe, and the first test() gate is up to
+        // preflightTimeout away.
+        const deadline = AbortSignal.timeout(preflightTimeout);
         const preflight = await request(resolvedTarget.url, {
           method: "POST",
           headers: {
@@ -471,7 +469,7 @@ export async function runComplianceSuite(
             ...userHeaders,
           },
           body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "server/discover", params: probe.params }),
-          signal: AbortSignal.timeout(preflightTimeout),
+          signal: options.signal ? AbortSignal.any([options.signal, deadline]) : deadline,
         });
         const text = await preflight.body.text();
         const rawCt = preflight.headers["content-type"];
@@ -487,6 +485,7 @@ export async function runComplianceSuite(
         }
         preflightResponse = { body, requestId: 0, statusCode: preflight.statusCode, headers: {} };
       } catch (err: unknown) {
+        throwIfAborted(options.signal);
         serverReachable = false;
         preflightTimedOut = isTimeoutError(err);
         preflightError = err instanceof Error ? err.message : String(err);
@@ -494,6 +493,7 @@ export async function runComplianceSuite(
     }
 
     const preWarnings: string[] = [];
+    const hasAuthHeader = Object.keys(userHeaders).some((h) => h.toLowerCase() === "authorization");
 
     // ── Spec version resolution ──────────────────────────────────────
     // `auto` classifies the spec's own era probe (a modern
@@ -519,30 +519,47 @@ export async function runComplianceSuite(
         clientInfo,
         signal: options.signal,
       });
+      throwIfAborted(options.signal);
       if (retry.responded) {
         serverReachable = true;
         detection = retry;
       }
     }
+    // The unreachable warning is provisional on a preflight TIMEOUT: a
+    // pinned run is not re-probed, so a slow cold start can miss the
+    // preflight and still answer the handshake; once it does, the
+    // warning is replaced (see settleUnreachableWarning).
+    let unreachableWarning: string | null = null;
     if (!serverReachable) {
-      preWarnings.push(
-        preflightTimedOut
-          ? `Server at ${displayUrl} did not answer the preflight within ${preflightTimeout}ms${reprobedAfterTimeout ? ` or the era probe within ${startupTimeout}ms` : ""}; treating it as unreachable -- every test that needs the server will fail. A slow cold start needs a higher --preflight-timeout${reprobedAfterTimeout ? " / --startup-timeout" : ""}.`
-          : `Server at ${displayUrl} is unreachable (${preflightError}) -- every test that needs the server will fail. Check the URL or command and ensure the server is running.`,
-      );
+      unreachableWarning = preflightTimedOut
+        ? `Server at ${displayUrl} did not answer the preflight within ${preflightTimeout}ms${reprobedAfterTimeout ? ` or the era probe within ${startupTimeout}ms` : ""}; treating it as unreachable -- every test that needs the server will fail. A slow cold start needs a higher --preflight-timeout${reprobedAfterTimeout ? " / --startup-timeout" : ""}.`
+        : `Server at ${displayUrl} is unreachable (${preflightError}) -- every test that needs the server will fail. Check the URL or command and ensure the server is running.`;
+      preWarnings.push(unreachableWarning);
     }
+    const settleUnreachableWarning = (warnings: string[], answered: boolean) => {
+      if (!unreachableWarning || !preflightTimedOut || !answered) return;
+      const i = warnings.indexOf(unreachableWarning);
+      if (i === -1) return;
+      warnings[i] =
+        `Server at ${displayUrl} did not answer the preflight within ${preflightTimeout}ms${reprobedAfterTimeout ? ` or the era probe within ${startupTimeout}ms` : ""} but did answer later requests; a slow cold start needs a higher --preflight-timeout${reprobedAfterTimeout ? " / --startup-timeout" : ""}.`;
+    };
+    // A stdio child that died on the era probe; the warning is composed
+    // once the fresh instance's first exchange has settled (a server that
+    // exits at startup regardless of the probe must not be told to pin).
+    let probeExit: ProbeExit | null = null;
     if (requested === "auto" && serverReachable) {
       if (!detection) {
         detection =
           resolvedTarget.type === "http"
             ? classifyDiscoverResponse(preflightResponse)
-            : await detectStdioEra(transport, {
+            : await detectSpecVersion(transport, {
                 nextId,
                 timeout: startupTimeout,
                 clientInfo,
                 signal: options.signal,
                 onStatus: options.onStatus,
               });
+        throwIfAborted(options.signal);
       }
       resolvedSpec = detection.version;
       preWarnings.push(
@@ -551,55 +568,61 @@ export async function runComplianceSuite(
       // A legacy server whose dispatcher throws on an unknown method dies
       // on the probe. The transport already rejected the probe with the
       // exit diagnostic (detectSpecVersion folds that into "no response");
-      // say so, and give the suite a live child instead of a dead one.
-      if (transport.kind === "stdio" && (transport as StdioTransport).exited) {
-        const dead = transport as StdioTransport;
-        const tail = summarizeStderr(await settledStderr(dead));
-        const why =
-          detection.era === "legacy"
-            ? ` A ${LEGACY_SPEC_VERSION} server must tolerate unknown pre-initialize requests (answer with a JSON-RPC error or ignore them, never exit); pin --spec-version ${LEGACY_SPEC_VERSION} to skip the probe.`
-            : "";
-        preWarnings.push(
-          `Server exited (code ${dead.exitCode}) after the ${MODERN_SPEC_VERSION} era probe (server/discover)${tail ? `; last stderr: ${tail}` : ""}. The suite spawned a fresh instance.${why}`,
-        );
+      // give the suite a live child instead of a dead one, and say so
+      // once that child has shown whether it survives at all.
+      probeExit = await probeExitOf(transport);
+      if (probeExit) {
         await transport.close().catch(() => {});
         transport = spawnStdio() as Transport;
+        if (detection.era === "modern") {
+          // The modern suite's first exchange is its own discover; the
+          // probe was answered, so the child did not exit at startup.
+          preWarnings.push(
+            await probeExitWarning(probeExit, transport, { era: "modern", answered: true, spawner: "suite" }),
+          );
+          probeExit = null;
+        }
+      }
+      if (detection.eraUndetermined && !hasAuthHeader) {
+        preWarnings.unshift(
+          `Server at ${displayUrl} requires authentication (the server/discover probe got HTTP ${preflightResponse?.statusCode ?? 401}) and no Authorization header was sent, so the era could not be determined and the ${resolvedSpec} grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`,
+        );
       }
     } else {
       resolvedSpec = requested === "auto" ? LEGACY_SPEC_VERSION : requested;
       // A pinned HTTP run still sent the probe as its preflight; when the
-      // answer belongs to the OTHER era, say so -- a pinned 2025-11-25 run
-      // against a modern-only server otherwise fails 20 tests whose
-      // headline ("lifecycle-init: ...") never mentions 2026-07-28.
+      // answer plainly belongs to the OTHER era, say so -- a pinned
+      // 2025-11-25 run against a modern-only server otherwise fails 20
+      // tests whose headline ("lifecycle-init: ...") never mentions
+      // 2026-07-28. A dual-era server pinned to its legacy side is not a
+      // mismatch, and a 5xx or an intermediary's page is not an era.
       if (requested !== "auto" && preflightResponse) {
         const seen = classifyDiscoverResponse(preflightResponse);
-        if (seen.version !== requested && !seen.eraUndetermined) {
-          preWarnings.push(
-            `Server answered the ${MODERN_SPEC_VERSION} server/discover probe with ${describeProbeAnswer(seen)}; this run is pinned to ${requested}. Re-run with --spec-version ${seen.version} (or auto) to grade it.`,
+        if (seen.eraUndetermined && !hasAuthHeader) {
+          preWarnings.unshift(
+            `Server at ${displayUrl} requires authentication (the preflight got HTTP ${preflightResponse.statusCode ?? 401}) and no Authorization header was sent, so the ${resolvedSpec} grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`,
           );
+        } else if (seen.version !== requested && !seen.eraUndetermined) {
+          if (seen.supportedVersions?.includes(requested)) {
+            preWarnings.push(
+              `Server is dual-era (server/discover advertised supportedVersions [${seen.supportedVersions.join(", ")}]); this run grades its ${requested} side.`,
+            );
+          } else if (seen.era === "modern" || probeAnswerShowsEra(preflightResponse)) {
+            preWarnings.push(
+              `Server answered the ${MODERN_SPEC_VERSION} server/discover probe with ${describeProbeAnswer(seen)}; this run is pinned to ${requested}. Re-run with --spec-version ${seen.version} (or auto) to grade it.`,
+            );
+          }
         }
       }
     }
 
     // `--only` / `--skip` values that match nothing in the resolved
-    // catalog would silently produce an empty (grade F) or partial run.
-    // Ids are only meaningful within one catalog — a legacy id such as
-    // lifecycle-init does not exist in 2026-07-28 — so name the miss.
-    {
-      const catalog = getTestDefinitionMap(resolvedSpec);
-      const categories = new Set([...catalog.values()].map((d) => d.category as string));
-      const unknown = [...(options.only ?? []), ...(options.skip ?? [])].filter(
-        (f) => !catalog.has(f) && !categories.has(f),
-      );
-      if (unknown.length > 0) {
-        preWarnings.push(
-          `Filter value(s) ${unknown.map((u) => `"${u}"`).join(", ")} match no test id or category in the ${resolvedSpec} catalog; run --list --spec-version ${resolvedSpec} to see valid ids.`,
-        );
-      }
-    }
+    // catalog, or only tests gated off this transport, would silently
+    // produce an empty (grade F) or partial run: name the miss.
+    preWarnings.push(...filterWarnings(resolvedSpec, transport.kind, options.only, options.skip));
 
     if (resolvedSpec === MODERN_SPEC_VERSION) {
-      return await runModernSuite({
+      const report = await runModernSuite({
         transport,
         options,
         nextId,
@@ -613,6 +636,10 @@ export async function runComplianceSuite(
         warnings: preWarnings,
         spawnFresh: resolvedTarget.type === "stdio" ? () => spawnStdio() as Transport : undefined,
       });
+      // A served discover (the suite's first exchange) is proof the server
+      // was reachable after all.
+      settleUnreachableWarning(report.warnings, report.serverInfo.protocolVersion !== null);
+      return report;
     }
 
     const harness = createHarness({
@@ -661,6 +688,7 @@ export async function runComplianceSuite(
         timeout: timeoutMs,
         headers: extraHeaders,
         omitUserHeaders,
+        signal: options.signal,
       });
       return {
         statusCode: res.statusCode ?? 200,
@@ -680,6 +708,7 @@ export async function runComplianceSuite(
       const res = await transport.notify(method, params, {
         timeout: timeoutMs,
         headers: extraHeaders,
+        signal: options.signal,
       });
       return { statusCode: res.statusCode ?? 200, headers: res.headers ?? {} };
     }
@@ -882,15 +911,20 @@ export async function runComplianceSuite(
     // timeout, crashed child, refused connection); lifecycle-init prints it.
     let initError: string | null = null;
     const initStart = Date.now();
+    // The handshake uses `startupTimeout` (not `timeout`) to give
+    // slow-starting stdio servers room (see RunOptions.startupTimeout) --
+    // unless the server has already sat silent through the preflight AND
+    // the era re-probe's full startup budget, in which case a third
+    // startup-sized wait buys nothing and the per-request timeout bounds
+    // it instead.
+    const handshakeTimeout = reprobedAfterTimeout && !serverReachable ? timeout : startupTimeout;
+    throwIfAborted(options.signal);
     try {
       // Declare all three client capabilities so servers see us as a
       // fully-capable client. Servers that break on unknown or
       // unexpected client capabilities (they shouldn't — spec is
       // forward-compatible) will fail the lifecycle-*-capability
       // tests below.
-      //
-      // The handshake uses `startupTimeout` (not `timeout`) to give
-      // slow-starting stdio servers room. See RunOptions.startupTimeout.
       initRes = await mcpRequest(
         backendUrl,
         "initialize",
@@ -905,7 +939,7 @@ export async function runComplianceSuite(
         },
         nextId,
         buildHeaders(),
-        startupTimeout,
+        handshakeTimeout,
       );
       const result = initRes?.body?.result;
       if (result) {
@@ -924,9 +958,31 @@ export async function runComplianceSuite(
         }
       }
     } catch (err: unknown) {
+      throwIfAborted(options.signal);
       // Init failed — lifecycle-init reports the failure with this reason.
-      initError = err instanceof Error ? err.message : String(err);
+      const message = err instanceof Error ? err.message : String(err);
+      if (transport.kind === "stdio") {
+        // The transport's message appends the raw stderr tail, which for a
+        // crashing Node child is mostly stack frames; keep the diagnostic
+        // ("server crashed with exit code 1 ...") and summarize the stderr
+        // so the line naming the cause survives ahead of the frames.
+        const head = message.split(/\n\s*child stderr:/)[0];
+        const tail = summarizeStderr(await settledStderr(transport as StdioTransport));
+        initError = tail ? `${head} (last stderr: ${tail})` : head;
+      } else {
+        initError = message;
+      }
     }
+    if (probeExit && detection) {
+      warnings.push(
+        await probeExitWarning(probeExit, transport, {
+          era: detection.era,
+          answered: initRes !== null,
+          spawner: "suite",
+        }),
+      );
+    }
+    settleUnreachableWarning(warnings, initRes !== null);
 
     // Warn if initialize crossed the per-request timeout. The server
     // answered in the end (we got here), but steady-state tests will
@@ -940,12 +996,16 @@ export async function runComplianceSuite(
       );
     }
 
-    // Send initialized notification (always, for session setup). Shares
-    // the startup budget — some servers don't write their prompt to
-    // stdout until this lands.
-    try {
-      await mcpNotification(backendUrl, "notifications/initialized", undefined, buildHeaders(), startupTimeout);
-    } catch {}
+    // Send initialized notification (for session setup). Shares the
+    // startup budget — some servers don't write their prompt to stdout
+    // until this lands. Skipped when initialize got no response at all:
+    // there is nothing to acknowledge, and against a hung server the
+    // notification would only cost a second startup-sized wait.
+    if (initRes !== null) {
+      try {
+        await mcpNotification(backendUrl, "notifications/initialized", undefined, buildHeaders(), handshakeTimeout);
+      } catch {}
+    }
 
     // Capability flags computed once post-init. Some later-section tests
     // read these from closures declared before the tools/resources/prompts
@@ -2533,6 +2593,18 @@ export async function runComplianceSuite(
       "basic/authorization",
       async () => {
         if (!hasAuth) {
+          // The preflight was itself an unauthenticated request; when it
+          // drew a 401/403 the server does reject unauthenticated
+          // requests, and saying it "accepted" them would contradict
+          // transport-post's "auth required -- pass --auth" on the same
+          // report.
+          const status = preflightResponse?.statusCode;
+          if (status === 401 || status === 403) {
+            return {
+              passed: true,
+              details: `HTTP ${status} (unauthenticated preflight rejected; pass --auth to run the authenticated suite and the remaining auth tests)`,
+            };
+          }
           return {
             passed: false,
             details: "Server does not require auth (no --auth provided and server accepted unauthenticated requests)",
@@ -2943,8 +3015,14 @@ export async function runComplianceSuite(
     );
 
     // Input validation security tests (only run if tools are available)
-    // Shared helper for injection tests: sends payloads to a tool param, checks output against a detection pattern
-    // Rejection heuristics live in src/checks/patterns.ts (looksRejected).
+    // Shared helper for injection tests: sends payloads to a tool param and
+    // classifies the output the way the 2026-07-28 suite does
+    // (classifyInjectionOutput): every verbatim copy of the payload is
+    // scrubbed before the detector runs, so an echo tool returning
+    // "&& echo pwned" as-is is benign reflection, not "pwned" produced by
+    // a shell, and only execution evidence (uid=..., root:x:..., a real
+    // database error) counts as an issue. Rejection heuristics live in
+    // src/checks/patterns.ts (looksRejected).
 
     async function runInjectionTest(
       toolName: string,
@@ -2952,9 +3030,11 @@ export async function runComplianceSuite(
       payloads: string[],
       detectPattern: RegExp,
       label: string,
+      evidence: string,
     ): Promise<{ passed: boolean; details: string }> {
       const issues: string[] = [];
-      let defended = 0;
+      let rejected = 0;
+      let benign = 0;
       for (const payload of payloads) {
         try {
           const res = await rpc("tools/call", { name: toolName, arguments: { [paramName]: payload } });
@@ -2963,28 +3043,32 @@ export async function runComplianceSuite(
           const isErrorFlag = result?.isError === true;
           if (Array.isArray(content)) {
             const text = content.map((c: any) => c.text || "").join(" ");
-            if (detectPattern.test(text)) {
-              if (looksRejected(text, isErrorFlag)) {
-                defended++;
-              } else {
-                issues.push(`Payload "${payload}" ${label} (output: ${text.substring(0, 100)})`);
-              }
+            const verdict = classifyInjectionOutput(text, payload, detectPattern, isErrorFlag);
+            if (verdict === "issue") {
+              issues.push(`Payload "${payload}" ${label} (output: ${text.substring(0, 100)})`);
+            } else if (verdict === "rejected") {
+              rejected++;
             } else {
-              defended++;
+              benign++;
             }
+          } else {
+            // A JSON-RPC error (invalid params, unknown tool): the input
+            // never reached a handler.
+            rejected++;
           }
         } catch {
           // Error is acceptable — server rejected the input
-          defended++;
+          rejected++;
         }
       }
       if (issues.length > 0) return { passed: false, details: issues.join("; ") };
+      const scope = `Tested ${payloads.length} payloads against ${toolName}.${paramName}`;
       return {
         passed: true,
         details:
-          defended === payloads.length
-            ? `Tested ${payloads.length} payloads against ${toolName}.${paramName} — server defended (rejected or sanitized)`
-            : `Tested ${payloads.length} payloads against ${toolName}.${paramName} — no ${label.split(" ")[0]} detected`,
+          benign === 0
+            ? `${scope} — server defended (rejected or sanitized)`
+            : `${scope} — no ${evidence} detected (${rejected} rejected, ${benign} returned without it)`,
       };
     }
 
@@ -3018,6 +3102,7 @@ export async function runComplianceSuite(
             INJECTION_PAYLOADS.command,
             /root:.*:\d+:\d+:.*:\/|uid=\d+\(\w+\)|drwxr|pwned/i,
             "appears to have executed",
+            "command execution",
           );
         },
       );
@@ -3037,6 +3122,7 @@ export async function runComplianceSuite(
             INJECTION_PAYLOADS.sql,
             /syntax error|sql|mysql|postgres|sqlite|information_schema|table_name/i,
             "triggered database error",
+            "database error",
           );
         },
       );
@@ -3056,6 +3142,7 @@ export async function runComplianceSuite(
             INJECTION_PAYLOADS.pathTraversal,
             /root:.*:0:0|\[boot loader\]|\[extensions\]/i,
             "returned sensitive file content",
+            "sensitive file content",
           );
         },
       );
@@ -3085,6 +3172,7 @@ export async function runComplianceSuite(
             INJECTION_PAYLOADS.ssrf,
             /ami-|instance-id|hostname|iam|security-credentials/i,
             "returned internal data",
+            "internal data",
           );
         },
       );

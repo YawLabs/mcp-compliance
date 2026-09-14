@@ -866,7 +866,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization",
     description:
-      "Sends a request without an Authorization header and verifies the server returns HTTP 401. Servers exposed over the network should require authentication.",
+      "Sends a request without an Authorization header and verifies the server returns HTTP 401. Servers exposed over the network should require authentication. Without --auth the unauthenticated preflight stands in for the probe: a 401/403 there passes (the details suggest --auth to run the authenticated suite and the remaining auth tests), and a server that served it fails as not requiring auth.",
     recommendation:
       "Implement authentication on your MCP endpoint. Return HTTP 401 Unauthorized for requests without valid credentials. Use OAuth 2.1 or Bearer tokens as recommended by the MCP spec.",
   },
@@ -979,7 +979,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "Calls each tool with OS command injection payloads in string parameters (e.g., '; cat /etc/passwd', '$(whoami)'). Verifies the server does not execute injected commands.",
+      "Calls each tool with OS command injection payloads in string parameters (e.g., '; cat /etc/passwd', '$(whoami)'). Verifies the server does not execute injected commands. Output that only reflects the payload back (an echo tool) is benign; the check fails on evidence of execution (uid=... id output, /etc/passwd lines, a directory listing).",
     recommendation:
       "Never pass tool argument values directly to shell commands. Use parameterized APIs, execFile() instead of exec(), or allowlists. Sanitize all user-provided input before use in system calls.",
   },
@@ -990,7 +990,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      'Calls each tool with SQL injection payloads in string parameters (e.g., "\' OR 1=1 --"). Verifies the server does not return database errors or unexpected data.',
+      'Calls each tool with SQL injection payloads in string parameters (e.g., "\' OR 1=1 --"). Verifies the server does not return database errors or unexpected data. Output that only reflects the payload is benign; the check fails on a database error message or schema names in the output.',
     recommendation:
       "Use parameterized queries or prepared statements for all database operations. Never concatenate user input into SQL strings. Return generic error messages that do not reveal database structure.",
   },
@@ -1001,7 +1001,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "Calls each tool with path traversal payloads in string parameters (e.g., '../../etc/passwd', '..\\\\..\\\\windows\\\\system.ini'). Verifies the server does not expose files outside its intended scope.",
+      "Calls each tool with path traversal payloads in string parameters (e.g., '../../etc/passwd', '..\\\\..\\\\windows\\\\system.ini'). Verifies the server does not expose files outside its intended scope. Output that only reflects the payload is benign; the check fails on sensitive file content (a root passwd entry, boot.ini / system.ini sections).",
     recommendation:
       "Validate and sanitize file paths. Use path.resolve() and verify the result is within the allowed directory. Reject paths containing '..' segments. Use a chroot or sandboxed filesystem for file operations.",
   },
@@ -1012,7 +1012,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "For tools that accept URL parameters, submits internal IP addresses (169.254.169.254, 127.0.0.1, 10.0.0.0/8) and cloud metadata endpoints. Verifies the server blocks requests to internal networks.",
+      "For tools that accept URL parameters, submits internal IP addresses (169.254.169.254, 127.0.0.1, 10.0.0.0/8) and cloud metadata endpoints. Verifies the server blocks requests to internal networks. Output that only reflects the URL is benign; the check fails on metadata-service content (ami-, instance-id, hostname, iam, security-credentials).",
     recommendation:
       "Validate and restrict URLs in tool parameters. Block requests to private IP ranges (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x), link-local addresses, and cloud metadata endpoints. Use an allowlist of permitted domains.",
   },

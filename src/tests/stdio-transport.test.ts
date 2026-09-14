@@ -216,17 +216,25 @@ describe("StdioTransport", () => {
       if (msg.method === "notifications/test/cancel-seen") cancels.push(msg.params);
     });
     const nextId = createIdCounter(7100);
-    const stream = await t.stream("subscriptions/listen", { notifications: {} }, nextId, { timeout: 300 });
+    const reported: unknown[] = [];
+    const stream = await t.stream("subscriptions/listen", { notifications: {} }, nextId, {
+      timeout: 300,
+      onSent: (m) => reported.push(m),
+    });
     const seen: unknown[] = [];
     for await (const msg of stream.messages) seen.push(msg);
     expect(seen).toEqual([]); // the timer ended the stream
     expect(stream.exit).toBeUndefined();
+    expect(reported).toEqual([]); // nothing composed on our behalf yet
     await stream.close();
     await vi.waitFor(() => expect(cancels).toEqual([{ requestId: 7101 }]), { timeout: 5000, interval: 10 });
+    // The cancel the transport wrote itself is reported through onSent, as written.
+    expect(reported).toEqual([{ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 7101 } }]);
     // A second close() does not cancel twice.
     await stream.close();
     await new Promise((r) => setTimeout(r, 100));
     expect(cancels).toHaveLength(1);
+    expect(reported).toHaveLength(1);
   });
 
   it("stream().close() does not send notifications/cancelled once the response carrying the id arrived", async () => {
@@ -242,7 +250,11 @@ describe("StdioTransport", () => {
       if (msg.method === "notifications/test/cancel-seen") cancels.push(msg.params);
     });
     const nextId = createIdCounter(7200);
-    const stream = await t.stream("subscriptions/listen", { notifications: {} }, nextId, { timeout: 5000 });
+    const reported: unknown[] = [];
+    const stream = await t.stream("subscriptions/listen", { notifications: {} }, nextId, {
+      timeout: 5000,
+      onSent: (m) => reported.push(m),
+    });
     const seen: unknown[] = [];
     for await (const msg of stream.messages) seen.push(msg);
     expect(seen).toHaveLength(1);
@@ -250,5 +262,7 @@ describe("StdioTransport", () => {
     // Give a stray cancel time to round-trip before asserting none came.
     await new Promise((r) => setTimeout(r, 300));
     expect(cancels).toEqual([]);
+    // No cancel was written, so none is reported: onSent mirrors the wire, not the close() call.
+    expect(reported).toEqual([]);
   });
 });

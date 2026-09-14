@@ -20,9 +20,13 @@ out explicitly here.
   per-request log-level gating, MRTR `input_required` results, and rejection of
   the removed `ping` / `logging/setLevel` / `resources/subscribe` methods. Eight
   post-hoc tests scan a recording of every message the server sent, including a
-  full validation against the vendored 2026-07-28 JSON schema. Ids shared with the
-  2025-11-25 catalog are semantically identical checks; changed checks have new
-  ids (`lifecycle-discover`, `transport-get-removed`, `resources-not-found`, ...).
+  full validation against the vendored 2026-07-28 JSON schema. An id shared with
+  the 2025-11-25 catalog covers the same feature, but its criteria and required
+  flag may differ between the catalogs (`stdio-framing` and
+  `error-invalid-jsonrpc` are optional in 2026-07-28, `error-method-code` is
+  required), so ids are comparable only within one catalog; checks whose verdict
+  flipped have new ids (`lifecycle-discover`, `transport-get-removed`,
+  `resources-not-found`, ...).
 - **`--spec-version auto|2025-11-25|2026-07-28`** on `test` and `benchmark`, a
   `specVersion` key in the config file, a `specVersion` input on the
   `mcp_compliance_test` MCP tool (and an optional one on `mcp_compliance_explain`,
@@ -91,8 +95,8 @@ out explicitly here.
 - **`ajv` and `ajv-formats` are runtime dependencies** (previously dev-only): the
   2026-07-28 suite validates recorded server messages against the spec schema.
 - **Config forward-compatibility:** a config file that sets `specVersion` is
-  rejected as an unknown key by mcp-compliance < 0.18. Pin the tool version where
-  such a config is consumed.
+  rejected as an unknown key by mcp-compliance < 0.19 (0.18.x included). Pin
+  `@yawlabs/mcp-compliance@^0.19` where such a config is consumed.
 - `--only` / `--skip` values that match no test id or category in the resolved
   catalog now produce a warning naming the miss (and the `--list --spec-version`
   command to see valid ids) instead of silently running an empty or partial suite
@@ -106,8 +110,9 @@ out explicitly here.
   lifecycle` and `--only transport` exercise the real checks (ten security tests,
   the six definition checks, `lifecycle-progress-token`, `lifecycle-completions`
   and `transport-header-name-mismatch` used to skip-pass and grade A). A test
-  skip-passes only when the capability is undeclared or the list call itself
-  failed, and its details say which.
+  skip-passes when the capability is undeclared; when the list call itself failed
+  it skip-passes pointing at the `-list` test if that test is in the run, and
+  fails with the recorded reason when it was filtered out.
 - **`--preflight-timeout` bounds the HTTP era probe; `--startup-timeout` bounds
   the stdio one.** Under `auto` a preflight that times out (as opposed to a
   refused connection) is re-probed once within `--startup-timeout` before the run
@@ -120,17 +125,28 @@ out explicitly here.
   legacy` / `no response, legacy` replace the sentence-long notes; the JSON
   warning keeps the `Spec version auto-detected as <v> (...)` shape.
 - **Leak patterns widened (both suites).** `security-error-no-internal-ip` now
-  matches 169.254.x and internal hostnames (`*.internal`, `*.local`, `*.corp`,
-  `*.lan`, `*.intranet`), and `security-error-no-stacktrace` matches Windows
-  paths in their JSON-escaped form (`C:\\Users\\svc\\app`), which every scanned
-  sample is. Strictly wider detection; the 2025-11-25 catalog text is unchanged.
+  matches 169.254.x, IPv6 loopback in its usual forms (`::1`, `[::1]:5432`,
+  `::1:5432`; not a public address such as `2001:db8::1`) and internal
+  hostnames (lowercase `*.internal`, `*.local`, `*.corp`, `*.lan`,
+  `*.intranet` as the last label, with hostname context: two or more labels
+  before the suffix, or a preceding `//`, `@`, `getaddrinfo`/`ENOTFOUND`, or
+  a `:port` -- so `ctx.internal`, `settings.local.json` and
+  `api.corp-services.example.com` are not flagged), and
+  `security-error-no-stacktrace` matches Windows paths with any drive-letter
+  case in their JSON-escaped form (`C:\\Users\\svc\\app`), which every scanned
+  sample is, without mistaking `ERROR:` before an escaped newline for a drive.
+  The 2025-11-25 catalog text is unchanged. A leak repeated across responses is
+  reported once with a repeat count.
 - **Injection tests probe one target (2026-07-28).** The four injection tests
-  send their payloads to a single (tool, argument): the first tool with a string
-  argument, `readOnlyHint` tools preferred, `destructiveHint` tools skipped while
-  an alternative exists, other required arguments filled with schema-typed
-  placeholders so the payload reaches the handler, and `x-mcp-header` arguments
-  mirrored. The details count rejected / benign / never-reached payloads and
-  claim "server defended" only when every payload was rejected.
+  send their payloads to a single (tool, argument) from the safest annotation
+  tier that has a string argument -- `readOnlyHint: true`, then
+  `destructiveHint: false`, then unannotated tools (the spec defaults
+  `destructiveHint` to true), then `destructiveHint: true` -- with free-form
+  arguments before enum/const/pattern ones, other required arguments filled with
+  schema-honouring placeholders so the payload reaches the handler, and
+  `x-mcp-header` arguments mirrored. The details count rejected / benign /
+  never-reached payloads, claim "server defended" only when every payload was
+  rejected, and say "inconclusive" (with a warning) when none reached the tool.
 - npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
 - `release.sh` writes a `## [x.y.z]` changelog entry for every release — promoting `[Unreleased]` when it has content, otherwise generating one from the commit subjects since the previous tag — keeps the Keep-a-Changelog link references current when the file has them, and takes the GitHub release notes from that entry instead of from `git log` subjects. Before this, the script never touched CHANGELOG.md at all: a release got an entry only if someone wrote one by hand (0.18.0 below is backfilled), and every GitHub release page showed raw commit subjects.
 
@@ -155,7 +171,11 @@ out explicitly here.
     proxy answers 401/403/413/415/429 with a non-JSON-RPC body (the official
     SDK's `requireBearerAuth` writes `{"error":"invalid_token"}`), and
     `error-id-echo` exempted every null-id `-32600`/`-32700` reply by code even
-    on well-formed requests; the status now decides, not the code.
+    on well-formed requests; the status now decides, not the code. A body that
+    is not `jsonrpc: "2.0"` is not a JSON-RPC error at all (a gateway's
+    `{"error":{"code":400,...}}` is not counted), a non-JSON-RPC body on any
+    HTTP 4xx/5xx is noted rather than schema-validated, and only an id-less reply
+    is exempt on a transport-level status -- a present but wrong id fails.
   - `schema-result-type` accepted any string; it now requires `complete` or
     `input_required` unless an `extensions` capability is advertised (then other
     values pass with a warning naming them). `schema-input-required-shape`
@@ -169,12 +189,14 @@ out explicitly here.
     `invalid_request` 400 to a syntactically invalid credential; it now pins the
     401 with a well-formed invalid token and accepts 400/401/403 for garbage.
   - `security-oauth-metadata` never fetched the `resource_metadata` URL from the
-    `WWW-Authenticate` challenge and probed root before path; it now follows the
-    spec's order (challenge URL, path, root) and warns when `resource` is not the
-    endpoint.
+    `WWW-Authenticate` challenge and probed root before path; it now fetches the
+    advertised URL and only it (clients MUST use it, so an unreachable, non-200,
+    malformed or relative one fails, naming any valid well-known document), tries
+    path then root only without a challenge URL, and warns when `resource` is
+    not the endpoint.
   - `security-rate-limiting` bursted `server/discover` while citing the
-    tools/call MUST; it now bursts a read-only no-argument tool and passes with a
-    warning when only discovery could be bursted.
+    tools/call MUST; it now bursts a read-only no-argument tool when there is one
+    (see the second pass below for how a quiet burst is graded).
   - `security-auth-required` asserted "server accepted unauthenticated requests"
     without probing when `--auth` was absent, contradicting the 401 in the same
     report; it, `security-www-authenticate` and `security-oauth-metadata` now
@@ -184,6 +206,80 @@ out explicitly here.
     header limit instead of the body; `security-extra-params` reported a plain
     timeout as "server may have crashed"; the leak scan double-counted every
     probe response. All three corrected.
+- **A second review pass changed what several reports say:**
+  - **`--format github` (the Action's default) now carries the warnings and the
+    spec version.** Every report warning becomes a
+    `::warning title=mcp-compliance::` annotation (the dual-era, pinned-mismatch,
+    unreachable and "pass --auth" notes were invisible in CI), the `::notice`
+    summary ends with `; spec <version>` plus how `auto` detected it, and an
+    empty run's notice reads `No tests ran -- check --only/--skip` instead of
+    `Grade F (0%) -- 0/0 passed`.
+  - **Auth-gated server run without `--auth`.** When the probe or preflight draws
+    401/403 and no `Authorization` header was configured, the report's first
+    warning (index 0, every format) says the server requires authentication,
+    that the grade below is not meaningful, and to re-run with `--auth <token>`.
+    The 2025-11-25 `security-auth-required` now passes on that 401/403 (`HTTP 401
+    (unauthenticated preflight rejected; pass --auth ...)`) instead of claiming
+    the server "accepted unauthenticated requests" next to `transport-post`'s
+    401.
+  - **Injection targets follow the spec's annotation defaults.** The 2026-07-28
+    suite treated an unannotated tool as safe and could send path-traversal
+    payloads into a write tool; the spec defaults `destructiveHint` to true, so a
+    read-only tool now always wins, unannotated tools are a last resort named in
+    a warning, placeholders honour the argument schema, and an all-unreached run
+    is reported as inconclusive. The 2025-11-25 injection tests no longer fail a
+    tool that merely echoes the payload back; they fail only on evidence of
+    execution.
+  - **`security-rate-limiting` grades a quiet burst the same on both paths
+    (2026-07-28).** 50 `tools/call`s to a read-only tool that draw no 429 now pass
+    with a warning naming the tool and the 50 invocations, as the
+    `server/discover` fallback already did, so annotating a tool `readOnlyHint`
+    no longer lowers the grade. A burst that auth rejected (every answer 401/403)
+    is skipped with a `--auth` hint instead of passing as "server declares no
+    tools", and a burst that got no response fails as `server unreachable`. The
+    2025-11-25 check is unchanged.
+  - **`benchmark` under `auto` on stdio re-spawns the child the era probe
+    killed**, so the samples no longer all fail against a dead process. The probe
+    and the unmeasured warm-up are bounded by `--startup-timeout` (new on
+    `benchmark`, default `max(--timeout, 60000)`) instead of the per-request
+    timeout, terminal mode prints the same "Probing spec era" status line as
+    `test`, and `BenchmarkResult.warnings` carries the probe-exit warning. On
+    both commands a server that also exits at startup on the fresh instance is
+    told it exits at startup regardless of the probe (with its stderr) instead of
+    being told to pin `--spec-version`.
+  - **Probe ordering and attribution (2026-07-28).** The late lifecycle block
+    (`lifecycle-completions`, `lifecycle-progress-token`, the two claim-less
+    `_meta` probes and `lifecycle-dual-era`) now runs before the security tests,
+    so a gateway that rate-limits the 50-request burst cannot answer those probes
+    with 429; a 401/403/413/415/429 answer to any `_meta` or standard-header
+    rejection probe now fails it as `not evaluable` instead of being credited,
+    and `lifecycle-removed-methods` / `lifecycle-subscriptions-listen` no longer
+    credit rejections from a server that rejects everything. Under `--only` on
+    stdio the claim-less probes send a pinning request first, so their verdict
+    matches the full run. `lifecycle-dual-era` no longer fails a single-instance
+    stdio server (an idle second instance tells "exits at startup" from "exits on
+    `initialize`"), reports a server that serves `initialize` but rejects
+    `server/discover` as `legacy-only` rather than dual-era (with a matching
+    run warning), waits `--timeout` (stretched for a slow starter) rather than
+    `--startup-timeout` on its fresh process, and names a connection error as
+    such rather than "no response within Nms".
+  - Smaller: the pinned-run mismatch warning fires only on a real era signal
+    (not a 5xx or an HTML page) and a dual-era server whose `supportedVersions`
+    lists the pinned 2025-11-25 is told `this run grades its 2025-11-25 side` instead of being sent to the other
+    pin; a pinned run's "unreachable" warning is downgraded once later requests
+    are answered; `--only schema` fails over a broken list instead of grading A,
+    and `-list-caching` no longer re-sends a list that timed out; an `--only`
+    value gated off the target transport is warned about, and `--list` pads long
+    2026-07-28 ids and prints the filter warnings per catalog; `stdio-unicode`
+    fails a reply whose non-ASCII was replaced by `?` and passes a tool that
+    tokenizes its input; `schema-input-required-shape` fails a url-mode
+    elicitation the client did not declare; `mcp_compliance_explain` says only
+    the wording differs for a shared id whose required flag and category match;
+    `lifecycle-init` on a crashed stdio server quotes the stderr cause instead of
+    stack frames; `RunOptions.signal` now also aborts the HTTP preflight and the
+    raw transport probes; and a hung HTTP server costs preflight + startup
+    timeout + per-request timeout before the first test, not three startup
+    timeouts.
 - **`auto` graded a dead child.** A legacy stdio server whose dispatcher exits on
   the unknown `server/discover` was classified correctly but the 2025-11-25 suite
   then ran against the exited process and failed everything as "Initialize

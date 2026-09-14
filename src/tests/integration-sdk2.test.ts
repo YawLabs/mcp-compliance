@@ -30,8 +30,14 @@ import { resultOf } from "./helpers/modern-fixture.js";
 
 const SDK2_STDIO_FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "sdk2-stdio-server.mjs");
 
-/** Optional checks every HTTP run on plain loopback fails regardless of the server. */
-const LOCALHOST_INHERENT = ["security-auth-required", "security-rate-limiting", "security-tls-required"];
+/**
+ * Optional checks every 2026-07-28 HTTP run on plain loopback fails
+ * regardless of the server. That catalog's security-rate-limiting reports
+ * a quiet burst as a warning, not a failure (asserted in the warning
+ * list below); the 2025-11-25 catalog's still fails it.
+ */
+const LOCALHOST_INHERENT = ["security-auth-required", "security-tls-required"];
+const LEGACY_LOCALHOST_INHERENT = [...LOCALHOST_INHERENT, "security-rate-limiting"];
 
 /** The auto-detection note every run against the SDK opens with. */
 const AUTO_DETECT_NOTE = `${AUTO_DETECT_NOTE_PREFIX}2026-07-28 (${REASON_PREFIX}supportedVersions [2026-07-28]). Pin with --spec-version to override.`;
@@ -86,18 +92,12 @@ const SDK_LEGACY_REQUIRED_DEVIATIONS = ["transport-batch-reject"];
  * process modern, where the SDK answers them with the -32602 the spec
  * requires (basic/index#request-metadata). Asserted below by their
  * details: had they run early, the flipped process would have answered
- * -32601 and every modern-only check after them would have failed.
+ * -32601 and every modern-only check after them would have failed. A
+ * `--only` run that skips the feature modules pins the process itself
+ * with one modern request first, so a single-probe run measures the
+ * same state (asserted below too).
  */
 const CLAIM_LESS_PROBES = ["lifecycle-meta-required", "lifecycle-meta-protocol-version-required"];
-
-/**
- * The legacy suite's injection checks flag any tool that echoes its input:
- * the fixture's `echo` returns the payload verbatim, which the 2025 checks
- * read as "executed". The 2026 suite's classifier scrubs echoes and passes.
- * Fixture behaviour, not an SDK finding; integration.test.ts has the same
- * echo tool and only asserts required tests.
- */
-const LEGACY_ECHO_ARTIFACTS = ["security-command-injection", "security-sql-injection"];
 
 /** Same surface as src/tests/fixtures/sdk2-stdio-server.mjs; keep them in sync. */
 function createSdkServer(): McpServer {
@@ -262,12 +262,13 @@ describe("SDK v2 over HTTP, default (dual-era) serving", () => {
     expectClaimLessProbesClean(report, " (HTTP 400)");
   });
 
-  it("only warns about the auto-detection, the oversized-input observation and the dual era", () => {
+  it("only warns about the auto-detection, the oversized-input observation, the quiet burst and the dual era", () => {
     const prefixes = report.warnings.map((w) => w.split(":")[0]);
     expect(sorted(prefixes)).toEqual(
       sorted([
         AUTO_DETECT_NOTE.split(":")[0],
         "security-oversized-input",
+        "security-rate-limiting",
         "Server is dual-era (also serves the legacy initialize handshake); this run graded 2026-07-28. Re-run with --spec-version 2025-11-25 to test the legacy handshake.",
       ]),
     );
@@ -307,10 +308,11 @@ describe("SDK v2 over HTTP, pinned --spec-version 2025-11-25", () => {
     expect(resultOf(report, "lifecycle-reinit-reject").details).toMatch(/accepted second initialize/);
   });
 
-  it("fails exactly the loopback checks, the echo artifacts, the stateless reinit, and the batch deviation", () => {
+  it("fails exactly the loopback checks, the stateless reinit, and the batch deviation", () => {
+    // The legacy injection checks read the echo tool's verbatim reflection
+    // as benign (as the 2026 suite always did), so no echo artifacts here.
     expectFailingSets(report, SDK_LEGACY_REQUIRED_DEVIATIONS, [
-      ...LOCALHOST_INHERENT,
-      ...LEGACY_ECHO_ARTIFACTS,
+      ...LEGACY_LOCALHOST_INHERENT,
       "lifecycle-reinit-reject",
     ]);
   });
@@ -408,6 +410,24 @@ describe("SDK v2 over stdio (serveStdio)", () => {
     expect(init.passed, init.details).toBe(true);
     expect(report.serverInfo.name).toBe("sdk2-stdio-server");
     expect(report.toolNames).toEqual(["echo"]);
-    expectFailingSets(report, [], LEGACY_ECHO_ARTIFACTS);
+    expectFailingSets(report, [], []);
+  }, 60_000);
+
+  it("--only <claim-less probe>: the process is pinned modern first, so the verdict matches the full run", async () => {
+    // Only the setup discover has run, and discover does not pin: without a
+    // modern request first, the SDK reads the claim-less probe as a legacy
+    // opening and answers -32601 (with an "expected -32602" warning).
+    const single = await run({}, { only: ["lifecycle-meta-required"] });
+    expect(single.tests.map((t) => t.id)).toEqual(["lifecycle-meta-required"]);
+    expect(resultOf(single, "lifecycle-meta-required").details).toBe(
+      "server/discover without _meta: rejected with -32602",
+    );
+    expect(single.warnings.filter((w) => w.startsWith("lifecycle-meta-required:"))).toEqual([]);
+    // The pin request was the declared tools list, published to the report.
+    expect(single.toolNames).toEqual(["echo"]);
+
+    const pair = await run({}, { only: CLAIM_LESS_PROBES });
+    expect(pair.tests.map((t) => t.id)).toEqual(CLAIM_LESS_PROBES);
+    expectClaimLessProbesClean(pair, "");
   }, 60_000);
 });

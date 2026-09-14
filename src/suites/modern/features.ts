@@ -22,6 +22,7 @@ import {
   type ListKey,
   type ModernSuiteContext,
   publishList,
+  recordListFailure,
 } from "./context.js";
 
 /**
@@ -36,7 +37,9 @@ import {
  *
  * What stays private is the RESPONSE cache below: the `-list-caching`
  * tests validate the caching hints on the same response the `-list` test
- * saw, and the context only keeps the arrays.
+ * saw, and the context only keeps the arrays. A list call that THREW
+ * (timeout, crash) is cached as well, so the `-list-caching` test that
+ * follows re-throws the same error instead of paying a second timeout.
  */
 
 interface Outcome {
@@ -44,9 +47,12 @@ interface Outcome {
   details: string;
 }
 
+/** What one list call produced: the response, or the error it threw. */
+type ListSlot = { res: RpcResponse } | { failed: Error };
+
 /** Responses this module already obtained, so one run sends each once. */
 interface ResponseCache {
-  lists: Partial<Record<ListKey, RpcResponse>>;
+  lists: Partial<Record<ListKey, ListSlot>>;
   read?: { uri: string; res: RpcResponse };
 }
 
@@ -82,21 +88,37 @@ export async function runFeatures(ctx: ModernSuiteContext): Promise<void> {
 // ── Shared plumbing ───────────────────────────────────────────────
 
 /**
- * Send `<key>/list`, keep the response for the caching test and publish
- * the array into ctx.state when valid. Marks the attempt on the context so
- * a later `ensureList` never re-sends a list that was asked for and failed.
+ * Send `<key>/list`, keep the response (or the thrown error) for the
+ * caching test and publish the array into ctx.state when valid. Marks the
+ * attempt on the context so a later `ensureList` never re-sends a list
+ * that was asked for and failed.
  */
 async function fetchList(ctx: ModernSuiteContext, cache: ResponseCache, key: ListKey): Promise<RpcResponse> {
   ctx.state.listAttempts.add(key);
-  const res = await ctx.client.rpc(LIST_METHOD[key]);
-  cache.lists[key] = res;
+  let res: RpcResponse;
+  try {
+    res = await ctx.client.rpc(LIST_METHOD[key]);
+  } catch (err) {
+    const failed = err instanceof Error ? err : new Error(String(err));
+    cache.lists[key] = { failed };
+    recordListFailure(ctx, key, failed);
+    throw failed;
+  }
+  cache.lists[key] = { res };
   publishList(ctx, key, res);
   return res;
 }
 
-/** The list response, fetching once when the `-list` test did not run. */
+/**
+ * The list response, fetching once when the `-list` test did not run. A
+ * call that threw is not repeated: the same error is thrown again, so
+ * `-list` and `-list-caching` report one timeout, not two.
+ */
 async function listResponse(ctx: ModernSuiteContext, cache: ResponseCache, key: ListKey): Promise<RpcResponse> {
-  return cache.lists[key] ?? fetchList(ctx, cache, key);
+  const slot = cache.lists[key];
+  if (!slot) return fetchList(ctx, cache, key);
+  if ("failed" in slot) throw slot.failed;
+  return slot.res;
 }
 
 function listOutcome(res: RpcResponse, method: string, key: "tools" | "resources" | "prompts"): Outcome {

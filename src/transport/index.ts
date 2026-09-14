@@ -35,6 +35,15 @@ export interface TransportRequestInit {
    * first wins.
    */
   signal?: AbortSignal;
+  /**
+   * Called with every JSON-RPC message the transport composes and writes
+   * on the caller's behalf BEYOND the request body itself -- today only
+   * the `notifications/cancelled` a stdio stream's close() sends -- so a
+   * recorder can log it as a sent entry and a later reply to it can be
+   * attributed to it. Called right before the write; never for the
+   * request the caller built, which the caller already knows about.
+   */
+  onSent?: (message: { method: string; params?: unknown }) => void;
 }
 
 export interface TransportResponse {
@@ -87,8 +96,8 @@ export interface TransportStream {
    * Tear the stream down. HTTP: abort the connection (the spec's
    * cancellation mechanism for a stateless request). stdio: send
    * `notifications/cancelled` for `requestId` unless the response
-   * carrying that id already arrived or the child is gone, and stop
-   * listening.
+   * carrying that id already arrived or the child is gone (reported
+   * through `TransportRequestInit.onSent`), and stop listening.
    */
   close(): Promise<void>;
 }

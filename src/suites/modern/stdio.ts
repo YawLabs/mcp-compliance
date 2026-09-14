@@ -16,6 +16,9 @@ import { ensureTools, type ModernSuiteContext } from "./context.js";
 const UNICODE_PROBE = "héllo 世界 🚀";
 /** The probe's first word: present intact when only the astral/CJK part was lost. */
 const UNICODE_PROBE_LATIN1_WORD = "héllo";
+/** The probe's CJK word and emoji: either one anywhere in a reply rules out "dropped". */
+const UNICODE_PROBE_CJK = "世界";
+const UNICODE_PROBE_EMOJI = "🚀";
 /** What a UTF-8 byte stream decoded as Latin-1 makes of the first word ("hÃ©llo"). */
 const UNICODE_PROBE_MISDECODED = Buffer.from(UNICODE_PROBE_LATIN1_WORD, "utf8").toString("latin1");
 /**
@@ -27,6 +30,12 @@ const UNICODE_PROBE_STRIPPED = Array.from(UNICODE_PROBE)
   .filter((c) => c.charCodeAt(0) < 128)
   .join("")
   .replace(/ +$/, " ");
+/**
+ * The first word as an encoder on a legacy code page writes it: every
+ * unencodable character replaced by '?' (one per code point, or one per
+ * UTF-16 unit -- the .NET and Java default on a Windows code page).
+ */
+const UNICODE_PROBE_QUESTIONED = /h\?{1,2}llo/;
 /** What a decoder substitutes for bytes it could not decode. */
 const REPLACEMENT_CHARACTER = "\uFFFD";
 /** Argument names a tool most plausibly echoes, in order of preference. */
@@ -137,16 +146,32 @@ async function pickUnicodeTool(ctx: ModernSuiteContext): Promise<UnicodeTool | n
  * Evidence that a reply MANGLED the probe, or undefined when the probe is
  * merely absent (the tool did not echo its input). Absence proves
  * nothing: a `get_time` tool answers "12:00" whatever it was sent.
+ * "Dropped" needs the first word (intact or as its ASCII skeleton) with
+ * NEITHER the CJK word NOR the emoji anywhere in the reply: a search
+ * tool that tokenizes or truncates its query reflects the pieces apart,
+ * and that is not mangling.
  */
 function manglingEvidence(serialized: string): string | undefined {
   if (serialized.includes(REPLACEMENT_CHARACTER)) return "the reply carries U+FFFD replacement characters";
   if (serialized.includes(UNICODE_PROBE_MISDECODED)) {
     return `the reply carries the probe decoded as Latin-1 (${escapeNonAscii(UNICODE_PROBE_MISDECODED)})`;
   }
-  if (serialized.includes(UNICODE_PROBE_LATIN1_WORD) || serialized.includes(UNICODE_PROBE_STRIPPED)) {
-    return "the reply carries the probe with its CJK/emoji characters dropped";
+  if (UNICODE_PROBE_QUESTIONED.test(serialized)) {
+    return "the reply carries the probe with its non-ASCII characters replaced by '?'";
   }
+  const firstWord = serialized.includes(UNICODE_PROBE_LATIN1_WORD) || serialized.includes(UNICODE_PROBE_STRIPPED);
+  const rest = serialized.includes(UNICODE_PROBE_CJK) || serialized.includes(UNICODE_PROBE_EMOJI);
+  if (firstWord && !rest) return "the reply carries the probe with its CJK/emoji characters dropped";
   return undefined;
+}
+
+/** Whether every non-ASCII piece of the probe appears in a reply, contiguous or not (a tokenizing tool). */
+function reproducesEveryPiece(serialized: string): boolean {
+  return (
+    serialized.includes(UNICODE_PROBE_LATIN1_WORD) &&
+    serialized.includes(UNICODE_PROBE_CJK) &&
+    serialized.includes(UNICODE_PROBE_EMOJI)
+  );
 }
 
 /** Non-ASCII as \uXXXX escapes, so a mis-decoded sample survives the ASCII details. */
@@ -200,13 +225,14 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
 
   // ── stdio-unicode ──────────────────────────────────────────────
   // Same pass criteria as the 2025-11-25 test: push the probe through a
-  // tool when one is available and pass when it comes back byte-for-byte;
-  // fail only on EVIDENCE of mangling (U+FFFD, a Latin-1 mis-decode, the
-  // non-ASCII characters stripped, a -32700). A reply that merely lacks
-  // the probe means the tool did not echo its input -- an arbitrary
-  // first tool rarely does -- so the verdict then rests on the discover
-  // envelope: the probe rides in clientInfo.name, and the server parsing
-  // and answering that request is the round-trip verified.
+  // tool when one is available and pass when it comes back byte-for-byte
+  // (or every piece of it, for a tool that tokenizes its input); fail
+  // only on EVIDENCE of mangling (U+FFFD, a Latin-1 mis-decode, '?'
+  // substitution, the non-ASCII characters stripped, a -32700). A reply
+  // that merely lacks the probe means the tool did not echo its input --
+  // an arbitrary first tool rarely does -- so the verdict then rests on
+  // the discover envelope: the probe rides in clientInfo.name, and the
+  // server parsing and answering that request is the round-trip verified.
   await harness.check("stdio-unicode", async () => {
     let note = "";
     const tool = await pickUnicodeTool(ctx);
@@ -219,6 +245,12 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
       const serialized = JSON.stringify(res.body);
       if (serialized.includes(UNICODE_PROBE)) {
         return { passed: true, details: `tools/call ${tool.name} reproduced the CJK/emoji probe byte-for-byte` };
+      }
+      if (reproducesEveryPiece(serialized)) {
+        return {
+          passed: true,
+          details: `tools/call ${tool.name} reproduced every non-ASCII piece of the CJK/emoji probe (split across the reply, not byte-for-byte)`,
+        };
       }
       const err = errorOf(res.body);
       if (err?.code === JSONRPC_ERROR_CODES.PARSE_ERROR) {

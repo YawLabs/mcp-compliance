@@ -17,8 +17,11 @@ import {
   compareToolLists,
   findLeaks,
   INJECTION_DETECTORS,
+  parseResourceMetadata,
   pickInjectionTarget,
+  placeholderFor,
   runSecurity,
+  toolSafety,
 } from "../suites/modern/security.js";
 import { createHttpTransport } from "../transport/http.js";
 import type { Transport } from "../transport/index.js";
@@ -121,10 +124,17 @@ const UNREACHED = "never reached the tool (JSON-RPC or transport error)";
 const EXPECTED_FAIL_CLEAN_HTTP: Record<string, RegExp> = {
   "security-auth-required": new RegExp(`^${NO_AUTH_DETAILS.replace(/[()]/g, "\\$&")}$`),
   "security-tls-required": /^Server URL uses http: -- production servers should use HTTPS$/,
-  // content_types is the fixture's first read-only tool without required arguments.
-  "security-rate-limiting":
-    /^No rate limiting detected \(50 rapid tools\/call content_types requests all returned 200\)$/,
 };
+
+/**
+ * A quiet burst passes with a warning whichever method was bursted;
+ * content_types is the fixture's first read-only tool without required
+ * arguments, so the burst goes there and the details say so.
+ */
+const QUIET_BURST_DETAILS =
+  "No 429 within 50 rapid tools/call content_types requests (HTTP 200); rate limiting not detected (see warning)";
+const QUIET_BURST_WARNING =
+  "security-rate-limiting: 50 rapid tools/call content_types requests drew no 429 (HTTP 200); servers MUST rate limit tool invocations -- apply a per-client limiter to tools/call (429 + Retry-After) and verify it by hand. The burst invoked content_types 50 times.";
 
 function allPass(ids: string[]): Record<string, string> {
   return Object.fromEntries(ids.map((id) => [id, "pass"]));
@@ -229,20 +239,26 @@ async function runDirect(opts: DirectOptions): Promise<DirectRun> {
     state: { ...createModernState(), supportedVersions: [MODERN_SPEC_VERSION] },
   };
   try {
-    // Seed what lifecycle + features would have cached.
-    const discover = await client.rpc("server/discover", {}, { timeout: 10000 });
-    const caps = rpcResultOf(discover.body)?.capabilities;
-    if (caps && typeof caps === "object") {
-      ctx.state.discover = discover;
-      ctx.state.capabilities = caps as Record<string, unknown>;
-      if ((caps as Record<string, unknown>).tools) {
-        const listed = await client.rpc("tools/list", {});
-        const tools = rpcResultOf(listed.body)?.tools;
-        if (Array.isArray(tools)) {
-          ctx.state.tools = tools;
-          ctx.state.toolNames = tools.map((t: any) => t.name);
+    // Seed what lifecycle + features would have cached. An unreachable
+    // server leaves the state empty, as the real dispatcher's setup
+    // discover would.
+    try {
+      const discover = await client.rpc("server/discover", {}, { timeout: 10000 });
+      const caps = rpcResultOf(discover.body)?.capabilities;
+      if (caps && typeof caps === "object") {
+        ctx.state.discover = discover;
+        ctx.state.capabilities = caps as Record<string, unknown>;
+        if ((caps as Record<string, unknown>).tools) {
+          const listed = await client.rpc("tools/list", {});
+          const tools = rpcResultOf(listed.body)?.tools;
+          if (Array.isArray(tools)) {
+            ctx.state.tools = tools;
+            ctx.state.toolNames = tools.map((t: any) => t.name);
+          }
         }
       }
+    } catch {
+      // No answer at all: the security module must report that itself.
     }
     await runSecurity(ctx);
     await harness.drainPool();
@@ -337,20 +353,83 @@ describe("security classifiers (unit)", () => {
     annotations: { readOnlyHint: true },
   };
 
-  it("pickInjectionTarget: one target, read-only first, destructive skipped, required siblings filled", () => {
+  it("toolSafety applies the spec defaults: destructive unless readOnlyHint true or destructiveHint false", () => {
+    expect(toolSafety(readOnly)).toBe("read-only");
+    expect(toolSafety({ annotations: { readOnlyHint: true, destructiveHint: true } })).toBe("read-only");
+    expect(toolSafety({ annotations: { destructiveHint: false } })).toBe("non-destructive");
+    expect(toolSafety({ annotations: { readOnlyHint: false, destructiveHint: false } })).toBe("non-destructive");
+    expect(toolSafety(destructive)).toBe("destructive");
+    // Nothing said, or only readOnlyHint false: destructiveHint defaults to true.
+    expect(toolSafety(plain)).toBe("unannotated");
+    expect(toolSafety({ annotations: {} })).toBe("unannotated");
+    expect(toolSafety({ annotations: { readOnlyHint: false } })).toBe("unannotated");
+    expect(toolSafety({ annotations: { destructiveHint: "yes" } })).toBe("unannotated");
+  });
+
+  it("pickInjectionTarget: one target, read-only first, destructive and unannotated skipped, required siblings filled", () => {
     const target = pickInjectionTarget([destructive, plain, readOnly, file, fetch]);
     expect(target?.tool.name).toBe("lookup");
     expect(target?.param).toBe("q");
     expect(target?.fill).toEqual({ limit: 1, verbose: false, mode: "fast", tags: [], opts: {}, note: "test" });
+    expect(target?.safety).toBe("read-only");
     expect(target?.skippedDestructive).toEqual(["delete_record"]);
+    expect(target?.skippedUnannotated).toEqual(["search"]);
     expect(target?.destructiveProbed).toBe(false);
-    // Read-only beats list order; an unannotated tool beats a destructive one.
+    // Read-only beats list order.
     expect(pickInjectionTarget([plain, readOnly])?.tool.name).toBe("lookup");
-    expect(pickInjectionTarget([destructive, plain])?.tool.name).toBe("search");
     expect(pickInjectionTarget([plain, destructive])?.skippedDestructive).toEqual(["delete_record"]);
   });
 
-  it("pickInjectionTarget: argument-name preferences pick across tools, else the shared target", () => {
+  it("pickInjectionTarget: an unannotated tool is destructive by default -- a last resort, probed with the warning flag", () => {
+    // The finding's repro: search is read-only, write_file says nothing.
+    const search = {
+      name: "search",
+      inputSchema: { type: "object", properties: { query: { type: "string" } } },
+      annotations: { readOnlyHint: true },
+    };
+    const writeFile = {
+      name: "write_file",
+      inputSchema: {
+        type: "object",
+        properties: { path: { type: "string" }, content: { type: "string" } },
+        required: ["path", "content"],
+      },
+    };
+    const traversal = pickInjectionTarget([search, writeFile], [/path|file|dir|folder/i, /path|file|dir|url/i]);
+    expect([traversal?.tool.name, traversal?.param, traversal?.fill]).toEqual(["search", "query", {}]);
+    expect(traversal?.skippedUnannotated).toEqual(["write_file"]);
+    expect(traversal?.destructiveProbed).toBe(false);
+    // Alone, it is probed, and the caller is told it may write.
+    const deletePath = {
+      name: "delete_path",
+      inputSchema: { type: "object", properties: { path: { type: "string" } } },
+    };
+    const alone = pickInjectionTarget([deletePath]);
+    expect([alone?.tool.name, alone?.safety, alone?.destructiveProbed]).toEqual(["delete_path", "unannotated", true]);
+    // Among last resorts an unannotated tool still ranks before an explicit destructiveHint true.
+    const last = pickInjectionTarget([destructive, plain]);
+    expect([last?.tool.name, last?.safety, last?.destructiveProbed, last?.skippedDestructive]).toEqual([
+      "search",
+      "unannotated",
+      true,
+      ["delete_record"],
+    ]);
+    // destructiveHint false is safe to call but may write: read-only tools come first.
+    const append = {
+      name: "append_note",
+      inputSchema: { type: "object", properties: { text: { type: "string" } } },
+      annotations: { destructiveHint: false },
+    };
+    expect(pickInjectionTarget([append, readOnly])?.tool.name).toBe("lookup");
+    const appendOnly = pickInjectionTarget([append, plain]);
+    expect([appendOnly?.tool.name, appendOnly?.safety, appendOnly?.destructiveProbed]).toEqual([
+      "append_note",
+      "non-destructive",
+      false,
+    ]);
+  });
+
+  it("pickInjectionTarget: argument-name preferences pick across the read-only tools, else the shared target", () => {
     const all = [destructive, plain, readOnly, file, fetch];
     const byPath = pickInjectionTarget(all, [/path/i]);
     expect([byPath?.tool.name, byPath?.param, byPath?.fill]).toEqual(["read_file", "path", {}]);
@@ -360,6 +439,48 @@ describe("security classifiers (unit)", () => {
     expect([fallback?.tool.name, fallback?.param]).toEqual(["lookup", "q"]);
     // A destructive tool's matching argument does not win while an alternative exists.
     expect(pickInjectionTarget([destructive, plain], [/id/])?.tool.name).toBe("search");
+    // Nor does a non-read-only tool's: a read-only tool is preferred whatever its argument names.
+    const writer = {
+      name: "write_file",
+      inputSchema: { type: "object", properties: { path: { type: "string" } } },
+      annotations: { destructiveHint: false },
+    };
+    expect(pickInjectionTarget([writer, readOnly], [/path/i])?.tool.name).toBe("lookup");
+  });
+
+  it("pickInjectionTarget: enum/const/pattern string arguments rank last, since no payload can satisfy them", () => {
+    const convert = {
+      name: "convert",
+      inputSchema: {
+        type: "object",
+        properties: { format: { type: "string", enum: ["json", "yaml"] }, text: { type: "string" } },
+      },
+      annotations: { readOnlyHint: true },
+    };
+    expect(pickInjectionTarget([convert])?.param).toBe("text");
+    const formatOnly = {
+      name: "format_only",
+      inputSchema: { type: "object", properties: { format: { type: "string", enum: ["json"] } } },
+      annotations: { readOnlyHint: true },
+    };
+    // Across tools too: another tool's free-form argument beats the first tool's enum.
+    const free = {
+      name: "free",
+      inputSchema: { type: "object", properties: { text: { type: "string" } } },
+      annotations: { readOnlyHint: true },
+    };
+    expect(pickInjectionTarget([formatOnly, free])?.tool.name).toBe("free");
+    const patterned = {
+      name: "patterned",
+      inputSchema: {
+        type: "object",
+        properties: { code: { type: "string", pattern: "^[A-Z]{3}$" }, note: { type: ["null", "string"] } },
+      },
+      annotations: { readOnlyHint: true },
+    };
+    expect(pickInjectionTarget([patterned])?.param).toBe("note");
+    // A constrained argument is still probed when it is the only one.
+    expect(pickInjectionTarget([formatOnly])?.param).toBe("format");
   });
 
   it("pickInjectionTarget: a destructive tool is probed only when nothing else has a string argument", () => {
@@ -370,8 +491,43 @@ describe("security classifiers (unit)", () => {
       true,
       [],
     ]);
+    expect(only?.safety).toBe("destructive");
     expect(pickInjectionTarget([{ name: "noop", inputSchema: { type: "object", properties: {} } }])).toBeNull();
     expect(pickInjectionTarget([])).toBeNull();
+  });
+
+  it("placeholderFor honours the constraints a validating server would enforce", () => {
+    expect(placeholderFor({ type: "integer", minimum: 10 })).toBe(10);
+    expect(placeholderFor({ type: "integer", exclusiveMinimum: 0 })).toBe(1);
+    expect(placeholderFor({ type: "number", exclusiveMinimum: 4 })).toBe(5);
+    expect(placeholderFor({ type: "integer", minimum: 2.5 })).toBe(3);
+    expect(placeholderFor({ type: "integer", maximum: 0 })).toBe(0);
+    expect(placeholderFor({ type: "array", minItems: 2, items: { type: "integer" } })).toEqual([1, 1]);
+    expect(placeholderFor({ type: "array", minItems: 1 })).toEqual(["test"]);
+    expect(placeholderFor({ type: "array" })).toEqual([]);
+    expect(
+      placeholderFor({
+        type: "object",
+        properties: { id: { type: "integer" }, name: { type: "string" }, extra: { type: "boolean" } },
+        required: ["id", "name"],
+      }),
+    ).toEqual({ id: 1, name: "test" });
+    expect(placeholderFor({ properties: { id: { type: "integer" } }, required: ["id"] })).toEqual({ id: 1 });
+    expect(placeholderFor({ type: ["null", "integer"] })).toBe(1);
+    expect(placeholderFor({ type: "null" })).toBeNull();
+    expect(placeholderFor({ const: "fixed" })).toBe("fixed");
+    expect(placeholderFor({ type: "string", default: "dflt" })).toBe("dflt");
+    expect(placeholderFor({ type: "string", examples: ["ex"] })).toBe("ex");
+    expect(placeholderFor({ oneOf: [{ const: 7 }, { type: "string" }] })).toBe(7);
+    expect(placeholderFor({ anyOf: [{ type: "boolean" }, { type: "string" }] })).toBe(false);
+    expect(placeholderFor({ type: "string", format: "email" })).toBe("test@example.com");
+    expect(placeholderFor({ type: "string", format: "uri" })).toBe("https://example.com/");
+    expect(placeholderFor({ type: "string", minLength: 6 })).toBe("testte");
+    expect(placeholderFor({ type: "string", maxLength: 2 })).toBe("te");
+    expect(placeholderFor({ type: "string", enum: ["a", "b"] })).toBe("a");
+    // Unknown shapes still get a string, and a required name with no schema at all too.
+    expect(placeholderFor({})).toBe("test");
+    expect(placeholderFor(undefined)).toBe("test");
   });
 
   it("compareToolLists reports the first drift: count, names, then description/inputSchema/annotations", () => {
@@ -420,6 +576,57 @@ describe("security classifiers (unit)", () => {
     expect(findLeaks([clean], INTERNAL_IP_PATTERNS)).toEqual([]);
     // Capped and deduplicated.
     expect(findLeaks([trace, trace, trace, trace], STACK_TRACE_PATTERNS, 2)).toHaveLength(1);
+  });
+
+  it("findLeaks dedupes on the leaked text, not the surrounding response, and counts the repeats", () => {
+    const frame = "at Object.<anonymous> (/home/user/app/server.js:10:5)";
+    // The same frame appended to three different error messages is one leak.
+    const samples = [-32601, -32602, -32603].map((code) => ({
+      text: JSON.stringify({ code, message: `failure ${code}\n    ${frame}` }),
+      requestText: "{}",
+    }));
+    const issues = findLeaks(samples, STACK_TRACE_PATTERNS);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatch(
+      /^Response contains: at Object\.<anonymous> \(\/home\/user\/app\/server\.js:10:5\) \(matched in: /,
+    );
+    expect(issues[0]).toMatch(/; in 3 responses\)$/);
+    expect(issues[0]).toContain("failure -32601"); // the first sample is the context
+    // A single occurrence carries no count; distinct leaks are separate issues up to the cap.
+    const other = { text: JSON.stringify({ code: -32000, message: "see /home/user/app/x" }), requestText: "{}" };
+    const two = findLeaks([samples[0], other], STACK_TRACE_PATTERNS);
+    expect(two).toHaveLength(2);
+    expect(two[0]).not.toContain("; in ");
+    expect(two[1]).toMatch(/^Response contains: \/home\/ \(matched in: /);
+    expect(findLeaks([samples[0], other], STACK_TRACE_PATTERNS, 1)).toHaveLength(1);
+  });
+
+  it("parseResourceMetadata: one parser for the challenge, tolerant of spacing, strict about absolute URLs", () => {
+    expect(parseResourceMetadata(undefined)).toEqual({ present: false, raw: "", url: null });
+    expect(parseResourceMetadata('Bearer realm="x"')).toEqual({ present: false, raw: "", url: null });
+    expect(parseResourceMetadata('Bearer resource_metadata="https://h/prm"')).toEqual({
+      present: true,
+      raw: "https://h/prm",
+      url: "https://h/prm",
+    });
+    // Spaces around `=` and inside the quotes are not a missing parameter.
+    expect(parseResourceMetadata('Bearer resource_metadata = "https://h/prm"').url).toBe("https://h/prm");
+    expect(parseResourceMetadata('Bearer resource_metadata=" https://h/prm "')).toEqual({
+      present: true,
+      raw: "https://h/prm",
+      url: "https://h/prm",
+    });
+    expect(parseResourceMetadata('Bearer error="invalid_token", resource_metadata=https://h/prm, scope="s"').url).toBe(
+      "https://h/prm",
+    );
+    // Present but unusable: relative, empty, or not http(s).
+    expect(parseResourceMetadata('Bearer resource_metadata="/oauth/prm"')).toEqual({
+      present: true,
+      raw: "/oauth/prm",
+      url: null,
+    });
+    expect(parseResourceMetadata('Bearer resource_metadata=""')).toEqual({ present: true, raw: "", url: null });
+    expect(parseResourceMetadata('Bearer resource_metadata="urn:prm"').url).toBeNull();
   });
 
   it("leak patterns cover link-local addresses, internal hostnames and JSON-escaped Windows paths", () => {
@@ -496,18 +703,24 @@ describe("modern security suite: clean fixture over HTTP (runModern, --only secu
     await fixture.stop();
   });
 
-  it("passes every security test except the three that fail on this fixture by design", () => {
+  it("passes every security test except the two that fail on this fixture by design", () => {
     const passing = SECURITY_IDS.filter((id) => !(id in EXPECTED_FAIL_CLEAN_HTTP));
     expect(passedIds(report, passing)).toEqual(allPass(passing));
   });
 
-  it("fails auth-required (no --auth), tls-required (http URL) and rate-limiting (never 429) naming what was observed", () => {
+  it("fails auth-required (no --auth) and tls-required (http URL) naming what was observed", () => {
     for (const [id, pattern] of Object.entries(EXPECTED_FAIL_CLEAN_HTTP)) {
       const r = resultOf(report, id);
       expect(r.passed, id).toBe(false);
       expect(r.details, id).toMatch(pattern);
     }
     expect(report.toolCount).toBe(11);
+  });
+
+  it("rate-limiting: a quiet tools/call burst passes with a warning naming the tool and the call count", () => {
+    expect(resultOf(report, "security-rate-limiting").passed).toBe(true);
+    expect(resultOf(report, "security-rate-limiting").details).toBe(QUIET_BURST_DETAILS);
+    expect(report.warnings.filter((w) => w.startsWith("security-rate-limiting:"))).toEqual([QUIET_BURST_WARNING]);
   });
 
   it("without --auth on a server that needs none: the token-dependent tests skip, the rest report the 200", () => {
@@ -618,11 +831,11 @@ describe("modern security suite: direct context on the clean fixture", () => {
     }
   });
 
-  it("emits no other security warnings on a conformant server", () => {
-    for (const run of [http, stdio]) {
-      const others = run.warnings.filter((w) => !w.startsWith("security-oversized-input:"));
-      expect(others, run.kind).toEqual([]);
-    }
+  it("emits no other security warnings on a conformant server (HTTP: plus the quiet-burst note)", () => {
+    const others = (run: DirectRun) => run.warnings.filter((w) => !w.startsWith("security-oversized-input:"));
+    expect(others(stdio)).toEqual([]);
+    expect(others(http)).toEqual([QUIET_BURST_WARNING]);
+    expect(detailsOf(http.tests, "security-rate-limiting")).toBe(QUIET_BURST_DETAILS);
   });
 
   it("counts each distinct error response once: its own probes are already in the recorder", () => {
@@ -697,6 +910,18 @@ describe("modern security suite: auth fixture over HTTP", () => {
     );
   });
 
+  it("without --auth: a burst of 50 x 401 is inconclusive, not 'no tools' and not a pass", async () => {
+    // The fixture declares 11 tools; unauthenticated, discover is 401, so
+    // the capabilities are unknown and every burst request dies at auth.
+    const run = await runDirect({ url: fixture.url, only: ["security-rate-limiting"] });
+    expect(run.toolCount).toBe(0);
+    expect(detailsOf(run.tests, "security-rate-limiting")).toBe(
+      "Skipped: all 50 rapid server/discover requests were rejected by auth (HTTP 401) before reaching a handler, so rate limiting could not be measured; pass --auth",
+    );
+    expect(run.warnings.filter((w) => w.startsWith("security-rate-limiting:"))).toEqual([]);
+    expectAsciiDetails(run.tests, ["security-rate-limiting"]);
+  });
+
   it("fixture contract: the query-string token is rejected while the header token is accepted on the same URL", async () => {
     // Pins WHY security-token-in-uri passes above: the fixture ignores
     // ?access_token and answers 401, not because the URL variant is
@@ -730,6 +955,55 @@ describe("modern security suite: auth fixture over HTTP", () => {
     const text = await served.body.text();
     expect(served.statusCode).toBe(200);
     expect(JSON.parse(text).result.supportedVersions).toContain(MODERN_SPEC_VERSION);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unreachable server: the security checks that used to pass vacuously
+// ("pass --auth", "returned 0", "0 unique error responses") report one
+// "server unreachable" verdict, like the post-hoc scans.
+// ---------------------------------------------------------------------------
+
+describe("unreachable server: one 'server unreachable' verdict instead of vacuous passes", () => {
+  const IDS = [
+    "security-oauth-metadata",
+    "security-rate-limiting",
+    "security-error-no-stacktrace",
+    "security-error-no-internal-ip",
+  ];
+  let run: DirectRun;
+
+  beforeAll(async () => {
+    // A port nothing listens on: bind one, read it, release it.
+    const port = await new Promise<number>((resolve) => {
+      const s = createServer();
+      s.listen(0, "127.0.0.1", () => {
+        const { port } = s.address() as AddressInfo;
+        s.close(() => resolve(port));
+      });
+    });
+    run = await runDirect({ url: `http://127.0.0.1:${port}/mcp`, only: IDS });
+  });
+
+  it("fails all four, naming the connection failure rather than a timeout or an auth refusal", () => {
+    const v = verdicts(run.tests, IDS);
+    expect(v["security-oauth-metadata"]).toMatch(
+      /^FAIL: server unreachable: unauthenticated server\/discover got no response \(connection failed: .+\)$/,
+    );
+    expect(v["security-oauth-metadata"]).not.toMatch(/within \d+ms|--auth/);
+    expect(v["security-rate-limiting"]).toBe(
+      "FAIL: server unreachable: none of the 50 rapid server/discover requests got a response",
+    );
+    const scans =
+      "FAIL: server unreachable: none of the 6 failure probes was answered and the run recorded no server message, so there are no error responses to scan";
+    expect(v["security-error-no-stacktrace"]).toBe(scans);
+    expect(v["security-error-no-internal-ip"]).toBe(scans);
+    expectAsciiDetails(run.tests, IDS);
+  });
+
+  it("pushes no tool-specific rate-limiting advice for a server it never reached", () => {
+    expect(run.warnings.filter((w) => w.startsWith("security-rate-limiting:"))).toEqual([]);
+    expect(run.recorder.size).toBe(0);
   });
 });
 
@@ -919,14 +1193,31 @@ interface InlineOptions {
   /**
    * Where Protected Resource Metadata lives. "header": only at /oauth/prm,
    * advertised through WWW-Authenticate. "header-mismatch": the same, but
-   * its `resource` is not the endpoint.
+   * its `resource` is not the endpoint. "header-404": advertised at
+   * /oauth/prm, which 404s, while the root well-known document is valid.
+   * "header-malformed": advertised at /oauth/prm, which lacks
+   * authorization_servers, while the root well-known document is valid.
    */
-  prm?: "path" | "legacy" | "root-bad" | "none" | "header" | "header-mismatch";
+  prm?: "path" | "legacy" | "root-bad" | "none" | "header" | "header-mismatch" | "header-404" | "header-malformed";
+  /**
+   * How the 401's WWW-Authenticate spells resource_metadata. Default: the
+   * plain quoted form. "spaced-eq": spaces around `=`. "spaced-quotes":
+   * spaces inside the quotes. "relative": a path, not a URL.
+   */
+  challenge?: "spaced-eq" | "spaced-quotes" | "relative";
   /** POSTs (or tools/call only) beyond this count get 429. */
   rateLimit?: { after: number; scope: "all" | "tools-call" };
   /** Status for bodies over 500 KB. */
   bigBody?: 413 | 500;
-  tools?: "sink" | "injection-set" | "mirrored-first" | "mirrored-only" | "required-only" | "none";
+  tools?:
+    | "sink"
+    | "injection-set"
+    | "mirrored-first"
+    | "mirrored-only"
+    | "required-only"
+    | "strict-schema"
+    | "enum-first"
+    | "none";
   /** Delay every tools/call answer by this many ms. */
   slowToolsCall?: number;
   /** Destroy the socket on tools/call instead of answering. */
@@ -1009,6 +1300,36 @@ const REQUIRED_ONLY_TOOL = {
   annotations: { readOnlyHint: true },
 };
 
+/** Validated server-side: count >= 10, tags has 2+ entries, opts.mode present, level is one of the enum. */
+const STRICT_SCHEMA_TOOL = {
+  name: "strict",
+  description: "Read-only, validates every argument against its schema",
+  inputSchema: {
+    type: "object",
+    properties: {
+      q: { type: "string" },
+      count: { type: "integer", minimum: 10 },
+      tags: { type: "array", minItems: 2, items: { type: "string" } },
+      opts: { type: "object", properties: { mode: { type: "string" } }, required: ["mode"] },
+      level: { type: ["null", "integer"], minimum: 1 },
+    },
+    required: ["q", "count", "tags", "opts", "level"],
+  },
+  annotations: { readOnlyHint: true },
+};
+
+/** The enum argument is declared first; only `text` is free-form. */
+const ENUM_FIRST_TOOL = {
+  name: "convert",
+  description: "Converts text; format is an enum",
+  inputSchema: {
+    type: "object",
+    properties: { format: { type: "string", enum: ["json", "yaml"] }, text: { type: "string" } },
+    required: ["format", "text"],
+  },
+  annotations: { readOnlyHint: true },
+};
+
 const B64TOKEN = /^Bearer [A-Za-z0-9._~+/-]+=*$/;
 
 function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
@@ -1028,8 +1349,24 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         return [MIRRORED_ONLY_TOOL];
       case "required-only":
         return [REQUIRED_ONLY_TOOL];
+      case "strict-schema":
+        return [STRICT_SCHEMA_TOOL];
+      case "enum-first":
+        return [ENUM_FIRST_TOOL];
       case "none":
         return [];
+    }
+  };
+  const challengeFor = (prmUrl: string) => {
+    switch (opts.challenge) {
+      case "spaced-eq":
+        return `Bearer resource_metadata = "${prmUrl}"`;
+      case "spaced-quotes":
+        return `Bearer resource_metadata=" ${prmUrl} "`;
+      case "relative":
+        return `Bearer resource_metadata="${new URL(prmUrl).pathname}"`;
+      default:
+        return `Bearer resource_metadata="${prmUrl}"`;
     }
   };
   const server: Server = createServer((req, res) => {
@@ -1049,17 +1386,19 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         res.writeHead(status, { "Content-Type": "application/json", ...cors, ...extra });
         res.end(JSON.stringify(obj));
       };
-      const prmUrl =
-        opts.prm === "header" || opts.prm === "header-mismatch"
-          ? `${base}/oauth/prm`
-          : `${base}/.well-known/oauth-protected-resource`;
+      const headerPrm = opts.prm?.startsWith("header") ?? false;
+      const prmUrl = headerPrm ? `${base}/oauth/prm` : `${base}/.well-known/oauth-protected-resource`;
       const path = url.pathname;
+      const validDoc = { resource: `${base}/mcp`, authorization_servers: ["https://as.example.com"] };
       if (path === "/.well-known/oauth-protected-resource" && opts.prm === "root-bad") {
         return json(200, { resource: `${base}/mcp` }); // no authorization_servers
       }
-      if (path === "/.well-known/oauth-protected-resource/mcp" && opts.prm === "path") {
-        return json(200, { resource: `${base}/mcp`, authorization_servers: ["https://as.example.com"] });
+      if (path === "/.well-known/oauth-protected-resource" && opts.prm === "header-404") return json(200, validDoc);
+      if (path === "/.well-known/oauth-protected-resource" && opts.prm === "header-malformed") {
+        return json(200, validDoc);
       }
+      if (path === "/.well-known/oauth-protected-resource/mcp" && opts.prm === "path") return json(200, validDoc);
+      if (path === "/oauth/prm" && opts.prm === "header-malformed") return json(200, { resource: `${base}/mcp` });
       if (path === "/oauth/prm" && (opts.prm === "header" || opts.prm === "header-mismatch")) {
         const resource = opts.prm === "header" ? `${base}/mcp` : `${base}/other`;
         return json(200, { resource, authorization_servers: ["https://as.example.com"] });
@@ -1079,13 +1418,13 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         const authz = req.headers.authorization;
         const rejection = { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Unauthorized" } };
         if (!authz) {
-          return json(401, rejection, { "WWW-Authenticate": `Bearer resource_metadata="${prmUrl}"` });
+          return json(401, rejection, { "WWW-Authenticate": challengeFor(prmUrl) });
         }
         if (authz !== "Bearer tok") {
           const wellFormed = B64TOKEN.test(authz);
           if (wellFormed && opts.auth === "strict") {
             return json(401, rejection, {
-              "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${prmUrl}"`,
+              "WWW-Authenticate": `Bearer error="invalid_token", ${challengeFor(prmUrl).replace(/^Bearer /, "")}`,
             });
           }
           return json(400, rejection, { "WWW-Authenticate": 'Bearer error="invalid_request"' });
@@ -1141,6 +1480,26 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
           const args = (msg?.params?.arguments ?? {}) as Record<string, unknown>;
           if (opts.dropOnToolsCall) return req.socket.destroy();
           const answer = () => {
+            if (opts.tools === "strict-schema") {
+              const opt = args.opts as Record<string, unknown> | undefined;
+              const valid =
+                typeof args.q === "string" &&
+                Number.isInteger(args.count) &&
+                (args.count as number) >= 10 &&
+                Array.isArray(args.tags) &&
+                args.tags.length >= 2 &&
+                !!opt &&
+                typeof opt.mode === "string" &&
+                (args.level === null || (Number.isInteger(args.level) && (args.level as number) >= 1));
+              if (!valid) return error(-32602, "Invalid params: arguments do not match the schema");
+              return result({ content: [{ type: "text", text: `strict ok: ${String(args.q)}` }] });
+            }
+            if (opts.tools === "enum-first") {
+              if (args.format !== "json" && args.format !== "yaml") {
+                return error(-32602, "Invalid params: format must be json or yaml");
+              }
+              return result({ content: [{ type: "text", text: `converted ${String(args.text)}` }] });
+            }
             if (opts.tools !== "injection-set") return result({ content: [{ type: "text", text: "ok" }] });
             switch (name) {
               case "lookup":
@@ -1258,7 +1617,7 @@ describe("inline servers: permissive auth, CORS, PRM locations, throttling and b
     );
     expect(wildcard.warnings.filter((w) => w.startsWith("security-oauth-metadata:"))).toHaveLength(1);
     expect(verdicts(badPrm.tests, ["security-oauth-metadata"])["security-oauth-metadata"]).toBe(
-      "FAIL: PRM response at /.well-known/oauth-protected-resource missing 'authorization_servers' array",
+      "FAIL: PRM document at /.well-known/oauth-protected-resource is missing the 'authorization_servers' array",
     );
     // Spec order: the endpoint-path variant first, the root second.
     expect(verdicts(bare.tests, ["security-oauth-metadata"])["security-oauth-metadata"]).toBe(
@@ -1266,14 +1625,19 @@ describe("inline servers: permissive auth, CORS, PRM locations, throttling and b
     );
   });
 
-  it("rate-limiting bursts the read-only no-argument tool: passes on a 429, fails when every call is served", () => {
+  it("rate-limiting bursts the read-only no-argument tool: passes on a 429, and on a quiet burst with a warning naming tool and count", () => {
     expect(detailsOf(reflecting.tests, "security-rate-limiting")).toBe(
       "Rate limiting detected (429 returned within 50 rapid tools/call sink requests)",
     );
-    expect(verdicts(bare.tests, ["security-rate-limiting"])["security-rate-limiting"]).toBe(
-      "FAIL: No rate limiting detected (50 rapid tools/call sink requests all returned 200)",
+    expect(reflecting.warnings.filter((w) => w.startsWith("security-rate-limiting:"))).toEqual([]);
+    // Same grade as the discover fallback: a quiet burst is a warning, not a failure.
+    expect(verdicts(bare.tests, ["security-rate-limiting"])["security-rate-limiting"]).toBe("pass");
+    expect(detailsOf(bare.tests, "security-rate-limiting")).toBe(
+      "No 429 within 50 rapid tools/call sink requests (HTTP 200); rate limiting not detected (see warning)",
     );
-    expect(bare.warnings.filter((w) => w.startsWith("security-rate-limiting:"))).toEqual([]);
+    expect(bare.warnings.filter((w) => w.startsWith("security-rate-limiting:"))).toEqual([
+      "security-rate-limiting: 50 rapid tools/call sink requests drew no 429 (HTTP 200); servers MUST rate limit tool invocations -- apply a per-client limiter to tools/call (429 + Retry-After) and verify it by hand. The burst invoked sink 50 times.",
+    ]);
   });
 
   it("oversized-input passes on 413 and fails on a 5xx", () => {
@@ -1351,6 +1715,80 @@ describe("inline servers: strict bearer parsing and header-advertised PRM", () =
   });
 });
 
+describe("inline servers: the advertised resource_metadata URL is authoritative", () => {
+  const servers: InlineServer[] = [];
+  let missing: DirectRun;
+  let malformed: DirectRun;
+  let relative: DirectRun;
+  let spacedEq: DirectRun;
+  let spacedQuotes: DirectRun;
+  const AUTH = { Authorization: "Bearer tok" };
+  const PRM_IDS = ["security-www-authenticate", "security-oauth-metadata"];
+
+  beforeAll(async () => {
+    const a = await startInlineServer({ auth: "strict", prm: "header-404" });
+    const b = await startInlineServer({ auth: "strict", prm: "header-malformed" });
+    const c = await startInlineServer({ auth: "strict", prm: "path", challenge: "relative" });
+    const d = await startInlineServer({ auth: "strict", prm: "header", challenge: "spaced-eq" });
+    const e = await startInlineServer({ auth: "strict", prm: "header", challenge: "spaced-quotes" });
+    servers.push(a, b, c, d, e);
+    missing = await runDirect({ url: a.url, headers: AUTH, only: PRM_IDS });
+    malformed = await runDirect({ url: b.url, headers: AUTH, only: PRM_IDS });
+    relative = await runDirect({ url: c.url, headers: AUTH, only: PRM_IDS });
+    spacedEq = await runDirect({ url: d.url, headers: AUTH, only: PRM_IDS });
+    spacedQuotes = await runDirect({ url: e.url, headers: AUTH, only: PRM_IDS });
+  });
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("fails when the advertised URL 404s, even though the root well-known document is valid, and names both", () => {
+    expect(verdicts(missing.tests, ["security-oauth-metadata"])["security-oauth-metadata"]).toBe(
+      "FAIL: WWW-Authenticate resource_metadata /oauth/prm answered HTTP 404 -- clients MUST use the advertised URL, not the well-known fallback; valid document at /.well-known/oauth-protected-resource",
+    );
+    expect(detailsOf(missing.tests, "security-www-authenticate")).toBe(
+      `WWW-Authenticate: Bearer resource_metadata="${servers[0].base}/oauth/prm"`,
+    );
+    expect(missing.warnings.filter((w) => w.startsWith("security-"))).toEqual([]);
+  });
+
+  it("fails when the advertised document lacks authorization_servers instead of falling through to the root", () => {
+    expect(verdicts(malformed.tests, ["security-oauth-metadata"])["security-oauth-metadata"]).toBe(
+      "FAIL: WWW-Authenticate resource_metadata /oauth/prm is missing the 'authorization_servers' array -- clients MUST use the advertised URL, not the well-known fallback; valid document at /.well-known/oauth-protected-resource",
+    );
+  });
+
+  it("a relative resource_metadata is warned about by www-authenticate and fails oauth-metadata", () => {
+    expect(detailsOf(relative.tests, "security-www-authenticate")).toBe(
+      'WWW-Authenticate: Bearer resource_metadata="/.well-known/oauth-protected-resource"',
+    );
+    expect(relative.warnings.filter((w) => w.startsWith("security-www-authenticate:"))).toEqual([
+      'security-www-authenticate: the WWW-Authenticate resource_metadata value "/.well-known/oauth-protected-resource" is not an absolute http(s) URL (RFC 9728 section 5.1 requires one); clients cannot locate the Protected Resource Metadata from it.',
+    ]);
+    expect(verdicts(relative.tests, ["security-oauth-metadata"])["security-oauth-metadata"]).toBe(
+      'FAIL: WWW-Authenticate resource_metadata "/.well-known/oauth-protected-resource" is not an absolute http(s) URL (RFC 9728 section 5.1) -- clients MUST use the advertised URL and cannot fetch this one',
+    );
+  });
+
+  it("spaces around `=` or inside the quotes are neither a missing parameter nor a different label", () => {
+    for (const run of [spacedEq, spacedQuotes]) {
+      expect(run.warnings.filter((w) => w.startsWith("security-www-authenticate:"))).toEqual([]);
+      expect(verdicts(run.tests, PRM_IDS)).toEqual(allPass(PRM_IDS));
+    }
+    expect(detailsOf(spacedEq.tests, "security-oauth-metadata")).toBe(
+      `Protected Resource Metadata found at /oauth/prm (via WWW-Authenticate): resource=${servers[3].base}/mcp, 1 auth server(s)`,
+    );
+    expect(detailsOf(spacedQuotes.tests, "security-oauth-metadata")).toBe(
+      `Protected Resource Metadata found at /oauth/prm (via WWW-Authenticate): resource=${servers[4].base}/mcp, 1 auth server(s)`,
+    );
+  });
+
+  it("keeps every details string ASCII and bounded", () => {
+    for (const run of [missing, malformed, relative, spacedEq, spacedQuotes]) expectAsciiDetails(run.tests, PRM_IDS);
+  });
+});
+
 describe("inline servers: one injection target per test, destructive tools skipped, required siblings filled", () => {
   let server: InlineServer;
   let run: DirectRun;
@@ -1394,16 +1832,62 @@ describe("inline servers: one injection target per test, destructive tools skipp
     expect(detailsOf(run.tests, "security-path-traversal")).toBe(
       `Tested 3 payload(s) against read_file.path: 3 rejected, 0 returned without evidence of execution, 0 ${UNREACHED} -- server defended`,
     );
+    // Every SSRF payload died in validation: that is not a pass on the merits.
     expect(detailsOf(run.tests, "security-ssrf-internal")).toBe(
-      `Tested 4 payload(s) against fetch.url: 0 rejected, 0 returned without evidence of execution, 4 ${UNREACHED}`,
+      `Tested 4 payload(s) against fetch.url: 0 rejected, 0 returned without evidence of execution, 4 ${UNREACHED} -- inconclusive (see warning)`,
     );
     expectAsciiDetails(run.tests, INJECTION_IDS);
   });
 
-  it("pushes exactly one warning for the skipped destructive tool and one for the placeholder fill", () => {
+  it("pushes one warning each for the skipped destructive tool, the skipped unannotated tool, the placeholder fill and the unreached target", () => {
     expect(run.warnings).toEqual([
       "security injection tests: skipped destructive tool(s) delete_record (annotations.destructiveHint true).",
+      "security injection tests: skipped 1 unannotated tool(s) search: the spec defaults destructiveHint to true, so a tool without readOnlyHint true or destructiveHint false counts as destructive; annotate read-only tools to have them probed.",
       "security injection tests: filled required argument(s) limit=1, verbose=false of lookup with placeholders so the payload could reach the handler.",
+      "security injection tests: no payload sent to fetch.url reached the tool (every tools/call drew a JSON-RPC or transport error), so the verdict is inconclusive; check that the placeholder arguments satisfy the tool's schema, or expose a read-only tool with a free-form string argument.",
+    ]);
+  });
+});
+
+describe("inline servers: placeholders satisfy a validating schema, and enum arguments are not the target", () => {
+  const servers: InlineServer[] = [];
+  let strict: DirectRun;
+  let enumFirst: DirectRun;
+
+  beforeAll(async () => {
+    const a = await startInlineServer({ tools: "strict-schema" });
+    const b = await startInlineServer({ tools: "enum-first" });
+    servers.push(a, b);
+    strict = await runDirect({ url: a.url, only: ["security-command-injection"] });
+    enumFirst = await runDirect({ url: b.url, only: ["security-command-injection"] });
+  });
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("fills minimum, minItems, nested required and the first non-null type so the payload reaches the handler", () => {
+    expect(detailsOf(strict.tests, "security-command-injection")).toBe(
+      `Tested 5 payload(s) against strict.q: 0 rejected, 5 returned without evidence of execution, 0 ${UNREACHED}`,
+    );
+    expect(servers[0].calls).toHaveLength(5);
+    for (const call of servers[0].calls) {
+      expect(call.args).toMatchObject({ count: 10, tags: ["test", "test"], opts: { mode: "test" }, level: 1 });
+      expect(typeof call.args.q).toBe("string");
+    }
+    expect(strict.warnings).toEqual([
+      'security injection tests: filled required argument(s) count=10, tags=["test","test"], opts={"mode":"test"}, level=1 of strict with placeholders so the payload could reach the handler.',
+    ]);
+  });
+
+  it("sends the payloads to the free-form argument and fills the enum one with a member", () => {
+    expect(detailsOf(enumFirst.tests, "security-command-injection")).toBe(
+      `Tested 5 payload(s) against convert.text: 0 rejected, 5 returned without evidence of execution, 0 ${UNREACHED}`,
+    );
+    expect(servers[1].calls).toHaveLength(5);
+    for (const call of servers[1].calls) expect(call.args.format).toBe("json");
+    expect(enumFirst.warnings).toEqual([
+      'security injection tests: filled required argument(s) format="json" of convert with placeholders so the payload could reach the handler.',
     ]);
   });
 });

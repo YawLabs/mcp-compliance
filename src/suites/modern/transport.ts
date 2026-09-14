@@ -4,8 +4,17 @@ import { HEADER_METHOD, HEADER_NAME, HEADER_PROTOCOL_VERSION } from "../../moder
 import { META, MODERN_ERROR_CODES } from "../../modern/meta.js";
 import { parseSSEMessages } from "../../sse.js";
 import type { HttpTransport } from "../../transport/http.js";
-import { ensurePrompts, ensureResources, hasPrompts, hasResources, type ModernSuiteContext } from "./context.js";
-import { notEvaluable } from "./lifecycle.js";
+import {
+  ensurePrompts,
+  ensureResources,
+  hasPrompts,
+  hasResources,
+  LIST_METHOD,
+  type ListKey,
+  listUnavailable,
+  type ModernSuiteContext,
+} from "./context.js";
+import { notEvaluable, transportLevelRejection } from "./lifecycle.js";
 
 /**
  * Streamable HTTP transport tests of the 2026-07-28 suite (16 in the
@@ -17,7 +26,10 @@ import { notEvaluable } from "./lifecycle.js";
  * `transport-header-name-mismatch` reads the resource / prompt lists
  * through the context's `ensure*` loaders, which fetch once on demand, so
  * a `--only transport` run still reads a real resource; it skip-passes
- * only when the server declares neither capability or the list failed.
+ * when the server declares neither capability or nothing listed is
+ * readable by name, and when the list calls failed it points at the
+ * `-list` tests that report the failure -- or fails with the recorded
+ * reason when this run filtered those tests out (see `listUnavailable`).
  */
 
 const DISCOVER = "server/discover";
@@ -75,7 +87,10 @@ function clip(text: string, max: number): string {
  * with a warning naming the test. A 400 is credited to the injected
  * header defect only when the conformant discover was served: a server
  * that rejects everything (a legacy-only server pinned to this suite)
- * proves nothing by rejecting a malformed variant too.
+ * proves nothing by rejecting a malformed variant too. A transport-level
+ * status (401/403/413/415/429: an auth gate or rate limiter answering
+ * before the JSON-RPC layer) is not evaluable either, rather than "the
+ * wrong status".
  */
 function evaluateHeaderRejection(
   ctx: ModernSuiteContext,
@@ -85,11 +100,16 @@ function evaluateHeaderRejection(
 ): TestOutcome {
   const err = errorOf(res.body);
   const observed = `HTTP ${res.statusCode}, ${summarize(res)}`;
+  // A served request is a defect whatever the discover state; only a
+  // rejection needs attributing.
+  if (res.statusCode < 400 || resultOf(res.body)) {
+    return { passed: false, details: `${observed} (expected HTTP 400)` };
+  }
+  const unattributable = notEvaluable(ctx) ?? transportLevelRejection(ctx, res);
+  if (unattributable) return { passed: false, details: unattributable };
   if (res.statusCode !== 400) {
     return { passed: false, details: `${observed} (expected HTTP 400)` };
   }
-  const unattributable = notEvaluable(ctx);
-  if (unattributable) return { passed: false, details: unattributable };
   if (err && err.code === HEADER_MISMATCH) {
     return { passed: true, details: `HTTP 400, JSON-RPC error -32020 HeaderMismatch` };
   }
@@ -209,8 +229,12 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
         undefined,
         { Accept: "text/event-stream", [HEADER_PROTOCOL_VERSION]: client.protocolVersion },
         ctx.timeout,
+        undefined,
+        ctx.signal,
       );
     } catch (err: unknown) {
+      // A cancelled run is not a held-open stream; let the harness record it.
+      if (ctx.signal?.aborted) throw err;
       // A legacy GET stream held open never completes; the timeout is the signal.
       const message = err instanceof Error ? err.message : String(err);
       return {
@@ -243,6 +267,8 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
       undefined,
       { [HEADER_PROTOCOL_VERSION]: client.protocolVersion },
       ctx.timeout,
+      undefined,
+      ctx.signal,
     );
     if (res.statusCode === 405) return { passed: true, details: "HTTP 405 Method Not Allowed" };
     if (is4xx(res.statusCode)) {
@@ -310,7 +336,7 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
   await harness.check("transport-header-name-mismatch", async () => {
     if (ctx.kind !== "http") return notApplicable("Mcp-Name header");
     const probe = await nameHeaderProbe(ctx);
-    if ("skipped" in probe) return { passed: true, details: probe.skipped };
+    if ("outcome" in probe) return probe.outcome;
     const res = await client.rpc(probe.method, probe.params, { headers: { [HEADER_NAME]: "wrong-name" } });
     const outcome = evaluateHeaderRejection(ctx, "transport-header-name-mismatch", res, { codeRequired: false });
     return { passed: outcome.passed, details: `${probe.method} with Mcp-Name: wrong-name -> ${outcome.details}` };
@@ -347,15 +373,18 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
   });
 }
 
-type NameHeaderProbe = { method: string; params: Record<string, unknown> } | { skipped: string };
+type NameHeaderProbe = { method: string; params: Record<string, unknown> } | { outcome: TestOutcome };
 
 /**
  * A read-only request that carries `Mcp-Name`: the first listed resource
  * (resources/read on its uri), else the first prompt with no required
  * arguments (prompts/get). The lists are fetched once on demand through
- * the context (so `--only transport` still measures the server); the
- * skip names why no probe exists -- the capability is undeclared, the
- * list call failed, or nothing listed is readable with a name alone.
+ * the context (so `--only transport` still measures the server). When no
+ * probe exists the outcome names why: the capability is undeclared or
+ * nothing listed is readable with a name alone (skip-pass), or every
+ * declared list call failed -- a skip-pass pointing at the `-list` tests
+ * when they are in this run, else a failure carrying the recorded reason
+ * (`listUnavailable`), so a broken list is never a silent pass.
  */
 async function nameHeaderProbe(ctx: ModernSuiteContext): Promise<NameHeaderProbe> {
   const resources = await ensureResources(ctx);
@@ -368,15 +397,25 @@ async function nameHeaderProbe(ctx: ModernSuiteContext): Promise<NameHeaderProbe
     return !args.some((a: unknown) => !!a && typeof a === "object" && (a as { required?: unknown }).required === true);
   });
   if (prompt) return { method: "prompts/get", params: { name: prompt.name } };
-  const declared = [hasResources(ctx) ? "resources" : null, hasPrompts(ctx) ? "prompts" : null].filter(
-    (c): c is string => c !== null,
-  );
-  if (declared.length === 0) return { skipped: "skipped: server declares no resources or prompts" };
-  const failed = declared.filter((c) => (c === "resources" ? !resources : !prompts));
+  const skip = (details: string): NameHeaderProbe => ({ outcome: { passed: true, details } });
+  const declared: ListKey[] = [];
+  if (hasResources(ctx)) declared.push("resources");
+  if (hasPrompts(ctx)) declared.push("prompts");
+  if (declared.length === 0) return skip("skipped: server declares no resources or prompts");
+  const failed = declared.filter((key) => (key === "resources" ? !resources : !prompts));
   if (failed.length === declared.length) {
-    return {
-      skipped: `skipped: ${failed.map((c) => `${c}/list`).join(" and ")} failed (see ${failed.map((c) => `${c}-list`).join(", ")})`,
-    };
+    const what = "no resource or prompt to read by name";
+    // Filtered-out `-list` tests report nothing: fail with their reasons.
+    const unreported = failed.filter((key) => !listUnavailable(ctx, key, what).passed);
+    if (unreported.length > 0) {
+      const reasons = unreported.map(
+        (key) => `${LIST_METHOD[key]} failed (${ctx.state.listFailures[key] ?? "no list obtained"})`,
+      );
+      return { outcome: { passed: false, details: `${reasons.join(" and ")}; ${what}` } };
+    }
+    return skip(
+      `skipped: ${failed.map((k) => `${k}/list`).join(" and ")} failed, ${what} (see ${failed.map((k) => `${k}-list`).join(", ")})`,
+    );
   }
-  return { skipped: "skipped: no listed resource has a uri and no listed prompt is callable without arguments" };
+  return skip("skipped: no listed resource has a uri and no listed prompt is callable without arguments");
 }
