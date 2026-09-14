@@ -33,6 +33,14 @@ export const DEFAULT_SPEC_VERSION: SpecVersion = LEGACY_SPEC_VERSION;
 
 export type SpecEra = "legacy" | "modern";
 
+/**
+ * Prefix of the report warning the runner emits when `auto` resolved the
+ * spec version. Human-facing formatters lift that entry out of the
+ * warnings list and into the header (it is information, not a problem);
+ * JSON/SARIF consumers still see it as a warning.
+ */
+export const AUTO_DETECT_NOTE_PREFIX = "Spec version auto-detected as ";
+
 export function specEraOf(version: SpecVersion): SpecEra {
   return version >= MODERN_SPEC_VERSION ? "modern" : "legacy";
 }

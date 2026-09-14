@@ -21,6 +21,7 @@ import { createHarness, supportsTransportByDefinition } from "./harness.js";
 import { readPackageVersion } from "./pkg-version.js";
 import { assembleReport } from "./report.js";
 import {
+  AUTO_DETECT_NOTE_PREFIX,
   LEGACY_SPEC_VERSION,
   MODERN_SPEC_VERSION,
   type SpecVersion,
@@ -381,7 +382,7 @@ export async function runComplianceSuite(
           : await detectSpecVersion(transport, { nextId, timeout: startupTimeout, clientInfo });
       resolvedSpec = detection.version;
       preWarnings.push(
-        `Spec version auto-detected as ${resolvedSpec} (${detection.reason}). Pin with --spec-version to override.`,
+        `${AUTO_DETECT_NOTE_PREFIX}${resolvedSpec} (${detection.reason}). Pin with --spec-version to override.`,
       );
     } else {
       resolvedSpec = requested === "auto" ? LEGACY_SPEC_VERSION : requested;

@@ -628,3 +628,39 @@ describe("per-spec catalog lookups", () => {
     expect(formatHtml(modernReport())).toContain("Spec 2026-07-28");
   });
 });
+
+describe("auto-detection note placement", () => {
+  const note =
+    "Spec version auto-detected as 2026-07-28 (server/discover returned supportedVersions [2026-07-28]). Pin with --spec-version to override.";
+  const report = makeReport({ specVersion: "2026-07-28", warnings: [note, 'Resource "x" missing description'] });
+
+  it("terminal: the note sits under Spec:, not in WARNINGS, and the count excludes it", () => {
+    const out = formatTerminal(report);
+    expect(out).toContain(
+      "auto-detected: server/discover returned supportedVersions [2026-07-28]; pin with --spec-version",
+    );
+    expect(out).toContain("WARNINGS (1)");
+    expect(out).not.toContain("! Spec version auto-detected");
+  });
+
+  it("markdown and html: the note is appended to the spec line and dropped from the warnings", () => {
+    const md = formatMarkdown(report);
+    expect(md).toContain(
+      "- **Spec:** 2026-07-28 (auto-detected: server/discover returned supportedVersions [2026-07-28])",
+    );
+    expect(md).not.toContain("- Spec version auto-detected");
+    const html = formatHtml(report);
+    expect(html).toContain("Spec 2026-07-28 (auto-detected: server/discover returned supportedVersions [2026-07-28])");
+    expect(html).toContain("Warnings (1)");
+  });
+
+  it("json keeps the note as a warning for machine consumers", () => {
+    expect(JSON.parse(formatJson(report)).warnings).toContain(note);
+  });
+
+  it("a report without the note renders unchanged", () => {
+    const out = formatTerminal(makeReport({ warnings: ["only a real warning"] }));
+    expect(out).not.toContain("auto-detected");
+    expect(out).toContain("WARNINGS (1)");
+  });
+});

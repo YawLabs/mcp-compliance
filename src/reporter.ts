@@ -1,6 +1,6 @@
 import chalk from "chalk";
 import { findTestDefinition } from "./definitions/index.js";
-import { isSpecVersion, LEGACY_SPEC_VERSION, type SpecVersion, specBaseFor } from "./spec.js";
+import { AUTO_DETECT_NOTE_PREFIX, isSpecVersion, LEGACY_SPEC_VERSION, type SpecVersion, specBaseFor } from "./spec.js";
 import type { ComplianceReport, Grade, TestResult } from "./types.js";
 
 /**
@@ -26,6 +26,24 @@ const CATEGORY_LABELS: Record<string, string> = {
 };
 
 const CATEGORY_ORDER = ["transport", "lifecycle", "tools", "resources", "prompts", "errors", "schema", "security"];
+
+/**
+ * Separate the runner's auto-detection note from the real warnings. The
+ * note says which spec revision `auto` picked and why; it belongs in the
+ * header, not in a list of problems. Returns the note's explanation (the
+ * part in parentheses) so the header can say e.g.
+ * "2026-07-28 (auto-detected: server/discover returned ...)".
+ */
+function splitSpecNote(report: ComplianceReport): { specNote: string | null; warnings: string[] } {
+  const idx = report.warnings.findIndex((w) => w.startsWith(AUTO_DETECT_NOTE_PREFIX));
+  if (idx === -1) return { specNote: null, warnings: report.warnings };
+  const note = report.warnings[idx];
+  const reason = /\((.*)\)\. Pin with/.exec(note)?.[1] ?? "";
+  return {
+    specNote: reason ? `auto-detected: ${reason}` : "auto-detected",
+    warnings: report.warnings.filter((_, i) => i !== idx),
+  };
+}
 
 const GRADE_ART: Record<Grade, string[]> = {
   A: [" █████╗ ", "██╔══██╗", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
@@ -104,7 +122,9 @@ export function formatTerminal(report: ComplianceReport): string {
     out.push(chalk.dim(`  Server:   ${report.serverInfo.name}${v}${proto}`));
   }
   out.push(chalk.dim(`  Target:   ${report.url}`));
+  const { specNote, warnings } = splitSpecNote(report);
   out.push(chalk.dim(`  Spec:     ${report.specVersion}  ·  Tool v${report.toolVersion}  ·  ${report.timestamp}`));
+  if (specNote) out.push(chalk.dim(`            ${specNote}; pin with --spec-version`));
   out.push("");
 
   // Big grade block letter + side-by-side summary
@@ -167,10 +187,10 @@ export function formatTerminal(report: ComplianceReport): string {
   }
 
   // Warnings
-  if (report.warnings.length > 0) {
-    out.push(chalk.bold.yellow(`  WARNINGS (${report.warnings.length})`));
+  if (warnings.length > 0) {
+    out.push(chalk.bold.yellow(`  WARNINGS (${warnings.length})`));
     out.push(chalk.dim(`  ${RULE}`));
-    for (const w of report.warnings) {
+    for (const w of warnings) {
       out.push(`  ${chalk.yellow("!")} ${w}`);
     }
     out.push("");
@@ -354,8 +374,9 @@ export function formatMarkdown(report: ComplianceReport): string {
     `**Grade: ${gradeEmoji[report.grade] || ""} ${report.grade} (${report.score}%)** — ${report.overall.toUpperCase()}`,
   );
   lines.push("");
+  const { specNote: mdSpecNote, warnings: mdWarnings } = splitSpecNote(report);
   lines.push(`- **Target:** \`${report.url}\``);
-  lines.push(`- **Spec:** ${report.specVersion}`);
+  lines.push(`- **Spec:** ${report.specVersion}${mdSpecNote ? ` (${mdSpecNote})` : ""}`);
   lines.push(`- **Tested:** ${report.timestamp}`);
   lines.push(`- **Tool:** v${report.toolVersion}`);
   if (report.serverInfo.name) {
@@ -388,10 +409,10 @@ export function formatMarkdown(report: ComplianceReport): string {
     lines.push("");
   }
 
-  if (report.warnings.length > 0) {
+  if (mdWarnings.length > 0) {
     lines.push("## Warnings");
     lines.push("");
-    for (const w of report.warnings) lines.push(`- ${w}`);
+    for (const w of mdWarnings) lines.push(`- ${w}`);
     lines.push("");
   }
 
@@ -404,6 +425,7 @@ export function formatMarkdown(report: ComplianceReport): string {
  * static artifact (CI artifact upload, GitHub Pages, S3 static hosting).
  */
 export function formatHtml(report: ComplianceReport): string {
+  const { specNote: htmlSpecNote, warnings: htmlWarnings } = splitSpecNote(report);
   const gradeColors: Record<string, string> = {
     A: "#10b981",
     B: "#84cc16",
@@ -474,7 +496,7 @@ export function formatHtml(report: ComplianceReport): string {
   <header>
     <h1>MCP Compliance Report</h1>
     <div class="muted">${esc(report.url)}</div>
-    <div class="muted" style="margin-top:6px">Spec ${esc(report.specVersion)} · Tool v${esc(report.toolVersion)} · ${new Date(report.timestamp).toLocaleString()}</div>
+    <div class="muted" style="margin-top:6px">Spec ${esc(report.specVersion)}${htmlSpecNote ? ` (${esc(htmlSpecNote)})` : ""} · Tool v${esc(report.toolVersion)} · ${new Date(report.timestamp).toLocaleString()}</div>
     ${report.serverInfo.name ? `<div class="muted">Server: ${esc(report.serverInfo.name)}${report.serverInfo.version ? ` v${esc(report.serverInfo.version)}` : ""}</div>` : ""}
   </header>
 
@@ -495,7 +517,7 @@ export function formatHtml(report: ComplianceReport): string {
       .join("")}
   </div>
 
-  ${report.warnings.length ? `<div class="card"><h2>Warnings (${report.warnings.length})</h2>${report.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("")}</div>` : ""}
+  ${htmlWarnings.length ? `<div class="card"><h2>Warnings (${htmlWarnings.length})</h2>${htmlWarnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("")}</div>` : ""}
 
   ${
     failed.length
