@@ -5,13 +5,22 @@ import chalk from "chalk";
 import { Command, Option } from "commander";
 import { renderBadgeSvg } from "./badge-svg.js";
 import { formatBenchmark, runBenchmark } from "./benchmark.js";
-import { type ComplianceConfig, loadConfig } from "./config.js";
+import { type ComplianceConfig, loadConfig, OUTPUT_FORMATS } from "./config.js";
 import { diffReports, formatDiff, hasRegressions } from "./diff.js";
 import { startServer } from "./mcp/server.js";
 import { formatGithub, formatHtml, formatJson, formatMarkdown, formatSarif, formatTerminal } from "./reporter.js";
 import { previewTests, runComplianceSuite } from "./runner.js";
+import { type SpecVersionOption, SUPPORTED_SPEC_VERSIONS } from "./spec.js";
 import { splitStdioTarget } from "./stdio-split.js";
-import type { TransportTarget } from "./types.js";
+import type { TestDefinition, TransportTarget } from "./types.js";
+
+/** `--spec-version` choices: `auto` plus every catalog the tool ships. */
+const SPEC_VERSION_CHOICES: string[] = ["auto", ...SUPPORTED_SPEC_VERSIONS];
+
+const SPEC_VERSION_HELP =
+  "MCP spec revision to test against (default: auto, or `specVersion` in config). " +
+  "auto probes the server with a 2026-07-28 server/discover request and grades the newest revision it speaks; " +
+  "pin a date to force one suite. With --list (no connection is made) auto prints every catalog.";
 
 // `__VERSION__` is injected by esbuild's `--define` at single-binary (SEA)
 // build time; esbuild dead-code-eliminates the else branch under the define.
@@ -201,17 +210,16 @@ program
   .argument("[extraArgs...]", "Additional args passed to the stdio command")
   .addOption(
     new Option("--format <format>", "Output format (default: terminal, or `format` in config)").choices([
-      "terminal",
-      "json",
-      "sarif",
-      "github",
-      "markdown",
-      "html",
+      ...OUTPUT_FORMATS,
     ]),
   )
+  .addOption(new Option("--spec-version <version>", SPEC_VERSION_HELP).choices(SPEC_VERSION_CHOICES))
   .option("--config <path>", "Load options from a config file (default: mcp-compliance.config.json in cwd)")
   .option("--output <file>", "Write a local SVG badge to the given path after the run (works with any transport)")
-  .option("--list", "Print the test IDs that would run given current filters, then exit (no connection)")
+  .option(
+    "--list",
+    "Print the test IDs that would run given current filters, then exit (no connection; with --spec-version auto, both catalogs are listed)",
+  )
   .addOption(
     new Option(
       "--transport <kind>",
@@ -244,7 +252,7 @@ program
   )
   .option(
     "--startup-timeout <ms>",
-    "Deadline for the initial initialize handshake (default: max(--timeout, 60000); covers cold `npx` cache fetches before a stdio server starts)",
+    "Deadline for the server's first reply -- the era probe and, on 2025-11-25, the initialize handshake (default: max(--timeout, 60000); covers cold `npx` cache fetches before a stdio server starts)",
   )
   .option("--no-color", "Disable colored output (also honors NO_COLOR env var)")
   .option("--watch", "Re-run tests when files in the cwd change (stdio targets only)")
@@ -279,6 +287,7 @@ program
         watch?: boolean;
         concurrency: string;
         format?: string;
+        specVersion?: SpecVersionOption;
         strict?: boolean;
         minGrade?: "A" | "B" | "C" | "D" | "F";
         header: Record<string, string>;
@@ -300,6 +309,9 @@ program
       try {
         const config = loadConfig(opts.config);
 
+        // CLI flag > config `specVersion` > auto, like --format.
+        const specVersion: SpecVersionOption = opts.specVersion ?? config?.specVersion ?? "auto";
+
         // --list short-circuits before connecting. Transport defaults to
         // http when not specified and no target is provided; if a target
         // is given we infer from it (URL → http, else stdio).
@@ -309,16 +321,41 @@ program
             const t = target ? (looksLikeUrl(target) ? "http" : "stdio") : config?.target?.type;
             if (t === "http" || t === "stdio") transportKind = t;
           }
-          const defs = previewTests({
+          const filters = {
             transport: transportKind,
             only: opts.only ?? config?.only,
             skip: opts.skip ?? config?.skip,
-          });
-          for (const d of defs) {
-            const req = d.required ? chalk.yellow("required") : chalk.dim("optional");
-            console.log(`${chalk.bold(d.id.padEnd(38))} ${chalk.cyan(d.category.padEnd(10))} ${req}  ${d.name}`);
+          };
+          const printCatalog = (defs: TestDefinition[]) => {
+            for (const d of defs) {
+              const req = d.required ? chalk.yellow("required") : chalk.dim("optional");
+              console.log(`${chalk.bold(d.id.padEnd(38))} ${chalk.cyan(d.category.padEnd(10))} ${req}  ${d.name}`);
+            }
+          };
+          // A preview never connects, so `auto` cannot be resolved here:
+          // an explicit spec prints that one catalog, `auto` prints every
+          // catalog in its own labelled section so the reader can find
+          // the ids of whichever suite the live run will pick.
+          if (specVersion !== "auto") {
+            const defs = previewTests({ ...filters, specVersion });
+            printCatalog(defs);
+            console.log(
+              chalk.dim(`\n${defs.length} tests would run for transport=${transportKind} spec=${specVersion}`),
+            );
+            return;
           }
-          console.log(chalk.dim(`\n${defs.length} tests would run for transport=${transportKind}`));
+          const counts: string[] = [];
+          for (const v of SUPPORTED_SPEC_VERSIONS) {
+            const defs = previewTests({ ...filters, specVersion: v });
+            console.log(chalk.bold(`\nMCP ${v} catalog (${defs.length} tests)`));
+            printCatalog(defs);
+            counts.push(`${defs.length} (${v})`);
+          }
+          console.log(
+            chalk.dim(
+              `\n${counts.join(" or ")} tests would run for transport=${transportKind}; --spec-version auto picks one catalog at run time from the era the server speaks`,
+            ),
+          );
           return;
         }
 
@@ -367,6 +404,7 @@ program
             concurrency: parsePositiveInt(opts.concurrency, "--concurrency", 1),
             only,
             skip,
+            specVersion,
             onProgress: verbose
               ? (testId, passed, details) => {
                   const icon = passed ? chalk.green("PASS") : chalk.red("FAIL");
@@ -492,12 +530,20 @@ program
 
 program
   .command("benchmark")
-  .description("Measure ping latency and throughput against an MCP server (URL or stdio command)")
+  .description(
+    "Measure request latency and throughput against an MCP server (URL or stdio command): ping on 2025-11-25, server/discover on 2026-07-28",
+  )
   .argument("[target]", "Server URL or stdio command")
   .argument("[extraArgs...]", "Additional args for stdio command")
-  .option("-r, --requests <n>", "Number of ping requests to send", "100")
+  .option("-r, --requests <n>", "Number of probe requests to send", "100")
   .option("-c, --concurrency <n>", "Concurrent in-flight requests", "1")
   .option("--timeout <ms>", "Per-request timeout in milliseconds", "15000")
+  .addOption(
+    new Option(
+      "--spec-version <version>",
+      "MCP spec revision whose probe to measure (default: auto, or `specVersion` in config). auto sends one 2026-07-28 server/discover first and picks the newest revision the server speaks.",
+    ).choices(SPEC_VERSION_CHOICES),
+  )
   .option("--config <path>", "Load options from a config file")
   .option("--format <format>", "terminal or json", "terminal")
   .option("-H, --header <header>", "HTTP header (repeatable)", parseHeaderArg, {})
@@ -513,6 +559,7 @@ program
         requests: string;
         concurrency: string;
         timeout: string;
+        specVersion?: SpecVersionOption;
         config?: string;
         format: string;
         header: Record<string, string>;
@@ -534,6 +581,7 @@ program
           requests: parsePositiveInt(opts.requests, "--requests", 1),
           concurrency: parsePositiveInt(opts.concurrency, "--concurrency", 1),
           timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
+          specVersion: opts.specVersion ?? config?.specVersion ?? "auto",
         });
         if (opts.format === "json") {
           console.log(JSON.stringify(result, null, 2));

@@ -2,7 +2,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { loadConfig } from "../config.js";
+import { loadConfig, OUTPUT_FORMATS } from "../config.js";
+import { SUPPORTED_SPEC_VERSIONS } from "../spec.js";
 
 let workDir: string;
 
@@ -79,9 +80,40 @@ describe("loadConfig", () => {
     expect(() => loadConfig(undefined, workDir)).toThrow(/"command"/);
   });
 
-  it("rejects an invalid format value", () => {
+  it("rejects an invalid format value and names every accepted one", () => {
     writeFileSync(join(workDir, "mcp-compliance.config.json"), JSON.stringify({ format: "xml" }));
-    expect(() => loadConfig(undefined, workDir)).toThrow(/format must be/);
+    expect(() => loadConfig(undefined, workDir)).toThrow(
+      /format must be one of terminal, json, sarif, github, markdown, html/,
+    );
+  });
+
+  // Issue #67: the config file used to accept only terminal/json/sarif
+  // while the CLI's --format also took github/markdown/html, so a config
+  // pinning one of the latter was rejected as invalid.
+  it("accepts every --format the CLI accepts", () => {
+    for (const format of OUTPUT_FORMATS) {
+      writeFileSync(join(workDir, "mcp-compliance.config.json"), JSON.stringify({ format }));
+      expect(loadConfig(undefined, workDir)?.format, format).toBe(format);
+    }
+    expect([...OUTPUT_FORMATS]).toEqual(["terminal", "json", "sarif", "github", "markdown", "html"]);
+  });
+
+  it("accepts specVersion auto and every supported spec revision", () => {
+    for (const specVersion of ["auto", ...SUPPORTED_SPEC_VERSIONS]) {
+      writeFileSync(join(workDir, "mcp-compliance.config.json"), JSON.stringify({ specVersion }));
+      expect(loadConfig(undefined, workDir)?.specVersion, specVersion).toBe(specVersion);
+    }
+  });
+
+  it("rejects an unsupported specVersion and names the accepted values", () => {
+    writeFileSync(join(workDir, "mcp-compliance.config.json"), JSON.stringify({ specVersion: "2025-06-18" }));
+    expect(() => loadConfig(undefined, workDir)).toThrow(/specVersion: Invalid spec version "2025-06-18"/);
+    expect(() => loadConfig(undefined, workDir)).toThrow(/auto, 2025-11-25, 2026-07-28/);
+  });
+
+  it("rejects a non-string specVersion", () => {
+    writeFileSync(join(workDir, "mcp-compliance.config.json"), JSON.stringify({ specVersion: 2026 }));
+    expect(() => loadConfig(undefined, workDir)).toThrow(/specVersion must be a string/);
   });
 
   it("throws on malformed JSON", () => {

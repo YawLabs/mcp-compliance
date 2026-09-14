@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { diffReports, hasRegressions } from "../diff.js";
+import { diffReports, formatDiff, hasRegressions } from "../diff.js";
 import type { ComplianceReport } from "../types.js";
 
 function stubReport(over: Partial<ComplianceReport> = {}): ComplianceReport {
@@ -38,6 +38,39 @@ describe("diffReports — spec version guard", () => {
     const baseline = stubReport({ specVersion: "2025-06-18" });
     const current = stubReport({ specVersion: "2025-11-25" });
     expect(() => diffReports(baseline, current)).toThrow(/Spec version mismatch/);
+  });
+
+  // The case a CI job hits the day its server upgrades: the stored
+  // baseline is 2025-11-25, `auto` now resolves to 2026-07-28. One tool
+  // version grades both, so the remedy is to pin the run, not to change
+  // tool versions.
+  it("names both versions and suggests pinning --spec-version to the baseline's", () => {
+    const baseline = stubReport({ specVersion: "2025-11-25" });
+    const current = stubReport({ specVersion: "2026-07-28" });
+    let message = "";
+    try {
+      diffReports(baseline, current);
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).toMatch(/Spec version mismatch: baseline is 2025-11-25, current is 2026-07-28/);
+    expect(message).toContain("--spec-version 2025-11-25");
+    expect(message).toContain("--spec-version 2026-07-28");
+    expect(message).not.toMatch(/downgrade the tool/);
+  });
+
+  it("records the shared specVersion on the summary and prints it", () => {
+    const summary = diffReports(stubReport({ specVersion: "2026-07-28" }), stubReport({ specVersion: "2026-07-28" }));
+    expect(summary.specVersion).toBe("2026-07-28");
+    expect(formatDiff(summary)).toContain("Spec version: 2026-07-28");
+  });
+
+  it("falls back to whichever side records a specVersion, else null", () => {
+    const baseOnly = diffReports(stubReport({ specVersion: "2025-11-25" }), stubReport({ specVersion: undefined }));
+    expect(baseOnly.specVersion).toBe("2025-11-25");
+    const neither = diffReports(stubReport({ specVersion: undefined }), stubReport({ specVersion: undefined }));
+    expect(neither.specVersion).toBeNull();
+    expect(formatDiff(neither)).not.toContain("Spec version:");
   });
 
   it("allows matching specVersion to diff normally", () => {
