@@ -7,15 +7,55 @@ import { request } from "undici";
 // share the same code path. If you find yourself reaching for `request`
 // below the lifecycle gate, first check whether Transport.rawRequest /
 // rawPost already exposes what you need.
-import { computeScore } from "./grader.js";
+import {
+  INJECTION_PAYLOADS,
+  INTERNAL_IP_PATTERNS,
+  looksRejected,
+  POISONING_PATTERNS,
+  STACK_TRACE_PATTERNS,
+  VALID_CONTENT_TYPES,
+} from "./checks/patterns.js";
+import { getTestDefinitionMap } from "./definitions/index.js";
+import {
+  buildDiscoverProbe,
+  classifyDiscoverResponse,
+  type DetectionResult,
+  type DetectOptions,
+  detectSpecVersion,
+  REASON_PREFIX,
+} from "./detect.js";
+import { createHarness, supportsTransportByDefinition } from "./harness.js";
 import { readPackageVersion } from "./pkg-version.js";
+import { assembleReport } from "./report.js";
+import {
+  AUTO_DETECT_NOTE_PREFIX,
+  LEGACY_SPEC_VERSION,
+  MODERN_SPEC_VERSION,
+  type SpecVersion,
+  type SpecVersionOption,
+  specBaseFor,
+} from "./spec.js";
+import { runModernSuite } from "./suites/modern/index.js";
 import { createHttpTransport } from "./transport/http.js";
-import type { Transport } from "./transport/index.js";
-import { createStdioTransport } from "./transport/stdio.js";
+import type { Transport, TransportResponse } from "./transport/index.js";
+import { createStdioTransport, type StdioTransport } from "./transport/stdio.js";
 import type { ComplianceReport, TestDefinition, TestResult, TransportTarget } from "./types.js";
-import { REPORT_SCHEMA_VERSION, TEST_DEFINITIONS } from "./types.js";
+import { TEST_DEFINITIONS } from "./types.js";
 
+export { findTestDefinition, getTestDefinitions, MODERN_TEST_DEFINITIONS } from "./definitions/index.js";
+export { classifyDiscoverResponse, type DetectionResult, detectSpecVersion } from "./detect.js";
 export { computeGrade, computeScore } from "./grader.js";
+export { dedupAndCapWarnings } from "./harness.js";
+export {
+  DEFAULT_SPEC_VERSION,
+  LEGACY_SPEC_VERSION,
+  MODERN_SPEC_VERSION,
+  parseSpecVersionOption,
+  type SpecVersion,
+  type SpecVersionOption,
+  SUPPORTED_SPEC_VERSIONS,
+  specBaseFor,
+} from "./spec.js";
 export type { ComplianceReport, TestResult } from "./types.js";
 export { TEST_DEFINITIONS } from "./types.js";
 
@@ -23,55 +63,17 @@ const TEST_DEFINITIONS_MAP = new Map(TEST_DEFINITIONS.map((t) => [t.id, t]));
 
 const TOOL_VERSION = readPackageVersion(import.meta.url);
 
-export const SPEC_VERSION = "2025-11-25";
-export const SPEC_BASE = `https://modelcontextprotocol.io/specification/${SPEC_VERSION}`;
-
-const VALID_CONTENT_TYPES = ["text", "image", "audio", "resource", "resource_link"];
-
-const INJECTION_PAYLOADS = {
-  command: ["; cat /etc/passwd", "$(whoami)", "| ls -la", "`id`", "&& echo pwned"],
-  sql: ["' OR 1=1 --", "'; DROP TABLE users; --", "1 UNION SELECT * FROM information_schema.tables--"],
-  pathTraversal: ["../../etc/passwd", "..\\..\\windows\\system.ini", "%2e%2e%2f%2e%2e%2fetc%2fpasswd"],
-  ssrf: ["http://169.254.169.254/latest/meta-data/", "http://127.0.0.1:22", "http://[::1]/", "http://10.0.0.1/"],
-};
-
-// Patterns that indicate leakage of server internals in an error
-// response. The test name (security-error-no-stacktrace) is historical —
-// this catches stack traces *and* adjacent implementation-detail leaks
-// (filesystem paths, DB connection strings) as the rubric calls out.
-// Deliberately NOT included:
-//   - /password|passwd|secret|credential/i — false-positives every
-//     legitimate auth error ("Invalid password", "Missing credential").
-//     If you want a secrets-leak check, it belongs in its own test with
-//     a narrower signature (e.g. Bearer tokens, AWS keys).
-//   - bare /ENOENT|EACCES|EPERM/ — these appear in well-formed error
-//     messages ("ENOENT: no such file"), so we only flag them when they
-//     co-occur with a filesystem path below.
-const STACK_TRACE_PATTERNS = [
-  /at\s+\S+\s+\(.*:\d+:\d+\)/i, // Node.js: "at Function (file.js:10:5)"
-  /Traceback\s+\(most recent/i, // Python
-  /\.py",\s+line\s+\d+/i, // Python file reference
-  /\.java:\d+\)/i, // Java
-  /\.go:\d+/i, // Go
-  /from\s+\S+\.rb:\d+/i, // Ruby
-  /\.cs:line\s+\d+/i, // C#/.NET
-  /#\d+\s+\/.*\.php\(\d+\)/i, // PHP
-  /panicked\s+at\s+'/i, // Rust
-  /node_modules\//, // Node.js module paths (filesystem layout leak)
-  /\/usr\/local\/|\/home\/|\/root\//, // Unix absolute paths
-  /[A-Z]:\\[\w\s.-]+\\[\w\s.-]+/, // Windows absolute paths (drive + 2+ segments)
-  /jdbc:|mysql:\/\/|postgres(?:ql)?:\/\/|mongodb(?:\+srv)?:\/\//i, // DB connection strings
-];
-
-const INTERNAL_IP_PATTERNS = [
-  /\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
-  /\b172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/,
-  /\b192\.168\.\d{1,3}\.\d{1,3}\b/,
-  /\b127\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
-  /\b::1\b/, // IPv6 loopback
-  /\bfe80:/i, // IPv6 link-local
-  /\bf[cd][0-9a-f]{2}:/i, // IPv6 unique local (fc00::/fd00::)
-];
+/**
+ * The legacy (2025-11-25) spec version. Kept for library consumers that
+ * pinned against a single global; runs may now resolve to a different
+ * version (see `RunOptions.specVersion`), so read `report.specVersion`
+ * and use `specBaseFor(report.specVersion)` for spec links.
+ *
+ * @deprecated Use `LEGACY_SPEC_VERSION` / `SUPPORTED_SPEC_VERSIONS` and `specBaseFor()`.
+ */
+export const SPEC_VERSION: SpecVersion = LEGACY_SPEC_VERSION;
+/** @deprecated Use `specBaseFor(version)`. */
+export const SPEC_BASE = specBaseFor(LEGACY_SPEC_VERSION);
 
 function createIdCounter(start = 0) {
   let id = start;
@@ -79,25 +81,94 @@ function createIdCounter(start = 0) {
 }
 
 /**
- * Dedupe and cap a list of warnings, preserving insertion order and
- * appending a truncation sentinel when capped. Extracted so the cap
- * semantics can be unit-tested without spinning up a suite run.
- *
- * @internal Exported for testing.
+ * undici rejects an `AbortSignal.timeout()` with a DOMException named
+ * `TimeoutError`; its own deadlines reject with `HeadersTimeoutError` /
+ * `BodyTimeoutError`. A refused connection or DNS failure is a plain
+ * Error with an errno code (ECONNREFUSED, ENOTFOUND) and no such name.
  */
-export function dedupAndCapWarnings(warnings: readonly string[], max: number): string[] {
-  const seen = new Set<string>();
-  const deduped: string[] = [];
-  for (const w of warnings) {
-    if (seen.has(w)) continue;
-    seen.add(w);
-    deduped.push(w);
+function isTimeoutError(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return typeof name === "string" && /timeout/i.test(name);
+}
+
+function formatSeconds(ms: number): string {
+  return ms % 1000 === 0 ? `${ms / 1000}s` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+/**
+ * How long the stdio era probe may sit unanswered before `onStatus`
+ * tells the user what the wait is. A server that answers the probe
+ * (result or error) does so in milliseconds; only a 2025-11-25 server
+ * that IGNORES unknown pre-initialize methods reaches this.
+ */
+const STDIO_PROBE_STATUS_DELAY_MS = 2000;
+
+/**
+ * The stdio era probe with a status hook: nothing has been printed since
+ * "Testing stdio:..." and the probe may take the whole startup budget,
+ * so ~2s in say what is being waited on and how to skip it.
+ */
+async function detectStdioEra(
+  transport: Transport,
+  opts: DetectOptions & { onStatus?: (message: string) => void },
+): Promise<DetectionResult> {
+  const timer = opts.onStatus
+    ? setTimeout(() => {
+        opts.onStatus?.(
+          `Probing spec era (server/discover, up to ${formatSeconds(opts.timeout)}). A ${LEGACY_SPEC_VERSION} server that ignores unknown methods takes the whole startup timeout; --spec-version ${LEGACY_SPEC_VERSION} skips the probe.`,
+        );
+      }, STDIO_PROBE_STATUS_DELAY_MS)
+    : null;
+  try {
+    return await detectSpecVersion(transport, opts);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  if (deduped.length > max) {
-    const truncated = deduped.length - max;
-    return [...deduped.slice(0, max), `... and ${truncated} more warning(s) suppressed`];
+}
+
+/**
+ * The stderr a dead child left behind. The 'exit' event that rejected the
+ * probe can land before the parent has read the pipe (a crashing Node
+ * prints its stack, then exits; the two completions are not ordered), so
+ * give the stream a moment to drain before quoting it.
+ */
+async function settledStderr(dead: StdioTransport): Promise<string> {
+  const deadline = Date.now() + 200;
+  while (!dead.stderrTail().trim() && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 20));
   }
-  return deduped;
+  await new Promise((r) => setTimeout(r, 20));
+  return dead.stderrTail();
+}
+
+/**
+ * The last few meaningful stderr lines of a stdio child, one line, for a
+ * warning. Drops stack-frame lines ("    at ...") and bare punctuation so
+ * the line that names the cause (e.g. "Error: unhandled method
+ * server/discover") survives ahead of the frames that follow it.
+ */
+function summarizeStderr(tail: string): string {
+  const lines = tail
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !/^at\s/.test(l) && /[A-Za-z0-9]/.test(l));
+  return lines
+    .slice(-3)
+    .map((l) => (l.length > 160 ? `${l.slice(0, 157)}...` : l))
+    .join(" | ");
+}
+
+/** Collapse whitespace (a transport error carries a multi-line stderr tail) and cap the length for a details string. */
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 3)}...` : flat;
+}
+
+/** The probe answer in a pinned-run warning: "a DiscoverResult (...)" or the raw shape ("JSON-RPC error -32601"). */
+function describeProbeAnswer(d: DetectionResult): string {
+  if (d.discover) return `a DiscoverResult (supportedVersions [${(d.supportedVersions ?? []).join(", ")}])`;
+  const rest = d.reason.startsWith(REASON_PREFIX) ? d.reason.slice(REASON_PREFIX.length) : d.reason;
+  return rest.replace(/, legacy$/, "");
 }
 
 /**
@@ -173,23 +244,35 @@ export interface PreviewOptions {
   only?: string[];
   /** Exclude matching categories or test IDs. */
   skip?: string[];
+  /**
+   * Spec revision whose catalog to preview. Defaults to 2025-11-25.
+   * There is no `auto` here: a preview never connects, so it cannot
+   * detect the server's era.
+   */
+  specVersion?: SpecVersion;
 }
 
 /**
  * Return the set of TestDefinitions that would actually run given the
  * filters. Powers the CLI's --list flag without requiring a connection.
  * Capability-gated tests are still included — that gating happens after
- * the live initialize handshake and can't be predicted offline.
+ * the live handshake / discover and can't be predicted offline.
+ *
+ * Filter precedence mirrors the live run (`only` wins; `skip` is only
+ * consulted when `only` is empty) so `--list` predicts what will run.
  */
 export function previewTests(opts: PreviewOptions = {}): TestDefinition[] {
   const transport = opts.transport ?? "http";
-  return TEST_DEFINITIONS.filter((def) => {
-    if (!supportsTransport(def, transport)) return false;
+  const specVersion = opts.specVersion ?? LEGACY_SPEC_VERSION;
+  const supports = specVersion === LEGACY_SPEC_VERSION ? supportsTransport : supportsTransportByDefinition;
+  const defs = [...getTestDefinitionMap(specVersion).values()];
+  return defs.filter((def) => {
+    if (!supports(def, transport)) return false;
     if (opts.only?.length) {
-      if (!opts.only.includes(def.category) && !opts.only.includes(def.id)) return false;
+      return opts.only.includes(def.category) || opts.only.includes(def.id);
     }
     if (opts.skip?.length) {
-      if (opts.skip.includes(def.category) || opts.skip.includes(def.id)) return false;
+      return !opts.skip.includes(def.category) && !opts.skip.includes(def.id);
     }
     return true;
   });
@@ -227,8 +310,22 @@ export interface RunOptions {
   only?: string[];
   /** Skip tests matching these category names or test IDs */
   skip?: string[];
-  /** Preflight connectivity check timeout in milliseconds (default: min(timeout, 10000)) */
+  /**
+   * HTTP only: deadline for the preflight request, in milliseconds
+   * (default: min(timeout, 10000)). The preflight body is the era probe,
+   * so under `specVersion: "auto"` a preflight that TIMES OUT (as
+   * opposed to a refused connection) is re-probed once within
+   * `startupTimeout` before the run defaults to 2025-11-25.
+   */
   preflightTimeout?: number;
+  /**
+   * Optional callback for human-facing status lines while the runner is
+   * waiting on something no test has started yet -- today the stdio era
+   * probe, which fires this ~2s in when a 2025-11-25 server that ignores
+   * unknown methods is silently costing the whole startup timeout. Not
+   * part of the report; the CLI prints it dim to stderr in terminal mode.
+   */
+  onStatus?: (message: string) => void;
   /**
    * Maximum number of parallel-safe tests in flight at once. Default 1
    * (strictly sequential — matches pre-0.12 behavior). Tests are only
@@ -248,6 +345,16 @@ export interface RunOptions {
    * stops the server from burning compute on a dropped client.
    */
   signal?: AbortSignal;
+  /**
+   * Which MCP specification revision to test against. `auto` (default)
+   * probes the server with a modern `server/discover` request and grades
+   * the newest era it speaks: a DiscoverResult or a recognised modern
+   * error (-32020/-32021/-32022) selects 2026-07-28, anything else —
+   * including no reply — selects 2025-11-25. A dual-era server is graded
+   * as 2026-07-28 and the report warns that the legacy side was not
+   * tested. The report's `specVersion` is always the RESOLVED version.
+   */
+  specVersion?: SpecVersionOption;
 }
 
 /**
@@ -276,20 +383,31 @@ export async function runComplianceSuite(
     throw new Error("stdio target requires a command");
   }
 
-  // Construct transport.
-  const transport: Transport =
-    resolvedTarget.type === "http"
-      ? createHttpTransport({
-          url: resolvedTarget.url,
-          headers: resolvedTarget.headers ?? options.headers,
-        })
-      : createStdioTransport({
+  // Construct transport. The stdio factory is kept so the modern suite
+  // can spawn an independent second instance for probes that must not
+  // share the suite's process (a dual-era stdio server pins its era per
+  // process).
+  const spawnStdio = () =>
+    resolvedTarget.type === "stdio"
+      ? createStdioTransport({
           command: resolvedTarget.command,
           args: resolvedTarget.args,
           env: resolvedTarget.env,
           cwd: resolvedTarget.cwd,
           verbose: resolvedTarget.verbose,
-        });
+        })
+      : null;
+  // Reassigned once, and only on stdio: when the era probe kills the child
+  // (a legacy server that exits on an unknown pre-initialize request) the
+  // suite runs against a fresh instance; `finally` closes whichever is
+  // current.
+  let transport: Transport =
+    resolvedTarget.type === "http"
+      ? createHttpTransport({
+          url: resolvedTarget.url,
+          headers: resolvedTarget.headers ?? options.headers,
+        })
+      : (spawnStdio() as Transport);
 
   // Wrap everything below in try/finally so the child process is always
   // cleaned up — even if a test throws or the runner aborts mid-suite.
@@ -307,48 +425,211 @@ export async function runComplianceSuite(
         ? resolvedTarget.url
         : `stdio:${resolvedTarget.command}${resolvedTarget.args?.length ? ` ${resolvedTarget.args.join(" ")}` : ""}`;
 
+    const clientInfo = { name: "mcp-compliance", version: TOOL_VERSION };
+    const requested: SpecVersionOption = options.specVersion ?? "auto";
+
+    // Use high start offset for the main ID counter to avoid collision with transport test hardcoded IDs
+    const nextId = createIdCounter(1000);
+    const timeout = options.timeout || 15000;
+    // Startup budget covers the first exchange: the stdio era probe, the
+    // legacy initialize + initialized notification, and on HTTP the era
+    // re-probe after a preflight timeout. Cold `npx @pkg serve` targets
+    // can take 20-40s to resolve and exec the package before the MCP loop
+    // runs; a 15s request timeout would fire before the first byte.
+    // Default to max(timeout, 60000).
+    const startupTimeout = options.startupTimeout ?? Math.max(timeout, 60000);
+    const preflightTimeout = options.preflightTimeout ?? Math.min(timeout, 10000);
+
     // Preflight connectivity check — fail fast instead of running all tests
-    // against an unreachable server. HTTP-only: a quick ping catches DNS,
-    // TLS, and connection-refused failures before we burn through 80
-    // tests. For stdio there's no equivalent — spawn errors surface via
-    // the child 'error' event (handled by the transport) and the
-    // lifecycle-init test is the real reachability signal.
+    // against an unreachable server. HTTP-only: a quick request catches DNS,
+    // TLS, and connection-refused failures before we burn through the
+    // suite. For stdio there's no equivalent — spawn errors surface via
+    // the child 'error' event (handled by the transport) and the first
+    // exchange is the real reachability signal.
+    //
+    // The preflight body is the spec's era probe — a modern
+    // `server/discover` with full `_meta` and headers — so on HTTP one
+    // round-trip answers both "is it up" and "which era does it speak".
+    // Any HTTP response at all counts as reachable. A thrown error is
+    // split two ways: a TIMEOUT (the server may just be cold; under
+    // `auto` the probe is retried within the startup budget below) and a
+    // connection failure (refused, DNS, TLS), which marks the server
+    // unreachable right away.
     let serverReachable = true;
+    let preflightResponse: TransportResponse | null = null;
+    let preflightTimedOut = false;
+    let preflightError = "";
     if (resolvedTarget.type === "http") {
       try {
-        const preflightTimeout = options.preflightTimeout ?? Math.min(options.timeout || 15000, 10000);
+        const probe = buildDiscoverProbe(clientInfo);
         const preflight = await request(resolvedTarget.url, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Accept: "application/json, text/event-stream",
+            ...probe.headers,
             ...userHeaders,
           },
-          body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "ping" }),
+          body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "server/discover", params: probe.params }),
           signal: AbortSignal.timeout(preflightTimeout),
         });
-        await preflight.body.text();
-      } catch {
+        const text = await preflight.body.text();
+        const rawCt = preflight.headers["content-type"];
+        const ct = (Array.isArray(rawCt) ? rawCt[0] : rawCt || "").toLowerCase();
+        let body: unknown = null;
+        if (ct.includes("text/event-stream")) body = parseSSEResponse(text);
+        if (body === null) {
+          try {
+            body = JSON.parse(text);
+          } catch {
+            body = { _raw: text };
+          }
+        }
+        preflightResponse = { body, requestId: 0, statusCode: preflight.statusCode, headers: {} };
+      } catch (err: unknown) {
         serverReachable = false;
+        preflightTimedOut = isTimeoutError(err);
+        preflightError = err instanceof Error ? err.message : String(err);
       }
     }
 
-    const tests: TestResult[] = [];
-    const warnings: string[] = [];
+    const preWarnings: string[] = [];
+
+    // ── Spec version resolution ──────────────────────────────────────
+    // `auto` classifies the spec's own era probe (a modern
+    // `server/discover`). On HTTP the preflight already sent it; on stdio
+    // it is the first exchange and shares the startup budget. An
+    // unreachable HTTP server takes the legacy default, so today's
+    // "everything fails" report shape is preserved.
+    let detection: DetectionResult | undefined;
+    let resolvedSpec: SpecVersion;
+    let reprobedAfterTimeout = false;
+    if (requested === "auto" && resolvedTarget.type === "http" && preflightTimedOut) {
+      // The preflight deadline is short by design (min(timeout, 10s)) and
+      // a modern server on a cold start can miss it; the legacy path gave
+      // that server the whole startup budget for `initialize`, so give
+      // the era probe the same budget before defaulting to 2025-11-25.
+      reprobedAfterTimeout = true;
+      options.onStatus?.(
+        `Preflight got no reply within ${preflightTimeout}ms; re-sending the era probe (server/discover, up to ${formatSeconds(startupTimeout)}) before defaulting to ${LEGACY_SPEC_VERSION}.`,
+      );
+      const retry = await detectSpecVersion(transport, {
+        nextId,
+        timeout: startupTimeout,
+        clientInfo,
+        signal: options.signal,
+      });
+      if (retry.responded) {
+        serverReachable = true;
+        detection = retry;
+      }
+    }
     if (!serverReachable) {
-      warnings.push(
-        `Server at ${displayUrl} is unreachable — all tests will fail. Check the URL or command and ensure the server is running.`,
+      preWarnings.push(
+        preflightTimedOut
+          ? `Server at ${displayUrl} did not answer the preflight within ${preflightTimeout}ms${reprobedAfterTimeout ? ` or the era probe within ${startupTimeout}ms` : ""}; treating it as unreachable -- every test that needs the server will fail. A slow cold start needs a higher --preflight-timeout${reprobedAfterTimeout ? " / --startup-timeout" : ""}.`
+          : `Server at ${displayUrl} is unreachable (${preflightError}) -- every test that needs the server will fail. Check the URL or command and ensure the server is running.`,
       );
     }
-    // Use high start offset for the main ID counter to avoid collision with transport test hardcoded IDs
-    const nextId = createIdCounter(1000);
-    const timeout = options.timeout || 15000;
-    // Startup budget covers initialize + initialized notification. Cold
-    // `npx @pkg serve` targets can take 20-40s to resolve and exec the
-    // package before the MCP loop runs; a 15s request timeout would fire
-    // before the first byte. Default to max(timeout, 60000).
-    const startupTimeout = options.startupTimeout ?? Math.max(timeout, 60000);
-    const retries = options.retries || 0;
+    if (requested === "auto" && serverReachable) {
+      if (!detection) {
+        detection =
+          resolvedTarget.type === "http"
+            ? classifyDiscoverResponse(preflightResponse)
+            : await detectStdioEra(transport, {
+                nextId,
+                timeout: startupTimeout,
+                clientInfo,
+                signal: options.signal,
+                onStatus: options.onStatus,
+              });
+      }
+      resolvedSpec = detection.version;
+      preWarnings.push(
+        `${AUTO_DETECT_NOTE_PREFIX}${resolvedSpec} (${detection.reason}). Pin with --spec-version to override.`,
+      );
+      // A legacy server whose dispatcher throws on an unknown method dies
+      // on the probe. The transport already rejected the probe with the
+      // exit diagnostic (detectSpecVersion folds that into "no response");
+      // say so, and give the suite a live child instead of a dead one.
+      if (transport.kind === "stdio" && (transport as StdioTransport).exited) {
+        const dead = transport as StdioTransport;
+        const tail = summarizeStderr(await settledStderr(dead));
+        const why =
+          detection.era === "legacy"
+            ? ` A ${LEGACY_SPEC_VERSION} server must tolerate unknown pre-initialize requests (answer with a JSON-RPC error or ignore them, never exit); pin --spec-version ${LEGACY_SPEC_VERSION} to skip the probe.`
+            : "";
+        preWarnings.push(
+          `Server exited (code ${dead.exitCode}) after the ${MODERN_SPEC_VERSION} era probe (server/discover)${tail ? `; last stderr: ${tail}` : ""}. The suite spawned a fresh instance.${why}`,
+        );
+        await transport.close().catch(() => {});
+        transport = spawnStdio() as Transport;
+      }
+    } else {
+      resolvedSpec = requested === "auto" ? LEGACY_SPEC_VERSION : requested;
+      // A pinned HTTP run still sent the probe as its preflight; when the
+      // answer belongs to the OTHER era, say so -- a pinned 2025-11-25 run
+      // against a modern-only server otherwise fails 20 tests whose
+      // headline ("lifecycle-init: ...") never mentions 2026-07-28.
+      if (requested !== "auto" && preflightResponse) {
+        const seen = classifyDiscoverResponse(preflightResponse);
+        if (seen.version !== requested && !seen.eraUndetermined) {
+          preWarnings.push(
+            `Server answered the ${MODERN_SPEC_VERSION} server/discover probe with ${describeProbeAnswer(seen)}; this run is pinned to ${requested}. Re-run with --spec-version ${seen.version} (or auto) to grade it.`,
+          );
+        }
+      }
+    }
+
+    // `--only` / `--skip` values that match nothing in the resolved
+    // catalog would silently produce an empty (grade F) or partial run.
+    // Ids are only meaningful within one catalog — a legacy id such as
+    // lifecycle-init does not exist in 2026-07-28 — so name the miss.
+    {
+      const catalog = getTestDefinitionMap(resolvedSpec);
+      const categories = new Set([...catalog.values()].map((d) => d.category as string));
+      const unknown = [...(options.only ?? []), ...(options.skip ?? [])].filter(
+        (f) => !catalog.has(f) && !categories.has(f),
+      );
+      if (unknown.length > 0) {
+        preWarnings.push(
+          `Filter value(s) ${unknown.map((u) => `"${u}"`).join(", ")} match no test id or category in the ${resolvedSpec} catalog; run --list --spec-version ${resolvedSpec} to see valid ids.`,
+        );
+      }
+    }
+
+    if (resolvedSpec === MODERN_SPEC_VERSION) {
+      return await runModernSuite({
+        transport,
+        options,
+        nextId,
+        timeout,
+        startupTimeout,
+        backendUrl,
+        userHeaders,
+        displayUrl,
+        toolVersion: TOOL_VERSION,
+        detection,
+        warnings: preWarnings,
+        spawnFresh: resolvedTarget.type === "stdio" ? () => spawnStdio() as Transport : undefined,
+      });
+    }
+
+    const harness = createHarness({
+      definitions: TEST_DEFINITIONS_MAP,
+      specBase: SPEC_BASE,
+      transportKind: transport.kind,
+      supportsTransport,
+      only: options.only,
+      skip: options.skip,
+      retries: options.retries,
+      concurrency: options.concurrency,
+      signal: options.signal,
+      onProgress: options.onProgress,
+      onTestComplete: options.onTestComplete,
+    });
+    const { tests, warnings, test, drainPool } = harness;
+    warnings.push(...preWarnings);
 
     // Session state — kept as locals for backwards-compat with existing
     // call sites that reference `sessionId`/`negotiatedProtocolVersion`
@@ -385,7 +666,8 @@ export async function runComplianceSuite(
         statusCode: res.statusCode ?? 200,
         body: res.body as any,
         headers: res.headers ?? {},
-        requestId: res.requestId,
+        // The legacy suite only ever allocates numeric ids.
+        requestId: res.requestId as number,
       };
     }
     async function mcpNotification(
@@ -405,18 +687,6 @@ export async function runComplianceSuite(
     const rpc = (method: string, params?: unknown) =>
       mcpRequest(backendUrl, method, params, nextId, buildHeaders(), timeout);
 
-    function shouldRun(id: string, category: string): boolean {
-      const def = TEST_DEFINITIONS_MAP.get(id);
-      if (!supportsTransport(def, transport.kind)) return false;
-      if (options.only && options.only.length > 0) {
-        return options.only.includes(category) || options.only.includes(id);
-      }
-      if (options.skip && options.skip.length > 0) {
-        return !options.skip.includes(category) && !options.skip.includes(id);
-      }
-      return true;
-    }
-
     const serverInfo = {
       protocolVersion: null as string | null,
       name: null as string | null,
@@ -429,97 +699,6 @@ export async function runComplianceSuite(
     let resourceNames: string[] = [];
     let promptCount = 0;
     let promptNames: string[] = [];
-
-    // Parallel execution pool. Tests marked `parallelSafe: true` in
-    // TEST_DEFINITIONS are queued here up to `concurrency` at a time.
-    // Sequential tests call `drainPool()` first to barrier against any
-    // pending parallel work, so order-dependent state (cachedToolsList,
-    // sessionId, etc.) stays consistent.
-    const concurrency = Math.max(1, options.concurrency ?? 1);
-    const inFlight = new Set<Promise<void>>();
-
-    async function drainPool(): Promise<void> {
-      while (inFlight.size > 0) {
-        await Promise.race(inFlight);
-      }
-    }
-
-    async function runTestFn(
-      id: string,
-      name: string,
-      category: TestResult["category"],
-      required: boolean,
-      specRef: string,
-      fn: () => Promise<{ passed: boolean; details: string }>,
-    ): Promise<void> {
-      const start = Date.now();
-      let lastResult = { passed: false, details: "" };
-
-      for (let attempt = 0; attempt <= retries; attempt++) {
-        try {
-          lastResult = await fn();
-          if (lastResult.passed) break;
-          if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
-          lastResult = { passed: false, details: `Error: ${message}` };
-          if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-        }
-      }
-
-      const result: TestResult = {
-        id,
-        name,
-        category,
-        required,
-        passed: lastResult.passed,
-        details: lastResult.details,
-        durationMs: Date.now() - start,
-        specRef: `${SPEC_BASE}/${specRef}`,
-      };
-      tests.push(result);
-      options.onProgress?.(id, lastResult.passed, lastResult.details);
-      options.onTestComplete?.(result);
-    }
-
-    async function test(
-      id: string,
-      name: string,
-      category: TestResult["category"],
-      required: boolean,
-      specRef: string,
-      fn: () => Promise<{ passed: boolean; details: string }>,
-    ): Promise<void> {
-      // Abort gate: if the caller's signal has fired, drop any pending
-      // parallel work and propagate the reason. We check at the top of
-      // every test() call so the first awaited test after abort returns
-      // immediately rather than waiting on the rest of the suite.
-      if (options.signal?.aborted) {
-        if (inFlight.size > 0) await drainPool().catch(() => {});
-        throw options.signal.reason ?? new Error("Aborted");
-      }
-
-      if (!shouldRun(id, category)) return;
-
-      const def = TEST_DEFINITIONS_MAP.get(id);
-      const eligible = concurrency > 1 && def?.parallelSafe === true;
-
-      if (!eligible) {
-        // Sequential path: barrier against any in-flight parallel tests
-        // first, then execute synchronously. Preserves the pre-0.12
-        // ordering semantics.
-        if (inFlight.size > 0) await drainPool();
-        await runTestFn(id, name, category, required, specRef, fn);
-        return;
-      }
-
-      // Parallel path: wait for a slot, then launch without awaiting.
-      while (inFlight.size >= concurrency) await Promise.race(inFlight);
-      const p = runTestFn(id, name, category, required, specRef, fn).finally(() => {
-        inFlight.delete(p);
-      });
-      inFlight.add(p);
-    }
 
     // ── 1. TRANSPORT (basic, pre-init) ───────────────────────────────
 
@@ -699,6 +878,9 @@ export async function runComplianceSuite(
     // ── 2. LIFECYCLE SETUP (always runs) ─────────────────────────────
 
     let initRes: any = null;
+    // Why the handshake produced no response at all (transport error:
+    // timeout, crashed child, refused connection); lifecycle-init prints it.
+    let initError: string | null = null;
     const initStart = Date.now();
     try {
       // Declare all three client capabilities so servers see us as a
@@ -741,8 +923,9 @@ export async function runComplianceSuite(
           transport.setProtocolVersion(result.protocolVersion);
         }
       }
-    } catch {
-      // Init failed — lifecycle tests will report the failure
+    } catch (err: unknown) {
+      // Init failed — lifecycle-init reports the failure with this reason.
+      initError = err instanceof Error ? err.message : String(err);
     }
 
     // Warn if initialize crossed the per-request timeout. The server
@@ -780,9 +963,25 @@ export async function runComplianceSuite(
       true,
       "basic/lifecycle#initialization",
       async () => {
-        if (!initRes) return { passed: false, details: "Initialize request failed" };
+        if (!initRes) {
+          return { passed: false, details: `Initialize request failed: ${oneLine(initError ?? "no response", 400)}` };
+        }
         const result = initRes.body?.result;
-        if (!result) return { passed: false, details: "No result in response" };
+        if (!result) {
+          // A modern-only server answers initialize with a JSON-RPC error
+          // that (per spec SHOULD) names the versions it does speak; that
+          // message is the one diagnostic a pinned legacy run can show.
+          const err = initRes.body?.error;
+          if (err && typeof err === "object") {
+            const code = typeof err.code === "number" ? err.code : "?";
+            const message = typeof err.message === "string" ? err.message : "";
+            return {
+              passed: false,
+              details: `Initialize answered with JSON-RPC error ${code}${message ? `: ${oneLine(message, 300)}` : ""}${initRes.statusCode !== 200 ? ` (HTTP ${initRes.statusCode})` : ""}`,
+            };
+          }
+          return { passed: false, details: "No result in response" };
+        }
         return { passed: !!result.protocolVersion, details: `Protocol: ${result.protocolVersion || "missing"}` };
       },
     );
@@ -1149,64 +1348,6 @@ export async function runComplianceSuite(
           passed: true,
           details: `${applicable.length} listChanged notification(s) accepted: ${applicable.map((n) => n.method).join(", ")}`,
         };
-      },
-    );
-
-    // Progress token test — send request with _meta.progressToken and check for progress events
-    await test(
-      "lifecycle-progress-token",
-      "Supports progress tokens in requests",
-      "lifecycle",
-      false,
-      "basic/utilities#progress",
-      async () => {
-        if (!hasTools || toolNames.length === 0) {
-          return { passed: true, details: "No tools available for progress token test (skipped)" };
-        }
-        // Send a tools/call with _meta.progressToken via raw request to read SSE for progress events
-        const progressToken = "compliance-progress-test";
-        const reqBody = JSON.stringify({
-          jsonrpc: "2.0",
-          id: nextId(),
-          method: "tools/call",
-          params: {
-            name: toolNames[0],
-            arguments: {},
-            _meta: { progressToken },
-          },
-        });
-        try {
-          const res = await request(backendUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Accept: "text/event-stream",
-              ...buildHeaders(),
-            },
-            body: reqBody,
-            signal: AbortSignal.timeout(timeout),
-          });
-          const text = await res.body.text();
-          const rawCtProgress = res.headers["content-type"];
-          const ct = (Array.isArray(rawCtProgress) ? rawCtProgress[0] : rawCtProgress || "").toLowerCase();
-          // Check if any SSE events contain progress notifications
-          if (ct.includes("text/event-stream") && text.includes("notifications/progress")) {
-            return { passed: true, details: "Server sent progress notifications via SSE with progressToken" };
-          }
-          // Server may not support progress — that's acceptable, just note it
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            return {
-              passed: true,
-              details: "Server accepted request with progressToken (no progress events observed — optional)",
-            };
-          }
-          return { passed: true, details: `HTTP ${res.statusCode} — request with progressToken accepted` };
-        } catch {
-          return {
-            passed: true,
-            details: "Request with progressToken handled (no progress events observed — optional)",
-          };
-        }
       },
     );
 
@@ -1802,6 +1943,67 @@ export async function runComplianceSuite(
         },
       );
     }
+
+    // Progress token test — send request with _meta.progressToken and check
+    // for progress events. Lives after the tools section on purpose: it
+    // needs `toolNames`, which tools-list fills. It used to sit among the
+    // lifecycle tests and always saw an empty list, so it never ran.
+    await test(
+      "lifecycle-progress-token",
+      "Supports progress tokens in requests",
+      "lifecycle",
+      false,
+      "basic/utilities#progress",
+      async () => {
+        if (!hasTools || toolNames.length === 0) {
+          return { passed: true, details: "No tools available for progress token test (skipped)" };
+        }
+        // Send a tools/call with _meta.progressToken via raw request to read SSE for progress events
+        const progressToken = "compliance-progress-test";
+        const reqBody = JSON.stringify({
+          jsonrpc: "2.0",
+          id: nextId(),
+          method: "tools/call",
+          params: {
+            name: toolNames[0],
+            arguments: {},
+            _meta: { progressToken },
+          },
+        });
+        try {
+          const res = await request(backendUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+              ...buildHeaders(),
+            },
+            body: reqBody,
+            signal: AbortSignal.timeout(timeout),
+          });
+          const text = await res.body.text();
+          const rawCtProgress = res.headers["content-type"];
+          const ct = (Array.isArray(rawCtProgress) ? rawCtProgress[0] : rawCtProgress || "").toLowerCase();
+          // Check if any SSE events contain progress notifications
+          if (ct.includes("text/event-stream") && text.includes("notifications/progress")) {
+            return { passed: true, details: "Server sent progress notifications via SSE with progressToken" };
+          }
+          // Server may not support progress — that's acceptable, just note it
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            return {
+              passed: true,
+              details: "Server accepted request with progressToken (no progress events observed — optional)",
+            };
+          }
+          return { passed: true, details: `HTTP ${res.statusCode} — request with progressToken accepted` };
+        } catch {
+          return {
+            passed: true,
+            details: "Request with progressToken handled (no progress events observed — optional)",
+          };
+        }
+      },
+    );
 
     // ── 6. RESOURCES ─────────────────────────────────────────────────
 
@@ -2622,10 +2824,28 @@ export async function runComplianceSuite(
         }
         const uriWithToken = `${backendUrl}${backendUrl.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(token)}`;
         try {
-          // Send WITHOUT auth header, WITH token in URI
-          const noAuthHeaders: Record<string, string> = {};
+          // Send WITHOUT the Authorization header, WITH the token in the
+          // URI. This goes through undici directly: the transport is bound
+          // to the plain URL and re-injects the configured Authorization
+          // header on every request, which used to turn this probe into an
+          // ordinary authenticated call whose 2xx read as "accepted a token
+          // in the query string" — a false failure on every server with auth.
+          const noAuthHeaders: Record<string, string> = {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+          };
+          for (const [k, v] of Object.entries(userHeaders)) {
+            if (k.toLowerCase() !== "authorization") noAuthHeaders[k] = v;
+          }
           if (sessionId) noAuthHeaders["mcp-session-id"] = sessionId;
-          const res = await mcpRequest(uriWithToken, "ping", undefined, nextId, noAuthHeaders, timeout);
+          if (negotiatedProtocolVersion) noAuthHeaders["mcp-protocol-version"] = negotiatedProtocolVersion;
+          const res = await request(uriWithToken, {
+            method: "POST",
+            headers: noAuthHeaders,
+            body: JSON.stringify({ jsonrpc: "2.0", id: nextId(), method: "ping" }),
+            signal: AbortSignal.timeout(timeout),
+          });
+          await res.body.text();
           if (res.statusCode === 401 || res.statusCode === 403) {
             return { passed: true, details: `HTTP ${res.statusCode} (token in query string rejected)` };
           }
@@ -2724,35 +2944,7 @@ export async function runComplianceSuite(
 
     // Input validation security tests (only run if tools are available)
     // Shared helper for injection tests: sends payloads to a tool param, checks output against a detection pattern
-    /**
-     * Heuristic patterns that indicate the server REJECTED the payload
-     * rather than executing it. If a response matches both `detectPattern`
-     * (suggesting execution) AND a rejection pattern, treat as a pass —
-     * the server defended correctly and just happened to echo the payload
-     * in its error message. Without this, well-defended servers like
-     * @modelcontextprotocol/server-filesystem look like they're vulnerable
-     * just because their error responses include the offending input.
-     */
-    const REJECTION_PATTERNS = [
-      /access denied/i,
-      /permission denied/i,
-      /not allowed/i,
-      /not permitted/i,
-      /outside (allowed|permitted)/i,
-      /forbidden/i,
-      /unauthorized/i,
-      /invalid (path|input|argument|parameter|request)/i,
-      /(payload|request) (rejected|blocked|refused)/i,
-      /enoent|eacces|eperm/i,
-      /sandbox(ed)?/i,
-      /(no such file|file not found)/i,
-      /\binvalid\b.*\b(input|json|argument|parameter|character)/i,
-    ];
-
-    function looksRejected(text: string, isErrorFlag: boolean): boolean {
-      if (isErrorFlag) return true;
-      return REJECTION_PATTERNS.some((p) => p.test(text));
-    }
+    // Rejection heuristics live in src/checks/patterns.ts (looksRejected).
 
     async function runInjectionTest(
       toolName: string,
@@ -3070,17 +3262,6 @@ export async function runComplianceSuite(
         const tools = cachedToolsList ?? [];
         if (tools.length === 0) return { passed: true, details: "No tools to validate" };
 
-        const suspiciousPatterns = [
-          { pattern: /ignore\s+(all\s+)?previous/i, label: "ignore previous instructions" },
-          { pattern: /override\s+(system|instructions|rules)/i, label: "override instructions" },
-          { pattern: /system\s+prompt/i, label: "system prompt reference" },
-          { pattern: /you\s+must\s+(always|never)/i, label: "behavioral override" },
-          { pattern: /do\s+not\s+(tell|inform|mention)/i, label: "concealment instruction" },
-          { pattern: /\b[A-Za-z0-9+/]{40,}={0,2}\b/, label: "possible Base64-encoded payload" },
-          // Zero-width characters (U+200B, U+200C, U+200D, U+FEFF)
-          { pattern: /\u200B|\u200C|\u200D|\uFEFF/, label: "hidden Unicode characters" },
-        ];
-
         const issues: string[] = [];
         for (const tool of tools) {
           const textsToCheck = [
@@ -3090,7 +3271,7 @@ export async function runComplianceSuite(
               : []),
           ];
           const combined = textsToCheck.join(" ");
-          for (const { pattern, label } of suspiciousPatterns) {
+          for (const { pattern, label } of POISONING_PATTERNS) {
             if (pattern.test(combined)) {
               issues.push(`Tool "${tool.name}": ${label}`);
             }
@@ -3395,38 +3576,17 @@ export async function runComplianceSuite(
     // last-declared test was parallel-safe we still have work in flight
     // when we get here. MUST happen before warning dedup/cap below —
     // draining can push more warnings.
-    if (inFlight.size > 0) await drainPool();
+    await drainPool();
 
-    // ── Dedup + cap warnings ─────────────────────────────────────────
-    // A server with, say, 60 tools all missing descriptions produces 60
-    // near-identical lines that crowd out every other signal. Preserve
-    // insertion order but collapse exact duplicates, then cap. Mutates
-    // the array in place so the return value below picks up the change.
+    // Dedup + cap warnings: a server with, say, 60 tools all missing
+    // descriptions produces 60 near-identical lines that crowd out every
+    // other signal.
+    harness.finalizeWarnings();
 
-    const MAX_WARNINGS = 50;
-    const capped = dedupAndCapWarnings(warnings, MAX_WARNINGS);
-    warnings.length = 0;
-    warnings.push(...capped);
-
-    // ── Compute score ────────────────────────────────────────────────
-
-    const { score, grade, overall, summary, categories } = computeScore(tests);
-    // Badge URLs are retired (the mcp.hosting renderer is gone); the field is
-    // kept empty for report-schema back-compat. Use `--output <file>.svg` for
-    // a local badge image instead.
-    const badge = { imageUrl: "", reportUrl: "", markdown: "", html: "" };
-
-    return {
-      schemaVersion: REPORT_SCHEMA_VERSION,
-      specVersion: SPEC_VERSION,
+    return assembleReport({
+      specVersion: LEGACY_SPEC_VERSION,
       toolVersion: TOOL_VERSION,
       url: displayUrl,
-      timestamp: new Date().toISOString(),
-      score,
-      grade,
-      overall,
-      summary,
-      categories,
       tests,
       warnings,
       serverInfo,
@@ -3436,8 +3596,7 @@ export async function runComplianceSuite(
       resourceNames,
       promptCount,
       promptNames,
-      badge,
-    };
+    });
   } finally {
     // Always close the transport — swallow any close error so we don't
     // mask the real failure that brought us here.

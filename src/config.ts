@@ -1,6 +1,17 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { parseSpecVersionOption, type SpecVersionOption } from "./spec.js";
 import type { TransportTarget } from "./types.js";
+
+/**
+ * Every report format the `test` command can emit. Single source of
+ * truth for both the CLI's `--format` choices and the config validator,
+ * so the two cannot drift apart again (issue #67: the config file used
+ * to reject github/markdown/html while the CLI accepted them).
+ */
+export const OUTPUT_FORMATS = ["terminal", "json", "sarif", "github", "markdown", "html"] as const;
+
+export type OutputFormat = (typeof OUTPUT_FORMATS)[number];
 
 /**
  * Config file shape. Every field optional — config supplies defaults
@@ -15,8 +26,15 @@ export interface ComplianceConfig {
   only?: string[];
   skip?: string[];
   strict?: boolean;
-  format?: "terminal" | "json" | "sarif";
+  format?: OutputFormat;
   verbose?: boolean;
+  /**
+   * MCP spec revision to test against; `auto` probes the server. Same
+   * precedence as `format`: `--spec-version` on the CLI wins, then this
+   * key, then `auto`. Note that tool versions before 0.18 reject this
+   * key as unknown.
+   */
+  specVersion?: SpecVersionOption;
 }
 
 const SEARCH_NAMES = ["mcp-compliance.config.json", ".mcp-compliancerc.json", ".mcp-compliancerc"];
@@ -77,6 +95,7 @@ function validate(raw: unknown, source: string): ComplianceConfig {
     "strict",
     "format",
     "verbose",
+    "specVersion",
   ]);
   for (const k of Object.keys(obj)) {
     if (!allowed.has(k)) {
@@ -84,8 +103,18 @@ function validate(raw: unknown, source: string): ComplianceConfig {
     }
   }
   if (obj.target !== undefined) validateTarget(obj.target, source);
-  if (obj.format !== undefined && !["terminal", "json", "sarif"].includes(obj.format as string)) {
-    throw new Error(`Config at ${source}: format must be one of terminal, json, sarif`);
+  if (obj.format !== undefined && !(OUTPUT_FORMATS as readonly string[]).includes(obj.format as string)) {
+    throw new Error(`Config at ${source}: format must be one of ${OUTPUT_FORMATS.join(", ")}`);
+  }
+  if (obj.specVersion !== undefined) {
+    if (typeof obj.specVersion !== "string") {
+      throw new Error(`Config at ${source}: specVersion must be a string`);
+    }
+    try {
+      parseSpecVersionOption(obj.specVersion);
+    } catch (err) {
+      throw new Error(`Config at ${source}: specVersion: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   return obj as ComplianceConfig;
 }

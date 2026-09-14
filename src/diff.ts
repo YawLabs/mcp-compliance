@@ -12,6 +12,12 @@ export interface DiffEntry {
 }
 
 export interface DiffSummary {
+  /**
+   * The MCP spec revision both reports were graded against, or null
+   * when neither report records one (reports from tool versions before
+   * 0.13 carry no `specVersion`).
+   */
+  specVersion: string | null;
   baselineGrade: string;
   currentGrade: string;
   baselineScore: number;
@@ -28,14 +34,20 @@ export interface DiffSummary {
  * both files and renders the result.
  *
  * Throws if the two reports were produced against incompatible spec
- * versions. Diffing across spec revisions would silently mis-classify
- * renamed or repurposed test IDs as regressions/fixes.
+ * versions. Test ids are only comparable within one spec catalog, so
+ * diffing across revisions would silently mis-classify renamed or
+ * repurposed test IDs as regressions/fixes. One tool version grades
+ * both revisions, so the fix is to pin `--spec-version` on the run
+ * whose report drifted — typically an `auto` run against a server that
+ * upgraded to a newer spec since the baseline was taken.
  */
 export function diffReports(baseline: ComplianceReport, current: ComplianceReport): DiffSummary {
   if (baseline.specVersion && current.specVersion && baseline.specVersion !== current.specVersion) {
     throw new Error(
       `Spec version mismatch: baseline is ${baseline.specVersion}, current is ${current.specVersion}. ` +
-        "Re-run the baseline with this tool version (or downgrade the tool to match) before diffing.",
+        "Test ids are only comparable within one spec revision. " +
+        `Re-run the current report with --spec-version ${baseline.specVersion} to keep diffing against this baseline, ` +
+        `or take a new baseline with --spec-version ${current.specVersion}.`,
     );
   }
 
@@ -89,6 +101,7 @@ export function diffReports(baseline: ComplianceReport, current: ComplianceRepor
   }
 
   return {
+    specVersion: current.specVersion || baseline.specVersion || null,
     baselineGrade: baseline.grade,
     currentGrade: current.grade,
     baselineScore: baseline.score,
@@ -106,6 +119,7 @@ export function formatDiff(summary: DiffSummary): string {
   let arrow = "→";
   if (summary.currentScore > summary.baselineScore) arrow = "↑";
   else if (summary.currentScore < summary.baselineScore) arrow = "↓";
+  if (summary.specVersion) lines.push(`Spec version: ${summary.specVersion}`);
   lines.push(
     `Grade ${summary.baselineGrade} (${summary.baselineScore}%) ${arrow} ${summary.currentGrade} (${summary.currentScore}%)`,
   );

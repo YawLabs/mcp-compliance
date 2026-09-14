@@ -49,7 +49,15 @@ describe("runComplianceSuite — connection failures", () => {
       timeout: 2000,
       only: ["transport-post"],
     });
-    expect(report.warnings.some((w) => w.includes("unreachable"))).toBe(true);
+    const warning = report.warnings.find((w) => w.includes("unreachable"));
+    expect(warning, JSON.stringify(report.warnings)).toBeDefined();
+    // Names the connection error, and promises only what is true: the
+    // tests that need the server fail (post-hoc scans over an empty
+    // recording and security skips still pass vacuously).
+    expect(warning).toMatch(
+      /^Server at http:\/\/127\.0\.0\.1:1\/mcp is unreachable \(.*ECONNREFUSED[^)]*\) -- every test that needs the server will fail\./,
+    );
+    expect(warning).not.toContain("all tests will fail");
   }, 15000);
 });
 

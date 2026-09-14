@@ -1,6 +1,13 @@
 import { request } from "undici";
-import { parseSSEResponse } from "../sse.js";
-import type { Transport, TransportNotifyResult, TransportResponse } from "./index.js";
+import { createSSEDecoder, parseSSEMessages, parseSSEResponse } from "../sse.js";
+import type {
+  JsonRpcId,
+  MessageListener,
+  Transport,
+  TransportNotifyResult,
+  TransportResponse,
+  TransportStream,
+} from "./index.js";
 
 export interface HttpTransport extends Transport {
   readonly kind: "http";
@@ -14,12 +21,14 @@ export interface HttpTransport extends Transport {
     body: string,
     extraHeaders: Record<string, string>,
     timeout: number,
+    omitUserHeaders?: string[],
   ): Promise<{ statusCode: number; body: string; headers: Record<string, string> }>;
   rawRequest(
-    method: "GET" | "POST" | "DELETE",
+    method: "GET" | "POST" | "DELETE" | "OPTIONS",
     body: string | undefined,
     extraHeaders: Record<string, string>,
     timeout: number,
+    omitUserHeaders?: string[],
   ): Promise<{ statusCode: number; body: string; headers: Record<string, string> }>;
 }
 
@@ -29,11 +38,27 @@ export interface HttpTransportOptions {
   headers?: Record<string, string>;
 }
 
+function combineSignals(timeout: number, signal?: AbortSignal): AbortSignal {
+  const t = AbortSignal.timeout(timeout);
+  return signal ? AbortSignal.any([signal, t]) : t;
+}
+
 export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
   const { url } = opts;
   const userHeaders = { ...(opts.headers ?? {}) };
   let sessionId: string | null = null;
   let protocolVersion: string | null = null;
+  const listeners = new Set<MessageListener>();
+
+  function emit(message: unknown, statusCode: number) {
+    for (const l of listeners) {
+      try {
+        l(message, { statusCode });
+      } catch {
+        // A listener must never break the transport.
+      }
+    }
+  }
 
   function sessionHeaders(): Record<string, string> {
     const h: Record<string, string> = { ...userHeaders };
@@ -57,13 +82,7 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
     return out;
   }
 
-  async function doRawRequest(
-    method: "GET" | "POST" | "DELETE",
-    body: string | undefined,
-    extraHeaders: Record<string, string>,
-    timeout: number,
-    omitUserHeaders?: string[],
-  ) {
+  function buildHeaders(body: string | undefined, extraHeaders: Record<string, string>, omitUserHeaders?: string[]) {
     const base = sessionHeaders();
     // Strip any user-supplied headers the caller asked to omit (matched
     // case-insensitively). This is what lets the auth-stripping security
@@ -85,11 +104,22 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
     if (body !== undefined && !("Content-Type" in headers) && !("content-type" in headers)) {
       headers["Content-Type"] = "application/json";
     }
+    return headers;
+  }
+
+  async function doRawRequest(
+    method: "GET" | "POST" | "DELETE" | "OPTIONS",
+    body: string | undefined,
+    extraHeaders: Record<string, string>,
+    timeout: number,
+    omitUserHeaders?: string[],
+    signal?: AbortSignal,
+  ) {
     const res = await request(url, {
       method,
-      headers,
+      headers: buildHeaders(body, extraHeaders, omitUserHeaders),
       body,
-      signal: AbortSignal.timeout(timeout),
+      signal: combineSignals(timeout, signal),
     });
     const text = await res.body.text();
     return {
@@ -99,46 +129,139 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
     };
   }
 
+  function parseBody(text: string, contentType: string): { body: unknown; messages: unknown[] } {
+    if (contentType.includes("text/event-stream")) {
+      const messages = parseSSEMessages(text);
+      const sseParsed = parseSSEResponse(text);
+      if (sseParsed) return { body: sseParsed, messages };
+      try {
+        const parsed = JSON.parse(text);
+        return { body: parsed, messages: messages.length ? messages : [parsed] };
+      } catch {
+        return { body: { _raw: text }, messages };
+      }
+    }
+    try {
+      const parsed = JSON.parse(text);
+      return { body: parsed, messages: [parsed] };
+    } catch {
+      return { body: { _raw: text }, messages: [] };
+    }
+  }
+
   const transport: HttpTransport = {
     kind: "http",
     url,
     async request(method, params, nextId, init): Promise<TransportResponse> {
       const id = nextId();
       const body = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} });
-      const raw = await doRawRequest("POST", body, init.headers ?? {}, init.timeout, init.omitUserHeaders);
+      const raw = await doRawRequest("POST", body, init.headers ?? {}, init.timeout, init.omitUserHeaders, init.signal);
       const contentType = (raw.headers["content-type"] || "").toLowerCase();
-
-      let parsed: unknown;
-      if (contentType.includes("text/event-stream")) {
-        const sseParsed = parseSSEResponse(raw.body);
-        if (sseParsed) {
-          parsed = sseParsed;
-        } else {
-          try {
-            parsed = JSON.parse(raw.body);
-          } catch {
-            parsed = { _raw: raw.body };
-          }
-        }
-      } else {
-        try {
-          parsed = JSON.parse(raw.body);
-        } catch {
-          parsed = { _raw: raw.body };
-        }
-      }
-
+      const parsed = parseBody(raw.body, contentType);
+      for (const m of parsed.messages) emit(m, raw.statusCode);
       return {
-        body: parsed,
+        body: parsed.body,
         requestId: id,
         statusCode: raw.statusCode,
         headers: raw.headers,
+        messages: parsed.messages,
       };
     },
     async notify(method, params, init): Promise<TransportNotifyResult> {
       const body = JSON.stringify({ jsonrpc: "2.0", method, ...(params ? { params } : {}) });
-      const raw = await doRawRequest("POST", body, init.headers ?? {}, init.timeout, init.omitUserHeaders);
+      const raw = await doRawRequest("POST", body, init.headers ?? {}, init.timeout, init.omitUserHeaders, init.signal);
       return { statusCode: raw.statusCode, headers: raw.headers };
+    },
+    async stream(method, params, nextId, init): Promise<TransportStream> {
+      const id: JsonRpcId = nextId();
+      const body = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} });
+      const controller = new AbortController();
+      const upstream = init.signal;
+      if (upstream) {
+        if (upstream.aborted) controller.abort(upstream.reason);
+        else upstream.addEventListener("abort", () => controller.abort(upstream.reason), { once: true });
+      }
+      // The timeout bounds the WHOLE stream, so a `subscriptions/listen`
+      // that the server never closes still ends. Callers that need a
+      // shorter observation window call close() themselves.
+      const timer = setTimeout(
+        () => controller.abort(new Error(`stream timed out after ${init.timeout}ms`)),
+        init.timeout,
+      );
+      let res: Awaited<ReturnType<typeof request>>;
+      try {
+        res = await request(url, {
+          method: "POST",
+          headers: buildHeaders(body, init.headers ?? {}, init.omitUserHeaders),
+          body,
+          signal: controller.signal,
+        });
+      } catch (err) {
+        clearTimeout(timer);
+        throw err;
+      }
+      const headers = normalizeHeaders(res.headers as Record<string, string | string[] | undefined>);
+      const contentType = (headers["content-type"] || "").toLowerCase();
+      const isSSE = contentType.includes("text/event-stream");
+      const decoder = createSSEDecoder();
+      const textDecoder = new TextDecoder();
+
+      async function* iterate(): AsyncGenerator<unknown> {
+        try {
+          if (!isSSE) {
+            const text = await res.body.text();
+            const parsed = parseBody(text, contentType);
+            for (const m of parsed.messages) {
+              emit(m, res.statusCode);
+              yield m;
+            }
+            return;
+          }
+          for await (const chunk of res.body) {
+            const text = textDecoder.decode(chunk as Uint8Array, { stream: true });
+            for (const data of decoder.push(text)) {
+              const msg = jsonOrNull(data);
+              if (msg === null) continue;
+              emit(msg, res.statusCode);
+              yield msg;
+            }
+          }
+          for (const data of decoder.flush()) {
+            const msg = jsonOrNull(data);
+            if (msg === null) continue;
+            emit(msg, res.statusCode);
+            yield msg;
+          }
+        } catch (err) {
+          // An abort (ours or the caller's) is the normal way a held-open
+          // stream ends; anything else propagates.
+          if (!controller.signal.aborted) throw err;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      return {
+        requestId: id,
+        statusCode: res.statusCode,
+        headers,
+        messages: iterate(),
+        async close() {
+          clearTimeout(timer);
+          controller.abort(new Error("stream closed by client"));
+          try {
+            await res.body.dump({ limit: 0 });
+          } catch {
+            // already aborted
+          }
+        },
+      };
+    },
+    onMessage(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
     },
     async close() {
       /* HTTP has no persistent resources; each request opens a new connection pool entry. */
@@ -155,13 +278,22 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
     getProtocolVersion() {
       return protocolVersion;
     },
-    rawPost(body, extraHeaders, timeout) {
-      return doRawRequest("POST", body, extraHeaders, timeout);
+    rawPost(body, extraHeaders, timeout, omitUserHeaders) {
+      return doRawRequest("POST", body, extraHeaders, timeout, omitUserHeaders);
     },
-    rawRequest(method, body, extraHeaders, timeout) {
-      return doRawRequest(method, body, extraHeaders, timeout);
+    rawRequest(method, body, extraHeaders, timeout, omitUserHeaders) {
+      return doRawRequest(method, body, extraHeaders, timeout, omitUserHeaders);
     },
   };
 
   return transport;
+}
+
+function jsonOrNull(data: string): unknown | null {
+  if (!data.trim()) return null;
+  try {
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
 }
