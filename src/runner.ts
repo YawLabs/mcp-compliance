@@ -271,20 +271,27 @@ export async function runComplianceSuite(
     throw new Error("stdio target requires a command");
   }
 
-  // Construct transport.
+  // Construct transport. The stdio factory is kept so the modern suite
+  // can spawn an independent second instance for probes that must not
+  // share the suite's process (a dual-era stdio server pins its era per
+  // process).
+  const spawnStdio = () =>
+    resolvedTarget.type === "stdio"
+      ? createStdioTransport({
+          command: resolvedTarget.command,
+          args: resolvedTarget.args,
+          env: resolvedTarget.env,
+          cwd: resolvedTarget.cwd,
+          verbose: resolvedTarget.verbose,
+        })
+      : null;
   const transport: Transport =
     resolvedTarget.type === "http"
       ? createHttpTransport({
           url: resolvedTarget.url,
           headers: resolvedTarget.headers ?? options.headers,
         })
-      : createStdioTransport({
-          command: resolvedTarget.command,
-          args: resolvedTarget.args,
-          env: resolvedTarget.env,
-          cwd: resolvedTarget.cwd,
-          verbose: resolvedTarget.verbose,
-        });
+      : (spawnStdio() as Transport);
 
   // Wrap everything below in try/finally so the child process is always
   // cleaned up — even if a test throws or the runner aborts mid-suite.
@@ -418,6 +425,7 @@ export async function runComplianceSuite(
         toolVersion: TOOL_VERSION,
         detection,
         warnings: preWarnings,
+        spawnFresh: resolvedTarget.type === "stdio" ? () => spawnStdio() as Transport : undefined,
       });
     }
 

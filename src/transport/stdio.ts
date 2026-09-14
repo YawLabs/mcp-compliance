@@ -92,7 +92,7 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
   function emit(message: unknown) {
     for (const l of listeners) {
       try {
-        l(message);
+        l(message, {});
       } catch {
         // A listener must never break the transport.
       }

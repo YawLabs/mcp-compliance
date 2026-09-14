@@ -8,7 +8,7 @@ import { createHarness } from "../harness.js";
 import { createModernClient, resultOf as rpcResultOf } from "../modern/client.js";
 import { createRecorder } from "../recorder.js";
 import { MODERN_SPEC_VERSION, specBaseFor } from "../spec.js";
-import type { ModernSuiteContext } from "../suites/modern/context.js";
+import { createModernState, type ModernSuiteContext } from "../suites/modern/context.js";
 import {
   classifyInjectionOutput,
   compareToolLists,
@@ -203,20 +203,7 @@ async function runDirect(opts: DirectOptions): Promise<DirectRun> {
     displayUrl: opts.url ?? "stdio:fixture",
     detection: undefined,
     hasAuth: Object.keys(userHeaders).some((h) => h.toLowerCase() === "authorization"),
-    state: {
-      discover: null,
-      supportedVersions: [MODERN_SPEC_VERSION],
-      capabilities: {},
-      serverInfo: { name: null, version: null },
-      instructions: null,
-      tools: null,
-      toolNames: [],
-      resources: null,
-      resourceNames: [],
-      resourceTemplates: null,
-      prompts: null,
-      promptNames: [],
-    },
+    state: { ...createModernState(), supportedVersions: [MODERN_SPEC_VERSION] },
   };
   try {
     // Seed what lifecycle + features would have cached.

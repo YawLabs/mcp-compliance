@@ -84,7 +84,13 @@ export interface TransportStream {
   close(): Promise<void>;
 }
 
-export type MessageListener = (message: unknown) => void;
+/** Transport-level facts about a received message a listener may need. */
+export interface MessageMeta {
+  /** HTTP only: status of the response that carried the message. */
+  statusCode?: number;
+}
+
+export type MessageListener = (message: unknown, meta: MessageMeta) => void;
 
 export interface Transport {
   readonly kind: TransportKind;

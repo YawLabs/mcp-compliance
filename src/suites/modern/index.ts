@@ -8,7 +8,7 @@ import type { RunOptions } from "../../runner.js";
 import { LEGACY_SPEC_VERSION, MODERN_SPEC_VERSION, specBaseFor } from "../../spec.js";
 import type { JsonRpcId, Transport } from "../../transport/index.js";
 import type { ComplianceReport } from "../../types.js";
-import type { ModernSuiteContext } from "./context.js";
+import { createModernState, type ModernSuiteContext } from "./context.js";
 import { runErrors } from "./errors.js";
 import { runFeatures } from "./features.js";
 import { runLifecycle, runLifecycleLate } from "./lifecycle.js";
@@ -31,6 +31,8 @@ export interface ModernSuiteInput {
   detection: DetectionResult | undefined;
   /** Warnings accumulated before the suite started (preflight, detection). */
   warnings: string[];
+  /** stdio only: spawn an independent second instance of the server. */
+  spawnFresh?: () => Transport;
 }
 
 /**
@@ -59,7 +61,7 @@ export async function runModernSuite(input: ModernSuiteInput): Promise<Complianc
   harness.warnings.push(...input.warnings);
 
   const recorder = createRecorder();
-  const unsubscribe = transport.onMessage((m) => recorder.recordReceived(m));
+  const unsubscribe = transport.onMessage((m, meta) => recorder.recordReceived(m, meta));
   const client = createModernClient({
     transport,
     recorder,
@@ -86,20 +88,8 @@ export async function runModernSuite(input: ModernSuiteInput): Promise<Complianc
     displayUrl: input.displayUrl,
     detection: input.detection,
     hasAuth: Object.keys(input.userHeaders).some((h) => h.toLowerCase() === "authorization"),
-    state: {
-      discover: null,
-      supportedVersions: [],
-      capabilities: {},
-      serverInfo: { name: null, version: null },
-      instructions: null,
-      tools: null,
-      toolNames: [],
-      resources: null,
-      resourceNames: [],
-      resourceTemplates: null,
-      prompts: null,
-      promptNames: [],
-    },
+    spawnFresh: input.spawnFresh,
+    state: createModernState(),
   };
 
   try {
@@ -126,9 +116,14 @@ export async function runModernSuite(input: ModernSuiteInput): Promise<Complianc
     unsubscribe();
   }
 
-  if (ctx.state.supportedVersions.includes(LEGACY_SPEC_VERSION)) {
+  // SDK 2.0 servers advertise only modern versions in supportedVersions
+  // yet still serve the legacy initialize handshake, so key on either.
+  if (ctx.state.supportedVersions.includes(LEGACY_SPEC_VERSION) || ctx.state.legacyInitializeServed) {
+    const how = ctx.state.supportedVersions.includes(LEGACY_SPEC_VERSION)
+      ? `also advertises ${LEGACY_SPEC_VERSION}`
+      : "also serves the legacy initialize handshake";
     harness.warnings.push(
-      `Server is dual-era (also advertises ${LEGACY_SPEC_VERSION}); this run graded ${MODERN_SPEC_VERSION}. Re-run with --spec-version ${LEGACY_SPEC_VERSION} to test the legacy handshake.`,
+      `Server is dual-era (${how}); this run graded ${MODERN_SPEC_VERSION}. Re-run with --spec-version ${LEGACY_SPEC_VERSION} to test the legacy handshake.`,
     );
   }
   harness.finalizeWarnings();

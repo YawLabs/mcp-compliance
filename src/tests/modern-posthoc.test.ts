@@ -4,7 +4,7 @@ import { createHarness } from "../harness.js";
 import { createModernClient, type ModernClient } from "../modern/client.js";
 import { createRecorder } from "../recorder.js";
 import { MODERN_SPEC_VERSION, specBaseFor } from "../spec.js";
-import type { ModernState, ModernSuiteContext } from "../suites/modern/context.js";
+import { createModernState, type ModernState, type ModernSuiteContext } from "../suites/modern/context.js";
 import { runPostHoc } from "../suites/modern/posthoc.js";
 import { createHttpTransport } from "../transport/http.js";
 import type { Transport } from "../transport/index.js";
@@ -46,20 +46,7 @@ const TIMEOUT = 8000;
 /** For the one trigger that is EXPECTED never to resolve (a null-id reply on stdio). */
 const SHORT_TIMEOUT = 1500;
 
-const EMPTY_STATE: ModernState = {
-  discover: null,
-  supportedVersions: [],
-  capabilities: {},
-  serverInfo: { name: null, version: null },
-  instructions: null,
-  tools: null,
-  toolNames: [],
-  resources: null,
-  resourceNames: [],
-  resourceTemplates: null,
-  prompts: null,
-  promptNames: [],
-};
+const EMPTY_STATE: ModernState = createModernState();
 
 function makeContext(transport: Transport): ModernSuiteContext {
   const harness = createHarness({

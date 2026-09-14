@@ -30,13 +30,20 @@ export interface ReceivedMessage {
   seq: number;
   /** The request whose id this message echoes, if any. */
   request: SentRequest | undefined;
+  /**
+   * HTTP status of the response that carried the message (undefined on
+   * stdio). Lets post-hoc checks tell a transport-level rejection body
+   * (401/403/413/415/429 from an auth gate or proxy, which need not be
+   * JSON-RPC at all) from a JSON-RPC reply the server chose to send.
+   */
+  statusCode?: number;
 }
 
 export interface Recorder {
   readonly sent: SentRequest[];
   readonly received: ReceivedMessage[];
   recordSent(req: Omit<SentRequest, "seq">): SentRequest;
-  recordReceived(message: unknown): ReceivedMessage;
+  recordReceived(message: unknown, meta?: { statusCode?: number }): ReceivedMessage;
   /** Received messages that are JSON-RPC results (have `result`). */
   results(): ReceivedMessage[];
   /** Received messages that are JSON-RPC errors (have `error`). */
@@ -78,12 +85,13 @@ export function createRecorder(): Recorder {
       if (key) byId.set(key, entry);
       return entry;
     },
-    recordReceived(message) {
+    recordReceived(message, meta) {
       const key = isObj(message) ? idKey(message.id) : undefined;
       const entry: ReceivedMessage = {
         message,
         seq: seq++,
         request: key ? byId.get(key) : undefined,
+        statusCode: meta?.statusCode,
       };
       received.push(entry);
       return entry;

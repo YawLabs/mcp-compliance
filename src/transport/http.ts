@@ -50,10 +50,10 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
   let protocolVersion: string | null = null;
   const listeners = new Set<MessageListener>();
 
-  function emit(message: unknown) {
+  function emit(message: unknown, statusCode: number) {
     for (const l of listeners) {
       try {
-        l(message);
+        l(message, { statusCode });
       } catch {
         // A listener must never break the transport.
       }
@@ -158,7 +158,7 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
       const raw = await doRawRequest("POST", body, init.headers ?? {}, init.timeout, init.omitUserHeaders, init.signal);
       const contentType = (raw.headers["content-type"] || "").toLowerCase();
       const parsed = parseBody(raw.body, contentType);
-      for (const m of parsed.messages) emit(m);
+      for (const m of parsed.messages) emit(m, raw.statusCode);
       return {
         body: parsed.body,
         requestId: id,
@@ -212,7 +212,7 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
             const text = await res.body.text();
             const parsed = parseBody(text, contentType);
             for (const m of parsed.messages) {
-              emit(m);
+              emit(m, res.statusCode);
               yield m;
             }
             return;
@@ -222,14 +222,14 @@ export function createHttpTransport(opts: HttpTransportOptions): HttpTransport {
             for (const data of decoder.push(text)) {
               const msg = jsonOrNull(data);
               if (msg === null) continue;
-              emit(msg);
+              emit(msg, res.statusCode);
               yield msg;
             }
           }
           for (const data of decoder.flush()) {
             const msg = jsonOrNull(data);
             if (msg === null) continue;
-            emit(msg);
+            emit(msg, res.statusCode);
             yield msg;
           }
         } catch (err) {

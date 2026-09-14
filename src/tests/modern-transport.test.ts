@@ -6,7 +6,7 @@ import { createHarness } from "../harness.js";
 import { createModernClient } from "../modern/client.js";
 import { createRecorder } from "../recorder.js";
 import { MODERN_SPEC_VERSION, specBaseFor } from "../spec.js";
-import type { ModernSuiteContext } from "../suites/modern/context.js";
+import { createModernState, type ModernSuiteContext } from "../suites/modern/context.js";
 import { runTransport } from "../suites/modern/transport.js";
 import { createHttpTransport } from "../transport/http.js";
 import type { ComplianceReport } from "../types.js";
@@ -309,6 +309,7 @@ function directContext(url: string, state: Partial<ModernSuiteContext["state"]>,
     detection: undefined,
     hasAuth: false,
     state: {
+      ...createModernState(),
       discover: null,
       supportedVersions: [MODERN_SPEC_VERSION],
       capabilities: { resources: {}, prompts: {} },

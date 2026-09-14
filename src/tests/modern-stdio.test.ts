@@ -4,7 +4,7 @@ import { createHarness } from "../harness.js";
 import { createModernClient } from "../modern/client.js";
 import { createRecorder } from "../recorder.js";
 import { MODERN_SPEC_VERSION, specBaseFor } from "../spec.js";
-import type { ModernState, ModernSuiteContext } from "../suites/modern/context.js";
+import { createModernState, type ModernState, type ModernSuiteContext } from "../suites/modern/context.js";
 import { runStdio } from "../suites/modern/stdio.js";
 import type {
   JsonRpcId,
@@ -38,20 +38,7 @@ const STDIO_IDS = ["stdio-framing", "stdio-unicode", "stdio-unknown-method-recov
 const ALL_PASS = Object.fromEntries(STDIO_IDS.map((id) => [id, "pass"]));
 const TIMEOUT = 2000;
 
-const EMPTY_STATE: ModernState = {
-  discover: null,
-  supportedVersions: [],
-  capabilities: {},
-  serverInfo: { name: null, version: null },
-  instructions: null,
-  tools: null,
-  toolNames: [],
-  resources: null,
-  resourceNames: [],
-  resourceTemplates: null,
-  prompts: null,
-  promptNames: [],
-};
+const EMPTY_STATE: ModernState = createModernState();
 
 /** A suite context around any transport, the way runModernSuite builds one. */
 function makeContext(transport: Transport, state: Partial<ModernState> = {}): ModernSuiteContext {
@@ -189,7 +176,7 @@ function fakeStdio(script: FakeScript): FakeStdio {
     exited: false,
     exitCode: null,
     emit(message) {
-      for (const l of listeners) l(message);
+      for (const l of listeners) l(message, {});
     },
     async request(method, _params, nextId, init): Promise<TransportResponse> {
       const id = nextId();

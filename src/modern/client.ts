@@ -234,7 +234,7 @@ export function createModernClient(options: ModernClientOptions): ModernClient {
       recorder.recordSent({ id: undefined, method: opts.method ?? "", params: undefined, meta: undefined, raw: body });
       const res = await t.rawPost(body, headers, opts.timeout ?? options.timeout, opts.omitUserHeaders);
       // Raw responses bypass the transport's parser, so record them here.
-      recordRawBody(recorder, res.body, res.headers["content-type"] || "");
+      recordRawBody(recorder, res.body, res.headers["content-type"] || "", res.statusCode);
       return res;
     },
   };
@@ -242,7 +242,7 @@ export function createModernClient(options: ModernClientOptions): ModernClient {
   return client;
 }
 
-function recordRawBody(recorder: Recorder, text: string, contentType: string) {
+function recordRawBody(recorder: Recorder, text: string, contentType: string, statusCode: number) {
   if (!text) return;
   if (contentType.toLowerCase().includes("text/event-stream")) {
     // Lazy import avoided: parse minimal SSE here to keep this module light.
@@ -250,13 +250,13 @@ function recordRawBody(recorder: Recorder, text: string, contentType: string) {
       if (!line.startsWith("data:")) continue;
       const data = line.slice(5).trimStart();
       try {
-        recorder.recordReceived(JSON.parse(data));
+        recorder.recordReceived(JSON.parse(data), { statusCode });
       } catch {}
     }
     return;
   }
   try {
-    recorder.recordReceived(JSON.parse(text));
+    recorder.recordReceived(JSON.parse(text), { statusCode });
   } catch {}
 }
 
