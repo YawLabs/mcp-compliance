@@ -11,6 +11,15 @@ out explicitly here.
 
 ### Changed
 - npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
+- `release.sh` writes a `## [x.y.z]` changelog entry for every release — promoting `[Unreleased]` when it has content, otherwise generating one from the commit subjects since the previous tag — keeps the Keep-a-Changelog link references current when the file has them, and takes the GitHub release notes from that entry instead of from `git log` subjects. Before this, the script never touched CHANGELOG.md at all: a release got an entry only if someone wrote one by hand (0.18.0 below is backfilled), and every GitHub release page showed raw commit subjects.
+
+## [0.18.0] — 2026-09-13
+
+No runtime changes; the published package behaves exactly as 0.17.4.
+
+### Changed
+- `release.sh` waits for npm to actually serve the new version before the MCP Registry step. `npm publish` returns as soon as the registry accepts the tarball, but the version is not yet readable from npm's CDN-backed read path, and the MCP Registry validates a release by reading it — so a registry publish that ran straight after `npm publish` could fail with `version '<x>' was not found (status: 404)` and need a second run. The wait polls with `curl` the exact percent-encoded URL the registry's npm validator requests (`npm view` caches metadata for five minutes and could outlast the condition), warns rather than fails at its cap so `mcp-publisher` still reports its own precise error, and is tunable: `NPM_WAIT_TIMEOUT_S` (default 300) sets the cap and `SKIP_NPM_WAIT=1` bypasses it (#73).
+- README: the X follow badge moved from the top of the page to the bottom, so the description leads on npm and GitHub (#74).
 
 ## [0.17.4] — 2026-09-13
 
