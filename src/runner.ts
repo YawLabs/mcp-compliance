@@ -386,7 +386,7 @@ export async function runComplianceSuite(
       detection =
         resolvedTarget.type === "http"
           ? classifyDiscoverResponse(preflightResponse)
-          : await detectSpecVersion(transport, { nextId, timeout: startupTimeout, clientInfo });
+          : await detectSpecVersion(transport, { nextId, timeout: startupTimeout, clientInfo, signal: options.signal });
       resolvedSpec = detection.version;
       preWarnings.push(
         `${AUTO_DETECT_NOTE_PREFIX}${resolvedSpec} (${detection.reason}). Pin with --spec-version to override.`,

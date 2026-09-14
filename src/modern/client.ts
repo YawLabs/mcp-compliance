@@ -25,6 +25,8 @@ export interface ModernClientOptions {
   protocolVersion: string;
   clientCapabilities: Record<string, unknown>;
   clientInfo: ClientIdentity;
+  /** Default abort signal for every request (RunOptions.signal). */
+  signal?: AbortSignal;
 }
 
 export interface RpcOptions {
@@ -182,7 +184,7 @@ export function createModernClient(options: ModernClientOptions): ModernClient {
         timeout: opts.timeout ?? options.timeout,
         headers,
         omitUserHeaders: opts.omitUserHeaders,
-        signal: opts.signal,
+        signal: opts.signal ?? options.signal,
       });
       return {
         body: res.body as any,
@@ -202,7 +204,7 @@ export function createModernClient(options: ModernClientOptions): ModernClient {
         timeout: opts.timeout ?? options.timeout,
         headers,
         omitUserHeaders: opts.omitUserHeaders,
-        signal: opts.signal,
+        signal: opts.signal ?? options.signal,
       });
       return { statusCode: res.statusCode ?? 202, headers: res.headers ?? {} };
     },
@@ -218,7 +220,7 @@ export function createModernClient(options: ModernClientOptions): ModernClient {
         timeout: opts.timeout ?? options.timeout,
         headers,
         omitUserHeaders: opts.omitUserHeaders,
-        signal: opts.signal,
+        signal: opts.signal ?? options.signal,
       });
     },
     async raw(body, opts = {}) {

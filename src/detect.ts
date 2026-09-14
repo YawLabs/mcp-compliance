@@ -25,6 +25,8 @@ export interface DetectOptions {
   /** Time budget for the probe. Use the startup timeout: cold stdio servers are slow. */
   timeout: number;
   clientInfo: ClientIdentity;
+  /** Cancels the probe (RunOptions.signal). */
+  signal?: AbortSignal;
 }
 
 export interface DetectionResult {
@@ -121,6 +123,7 @@ export async function detectSpecVersion(transport: Transport, opts: DetectOption
     res = await transport.request("server/discover", probe.params, opts.nextId, {
       timeout: opts.timeout,
       headers: transport.kind === "http" ? probe.headers : undefined,
+      signal: opts.signal,
     });
   } catch {
     res = null;

@@ -73,6 +73,7 @@ export async function runModernSuite(input: ModernSuiteInput): Promise<Complianc
     // server that needs them must answer -32021, which is testable.
     clientCapabilities: { elicitation: {} },
     clientInfo: { name: "mcp-compliance", version: input.toolVersion },
+    signal: options.signal,
   });
 
   const ctx: ModernSuiteContext = {
