@@ -4,7 +4,8 @@ import { HEADER_METHOD, HEADER_NAME, HEADER_PROTOCOL_VERSION } from "../../moder
 import { META, MODERN_ERROR_CODES } from "../../modern/meta.js";
 import { parseSSEMessages } from "../../sse.js";
 import type { HttpTransport } from "../../transport/http.js";
-import type { ModernSuiteContext } from "./context.js";
+import { ensurePrompts, ensureResources, hasPrompts, hasResources, type ModernSuiteContext } from "./context.js";
+import { notEvaluable } from "./lifecycle.js";
 
 /**
  * Streamable HTTP transport tests of the 2026-07-28 suite (16 in the
@@ -13,9 +14,10 @@ import type { ModernSuiteContext } from "./context.js";
  * so the harness never runs them on stdio; the `ctx.kind` guards below
  * only keep a future catalog change from crashing a stdio run.
  *
- * Runs after the feature modules: `transport-header-name-mismatch` reads
- * the cached resource / prompt lists and skip-passes when neither is
- * available (a `--only` run may not have fetched them).
+ * `transport-header-name-mismatch` reads the resource / prompt lists
+ * through the context's `ensure*` loaders, which fetch once on demand, so
+ * a `--only transport` run still reads a real resource; it skip-passes
+ * only when the server declares neither capability or the list failed.
  */
 
 const DISCOVER = "server/discover";
@@ -70,7 +72,10 @@ function clip(text: string, max: number): string {
  * hard requirement (an intermediary may reject with a bare 400 the tool
  * cannot tell from the server's). The -32020 HeaderMismatch code is hard
  * only when `codeRequired`; otherwise a missing or different code passes
- * with a warning naming the test.
+ * with a warning naming the test. A 400 is credited to the injected
+ * header defect only when the conformant discover was served: a server
+ * that rejects everything (a legacy-only server pinned to this suite)
+ * proves nothing by rejecting a malformed variant too.
  */
 function evaluateHeaderRejection(
   ctx: ModernSuiteContext,
@@ -83,6 +88,8 @@ function evaluateHeaderRejection(
   if (res.statusCode !== 400) {
     return { passed: false, details: `${observed} (expected HTTP 400)` };
   }
+  const unattributable = notEvaluable(ctx);
+  if (unattributable) return { passed: false, details: unattributable };
   if (err && err.code === HEADER_MISMATCH) {
     return { passed: true, details: `HTTP 400, JSON-RPC error -32020 HeaderMismatch` };
   }
@@ -302,8 +309,8 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
 
   await harness.check("transport-header-name-mismatch", async () => {
     if (ctx.kind !== "http") return notApplicable("Mcp-Name header");
-    const probe = nameHeaderProbe(ctx);
-    if (!probe) return { passed: true, details: "skipped: no name-carrying read-only method available" };
+    const probe = await nameHeaderProbe(ctx);
+    if ("skipped" in probe) return { passed: true, details: probe.skipped };
     const res = await client.rpc(probe.method, probe.params, { headers: { [HEADER_NAME]: "wrong-name" } });
     const outcome = evaluateHeaderRejection(ctx, "transport-header-name-mismatch", res, { codeRequired: false });
     return { passed: outcome.passed, details: `${probe.method} with Mcp-Name: wrong-name -> ${outcome.details}` };
@@ -340,20 +347,36 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
   });
 }
 
+type NameHeaderProbe = { method: string; params: Record<string, unknown> } | { skipped: string };
+
 /**
  * A read-only request that carries `Mcp-Name`: the first listed resource
  * (resources/read on its uri), else the first prompt with no required
- * arguments (prompts/get). Null when neither list is available -- the
- * lists come from the feature modules, which a `--only` run may skip.
+ * arguments (prompts/get). The lists are fetched once on demand through
+ * the context (so `--only transport` still measures the server); the
+ * skip names why no probe exists -- the capability is undeclared, the
+ * list call failed, or nothing listed is readable with a name alone.
  */
-function nameHeaderProbe(ctx: ModernSuiteContext): { method: string; params: Record<string, unknown> } | null {
-  const resource = ctx.state.resources?.find((r) => r && typeof r === "object" && typeof r.uri === "string");
+async function nameHeaderProbe(ctx: ModernSuiteContext): Promise<NameHeaderProbe> {
+  const resources = await ensureResources(ctx);
+  const resource = resources?.find((r) => r && typeof r === "object" && typeof r.uri === "string");
   if (resource) return { method: "resources/read", params: { uri: resource.uri } };
-  const prompt = ctx.state.prompts?.find((p) => {
+  const prompts = await ensurePrompts(ctx);
+  const prompt = prompts?.find((p) => {
     if (!p || typeof p !== "object" || typeof p.name !== "string") return false;
     const args = Array.isArray(p.arguments) ? p.arguments : [];
     return !args.some((a: unknown) => !!a && typeof a === "object" && (a as { required?: unknown }).required === true);
   });
   if (prompt) return { method: "prompts/get", params: { name: prompt.name } };
-  return null;
+  const declared = [hasResources(ctx) ? "resources" : null, hasPrompts(ctx) ? "prompts" : null].filter(
+    (c): c is string => c !== null,
+  );
+  if (declared.length === 0) return { skipped: "skipped: server declares no resources or prompts" };
+  const failed = declared.filter((c) => (c === "resources" ? !resources : !prompts));
+  if (failed.length === declared.length) {
+    return {
+      skipped: `skipped: ${failed.map((c) => `${c}/list`).join(" and ")} failed (see ${failed.map((c) => `${c}-list`).join(", ")})`,
+    };
+  }
+  return { skipped: "skipped: no listed resource has a uri and no listed prompt is callable without arguments" };
 }

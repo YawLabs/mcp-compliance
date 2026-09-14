@@ -13,17 +13,30 @@ import {
   validateResourceTemplates,
 } from "../../checks/validators.js";
 import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
-import { hasPrompts, hasResources, hasTools, type ModernSuiteContext } from "./context.js";
+import {
+  ensureList,
+  hasPrompts,
+  hasResources,
+  hasTools,
+  LIST_METHOD,
+  type ListKey,
+  type ModernSuiteContext,
+  publishList,
+} from "./context.js";
 
 /**
  * Tools / resources / prompts tests of the 2026-07-28 suite. Each block is
  * gated on the capability `server/discover` declared (absent from the
- * report otherwise) and the list tests fill `ctx.state.tools` /
- * `resources` / `prompts` for the modules that run later.
+ * report otherwise). The list tests publish their arrays into `ctx.state`
+ * through the context's `publishList`, and every consumer -- here and in
+ * the lifecycle / transport / schema modules -- reads them back through
+ * the context's `ensureList`, which fetches once on demand when a `-list`
+ * test did not run (a `--only` run). One cache, one attempt per list, so
+ * the modules agree on what the server listed.
  *
- * Within this module a test that needs a list the `-list` test did not
- * produce (a `--only` run, or a failed list) fetches it once itself; the
- * schema module, which runs after transport/errors, only reads the cache.
+ * What stays private is the RESPONSE cache below: the `-list-caching`
+ * tests validate the caching hints on the same response the `-list` test
+ * saw, and the context only keeps the arrays.
  */
 
 interface Outcome {
@@ -31,18 +44,9 @@ interface Outcome {
   details: string;
 }
 
-type ListKey = "tools" | "resources" | "prompts";
-
-const LIST_METHOD: Record<ListKey, string> = {
-  tools: "tools/list",
-  resources: "resources/list",
-  prompts: "prompts/list",
-};
-
-/** Responses this module already obtained, so one run sends each list once. */
-interface FeatureCache {
+/** Responses this module already obtained, so one run sends each once. */
+interface ResponseCache {
   lists: Partial<Record<ListKey, RpcResponse>>;
-  templates?: RpcResponse;
   read?: { uri: string; res: RpcResponse };
 }
 
@@ -69,7 +73,7 @@ function showNames(names: string[], max = 5): string {
 }
 
 export async function runFeatures(ctx: ModernSuiteContext): Promise<void> {
-  const cache: FeatureCache = { lists: {} };
+  const cache: ResponseCache = { lists: {} };
   if (hasTools(ctx)) await runTools(ctx, cache);
   if (hasResources(ctx)) await runResources(ctx, cache);
   if (hasPrompts(ctx)) await runPrompts(ctx, cache);
@@ -77,46 +81,25 @@ export async function runFeatures(ctx: ModernSuiteContext): Promise<void> {
 
 // ── Shared plumbing ───────────────────────────────────────────────
 
-/** Send `<key>/list`, cache the response and publish the array into ctx.state when valid. */
-async function fetchList(ctx: ModernSuiteContext, cache: FeatureCache, key: ListKey): Promise<RpcResponse> {
+/**
+ * Send `<key>/list`, keep the response for the caching test and publish
+ * the array into ctx.state when valid. Marks the attempt on the context so
+ * a later `ensureList` never re-sends a list that was asked for and failed.
+ */
+async function fetchList(ctx: ModernSuiteContext, cache: ResponseCache, key: ListKey): Promise<RpcResponse> {
+  ctx.state.listAttempts.add(key);
   const res = await ctx.client.rpc(LIST_METHOD[key]);
   cache.lists[key] = res;
-  const list = resultOf(res.body)?.[key];
-  if (Array.isArray(list) && list.every(isPlainObject)) {
-    const names = namesOf(list);
-    if (key === "tools") {
-      ctx.state.tools = list;
-      ctx.state.toolNames = names;
-    } else if (key === "resources") {
-      ctx.state.resources = list;
-      ctx.state.resourceNames = names;
-    } else {
-      ctx.state.prompts = list;
-      ctx.state.promptNames = names;
-    }
-  }
+  publishList(ctx, key, res);
   return res;
 }
 
 /** The list response, fetching once when the `-list` test did not run. */
-async function listResponse(ctx: ModernSuiteContext, cache: FeatureCache, key: ListKey): Promise<RpcResponse> {
+async function listResponse(ctx: ModernSuiteContext, cache: ResponseCache, key: ListKey): Promise<RpcResponse> {
   return cache.lists[key] ?? fetchList(ctx, cache, key);
 }
 
-/**
- * The cached items, or null when the list is unavailable. Fetches once if
- * nothing has asked for the list yet; a list that was asked for and failed
- * stays null (the `-list` test reports why).
- */
-async function ensureItems(ctx: ModernSuiteContext, cache: FeatureCache, key: ListKey): Promise<unknown[] | null> {
-  const cached = ctx.state[key];
-  if (cached) return cached;
-  if (cache.lists[key]) return null;
-  await fetchList(ctx, cache, key);
-  return ctx.state[key];
-}
-
-function listOutcome(res: RpcResponse, method: string, key: ListKey): Outcome {
+function listOutcome(res: RpcResponse, method: string, key: "tools" | "resources" | "prompts"): Outcome {
   const err = errorOf(res.body);
   if (err) return fail(`${method} returned ${errDetail(err)}`);
   const result = resultOf(res.body);
@@ -189,7 +172,7 @@ export function pickTool(tools: unknown[]): PickedTool | undefined {
   return chosen ? { name: chosen.name as string, inputSchema: chosen.inputSchema } : undefined;
 }
 
-async function runTools(ctx: ModernSuiteContext, cache: FeatureCache): Promise<void> {
+async function runTools(ctx: ModernSuiteContext, cache: ResponseCache): Promise<void> {
   const { harness, client } = ctx;
 
   await harness.check(
@@ -207,7 +190,7 @@ async function runTools(ctx: ModernSuiteContext, cache: FeatureCache): Promise<v
   );
 
   await harness.check("tools-list-deterministic-order", async () => {
-    const first = await ensureItems(ctx, cache, "tools");
+    const first = await ensureList(ctx, "tools");
     if (!first) return pass("skipped: no tools list available");
     const baseline = namesOf(first);
     const snapshots: string[][] = [];
@@ -237,7 +220,7 @@ async function runTools(ctx: ModernSuiteContext, cache: FeatureCache): Promise<v
   });
 
   const callPicked = async (): Promise<{ tool: PickedTool; res: RpcResponse } | Outcome> => {
-    const tools = await ensureItems(ctx, cache, "tools");
+    const tools = await ensureList(ctx, "tools");
     if (!tools) return pass("skipped: no tools list available");
     const tool = pickTool(tools);
     if (!tool) return pass("skipped: server lists no tools");
@@ -303,9 +286,9 @@ async function runTools(ctx: ModernSuiteContext, cache: FeatureCache): Promise<v
 type ReadAttempt = { uri: string; res: RpcResponse } | { skipped: string };
 
 /** resources/read of the first listed resource, sent once per run. */
-async function readFirstResource(ctx: ModernSuiteContext, cache: FeatureCache): Promise<ReadAttempt> {
+async function readFirstResource(ctx: ModernSuiteContext, cache: ResponseCache): Promise<ReadAttempt> {
   if (cache.read) return cache.read;
-  const resources = await ensureItems(ctx, cache, "resources");
+  const resources = await ensureList(ctx, "resources");
   if (!resources) return { skipped: "skipped: no resources list available" };
   const first = resources.find((r) => isPlainObject(r) && typeof r.uri === "string" && r.uri.length > 0);
   if (!isPlainObject(first)) return { skipped: "skipped: server lists no resources with a uri" };
@@ -315,16 +298,12 @@ async function readFirstResource(ctx: ModernSuiteContext, cache: FeatureCache): 
   return cache.read;
 }
 
-async function templatesResponse(ctx: ModernSuiteContext, cache: FeatureCache): Promise<RpcResponse> {
-  if (cache.templates) return cache.templates;
-  const res = await ctx.client.rpc("resources/templates/list");
-  cache.templates = res;
-  const templates = resultOf(res.body)?.resourceTemplates;
-  if (Array.isArray(templates)) ctx.state.resourceTemplates = templates;
-  return res;
+/** resources/templates/list, sent once per run; the same shared list slot as the other lists. */
+function templatesResponse(ctx: ModernSuiteContext, cache: ResponseCache): Promise<RpcResponse> {
+  return listResponse(ctx, cache, "resourceTemplates");
 }
 
-async function runResources(ctx: ModernSuiteContext, cache: FeatureCache): Promise<void> {
+async function runResources(ctx: ModernSuiteContext, cache: ResponseCache): Promise<void> {
   const { harness, client } = ctx;
 
   await harness.check(
@@ -460,7 +439,7 @@ export function pickPrompt(prompts: unknown[]): PickedPrompt | undefined {
   return chosen ? { name: chosen.name as string, requiredArgs: requiredArgsOf(chosen) } : undefined;
 }
 
-async function runPrompts(ctx: ModernSuiteContext, cache: FeatureCache): Promise<void> {
+async function runPrompts(ctx: ModernSuiteContext, cache: ResponseCache): Promise<void> {
   const { harness, client } = ctx;
 
   await harness.check(
@@ -478,7 +457,7 @@ async function runPrompts(ctx: ModernSuiteContext, cache: FeatureCache): Promise
   await harness.check(
     "prompts-get",
     async () => {
-      const prompts = await ensureItems(ctx, cache, "prompts");
+      const prompts = await ensureList(ctx, "prompts");
       if (!prompts) return pass("skipped: no prompts list available");
       const prompt = pickPrompt(prompts);
       if (!prompt) return pass("skipped: server lists no prompts");

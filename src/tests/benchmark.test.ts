@@ -1,7 +1,65 @@
+import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type BenchmarkResult, describeProbeFailure, formatBenchmark, runBenchmark } from "../benchmark.js";
 import type { TransportTarget } from "../types.js";
 import { type HttpFixture, LEGACY_ECHO_FIXTURE, startHttpFixture, stdioFixture } from "./helpers/modern-fixture.js";
+
+/**
+ * A dual-era counting stub: answers `server/discover` with a
+ * DiscoverResult, `initialize` with an InitializeResult, `ping` with {},
+ * and tallies every method it sees -- so a test can assert exactly which
+ * requests a benchmark sent around its timed loop.
+ */
+async function startCountingServer(): Promise<{ url: string; counts: Record<string, number>; stop(): Promise<void> }> {
+  const counts: Record<string, number> = {};
+  const server: Server = createServer((req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (c: string) => {
+      body += c;
+    });
+    req.on("end", () => {
+      let msg: { id?: unknown; method?: string } = {};
+      try {
+        msg = JSON.parse(body);
+      } catch {}
+      const method = msg.method ?? "?";
+      counts[method] = (counts[method] ?? 0) + 1;
+      if (msg.id === undefined) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      let result: unknown;
+      if (method === "server/discover") {
+        result = {
+          resultType: "complete",
+          supportedVersions: ["2026-07-28"],
+          capabilities: {},
+          ttlMs: 0,
+          cacheScope: "public",
+        };
+      } else if (method === "initialize") {
+        result = { protocolVersion: "2025-11-25", capabilities: {}, serverInfo: { name: "counting", version: "1" } };
+      } else {
+        result = {};
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }));
+    });
+  });
+  const url = await new Promise<string>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      resolve(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+    });
+  });
+  return {
+    url,
+    counts,
+    stop: () => new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve()))),
+  };
+}
 
 /**
  * `benchmark` is spec-aware: it resolves the era the way the runner does
@@ -124,6 +182,66 @@ describe("runBenchmark against the legacy echo fixture over stdio", () => {
     expect(result.specVersion).toBe("2026-07-28");
     expect(result.method).toBe("server/discover");
     expectAllFailed(result, /^JSON-RPC error -32601 /);
+  });
+});
+
+describe("runBenchmark warm-up (what is sent around the timed loop)", () => {
+  // A pinned 2026-07-28 run used to send NO unmeasured request, so on
+  // stdio the first timed server/discover absorbed the child's boot and
+  // inflated mean/max by orders of magnitude relative to an auto run
+  // (where the detection probe doubled as the warm-up). The counting stub
+  // pins the contract transport-independently: exactly one server/discover
+  // more than `requests`, whether the probe or the warm-up sent it.
+  it("pinned 2026-07-28: one unmeasured server/discover precedes the N measured ones", async () => {
+    const stub = await startCountingServer();
+    try {
+      const result = await runBenchmark(
+        { type: "http", url: stub.url },
+        { requests: 3, timeout: 5000, specVersion: "2026-07-28" },
+      );
+      expect(result.method).toBe("server/discover");
+      expect(result.succeeded).toBe(3);
+      expect(stub.counts).toEqual({ "server/discover": 4 });
+    } finally {
+      await stub.stop();
+    }
+  });
+
+  it("auto: the detection probe IS the warm-up -- still N + 1, not N + 2", async () => {
+    const stub = await startCountingServer();
+    try {
+      const result = await runBenchmark({ type: "http", url: stub.url }, { requests: 3, timeout: 5000 });
+      expect(result.specVersion).toBe("2026-07-28");
+      expect(result.succeeded).toBe(3);
+      expect(stub.counts).toEqual({ "server/discover": 4 });
+    } finally {
+      await stub.stop();
+    }
+  });
+
+  it("pinned 2025-11-25: the initialize handshake warms up and no server/discover is sent", async () => {
+    const stub = await startCountingServer();
+    try {
+      const result = await runBenchmark(
+        { type: "http", url: stub.url },
+        { requests: 3, timeout: 5000, specVersion: "2025-11-25" },
+      );
+      expect(result.method).toBe("ping");
+      expect(result.succeeded).toBe(3);
+      expect(stub.counts).toEqual({ initialize: 1, "notifications/initialized": 1, ping: 3 });
+    } finally {
+      await stub.stop();
+    }
+  });
+
+  it("pinned 2026-07-28 on stdio: the first measured sample no longer carries the child's boot", async () => {
+    // Boot (Node + module load) is 150ms and up; a served server/discover
+    // is a few ms. With the warm-up in place the slowest of 8 timed
+    // samples stays well below boot time. (The counting cases above pin
+    // the contract exactly; this one shows the effect it exists for.)
+    const result = await runBenchmark(stdioFixture().target, { ...OPTS, specVersion: "2026-07-28" });
+    expectAllSucceeded(result);
+    expect(result.latencyMs.max, `max ${result.latencyMs.max}ms`).toBeLessThan(100);
   });
 });
 

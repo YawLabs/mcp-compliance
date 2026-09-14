@@ -77,9 +77,18 @@ export interface TransportStream {
   headers?: Record<string, string>;
   messages: AsyncIterable<unknown>;
   /**
+   * stdio only: set once the child process exits while the stream is
+   * open (which also ends `messages`), so a caller can report "server
+   * exited (code N)" instead of a timeout. Undefined while the child is
+   * alive and on HTTP.
+   */
+  readonly exit?: { code: number | null; signal: string | null };
+  /**
    * Tear the stream down. HTTP: abort the connection (the spec's
    * cancellation mechanism for a stateless request). stdio: send
-   * `notifications/cancelled` for `requestId` and stop listening.
+   * `notifications/cancelled` for `requestId` unless the response
+   * carrying that id already arrived or the child is gone, and stop
+   * listening.
    */
   close(): Promise<void>;
 }

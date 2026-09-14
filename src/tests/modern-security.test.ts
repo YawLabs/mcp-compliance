@@ -1,12 +1,15 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { request } from "undici";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { INTERNAL_IP_PATTERNS, STACK_TRACE_PATTERNS } from "../checks/patterns.js";
 import { getTestDefinitionMap } from "../definitions/index.js";
 import { createHarness } from "../harness.js";
 import { createModernClient, resultOf as rpcResultOf } from "../modern/client.js";
-import { createRecorder } from "../recorder.js";
+import { createRecorder, type Recorder } from "../recorder.js";
 import { MODERN_SPEC_VERSION, specBaseFor } from "../spec.js";
 import { createModernState, type ModernSuiteContext } from "../suites/modern/context.js";
 import {
@@ -14,6 +17,7 @@ import {
   compareToolLists,
   findLeaks,
   INJECTION_DETECTORS,
+  pickInjectionTarget,
   runSecurity,
 } from "../suites/modern/security.js";
 import { createHttpTransport } from "../transport/http.js";
@@ -34,14 +38,17 @@ import {
  * The 2026-07-28 security module (src/suites/modern/security.ts): every
  * security test passes on the clean fixture over stdio AND HTTP (except
  * the three that fail there BY DESIGN: no --auth, an http:// URL, and a
- * fixture that never answers 429), the auth trio behaves with and
+ * fixture that never answers 429), the auth tests behave with and
  * without credentials, and each fixture knob turns the check it violates
  * RED. Knob runs are grouped one fixture start per knob.
  *
- * Two vehicles: `runModern` (the real dispatcher, with the lifecycle and
- * tools-list ids added so their modules fill ctx.state once they land)
- * and a direct context that seeds ctx.state itself, so the tool-dependent
- * tests are exercised for real today regardless of the other modules.
+ * Two vehicles: `runModern` (the real dispatcher, filtered to exactly the
+ * security ids -- the `--only security` shape, which must measure the
+ * server rather than skip) and a direct context that seeds ctx.state
+ * itself and runs only the security module. Branches the fixture has no
+ * knob for (strict bearer parsers, header-advertised PRM, tools/call-only
+ * rate limiting, destructive tools, slow or dying tools) run against
+ * small inline servers at the end of the file.
  */
 
 const SECURITY_IDS = [
@@ -90,11 +97,15 @@ const AUTH_IDS = [
   "security-token-in-uri",
 ];
 
-const TOOL_IDS = [
+const INJECTION_IDS = [
   "security-command-injection",
   "security-sql-injection",
   "security-path-traversal",
   "security-ssrf-internal",
+];
+
+const TOOL_IDS = [
+  ...INJECTION_IDS,
   "security-oversized-input",
   "security-extra-params",
   "security-tool-schema-defined",
@@ -103,17 +114,16 @@ const TOOL_IDS = [
   "security-tool-cross-reference",
 ];
 
-/** Lifecycle / feature ids whose bodies fill ctx.state (discover, tools) once those modules land. */
-const STATE_FILLERS = ["lifecycle-discover", "tools-list"];
-
-const NO_AUTH_DETAILS =
-  "Server does not require auth (no --auth provided and server accepted unauthenticated requests)";
+const NO_AUTH_DETAILS = "HTTP 200, result -- server accepted unauthenticated request (no --auth provided)";
+const UNREACHED = "never reached the tool (JSON-RPC or transport error)";
 
 /** Ids that FAIL on the clean HTTP fixture by design, with the details they must carry. */
 const EXPECTED_FAIL_CLEAN_HTTP: Record<string, RegExp> = {
   "security-auth-required": new RegExp(`^${NO_AUTH_DETAILS.replace(/[()]/g, "\\$&")}$`),
   "security-tls-required": /^Server URL uses http: -- production servers should use HTTPS$/,
-  "security-rate-limiting": /^No rate limiting detected \(50 rapid requests all returned 200\)$/,
+  // content_types is the fixture's first read-only tool without required arguments.
+  "security-rate-limiting":
+    /^No rate limiting detected \(50 rapid tools\/call content_types requests all returned 200\)$/,
 };
 
 function allPass(ids: string[]): Record<string, string> {
@@ -144,17 +154,26 @@ function expectAsciiDetails(tests: TestResult[], ids: string[]) {
   }
 }
 
+/** Distinct JSON-RPC error objects the recorder holds: what the leak scan must count. */
+function uniqueRecordedErrors(recorder: Recorder): number {
+  return new Set(recorder.errors().map((e) => JSON.stringify((e.message as { error?: unknown }).error ?? null))).size;
+}
+
 // ---------------------------------------------------------------------------
 // Direct context: seeds ctx.state the way lifecycle/features do, runs only
 // the security module, and returns its results.
 // ---------------------------------------------------------------------------
 
 interface DirectOptions {
-  /** HTTP endpoint; omitted = spawn the stdio fixture. */
+  /** HTTP endpoint; omitted = spawn a stdio server. */
   url?: string;
+  /** stdio command to spawn instead of the modern fixture. */
+  command?: { command: string; args: string[] };
   fixture?: FixtureOptions;
   headers?: Record<string, string>;
   only?: string[];
+  /** Per-request timeout (default 5000). */
+  timeout?: number;
 }
 
 interface DirectRun {
@@ -162,6 +181,7 @@ interface DirectRun {
   tests: TestResult[];
   warnings: string[];
   toolCount: number;
+  recorder: Recorder;
 }
 
 async function runDirect(opts: DirectOptions): Promise<DirectRun> {
@@ -170,9 +190,11 @@ async function runDirect(opts: DirectOptions): Promise<DirectRun> {
   if (stdio.type !== "stdio") throw new Error("stdioFixture must describe a stdio target");
   const transport: Transport = opts.url
     ? createHttpTransport({ url: opts.url, headers: opts.headers })
-    : createStdioTransport({ command: stdio.command, args: stdio.args, env: stdio.env });
+    : opts.command
+      ? createStdioTransport(opts.command)
+      : createStdioTransport({ command: stdio.command, args: stdio.args, env: stdio.env });
   const recorder = createRecorder();
-  const unsubscribe = transport.onMessage((m) => recorder.recordReceived(m));
+  const unsubscribe = transport.onMessage((m, meta) => recorder.recordReceived(m, meta));
   let id = 5000;
   const harness = createHarness({
     definitions: getTestDefinitionMap(MODERN_SPEC_VERSION),
@@ -180,11 +202,12 @@ async function runDirect(opts: DirectOptions): Promise<DirectRun> {
     transportKind: kind,
     only: opts.only ?? SECURITY_IDS,
   });
+  const timeout = opts.timeout ?? 5000;
   const client = createModernClient({
     transport,
     recorder,
     nextId: () => id++,
-    timeout: 5000,
+    timeout,
     protocolVersion: MODERN_SPEC_VERSION,
     clientCapabilities: { elicitation: {} },
     clientInfo: { name: "mcp-compliance-test", version: "0.0.0" },
@@ -196,7 +219,7 @@ async function runDirect(opts: DirectOptions): Promise<DirectRun> {
     recorder,
     transport,
     kind,
-    timeout: 5000,
+    timeout,
     startupTimeout: 10000,
     backendUrl: opts.url ?? "",
     userHeaders,
@@ -227,7 +250,13 @@ async function runDirect(opts: DirectOptions): Promise<DirectRun> {
     unsubscribe();
     await transport.close();
   }
-  return { kind, tests: harness.tests, warnings: [...harness.warnings], toolCount: ctx.state.tools?.length ?? 0 };
+  return {
+    kind,
+    tests: harness.tests,
+    warnings: [...harness.warnings],
+    toolCount: ctx.state.tools?.length ?? 0,
+    recorder,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -235,40 +264,114 @@ async function runDirect(opts: DirectOptions): Promise<DirectRun> {
 // ---------------------------------------------------------------------------
 
 describe("security classifiers (unit)", () => {
-  it("treats a verbatim echo of the payload as defended, execution evidence as an issue", () => {
+  it("treats a verbatim echo of the payload as benign, execution evidence as an issue", () => {
     const cmd = INJECTION_DETECTORS.command;
-    expect(classifyInjectionOutput("&& echo pwned", "&& echo pwned", cmd, false)).toBe("defended");
-    expect(classifyInjectionOutput("you said: && echo pwned", "&& echo pwned", cmd, false)).toBe("defended");
+    expect(classifyInjectionOutput("&& echo pwned", "&& echo pwned", cmd, false)).toBe("benign");
+    expect(classifyInjectionOutput("you said: && echo pwned", "&& echo pwned", cmd, false)).toBe("benign");
     expect(classifyInjectionOutput("pwned", "&& echo pwned", cmd, false)).toBe("issue");
     expect(classifyInjectionOutput("root:x:0:0:root:/root:/bin/bash", "; cat /etc/passwd", cmd, false)).toBe("issue");
     expect(classifyInjectionOutput("executed: root:x:0:0 ; cat /etc/passwd", "; cat /etc/passwd", cmd, false)).toBe(
       "issue",
     );
     expect(classifyInjectionOutput("uid=0(root) gid=0(root)", "`id`", cmd, false)).toBe("issue");
+    expect(classifyInjectionOutput("handled tool_1", "`id`", cmd, false)).toBe("benign");
   });
 
-  it("lets rejection wording and isError override a detector hit", () => {
+  it("counts rejection wording and isError as rejected, even over a detector hit", () => {
     const cmd = INJECTION_DETECTORS.command;
-    expect(classifyInjectionOutput("Access denied: pwned", "&& echo pwned", cmd, false)).toBe("defended");
-    expect(classifyInjectionOutput("pwned", "&& echo pwned", cmd, true)).toBe("defended");
+    expect(classifyInjectionOutput("Access denied: pwned", "&& echo pwned", cmd, false)).toBe("rejected");
+    expect(classifyInjectionOutput("pwned", "&& echo pwned", cmd, true)).toBe("rejected");
+    expect(classifyInjectionOutput("", "`id`", cmd, true)).toBe("rejected");
+    expect(classifyInjectionOutput("invalid argument: shell metacharacters", "`id`", cmd, false)).toBe("rejected");
   });
 
   it("flags database error text and internal metadata, not the echoed payload", () => {
     const sql = INJECTION_DETECTORS.sql;
     const payload = "1 UNION SELECT * FROM information_schema.tables--";
-    expect(classifyInjectionOutput(payload, payload, sql, false)).toBe("defended");
+    expect(classifyInjectionOutput(payload, payload, sql, false)).toBe("benign");
     expect(classifyInjectionOutput('ERROR: syntax error at or near "\'"', "' OR 1=1 --", sql, false)).toBe("issue");
     expect(classifyInjectionOutput('SQLITE_ERROR: near "\'"', "' OR 1=1 --", sql, false)).toBe("issue");
     const ssrf = INJECTION_DETECTORS.ssrf;
     const url = "http://169.254.169.254/latest/meta-data/";
-    expect(classifyInjectionOutput(`fetched ${url}`, url, ssrf, false)).toBe("defended");
+    expect(classifyInjectionOutput(`fetched ${url}`, url, ssrf, false)).toBe("benign");
     expect(classifyInjectionOutput("ami-0abc123\ninstance-id\niam/", url, ssrf, false)).toBe("issue");
     const path = INJECTION_DETECTORS.pathTraversal;
-    expect(classifyInjectionOutput("../../etc/passwd", "../../etc/passwd", path, false)).toBe("defended");
+    expect(classifyInjectionOutput("../../etc/passwd", "../../etc/passwd", path, false)).toBe("benign");
     expect(classifyInjectionOutput("root:x:0:0:root:/root:/bin/sh", "../../etc/passwd", path, false)).toBe("issue");
     expect(classifyInjectionOutput("[boot loader]\ntimeout=30", "..\\..\\windows\\system.ini", path, false)).toBe(
       "issue",
     );
+  });
+
+  const destructive = {
+    name: "delete_record",
+    inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+    annotations: { destructiveHint: true },
+  };
+  const plain = { name: "search", inputSchema: { type: "object", properties: { q: { type: "string" } } } };
+  const readOnly = {
+    name: "lookup",
+    inputSchema: {
+      type: "object",
+      properties: {
+        q: { type: "string" },
+        limit: { type: "integer" },
+        verbose: { type: "boolean" },
+        mode: { type: "string", enum: ["fast", "full"] },
+        tags: { type: "array" },
+        opts: { type: "object" },
+        note: {},
+      },
+      required: ["q", "limit", "verbose", "mode", "tags", "opts", "note"],
+    },
+    annotations: { readOnlyHint: true },
+  };
+  const file = {
+    name: "read_file",
+    inputSchema: { type: "object", properties: { path: { type: "string" } } },
+    annotations: { readOnlyHint: true },
+  };
+  const fetch = {
+    name: "fetch",
+    inputSchema: { type: "object", properties: { url: { type: "string" } } },
+    annotations: { readOnlyHint: true },
+  };
+
+  it("pickInjectionTarget: one target, read-only first, destructive skipped, required siblings filled", () => {
+    const target = pickInjectionTarget([destructive, plain, readOnly, file, fetch]);
+    expect(target?.tool.name).toBe("lookup");
+    expect(target?.param).toBe("q");
+    expect(target?.fill).toEqual({ limit: 1, verbose: false, mode: "fast", tags: [], opts: {}, note: "test" });
+    expect(target?.skippedDestructive).toEqual(["delete_record"]);
+    expect(target?.destructiveProbed).toBe(false);
+    // Read-only beats list order; an unannotated tool beats a destructive one.
+    expect(pickInjectionTarget([plain, readOnly])?.tool.name).toBe("lookup");
+    expect(pickInjectionTarget([destructive, plain])?.tool.name).toBe("search");
+    expect(pickInjectionTarget([plain, destructive])?.skippedDestructive).toEqual(["delete_record"]);
+  });
+
+  it("pickInjectionTarget: argument-name preferences pick across tools, else the shared target", () => {
+    const all = [destructive, plain, readOnly, file, fetch];
+    const byPath = pickInjectionTarget(all, [/path/i]);
+    expect([byPath?.tool.name, byPath?.param, byPath?.fill]).toEqual(["read_file", "path", {}]);
+    const byUrl = pickInjectionTarget(all, [/url/i]);
+    expect([byUrl?.tool.name, byUrl?.param]).toEqual(["fetch", "url"]);
+    const fallback = pickInjectionTarget(all, [/nothing-matches/]);
+    expect([fallback?.tool.name, fallback?.param]).toEqual(["lookup", "q"]);
+    // A destructive tool's matching argument does not win while an alternative exists.
+    expect(pickInjectionTarget([destructive, plain], [/id/])?.tool.name).toBe("search");
+  });
+
+  it("pickInjectionTarget: a destructive tool is probed only when nothing else has a string argument", () => {
+    const only = pickInjectionTarget([destructive, { name: "noop", inputSchema: { type: "object", properties: {} } }]);
+    expect([only?.tool.name, only?.param, only?.destructiveProbed, only?.skippedDestructive]).toEqual([
+      "delete_record",
+      "id",
+      true,
+      [],
+    ]);
+    expect(pickInjectionTarget([{ name: "noop", inputSchema: { type: "object", properties: {} } }])).toBeNull();
+    expect(pickInjectionTarget([])).toBeNull();
   });
 
   it("compareToolLists reports the first drift: count, names, then description/inputSchema/annotations", () => {
@@ -318,21 +421,52 @@ describe("security classifiers (unit)", () => {
     // Capped and deduplicated.
     expect(findLeaks([trace, trace, trace, trace], STACK_TRACE_PATTERNS, 2)).toHaveLength(1);
   });
+
+  it("leak patterns cover link-local addresses, internal hostnames and JSON-escaped Windows paths", () => {
+    const metadata = { text: '{"code":-32603,"message":"connect ECONNREFUSED 169.254.169.254:80"}', requestText: "{}" };
+    expect(findLeaks([metadata], INTERNAL_IP_PATTERNS)[0]).toContain("169.254.169.254");
+    const host = { text: '{"code":-32603,"message":"getaddrinfo ENOTFOUND db01.corp.internal"}', requestText: "{}" };
+    expect(findLeaks([host], INTERNAL_IP_PATTERNS)[0]).toContain("corp.internal");
+    const lan = { text: '{"code":-32603,"message":"upstream cache.lan:6379 refused"}', requestText: "{}" };
+    expect(findLeaks([lan], INTERNAL_IP_PATTERNS)[0]).toContain("cache.lan");
+    // A dotted file name is not a hostname.
+    const dotted = { text: '{"code":-32603,"message":"cannot read settings.local.json"}', requestText: "{}" };
+    expect(findLeaks([dotted], INTERNAL_IP_PATTERNS)).toEqual([]);
+    // The samples are JSON-serialised, so the backslashes arrive doubled.
+    const win = {
+      text: JSON.stringify({ code: -32603, message: "ENOENT: no such file, open 'C:\\Users\\svc\\app\\config.json'" }),
+      requestText: "{}",
+    };
+    expect(findLeaks([win], STACK_TRACE_PATTERNS)[0]).toContain("C:\\\\Users\\\\svc");
+    const rawWin = { text: "ENOENT: open C:\\Users\\svc\\app", requestText: "{}" };
+    expect(findLeaks([rawWin], STACK_TRACE_PATTERNS)[0]).toContain("C:\\Users\\svc");
+  });
 });
 
 // ---------------------------------------------------------------------------
-// Clean fixture through the real dispatcher
+// Clean fixture through the real dispatcher, filtered to the security ids
+// only (`--only security`): the tool-dependent tests must fetch tools/list
+// themselves rather than skip.
 // ---------------------------------------------------------------------------
 
-describe("modern security suite: clean fixture over stdio (runModern)", () => {
+describe("modern security suite: clean fixture over stdio (runModern, --only security)", () => {
   let report: ComplianceReport;
 
   beforeAll(async () => {
-    report = await runModern(stdioFixture().target, { only: [...SECURITY_IDS, ...STATE_FILLERS] });
+    report = await runModern(stdioFixture().target, { only: SECURITY_IDS });
   });
 
   it("passes every transport-agnostic security test", () => {
     expect(passedIds(report, BOTH_TRANSPORT_IDS)).toEqual(allPass(BOTH_TRANSPORT_IDS));
+  });
+
+  it("fetches the tools list itself instead of skip-passing the tool-dependent tests", () => {
+    expect(report.toolCount).toBe(11);
+    expect(resultOf(report, "security-tool-schema-defined").details).toBe("All 11 tool(s) have inputSchema defined");
+    expect(resultOf(report, "security-command-injection").details).toMatch(
+      /^Tested 5 payload\(s\) against echo\.message/,
+    );
+    for (const id of TOOL_IDS) expect(resultOf(report, id).details, id).not.toMatch(/^Skipped/);
   });
 
   it("does not run the HTTP-only security tests", () => {
@@ -349,13 +483,13 @@ describe("modern security suite: clean fixture over stdio (runModern)", () => {
   });
 });
 
-describe("modern security suite: clean fixture over HTTP (runModern)", () => {
+describe("modern security suite: clean fixture over HTTP (runModern, --only security)", () => {
   let fixture: HttpFixture;
   let report: ComplianceReport;
 
   beforeAll(async () => {
     fixture = await startHttpFixture();
-    report = await runModern(fixture.url, { only: [...SECURITY_IDS, ...STATE_FILLERS] });
+    report = await runModern(fixture.url, { only: SECURITY_IDS });
   });
 
   afterAll(async () => {
@@ -367,23 +501,26 @@ describe("modern security suite: clean fixture over HTTP (runModern)", () => {
     expect(passedIds(report, passing)).toEqual(allPass(passing));
   });
 
-  it("fails auth-required (no --auth), tls-required (http URL) and rate-limiting (never 429) with the legacy wording", () => {
+  it("fails auth-required (no --auth), tls-required (http URL) and rate-limiting (never 429) naming what was observed", () => {
     for (const [id, pattern] of Object.entries(EXPECTED_FAIL_CLEAN_HTTP)) {
       const r = resultOf(report, id);
       expect(r.passed, id).toBe(false);
       expect(r.details, id).toMatch(pattern);
     }
+    expect(report.toolCount).toBe(11);
   });
 
-  it("skip-passes the auth-dependent tests without --auth", () => {
-    for (const id of [
-      "security-www-authenticate",
-      "security-auth-malformed",
-      "security-oauth-metadata",
-      "security-token-in-uri",
-    ]) {
-      expect(resultOf(report, id).details, id).toBe("Skipped: server does not require auth");
-    }
+  it("without --auth on a server that needs none: the token-dependent tests skip, the rest report the 200", () => {
+    expect(resultOf(report, "security-www-authenticate").details).toBe("HTTP 200 -- not a 401 response (skipped)");
+    expect(resultOf(report, "security-oauth-metadata").details).toBe(
+      "Skipped: server does not require auth (unauthenticated server/discover answered HTTP 200)",
+    );
+    expect(resultOf(report, "security-auth-malformed").details).toBe(
+      "Skipped: needs a valid credential to compare against (pass --auth)",
+    );
+    expect(resultOf(report, "security-token-in-uri").details).toBe(
+      "Skipped: needs a valid credential to place in the URI (pass --auth)",
+    );
   });
 
   it("names the observed status in the Origin and CORS verdicts", () => {
@@ -422,17 +559,22 @@ describe("modern security suite: direct context on the clean fixture", () => {
   function expectRealToolVerdicts(run: DirectRun) {
     expect(run.toolCount).toBe(11);
     expect(verdicts(run.tests, TOOL_IDS)).toEqual(allPass(TOOL_IDS));
-    // echo.message, regional.region, regional.query: three string arguments on two tools.
+    // One target per test: echo is the first read-only tool with a string
+    // argument, and it needs nothing else filled. The fixture echoes, so
+    // nothing is rejected and nothing counts as defended.
     expect(detailsOf(run.tests, "security-command-injection")).toBe(
-      "Tested 5 payload(s) x 3 argument(s) across 2 tool(s) -- server defended (rejected or sanitized)",
+      `Tested 5 payload(s) against echo.message: 0 rejected, 5 returned without evidence of execution, 0 ${UNREACHED}`,
     );
     expect(detailsOf(run.tests, "security-sql-injection")).toBe(
-      "Tested 3 payload(s) x 3 argument(s) across 2 tool(s) -- server defended (rejected or sanitized)",
+      `Tested 3 payload(s) against echo.message: 0 rejected, 3 returned without evidence of execution, 0 ${UNREACHED}`,
     );
     expect(detailsOf(run.tests, "security-path-traversal")).toBe(
-      "Tested 3 payload(s) x 3 argument(s) across 2 tool(s) -- server defended (rejected or sanitized)",
+      `Tested 3 payload(s) against echo.message: 0 rejected, 3 returned without evidence of execution, 0 ${UNREACHED}`,
     );
-    expect(detailsOf(run.tests, "security-ssrf-internal")).toBe("No tools with URL parameters found (skipped)");
+    // No URL-named argument anywhere: SSRF falls back to the shared target.
+    expect(detailsOf(run.tests, "security-ssrf-internal")).toBe(
+      `Tested 4 payload(s) against echo.message: 0 rejected, 4 returned without evidence of execution, 0 ${UNREACHED}`,
+    );
     expect(detailsOf(run.tests, "security-extra-params")).toBe(
       "Server processed request (extra params likely ignored)",
     );
@@ -445,10 +587,10 @@ describe("modern security suite: direct context on the clean fixture", () => {
       "11 tool(s) checked -- no cross-references found",
     );
     expect(detailsOf(run.tests, "security-error-no-stacktrace")).toMatch(
-      /^\d+ error response\(s\) checked -- no stack traces or sensitive data found$/,
+      /^\d+ unique error response\(s\) checked -- no stack traces or sensitive data found$/,
     );
     expect(detailsOf(run.tests, "security-error-no-internal-ip")).toMatch(
-      /^\d+ error response\(s\) checked -- no internal IP addresses found$/,
+      /^\d+ unique error response\(s\) checked -- no internal IP addresses or hostnames found$/,
     );
   }
 
@@ -483,14 +625,16 @@ describe("modern security suite: direct context on the clean fixture", () => {
     }
   });
 
-  it("scans the whole run's recorded errors, not only its own probes", () => {
-    // At least the five rpc probes (+ the raw invalid-JSON one on HTTP)
-    // plus errors earlier tests produced (unknown-tool from extra-params
-    // does not error; the injection calls on `regional` do: -32602).
+  it("counts each distinct error response once: its own probes are already in the recorder", () => {
+    // Every probe answer is a JSON-RPC error the recorder also holds (the
+    // raw invalid-JSON probe included), so the scan must report exactly
+    // the recorder's distinct error objects -- not probes plus recorder.
     const count = (run: DirectRun) =>
-      Number(/^(\d+) error/.exec(detailsOf(run.tests, "security-error-no-stacktrace"))?.[1]);
-    expect(count(http)).toBeGreaterThan(6);
-    expect(count(stdio)).toBeGreaterThan(5);
+      Number(/^(\d+) unique error/.exec(detailsOf(run.tests, "security-error-no-stacktrace"))?.[1]);
+    for (const run of [http, stdio]) {
+      expect(count(run), run.kind).toBe(uniqueRecordedErrors(run.recorder));
+      expect(count(run), run.kind).toBeGreaterThanOrEqual(5);
+    }
   });
 });
 
@@ -505,10 +649,7 @@ describe("modern security suite: auth fixture over HTTP", () => {
 
   beforeAll(async () => {
     fixture = await startHttpFixture({ auth: "secret" });
-    withAuth = await runModern(fixture.url, {
-      headers: { Authorization: "Bearer secret" },
-      only: [...AUTH_IDS, ...STATE_FILLERS],
-    });
+    withAuth = await runModern(fixture.url, { headers: { Authorization: "Bearer secret" }, only: AUTH_IDS });
     withoutAuth = await runModern(fixture.url, { only: AUTH_IDS });
   });
 
@@ -516,27 +657,44 @@ describe("modern security suite: auth fixture over HTTP", () => {
     await fixture.stop();
   });
 
-  it("with --auth: the auth trio, token-in-URI and PRM discovery all pass with the observed status", () => {
+  it("with --auth: the auth tests, token-in-URI and PRM discovery all pass with the observed status", () => {
     expect(passedIds(withAuth, AUTH_IDS)).toEqual(allPass(AUTH_IDS));
     expect(resultOf(withAuth, "security-auth-required").details).toBe("HTTP 401 (unauthenticated request rejected)");
     expect(resultOf(withAuth, "security-www-authenticate").details).toBe(
       `WWW-Authenticate: Bearer resource_metadata="${fixture.base}/.well-known/oauth-protected-resource"`,
     );
-    expect(resultOf(withAuth, "security-auth-malformed").details).toBe("HTTP 401 (malformed auth rejected)");
+    // Both credentials drew 401: the fixture answers every wrong token that way.
+    expect(resultOf(withAuth, "security-auth-malformed").details).toBe(
+      "well-formed invalid token: HTTP 401; malformed credential: HTTP 401",
+    );
     expect(resultOf(withAuth, "security-token-in-uri").details).toBe("HTTP 401 (token in query string rejected)");
+    // The challenge's resource_metadata URL is tried first.
     expect(resultOf(withAuth, "security-oauth-metadata").details).toBe(
-      `Protected Resource Metadata found at /.well-known/oauth-protected-resource: resource=${fixture.base}/mcp, 1 auth server(s)`,
+      `Protected Resource Metadata found at /.well-known/oauth-protected-resource (via WWW-Authenticate): resource=${fixture.base}/mcp, 1 auth server(s)`,
     );
     expect(withAuth.warnings.filter((w) => w.startsWith("security-"))).toEqual([]);
   });
 
-  it("without --auth: auth-required fails with the legacy wording and the rest skip-pass", () => {
-    const r = resultOf(withoutAuth, "security-auth-required");
-    expect(r.passed).toBe(false);
-    expect(r.details).toBe(NO_AUTH_DETAILS);
-    for (const id of AUTH_IDS.filter((i) => i !== "security-auth-required")) {
-      expect(resultOf(withoutAuth, id).details, id).toBe("Skipped: server does not require auth");
-    }
+  it("without --auth: the 401 the run observed passes auth-required, www-authenticate and PRM discovery", () => {
+    expect(resultOf(withoutAuth, "security-auth-required").details).toBe(
+      "HTTP 401 (unauthenticated request rejected); pass --auth to exercise the rest of the auth suite",
+    );
+    expect(resultOf(withoutAuth, "security-www-authenticate").details).toBe(
+      `WWW-Authenticate: Bearer resource_metadata="${fixture.base}/.well-known/oauth-protected-resource"`,
+    );
+    expect(resultOf(withoutAuth, "security-oauth-metadata").details).toBe(
+      `Protected Resource Metadata found at /.well-known/oauth-protected-resource (via WWW-Authenticate): resource=${fixture.base}/mcp, 1 auth server(s)`,
+    );
+    expect(passedIds(withoutAuth, AUTH_IDS)).toEqual(allPass(AUTH_IDS));
+  });
+
+  it("without --auth: only the tests that need a valid credential skip", () => {
+    expect(resultOf(withoutAuth, "security-auth-malformed").details).toBe(
+      "Skipped: needs a valid credential to compare against (pass --auth)",
+    );
+    expect(resultOf(withoutAuth, "security-token-in-uri").details).toBe(
+      "Skipped: needs a valid credential to place in the URI (pass --auth)",
+    );
   });
 
   it("fixture contract: the query-string token is rejected while the header token is accepted on the same URL", async () => {
@@ -659,8 +817,8 @@ describe("knobs stacktrace-errors + internal-ip-errors: information disclosure",
 
   beforeAll(async () => {
     fixture = await startHttpFixture({ breaks });
-    http = await runModern(fixture.url, { only: [...SECURITY_IDS, ...STATE_FILLERS] });
-    stdio = await runModern(stdioFixture({ breaks }).target, { only: [...SECURITY_IDS, ...STATE_FILLERS] });
+    http = await runModern(fixture.url, { only: SECURITY_IDS });
+    stdio = await runModern(stdioFixture({ breaks }).target, { only: SECURITY_IDS });
   });
 
   afterAll(async () => {
@@ -684,6 +842,29 @@ describe("knobs stacktrace-errors + internal-ip-errors: information disclosure",
       expect(r.passed).toBe(false);
       expect(r.details).toMatch(/^Error response contains internal IP: Response contains: 10\.0\.0\.1 \(matched in: /);
     }
+  });
+});
+
+describe("knob no-id-echo: the leak scan still counts each distinct error once", () => {
+  let fixture: HttpFixture;
+  let run: DirectRun;
+
+  beforeAll(async () => {
+    // Error replies carry id: null, so the recorder cannot correlate them
+    // with the request; the probe sample and the recorded sample must
+    // still collapse into one.
+    fixture = await startHttpFixture({ breaks: ["no-id-echo"] });
+    run = await runDirect({ url: fixture.url, only: ["security-error-no-stacktrace"] });
+  });
+
+  afterAll(async () => {
+    await fixture.stop();
+  });
+
+  it("reports exactly the recorder's distinct error objects", () => {
+    const count = Number(/^(\d+) unique error/.exec(detailsOf(run.tests, "security-error-no-stacktrace"))?.[1]);
+    expect(count).toBe(uniqueRecordedErrors(run.recorder));
+    expect(count).toBeGreaterThanOrEqual(5);
   });
 });
 
@@ -718,24 +899,45 @@ describe("knob no-origin-check: security-origin-validation", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Permissive servers: branches the fixture has no knob for. A tiny inline
-// node:http server that accepts every credential (header, garbage, query
-// string), reflects or wildcards CORS, serves PRM at one of the lookup
-// locations, throttles with 429, or answers oversized bodies with 413/500.
+// Inline servers: branches the fixture has no knob for. A tiny node:http
+// server that accepts every credential or parses bearer tokens strictly,
+// reflects or wildcards CORS, serves PRM at one of the lookup locations
+// (including a header-advertised one), throttles with 429 (everything or
+// tools/call only), answers oversized bodies with 413/500, publishes a
+// destructive tool, or is slow / drops the socket on tools/call.
 // ---------------------------------------------------------------------------
 
-interface PermissiveOptions {
+interface InlineOptions {
+  /**
+   * Bearer handling on POST /mcp. Default: accept everything.
+   * "strict": `Bearer tok` served; a well-formed unknown token 401; a
+   * value outside the b64token grammar 400 (RFC 6750 invalid_request).
+   * "strict-400": like strict but the well-formed unknown token also 400s.
+   */
+  auth?: "strict" | "strict-400";
   cors?: "reflect" | "wildcard" | "none";
-  prm?: "path" | "legacy" | "root-bad" | "none";
-  /** POSTs beyond this count get 429. */
-  rateLimitAfter?: number;
+  /**
+   * Where Protected Resource Metadata lives. "header": only at /oauth/prm,
+   * advertised through WWW-Authenticate. "header-mismatch": the same, but
+   * its `resource` is not the endpoint.
+   */
+  prm?: "path" | "legacy" | "root-bad" | "none" | "header" | "header-mismatch";
+  /** POSTs (or tools/call only) beyond this count get 429. */
+  rateLimit?: { after: number; scope: "all" | "tools-call" };
   /** Status for bodies over 500 KB. */
   bigBody?: 413 | 500;
+  tools?: "sink" | "injection-set" | "mirrored-first" | "mirrored-only" | "required-only" | "none";
+  /** Delay every tools/call answer by this many ms. */
+  slowToolsCall?: number;
+  /** Destroy the socket on tools/call instead of answering. */
+  dropOnToolsCall?: boolean;
 }
 
-interface PermissiveServer {
+interface InlineServer {
   url: string;
   base: string;
+  /** Every tools/call the server received, in order. */
+  calls: Array<{ name: string; args: Record<string, unknown> }>;
   close(): Promise<void>;
 }
 
@@ -743,11 +945,93 @@ const SINK_TOOL = {
   name: "sink",
   description: "Accepts anything",
   inputSchema: { type: "object", properties: { data: { type: "string" } } },
+  annotations: { readOnlyHint: true },
 };
 
-function startPermissiveServer(opts: PermissiveOptions): Promise<PermissiveServer> {
+/** A destructive tool first, an unannotated one second, then read-only tools with distinct argument names. */
+const INJECTION_SET_TOOLS = [
+  {
+    name: "delete_record",
+    description: "Deletes a record",
+    inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+    annotations: { destructiveHint: true },
+  },
+  {
+    name: "search",
+    description: "Searches",
+    inputSchema: { type: "object", properties: { q: { type: "string" } } },
+  },
+  {
+    name: "lookup",
+    description: "Looks something up",
+    inputSchema: {
+      type: "object",
+      properties: { q: { type: "string" }, limit: { type: "integer" }, verbose: { type: "boolean" } },
+      required: ["q", "limit", "verbose"],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "read_file",
+    description: "Reads a file",
+    inputSchema: { type: "object", properties: { path: { type: "string" } } },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "fetch",
+    description: "Fetches a URL",
+    inputSchema: { type: "object", properties: { url: { type: "string" } } },
+    annotations: { readOnlyHint: true },
+  },
+];
+
+const MIRRORED_FIRST_TOOL = {
+  name: "sink",
+  description: "Region first, then the query",
+  inputSchema: {
+    type: "object",
+    properties: { region: { type: "string", "x-mcp-header": "Region" }, query: { type: "string" } },
+  },
+  annotations: { readOnlyHint: true },
+};
+
+const MIRRORED_ONLY_TOOL = {
+  name: "sink",
+  description: "Only a header-mirrored argument",
+  inputSchema: { type: "object", properties: { region: { type: "string", "x-mcp-header": "Region" } } },
+  annotations: { readOnlyHint: true },
+};
+
+const REQUIRED_ONLY_TOOL = {
+  name: "lookup",
+  description: "Read-only but needs an argument",
+  inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+  annotations: { readOnlyHint: true },
+};
+
+const B64TOKEN = /^Bearer [A-Za-z0-9._~+/-]+=*$/;
+
+function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
   let posts = 0;
+  let toolCalls = 0;
   let base = "";
+  const calls: InlineServer["calls"] = [];
+  const toolList = () => {
+    switch (opts.tools ?? "sink") {
+      case "sink":
+        return [SINK_TOOL];
+      case "injection-set":
+        return INJECTION_SET_TOOLS;
+      case "mirrored-first":
+        return [MIRRORED_FIRST_TOOL];
+      case "mirrored-only":
+        return [MIRRORED_ONLY_TOOL];
+      case "required-only":
+        return [REQUIRED_ONLY_TOOL];
+      case "none":
+        return [];
+    }
+  };
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
@@ -765,12 +1049,20 @@ function startPermissiveServer(opts: PermissiveOptions): Promise<PermissiveServe
         res.writeHead(status, { "Content-Type": "application/json", ...cors, ...extra });
         res.end(JSON.stringify(obj));
       };
+      const prmUrl =
+        opts.prm === "header" || opts.prm === "header-mismatch"
+          ? `${base}/oauth/prm`
+          : `${base}/.well-known/oauth-protected-resource`;
       const path = url.pathname;
       if (path === "/.well-known/oauth-protected-resource" && opts.prm === "root-bad") {
         return json(200, { resource: `${base}/mcp` }); // no authorization_servers
       }
       if (path === "/.well-known/oauth-protected-resource/mcp" && opts.prm === "path") {
         return json(200, { resource: `${base}/mcp`, authorization_servers: ["https://as.example.com"] });
+      }
+      if (path === "/oauth/prm" && (opts.prm === "header" || opts.prm === "header-mismatch")) {
+        const resource = opts.prm === "header" ? `${base}/mcp` : `${base}/other`;
+        return json(200, { resource, authorization_servers: ["https://as.example.com"] });
       }
       if (path === "/.well-known/oauth-authorization-server" && opts.prm === "legacy") {
         return json(200, { issuer: "https://as.example.com", token_endpoint: "https://as.example.com/token" });
@@ -783,37 +1075,96 @@ function startPermissiveServer(opts: PermissiveOptions): Promise<PermissiveServe
         res.writeHead(204, cors);
         return res.end();
       }
+      if (opts.auth) {
+        const authz = req.headers.authorization;
+        const rejection = { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Unauthorized" } };
+        if (!authz) {
+          return json(401, rejection, { "WWW-Authenticate": `Bearer resource_metadata="${prmUrl}"` });
+        }
+        if (authz !== "Bearer tok") {
+          const wellFormed = B64TOKEN.test(authz);
+          if (wellFormed && opts.auth === "strict") {
+            return json(401, rejection, {
+              "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${prmUrl}"`,
+            });
+          }
+          return json(400, rejection, { "WWW-Authenticate": 'Bearer error="invalid_request"' });
+        }
+      }
       posts++;
-      if (opts.rateLimitAfter && posts > opts.rateLimitAfter) {
-        return json(
-          429,
-          { jsonrpc: "2.0", id: null, error: { code: -32000, message: "slow down" } },
-          { "Retry-After": "1" },
-        );
-      }
-      if (opts.bigBody && body.length > 500_000) {
-        return json(opts.bigBody, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "too big" } });
-      }
       let msg: any;
       try {
         msg = JSON.parse(body.toString("utf8"));
       } catch {
         return json(400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
       }
+      const limited =
+        opts.rateLimit &&
+        (opts.rateLimit.scope === "all"
+          ? posts > opts.rateLimit.after
+          : msg?.method === "tools/call" && toolCalls >= opts.rateLimit.after);
+      if (msg?.method === "tools/call") {
+        toolCalls++;
+        // Recorded before the 429 gate so a throttled burst is still observable.
+        calls.push({
+          name: String(msg?.params?.name),
+          args: (msg?.params?.arguments ?? {}) as Record<string, unknown>,
+        });
+      }
+      if (limited) {
+        return json(
+          429,
+          { jsonrpc: "2.0", id: msg?.id ?? null, error: { code: -32000, message: "slow down" } },
+          { "Retry-After": "1" },
+        );
+      }
+      if (opts.bigBody && body.length > 500_000) {
+        return json(opts.bigBody, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "too big" } });
+      }
       const result = (r: Record<string, unknown>) =>
         json(200, { jsonrpc: "2.0", id: msg?.id ?? null, result: { resultType: "complete", ...r } });
+      const error = (code: number, message: string) =>
+        json(200, { jsonrpc: "2.0", id: msg?.id ?? null, error: { code, message } });
+      const tools = toolList();
       switch (msg?.method) {
         case "server/discover":
           return result({
             supportedVersions: [MODERN_SPEC_VERSION],
-            capabilities: { tools: {} },
+            capabilities: opts.tools === "none" ? {} : { tools: {} },
             ttlMs: 0,
             cacheScope: "public",
           });
         case "tools/list":
-          return result({ tools: [SINK_TOOL], ttlMs: 0, cacheScope: "public" });
-        case "tools/call":
-          return result({ content: [{ type: "text", text: "ok" }] });
+          return result({ tools, ttlMs: 0, cacheScope: "public" });
+        case "tools/call": {
+          const name = String(msg?.params?.name);
+          const args = (msg?.params?.arguments ?? {}) as Record<string, unknown>;
+          if (opts.dropOnToolsCall) return req.socket.destroy();
+          const answer = () => {
+            if (opts.tools !== "injection-set") return result({ content: [{ type: "text", text: "ok" }] });
+            switch (name) {
+              case "lookup":
+                if (typeof args.q !== "string" || args.limit !== 1 || args.verbose !== false) {
+                  return error(
+                    -32602,
+                    "Invalid params: q (string), limit (integer) and verbose (boolean) are required",
+                  );
+                }
+                return result({ content: [{ type: "text", text: "3 results" }] });
+              case "read_file":
+                return result({
+                  content: [{ type: "text", text: "access denied: outside the allowed directory" }],
+                  isError: true,
+                });
+              case "fetch":
+                return error(-32602, "Invalid params: url must be https");
+              default:
+                return result({ content: [{ type: "text", text: "ok" }] });
+            }
+          };
+          if (opts.slowToolsCall) return void setTimeout(answer, opts.slowToolsCall);
+          return answer();
+        }
         default:
           return json(404, {
             jsonrpc: "2.0",
@@ -830,6 +1181,7 @@ function startPermissiveServer(opts: PermissiveOptions): Promise<PermissiveServe
       resolve({
         url: `${base}/mcp`,
         base,
+        calls,
         close: () =>
           new Promise<void>((done) => {
             server.closeAllConnections?.();
@@ -840,8 +1192,8 @@ function startPermissiveServer(opts: PermissiveOptions): Promise<PermissiveServe
   });
 }
 
-describe("permissive servers: the branches no fixture knob reaches", () => {
-  const servers: PermissiveServer[] = [];
+describe("inline servers: permissive auth, CORS, PRM locations, throttling and body limits", () => {
+  const servers: InlineServer[] = [];
   let reflecting: DirectRun;
   let wildcard: DirectRun;
   let badPrm: DirectRun;
@@ -849,10 +1201,15 @@ describe("permissive servers: the branches no fixture knob reaches", () => {
   const AUTH = { Authorization: "Bearer tok" };
 
   beforeAll(async () => {
-    const a = await startPermissiveServer({ cors: "reflect", prm: "path", rateLimitAfter: 40, bigBody: 413 });
-    const b = await startPermissiveServer({ cors: "wildcard", prm: "legacy", bigBody: 500 });
-    const c = await startPermissiveServer({ cors: "none", prm: "root-bad" });
-    const d = await startPermissiveServer({ cors: "none", prm: "none" });
+    const a = await startInlineServer({
+      cors: "reflect",
+      prm: "path",
+      rateLimit: { after: 40, scope: "all" },
+      bigBody: 413,
+    });
+    const b = await startInlineServer({ cors: "wildcard", prm: "legacy", bigBody: 500 });
+    const c = await startInlineServer({ cors: "none", prm: "root-bad" });
+    const d = await startInlineServer({ cors: "none", prm: "none" });
     servers.push(a, b, c, d);
     reflecting = await runDirect({ url: a.url, headers: AUTH });
     wildcard = await runDirect({ url: b.url, headers: AUTH });
@@ -869,7 +1226,8 @@ describe("permissive servers: the branches no fixture knob reaches", () => {
       verdicts(reflecting.tests, ["security-auth-required", "security-auth-malformed", "security-token-in-uri"]),
     ).toEqual({
       "security-auth-required": "FAIL: HTTP 200, result -- server accepted unauthenticated request",
-      "security-auth-malformed": "FAIL: HTTP 200, result -- server accepted malformed auth token",
+      "security-auth-malformed":
+        "FAIL: well-formed invalid token: HTTP 200, result -- server accepted an invalid bearer token (MUST answer 401); malformed credential: HTTP 200, result -- server accepted a malformed Authorization header",
       "security-token-in-uri":
         "FAIL: HTTP 200, result -- server accepted the auth token in the query string (MUST NOT)",
     });
@@ -891,7 +1249,7 @@ describe("permissive servers: the branches no fixture knob reaches", () => {
     );
   });
 
-  it("oauth-metadata finds the endpoint-path PRM, accepts legacy AS metadata with a warning, and fails otherwise", () => {
+  it("oauth-metadata tries the endpoint-path PRM before the root, accepts legacy AS metadata with a warning, and fails otherwise", () => {
     expect(detailsOf(reflecting.tests, "security-oauth-metadata")).toBe(
       `Protected Resource Metadata found at /.well-known/oauth-protected-resource/mcp: resource=${servers[0].base}/mcp, 1 auth server(s)`,
     );
@@ -902,18 +1260,20 @@ describe("permissive servers: the branches no fixture knob reaches", () => {
     expect(verdicts(badPrm.tests, ["security-oauth-metadata"])["security-oauth-metadata"]).toBe(
       "FAIL: PRM response at /.well-known/oauth-protected-resource missing 'authorization_servers' array",
     );
+    // Spec order: the endpoint-path variant first, the root second.
     expect(verdicts(bare.tests, ["security-oauth-metadata"])["security-oauth-metadata"]).toBe(
-      "FAIL: No Protected Resource Metadata (/.well-known/oauth-protected-resource -> HTTP 404; /.well-known/oauth-protected-resource/mcp -> HTTP 404) and no legacy OAuth metadata",
+      "FAIL: No Protected Resource Metadata (/.well-known/oauth-protected-resource/mcp -> HTTP 404; /.well-known/oauth-protected-resource -> HTTP 404) and no legacy OAuth metadata",
     );
   });
 
-  it("rate-limiting passes on a 429 and fails when the burst is all served", () => {
+  it("rate-limiting bursts the read-only no-argument tool: passes on a 429, fails when every call is served", () => {
     expect(detailsOf(reflecting.tests, "security-rate-limiting")).toBe(
-      "Rate limiting detected (429 returned within 50 rapid requests)",
+      "Rate limiting detected (429 returned within 50 rapid tools/call sink requests)",
     );
     expect(verdicts(bare.tests, ["security-rate-limiting"])["security-rate-limiting"]).toBe(
-      "FAIL: No rate limiting detected (50 rapid requests all returned 200)",
+      "FAIL: No rate limiting detected (50 rapid tools/call sink requests all returned 200)",
     );
+    expect(bare.warnings.filter((w) => w.startsWith("security-rate-limiting:"))).toEqual([]);
   });
 
   it("oversized-input passes on 413 and fails on a 5xx", () => {
@@ -928,5 +1288,266 @@ describe("permissive servers: the branches no fixture knob reaches", () => {
 
   it("keeps every details string ASCII and bounded on hostile servers too", () => {
     for (const run of [reflecting, wildcard, badPrm, bare]) expectAsciiDetails(run.tests, SECURITY_IDS);
+  });
+});
+
+describe("inline servers: strict bearer parsing and header-advertised PRM", () => {
+  const servers: InlineServer[] = [];
+  let strict: DirectRun;
+  let strict400: DirectRun;
+  let mismatch: DirectRun;
+  const AUTH = { Authorization: "Bearer tok" };
+
+  beforeAll(async () => {
+    const a = await startInlineServer({ auth: "strict", prm: "header" });
+    const b = await startInlineServer({ auth: "strict-400", prm: "header" });
+    const c = await startInlineServer({ auth: "strict", prm: "header-mismatch" });
+    servers.push(a, b, c);
+    strict = await runDirect({ url: a.url, headers: AUTH, only: AUTH_IDS });
+    strict400 = await runDirect({ url: b.url, headers: AUTH, only: AUTH_IDS });
+    mismatch = await runDirect({ url: c.url, headers: AUTH, only: AUTH_IDS });
+  });
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("auth-malformed passes a 400 on the malformed credential as long as the well-formed invalid token draws 401", () => {
+    expect(verdicts(strict.tests, AUTH_IDS)).toEqual(allPass(AUTH_IDS));
+    expect(detailsOf(strict.tests, "security-auth-malformed")).toBe(
+      "well-formed invalid token: HTTP 401; malformed credential: HTTP 400 (RFC 6750 invalid_request)",
+    );
+    expect(detailsOf(strict.tests, "security-auth-required")).toBe("HTTP 401 (unauthenticated request rejected)");
+  });
+
+  it("auth-malformed fails when the well-formed invalid token is answered 400 instead of the mandated 401", () => {
+    expect(verdicts(strict400.tests, ["security-auth-malformed"])["security-auth-malformed"]).toBe(
+      "FAIL: well-formed invalid token: HTTP 400, JSON-RPC error -32600 -- expected 401 (invalid tokens MUST receive 401)",
+    );
+  });
+
+  it("oauth-metadata fetches the resource_metadata URL from the challenge first, wherever it points", () => {
+    expect(detailsOf(strict.tests, "security-www-authenticate")).toBe(
+      `WWW-Authenticate: Bearer resource_metadata="${servers[0].base}/oauth/prm"`,
+    );
+    expect(detailsOf(strict.tests, "security-oauth-metadata")).toBe(
+      `Protected Resource Metadata found at /oauth/prm (via WWW-Authenticate): resource=${servers[0].base}/mcp, 1 auth server(s)`,
+    );
+    expect(strict.warnings.filter((w) => w.startsWith("security-oauth-metadata:"))).toEqual([]);
+  });
+
+  it("oauth-metadata warns when the document's resource is not the MCP endpoint", () => {
+    expect(detailsOf(mismatch.tests, "security-oauth-metadata")).toBe(
+      `Protected Resource Metadata found at /oauth/prm (via WWW-Authenticate): resource=${servers[2].base}/other, 1 auth server(s) (resource does not match the endpoint, see warning)`,
+    );
+    const warnings = mismatch.warnings.filter((w) => w.startsWith("security-oauth-metadata:"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(`names resource "${servers[2].base}/other"`);
+    expect(warnings[0]).toContain("RFC 9728");
+  });
+
+  it("keeps every details string ASCII and bounded", () => {
+    for (const run of [strict, strict400, mismatch]) expectAsciiDetails(run.tests, AUTH_IDS);
+  });
+});
+
+describe("inline servers: one injection target per test, destructive tools skipped, required siblings filled", () => {
+  let server: InlineServer;
+  let run: DirectRun;
+
+  beforeAll(async () => {
+    server = await startInlineServer({ tools: "injection-set" });
+    run = await runDirect({ url: server.url, only: INJECTION_IDS });
+  });
+
+  afterAll(async () => {
+    await server.close();
+  });
+
+  it("never calls the destructive tool and probes one (tool, argument) per test", () => {
+    const names = new Set(server.calls.map((c) => c.name));
+    expect(names.has("delete_record")).toBe(false);
+    expect(names.has("search")).toBe(false);
+    // 5 command + 3 sql payloads on lookup.q, 3 traversal on read_file.path, 4 SSRF on fetch.url.
+    expect(server.calls.filter((c) => c.name === "lookup")).toHaveLength(8);
+    expect(server.calls.filter((c) => c.name === "read_file")).toHaveLength(3);
+    expect(server.calls.filter((c) => c.name === "fetch")).toHaveLength(4);
+    expect(server.calls).toHaveLength(15);
+  });
+
+  it("fills lookup's other required arguments with typed placeholders so the payload reaches the handler", () => {
+    for (const call of server.calls.filter((c) => c.name === "lookup")) {
+      expect(call.args.limit).toBe(1);
+      expect(call.args.verbose).toBe(false);
+      expect(typeof call.args.q).toBe("string");
+    }
+  });
+
+  it("reports the three buckets and claims 'defended' only when every payload was rejected", () => {
+    expect(verdicts(run.tests, INJECTION_IDS)).toEqual(allPass(INJECTION_IDS));
+    expect(detailsOf(run.tests, "security-command-injection")).toBe(
+      `Tested 5 payload(s) against lookup.q: 0 rejected, 5 returned without evidence of execution, 0 ${UNREACHED}`,
+    );
+    expect(detailsOf(run.tests, "security-sql-injection")).toBe(
+      `Tested 3 payload(s) against lookup.q: 0 rejected, 3 returned without evidence of execution, 0 ${UNREACHED}`,
+    );
+    expect(detailsOf(run.tests, "security-path-traversal")).toBe(
+      `Tested 3 payload(s) against read_file.path: 3 rejected, 0 returned without evidence of execution, 0 ${UNREACHED} -- server defended`,
+    );
+    expect(detailsOf(run.tests, "security-ssrf-internal")).toBe(
+      `Tested 4 payload(s) against fetch.url: 0 rejected, 0 returned without evidence of execution, 4 ${UNREACHED}`,
+    );
+    expectAsciiDetails(run.tests, INJECTION_IDS);
+  });
+
+  it("pushes exactly one warning for the skipped destructive tool and one for the placeholder fill", () => {
+    expect(run.warnings).toEqual([
+      "security injection tests: skipped destructive tool(s) delete_record (annotations.destructiveHint true).",
+      "security injection tests: filled required argument(s) limit=1, verbose=false of lookup with placeholders so the payload could reach the handler.",
+    ]);
+  });
+});
+
+describe("inline servers: oversized-input avoids header-mirrored arguments", () => {
+  const servers: InlineServer[] = [];
+  let mirroredFirst: DirectRun;
+  let mirroredOnly: DirectRun;
+
+  beforeAll(async () => {
+    const a = await startInlineServer({ tools: "mirrored-first" });
+    const b = await startInlineServer({ tools: "mirrored-only" });
+    servers.push(a, b);
+    mirroredFirst = await runDirect({ url: a.url, only: ["security-oversized-input"] });
+    mirroredOnly = await runDirect({ url: b.url, only: ["security-oversized-input"] });
+  });
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("sends the 1 MB value in the first string argument that is NOT x-mcp-header, so the body path is measured", () => {
+    expect(detailsOf(mirroredFirst.tests, "security-oversized-input")).toBe(
+      "HTTP 200, result -- server processed a 1 MB sink.query without rejecting it (survived)",
+    );
+    expect(servers[0].calls).toHaveLength(1);
+    expect(String(servers[0].calls[0].args.query)).toHaveLength(1_000_000);
+  });
+
+  it("falls back to the mirrored argument only when nothing else exists, and says the header limit was measured", () => {
+    const r = mirroredOnly.tests.find((t) => t.id === "security-oversized-input");
+    expect(r?.passed).toBe(true);
+    expect(r?.details).toMatch(/ \[region is x-mcp-header: measured the header limit, not the body\]$/);
+    expectAsciiDetails(mirroredOnly.tests, ["security-oversized-input"]);
+  });
+});
+
+describe("inline servers: rate limiting on tools/call only, and the discover fallback", () => {
+  const servers: InlineServer[] = [];
+  let toolsOnly: DirectRun;
+  let noTools: DirectRun;
+  let requiredOnly: DirectRun;
+
+  beforeAll(async () => {
+    const a = await startInlineServer({ rateLimit: { after: 10, scope: "tools-call" } });
+    const b = await startInlineServer({ tools: "none" });
+    const c = await startInlineServer({ tools: "required-only" });
+    servers.push(a, b, c);
+    toolsOnly = await runDirect({ url: a.url, only: ["security-rate-limiting"] });
+    noTools = await runDirect({ url: b.url, only: ["security-rate-limiting"] });
+    requiredOnly = await runDirect({ url: c.url, only: ["security-rate-limiting"] });
+  });
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("passes a server that throttles tool invocations but serves discovery freely", () => {
+    expect(detailsOf(toolsOnly.tests, "security-rate-limiting")).toBe(
+      "Rate limiting detected (429 returned within 50 rapid tools/call sink requests)",
+    );
+    expect(servers[0].calls.length).toBe(50);
+  });
+
+  it("bursts server/discover only when no read-only argument-free tool exists, and then passes with a warning", () => {
+    expect(detailsOf(noTools.tests, "security-rate-limiting")).toBe(
+      "50 rapid server/discover requests all returned 200; tool invocations could not be bursted (server declares no tools, see warning)",
+    );
+    expect(detailsOf(requiredOnly.tests, "security-rate-limiting")).toBe(
+      "50 rapid server/discover requests all returned 200; tool invocations could not be bursted (no read-only tool without required arguments, see warning)",
+    );
+    for (const run of [noTools, requiredOnly]) {
+      const warnings = run.warnings.filter((w) => w.startsWith("security-rate-limiting:"));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("only server/discover was bursted");
+    }
+    expect(servers[2].calls).toEqual([]);
+  });
+});
+
+describe("inline servers: extra-params tells a slow tool from a dead server", () => {
+  const servers: InlineServer[] = [];
+  let slow: DirectRun;
+  let dropped: DirectRun;
+  let died: DirectRun;
+  let dir = "";
+
+  beforeAll(async () => {
+    const a = await startInlineServer({ slowToolsCall: 1500 });
+    const b = await startInlineServer({ dropOnToolsCall: true });
+    servers.push(a, b);
+    slow = await runDirect({ url: a.url, only: ["security-extra-params"], timeout: 500 });
+    dropped = await runDirect({ url: b.url, only: ["security-extra-params"] });
+    // A stdio server that exits on tools/call.
+    dir = mkdtempSync(join(tmpdir(), "mcp-compliance-sec-"));
+    const script = join(dir, "exit-on-call.mjs");
+    writeFileSync(
+      script,
+      [
+        'import { createInterface } from "node:readline";',
+        "const rl = createInterface({ input: process.stdin });",
+        'const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");',
+        'rl.on("line", (line) => {',
+        "  let msg;",
+        "  try { msg = JSON.parse(line); } catch { return; }",
+        "  if (msg.id === undefined) return;",
+        '  const result = (r) => send({ jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", ...r } });',
+        '  if (msg.method === "server/discover") return result({ supportedVersions: ["2026-07-28"], capabilities: { tools: {} }, ttlMs: 0, cacheScope: "public" });',
+        '  if (msg.method === "tools/list") return result({ tools: [{ name: "boom", inputSchema: { type: "object", properties: {} } }], ttlMs: 0, cacheScope: "public" });',
+        '  if (msg.method === "tools/call") process.exit(3);',
+        '  send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });',
+        "});",
+        "",
+      ].join("\n"),
+    );
+    died = await runDirect({ command: { command: process.execPath, args: [script] }, only: ["security-extra-params"] });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("a timeout is inconclusive: passes with a warning, never 'crashed'", () => {
+    const r = slow.tests.find((t) => t.id === "security-extra-params");
+    expect(r?.passed).toBe(true);
+    expect(r?.details).toBe(
+      "tools/call sink did not answer within 500ms -- extra-params verdict inconclusive (see warning)",
+    );
+    const warnings = slow.warnings.filter((w) => w.startsWith("security-extra-params:"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("not a crash");
+  });
+
+  it("a dropped connection fails as a possible crash", () => {
+    expect(verdicts(dropped.tests, ["security-extra-params"])["security-extra-params"]).toMatch(
+      /^FAIL: connection dropped on unknown tool arguments \(tools\/call sink\): .+ \(server may have crashed\)$/,
+    );
+  });
+
+  it("a stdio child that exits on the call fails as died", () => {
+    expect(verdicts(died.tests, ["security-extra-params"])["security-extra-params"]).toMatch(
+      /^FAIL: server died on unknown tool arguments \(tools\/call boom\): .*exit code 3/,
+    );
+    expectAsciiDetails(died.tests, ["security-extra-params"]);
   });
 });

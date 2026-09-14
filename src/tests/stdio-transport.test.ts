@@ -160,4 +160,95 @@ describe("StdioTransport", () => {
     await expect(failure).rejects.toThrow(/request timed out after 500ms/);
     await expect(failure).rejects.toThrow(/stdout buffer exceeded/);
   });
+
+  /**
+   * A scripted stdio child for the stream() tests, written to a temp file
+   * (a multi-line `-e` script through cmd.exe is unreliable on Windows).
+   * It reads JSON lines; `onLine` is the body of the per-line handler and
+   * sees `msg` (the parsed line) and `send(obj)` (writes one JSON line).
+   */
+  function scriptedChild(onLine: string): StdioTransport {
+    const script = [
+      'const rl = require("node:readline").createInterface({ input: process.stdin });',
+      'const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");',
+      'rl.on("line", (line) => {',
+      "  let msg;",
+      "  try { msg = JSON.parse(line); } catch { return; }",
+      onLine,
+      "});",
+      "setTimeout(() => {}, 30000);",
+    ].join("\n");
+    const scriptPath = join(tmpdir(), `mcp-compliance-stream-${process.pid}-${Date.now()}-${Math.random()}.cjs`);
+    writeFileSync(scriptPath, script, "utf8");
+    tempFiles.push(scriptPath);
+    const t = createStdioTransport({ command: process.execPath, args: [scriptPath] });
+    openTransports.push(t);
+    return t;
+  }
+
+  it("stream() ends when the child exits and reports the exit, instead of waiting for the timeout", async () => {
+    // The child acknowledges nothing: it exits 50ms after the listen arrives.
+    const t = scriptedChild('  if (msg.method === "subscriptions/listen") setTimeout(() => process.exit(3), 50);');
+    const nextId = createIdCounter(7000);
+    const started = Date.now();
+    const stream = await t.stream("subscriptions/listen", { notifications: {} }, nextId, { timeout: 5000 });
+    expect(stream.exit).toBeUndefined();
+    const seen: unknown[] = [];
+    for await (const msg of stream.messages) seen.push(msg);
+    const elapsed = Date.now() - started;
+    expect(seen).toEqual([]);
+    // Without the child 'exit' hook the iterator only completes at the 5000ms timer.
+    expect(elapsed).toBeLessThan(4000);
+    expect(stream.exit).toEqual({ code: 3, signal: null });
+    expect(t.exited).toBe(true);
+    await stream.close();
+  });
+
+  it("stream().close() sends notifications/cancelled after the timer fired without a response", async () => {
+    // The child never acknowledges the listen; it reports the cancel it
+    // receives as a notification so the test can observe it.
+    const t = scriptedChild(
+      '  if (msg.method === "notifications/cancelled") send({ jsonrpc: "2.0", method: "notifications/test/cancel-seen", params: msg.params });',
+    );
+    const cancels: unknown[] = [];
+    t.onMessage((m) => {
+      const msg = m as { method?: string; params?: unknown };
+      if (msg.method === "notifications/test/cancel-seen") cancels.push(msg.params);
+    });
+    const nextId = createIdCounter(7100);
+    const stream = await t.stream("subscriptions/listen", { notifications: {} }, nextId, { timeout: 300 });
+    const seen: unknown[] = [];
+    for await (const msg of stream.messages) seen.push(msg);
+    expect(seen).toEqual([]); // the timer ended the stream
+    expect(stream.exit).toBeUndefined();
+    await stream.close();
+    await vi.waitFor(() => expect(cancels).toEqual([{ requestId: 7101 }]), { timeout: 5000, interval: 10 });
+    // A second close() does not cancel twice.
+    await stream.close();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(cancels).toHaveLength(1);
+  });
+
+  it("stream().close() does not send notifications/cancelled once the response carrying the id arrived", async () => {
+    const t = scriptedChild(
+      [
+        '  if (msg.method === "subscriptions/listen") send({ jsonrpc: "2.0", id: msg.id, result: { resultType: "complete" } });',
+        '  if (msg.method === "notifications/cancelled") send({ jsonrpc: "2.0", method: "notifications/test/cancel-seen", params: msg.params });',
+      ].join("\n"),
+    );
+    const cancels: unknown[] = [];
+    t.onMessage((m) => {
+      const msg = m as { method?: string; params?: unknown };
+      if (msg.method === "notifications/test/cancel-seen") cancels.push(msg.params);
+    });
+    const nextId = createIdCounter(7200);
+    const stream = await t.stream("subscriptions/listen", { notifications: {} }, nextId, { timeout: 5000 });
+    const seen: unknown[] = [];
+    for await (const msg of stream.messages) seen.push(msg);
+    expect(seen).toHaveLength(1);
+    await stream.close();
+    // Give a stray cancel time to round-trip before asserting none came.
+    await new Promise((r) => setTimeout(r, 300));
+    expect(cancels).toEqual([]);
+  });
 });

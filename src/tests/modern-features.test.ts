@@ -222,6 +222,40 @@ describe.each<Kind>(["stdio", "http"])("2026-07-28 features + schema over %s", (
       expect(resultOf(report, "tools-call").details).toBe("echo: returned 1 content item(s)");
     });
 
+    it("tool-no-input-schema under --only schema / --only tools-schema: the list is fetched on demand and tools-schema still fails", async () => {
+      // The features module does not run under either filter, so the
+      // schema module must fetch tools/list itself instead of skip-passing
+      // a check the user asked for by name.
+      const runOnly = async (only: string[]) => {
+        if (kind === "stdio") return runModern(stdioFixture({ breaks: ["tool-no-input-schema"] }).target, { only });
+        const fixture = await startHttpFixture({ breaks: ["tool-no-input-schema"] });
+        try {
+          return await runModern(fixture.target, { only });
+        } finally {
+          await fixture.stop();
+        }
+      };
+      const byCategory = await runOnly(["schema"]);
+      expect(byCategory.tests.map((t) => t.id).slice(0, SCHEMA_IDS.length)).toEqual(SCHEMA_IDS);
+      const schemaResult = resultOf(byCategory, "tools-schema");
+      expect(schemaResult.passed, schemaResult.details).toBe(false);
+      expect(schemaResult.details).toContain("echo: missing inputSchema (required)");
+      expect(passedIds(byCategory, ["tools-annotations", "prompts-schema", "resources-schema"])).toEqual(
+        allPass(["tools-annotations", "prompts-schema", "resources-schema"]),
+      );
+      expect(resultOf(byCategory, "resources-schema").details).toBe("All 2 resource(s) valid");
+      // Each list was fetched exactly once for the whole category.
+      expect(byCategory.toolCount).toBe(11);
+      expect(byCategory.promptCount).toBe(2);
+      // Before the fix this run scored 100 with "skipped: no tools list available".
+      expect(byCategory.score).toBeLessThan(100);
+
+      const byId = await runOnly(["tools-schema"]);
+      expect(byId.tests.map((t) => t.id)).toEqual(["tools-schema"]);
+      expect(resultOf(byId, "tools-schema").passed).toBe(false);
+      expect(resultOf(byId, "tools-schema").details).toContain("echo: missing inputSchema (required)");
+    });
+
     it("capabilities-mismatch: the prompts tests are absent when prompts is not declared", async () => {
       const report = await run(kind, { breaks: ["capabilities-mismatch"] });
       const present = new Set(report.tests.map((t) => t.id));

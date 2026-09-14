@@ -19,10 +19,11 @@ export interface BenchmarkOptions {
   /**
    * MCP spec revision to benchmark against (default `auto`). The era
    * decides the probe: 2025-11-25 warms up with the initialize handshake
-   * and measures `ping`; 2026-07-28 has neither, so it measures
-   * `server/discover` (the one request every modern server MUST serve).
-   * `auto` sends one modern `server/discover` first and classifies the
-   * reply the way the compliance runner does.
+   * and measures `ping`; 2026-07-28 has no handshake, so it warms up with
+   * one unmeasured `server/discover` and then measures `server/discover`
+   * (the one request every modern server MUST serve). `auto` sends one
+   * modern `server/discover` first and classifies the reply the way the
+   * compliance runner does; that probe doubles as the modern warm-up.
    */
   specVersion?: SpecVersionOption;
   /** Optional progress callback for verbose mode. */
@@ -113,17 +114,23 @@ export async function runBenchmark(target: TransportTarget, opts: BenchmarkOptio
     // modern `server/discover` probe, classified by its reply. On stdio
     // this doubles as the boot wait; on HTTP it is one extra round-trip.
     let specVersion: SpecVersion;
+    let probed = false;
     if (requested === "auto") {
       const detection = await detectSpecVersion(transport, { nextId, timeout, clientInfo });
       specVersion = detection.version;
+      probed = true;
     } else {
       specVersion = requested;
     }
 
     // The measured request per era. Legacy: `ping` after the initialize
     // handshake. Modern: `server/discover` with the conformant envelope
-    // (_meta on every request; MCP-Protocol-Version + Mcp-Method on HTTP)
-    // and no warm-up — 2026-07-28 has no handshake to warm up with.
+    // (_meta on every request; MCP-Protocol-Version + Mcp-Method on HTTP).
+    // 2026-07-28 has no handshake, so its warm-up is one UNMEASURED
+    // `server/discover` -- under `auto` the detection probe already was
+    // one; a pinned run sends it here so the first timed sample does not
+    // absorb a stdio child's boot (or an HTTP cold start) and inflate
+    // mean/max by orders of magnitude relative to an auto run.
     let method: string;
     let params: unknown;
     let headers: Record<string, string> | undefined;
@@ -132,6 +139,13 @@ export async function runBenchmark(target: TransportTarget, opts: BenchmarkOptio
       method = "server/discover";
       params = probe.params;
       headers = transport.kind === "http" ? probe.headers : undefined;
+      if (!probed) {
+        try {
+          await transport.request(method, params, nextId, { timeout, headers });
+        } catch {
+          // The timed loop reports the failure with its reason; carry on.
+        }
+      }
     } else {
       method = "ping";
       params = undefined;

@@ -252,7 +252,7 @@ program
   )
   .option(
     "--startup-timeout <ms>",
-    "Deadline for the server's first reply -- the era probe and, on 2025-11-25, the initialize handshake (default: max(--timeout, 60000); covers cold `npx` cache fetches before a stdio server starts)",
+    "Budget for the server's first reply: the stdio era probe under auto, the 2025-11-25 initialize handshake on either transport, and on HTTP the second era probe sent when the preflight times out (default: max(--timeout, 60000); covers cold `npx` cache fetches before a stdio server starts)",
   )
   .option("--no-color", "Disable colored output (also honors NO_COLOR env var)")
   .option("--watch", "Re-run tests when files in the cwd change (stdio targets only)")
@@ -261,11 +261,14 @@ program
     "Max parallel-safe tests in flight (default 1; see docs/PERFORMANCE.md before raising)",
     "1",
   )
-  .option("--preflight-timeout <ms>", "Preflight connectivity check timeout in milliseconds")
+  .option(
+    "--preflight-timeout <ms>",
+    "HTTP only: deadline for the preflight server/discover request, which under auto is also the era probe; a timeout here re-probes once within --startup-timeout before the run defaults to 2025-11-25 (default: min(--timeout, 10000))",
+  )
   .option("--retries <n>", "Number of retries for failed tests (default: 0, or `retries` in config)")
   .option(
     "--only <items>",
-    'Only run matching categories or test IDs, comma-separated (e.g., "transport,lifecycle" or "transport-post,lifecycle-init")',
+    'Only run matching categories or test IDs, comma-separated (e.g., "transport,lifecycle" or "transport-post,lifecycle-jsonrpc"); ids belong to one catalog -- see --list',
     parseList,
   )
   .option(
@@ -405,6 +408,12 @@ program
             only,
             skip,
             specVersion,
+            // Status lines (what the runner is waiting on before any test
+            // has started -- the stdio era probe against a silent legacy
+            // server costs the whole startup timeout) go to stderr, dim,
+            // in terminal mode only; machine-readable formats stay clean.
+            onStatus:
+              opts.format === "terminal" ? (message) => process.stderr.write(chalk.dim(`  ${message}\n`)) : undefined,
             onProgress: verbose
               ? (testId, passed, details) => {
                   const icon = passed ? chalk.green("PASS") : chalk.red("FAIL");

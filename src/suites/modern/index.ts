@@ -90,6 +90,7 @@ export async function runModernSuite(input: ModernSuiteInput): Promise<Complianc
     detection: input.detection,
     hasAuth: Object.keys(input.userHeaders).some((h) => h.toLowerCase() === "authorization"),
     spawnFresh: input.spawnFresh,
+    signal: options.signal,
     state: createModernState(),
   };
 

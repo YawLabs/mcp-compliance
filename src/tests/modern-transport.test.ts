@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getTestDefinitionMap } from "../definitions/index.js";
 import { createHarness } from "../harness.js";
-import { createModernClient } from "../modern/client.js";
+import { createModernClient, type RpcResponse } from "../modern/client.js";
 import { createRecorder } from "../recorder.js";
 import { MODERN_SPEC_VERSION, specBaseFor } from "../spec.js";
 import { createModernState, type ModernSuiteContext } from "../suites/modern/context.js";
@@ -51,8 +51,19 @@ const HEADER_REJECT_IDS = [
   "transport-header-method-mismatch",
 ];
 
-/** Feature/lifecycle ids whose bodies fill ctx.state so name-mismatch can pick a real resource. */
-const STATE_FILLERS = ["lifecycle-discover", "resources-list", "prompts-list"];
+/**
+ * The six "reject the malformed request" tests that are only evaluable
+ * when the conformant discover was served (the three _meta probes live in
+ * lifecycle.ts, the three standard-header probes here).
+ */
+const ATTRIBUTABLE_REJECTION_IDS = [
+  "lifecycle-meta-required",
+  "lifecycle-meta-protocol-version-required",
+  "lifecycle-meta-client-capabilities-required",
+  "transport-header-version-required",
+  "transport-header-method-required",
+  "transport-header-method-mismatch",
+];
 
 function allPass(ids: string[]): Record<string, string> {
   return Object.fromEntries(ids.map((id) => [id, "pass"]));
@@ -72,7 +83,9 @@ describe("modern transport suite: clean fixture over HTTP", () => {
 
   beforeAll(async () => {
     fixture = await startHttpFixture();
-    report = await runModern(fixture.url, { only: [...TRANSPORT_IDS, ...STATE_FILLERS] });
+    // Only the transport ids: the feature module does not run, so the
+    // name-mismatch test must fetch the resource list itself.
+    report = await runModern(fixture.url, { only: TRANSPORT_IDS });
   });
 
   afterAll(async () => {
@@ -113,13 +126,20 @@ describe("modern transport suite: clean fixture over HTTP", () => {
     }
   });
 
-  it("name-mismatch reads a real resource when the feature module filled the state, else skip-passes", () => {
-    // Until the feature module lands, ctx.state.resources is null and the
-    // test skip-passes; once it fills the list the real probe runs. Both
-    // shapes are asserted explicitly in the direct-context block below.
-    expect(resultOf(report, "transport-header-name-mismatch").details).toMatch(
-      /^(resources\/read with Mcp-Name: wrong-name -> HTTP 400, JSON-RPC error -32020 HeaderMismatch|skipped: no name-carrying read-only method available)$/,
+  it("name-mismatch fetches the resource list on demand and reads a real resource", () => {
+    expect(resultOf(report, "transport-header-name-mismatch").details).toBe(
+      "resources/read with Mcp-Name: wrong-name -> HTTP 400, JSON-RPC error -32020 HeaderMismatch",
     );
+    // The on-demand fetch is published like the feature module's would be.
+    expect(report.resourceCount).toBe(2);
+  });
+
+  it("--only transport (the category) reads a real resource too", async () => {
+    const byCategory = await runModern(fixture.url, { only: ["transport"] });
+    expect(resultOf(byCategory, "transport-header-name-mismatch").details).toBe(
+      "resources/read with Mcp-Name: wrong-name -> HTTP 400, JSON-RPC error -32020 HeaderMismatch",
+    );
+    expect(passedIds(byCategory, TRANSPORT_IDS)).toEqual(allPass(TRANSPORT_IDS));
   });
 });
 
@@ -274,6 +294,22 @@ interface DirectOptions {
   timeout?: number;
 }
 
+/**
+ * A served setup discover, as the lifecycle module would have recorded it:
+ * the header rejection tests credit a 400 only when this is in hand.
+ */
+const SYNTHETIC_DISCOVER: RpcResponse = {
+  body: {
+    jsonrpc: "2.0",
+    id: 0,
+    result: { resultType: "complete", supportedVersions: [MODERN_SPEC_VERSION], capabilities: {} },
+  },
+  requestId: 0,
+  statusCode: 200,
+  headers: {},
+  messages: [],
+};
+
 function directContext(url: string, state: Partial<ModernSuiteContext["state"]>, opts: DirectOptions = {}): DirectRun {
   const only = opts.only ?? ["transport-header-name-mismatch"];
   const timeout = opts.timeout ?? 5000;
@@ -310,18 +346,9 @@ function directContext(url: string, state: Partial<ModernSuiteContext["state"]>,
     hasAuth: false,
     state: {
       ...createModernState(),
-      discover: null,
+      discover: SYNTHETIC_DISCOVER,
       supportedVersions: [MODERN_SPEC_VERSION],
       capabilities: { resources: {}, prompts: {} },
-      serverInfo: { name: null, version: null },
-      instructions: null,
-      tools: null,
-      toolNames: [],
-      resources: null,
-      resourceNames: [],
-      resourceTemplates: null,
-      prompts: null,
-      promptNames: [],
       ...state,
     },
   };
@@ -429,8 +456,9 @@ describe("transport-header-name-mismatch: direct context", () => {
   });
 
   it("falls back to a prompt with no required arguments when no resource is listed", async () => {
+    // An EMPTY resource list (listed nothing) -- a null one would be fetched.
     const r = await directContext(clean.url, {
-      resources: null,
+      resources: [],
       prompts: PROMPTS,
       promptNames: ["greet", "simple"],
     }).run();
@@ -438,14 +466,42 @@ describe("transport-header-name-mismatch: direct context", () => {
     expect(r.passed).toBe(true);
   });
 
-  it("skip-passes when neither list is available", async () => {
-    const r = await directContext(clean.url, {
+  it("fetches a list that nothing cached yet, once, instead of skipping", async () => {
+    // Neither list cached (a --only transport run): resources/list is
+    // fetched on demand and the first resource is read.
+    const run = directContext(clean.url, { resources: null, prompts: null });
+    const r = await run.run();
+    expect(r.details).toBe(
+      "resources/read with Mcp-Name: wrong-name -> HTTP 400, JSON-RPC error -32020 HeaderMismatch",
+    );
+    expect(run.ctx.state.resources).toHaveLength(2);
+    expect(run.ctx.state.resourceNames).toEqual(["static-text", "static-binary"]);
+    expect(run.ctx.recorder.sent.filter((s) => s.method === "resources/list")).toHaveLength(1);
+    // prompts/list was never needed.
+    expect(run.ctx.recorder.sent.some((s) => s.method === "prompts/list")).toBe(false);
+  });
+
+  it("skip-passes naming why: undeclared capabilities, failed lists, or nothing readable by name", async () => {
+    const undeclared = await directContext(clean.url, { capabilities: {} }).run();
+    expect(undeclared).toMatchObject({ passed: true, details: "skipped: server declares no resources or prompts" });
+    // Both lists were asked for earlier and failed: no re-fetch, honest skip.
+    const failed = await directContext(clean.url, {
       resources: null,
+      prompts: null,
+      listAttempts: new Set(["resources", "prompts"]),
+    }).run();
+    expect(failed).toMatchObject({
+      passed: true,
+      details: "skipped: resources/list and prompts/list failed (see resources-list, prompts-list)",
+    });
+    const nothingReadable = await directContext(clean.url, {
+      resources: [],
       prompts: [{ name: "greet", arguments: [{ name: "name", required: true }] }],
     }).run();
-    expect(r).toMatchObject({ passed: true, details: "skipped: no name-carrying read-only method available" });
-    const empty = await directContext(clean.url, { resources: [], prompts: [] }).run();
-    expect(empty).toMatchObject({ passed: true, details: "skipped: no name-carrying read-only method available" });
+    expect(nothingReadable).toMatchObject({
+      passed: true,
+      details: "skipped: no listed resource has a uri and no listed prompt is callable without arguments",
+    });
   });
 
   it("accept-header-mismatch: a served read with the wrong Mcp-Name fails", async () => {
@@ -454,7 +510,7 @@ describe("transport-header-name-mismatch: direct context", () => {
       const r = await directContext(broken.url, { resources: RESOURCES }).run();
       expect(r.passed).toBe(false);
       expect(r.details).toContain("resources/read with Mcp-Name: wrong-name -> HTTP 200, result (expected HTTP 400)");
-      const viaPrompt = await directContext(broken.url, { prompts: PROMPTS }).run();
+      const viaPrompt = await directContext(broken.url, { resources: [], prompts: PROMPTS }).run();
       expect(viaPrompt.passed).toBe(false);
       expect(viaPrompt.details).toContain("prompts/get with Mcp-Name: wrong-name -> HTTP 200, result");
     } finally {
@@ -489,6 +545,41 @@ describe("transport-header-name-mismatch: direct context", () => {
 });
 
 describe("modern transport suite: stub servers for knob-less branches", () => {
+  it("a server that rejects everything (SDK v1 'Server not initialized') fails every rejection test as not evaluable", async () => {
+    // The 2026-07-28 catalog pinned against a 2025-era server: the
+    // conformant discover draws the same 400 / -32000 as every malformed
+    // variant, so none of the six rejections can be credited to the
+    // injected defect. Before the attribution guard all six PASSED here.
+    const stub = await startStub((_req, res, body) => {
+      let id: unknown = null;
+      try {
+        id = JSON.parse(body).id ?? null;
+      } catch {}
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: "Bad Request: Server not initialized" } }),
+      );
+    });
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-discover", ...ATTRIBUTABLE_REJECTION_IDS] });
+      expect(failed(report, "lifecycle-discover")).toBe(
+        "server/discover answered JSON-RPC error -32000 (Bad Request: Server not initialized) (HTTP 400)",
+      );
+      const reason =
+        "not evaluable: the conformant server/discover was itself rejected with -32000 (HTTP 400), so this rejection proves nothing about the injected defect";
+      for (const id of ATTRIBUTABLE_REJECTION_IDS) {
+        const details = failed(report, id);
+        expect(details, id).toContain(reason);
+        expect(resultOf(report, id).required, id).toBe(true);
+      }
+      expect(report.summary.requiredPassed).toBe(0);
+      // Nothing was credited, so no "rejected with -32000 (expected ...)" warnings either.
+      expect(report.warnings.filter((w) => /^(lifecycle|transport)-/.test(w))).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+
   it("transport-session-ignored fails when the server serves the result but mints Mcp-Session-Id", async () => {
     const stub = await startStub((_req, res, body) => {
       res.writeHead(200, { "Content-Type": "application/json", "Mcp-Session-Id": "minted-1" });

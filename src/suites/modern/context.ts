@@ -87,6 +87,8 @@ export interface ModernSuiteContext {
   detection: DetectionResult | undefined;
   /** Whether the run was given credentials (`--auth` / an Authorization header). */
   hasAuth: boolean;
+  /** RunOptions.signal, for requests made outside the shared client. */
+  signal?: AbortSignal;
   /**
    * stdio only: spawn a second, independent instance of the server. A
    * dual-era stdio server pins its era per process, so a probe that must

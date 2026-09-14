@@ -70,28 +70,43 @@ function paramToHeaderString(value: unknown): string | undefined {
   return undefined;
 }
 
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
 /**
  * `Mcp-Param-{Name}` headers for a tools/call, derived from the tool's
  * inputSchema `x-mcp-header` annotations. Null / absent arguments produce
  * no header (the server MUST NOT expect one).
+ *
+ * An annotation may sit on any property statically reachable from the
+ * schema root through a chain consisting solely of `properties` keys
+ * (streamable-http#schema-extension), and the header value is the
+ * argument at that exact path. So the walk descends `properties` --
+ * and only `properties`: never `items`, composition or conditional
+ * keywords, or `$ref`, where an annotation is invalid -- carrying the
+ * argument object alongside the schema node.
  */
 export function mcpParamHeadersFor(inputSchema: unknown, args: unknown): Record<string, string> {
   const out: Record<string, string> = {};
-  if (!inputSchema || typeof inputSchema !== "object") return out;
-  const props = (inputSchema as { properties?: unknown }).properties;
-  if (!props || typeof props !== "object") return out;
-  if (!args || typeof args !== "object") return out;
-  for (const [prop, schema] of Object.entries(props as Record<string, unknown>)) {
-    if (!schema || typeof schema !== "object") continue;
-    const suffix = (schema as Record<string, unknown>)["x-mcp-header"];
-    if (typeof suffix !== "string" || !suffix) continue;
-    const value = (args as Record<string, unknown>)[prop];
-    if (value === undefined || value === null) continue;
-    const str = paramToHeaderString(value);
-    if (str === undefined) continue;
-    out[`${HEADER_PARAM_PREFIX}${suffix}`] = encodeHeaderValue(str);
-  }
+  if (!isPlainObject(inputSchema) || !isPlainObject(args)) return out;
+  collectParamHeaders(inputSchema.properties, args, out);
   return out;
+}
+
+function collectParamHeaders(props: unknown, args: Record<string, unknown>, out: Record<string, string>): void {
+  if (!isPlainObject(props)) return;
+  for (const [prop, schema] of Object.entries(props)) {
+    if (!isPlainObject(schema)) continue;
+    const value = args[prop];
+    if (value === undefined || value === null) continue;
+    const suffix = schema["x-mcp-header"];
+    if (typeof suffix === "string" && suffix) {
+      const str = paramToHeaderString(value);
+      if (str !== undefined) out[`${HEADER_PARAM_PREFIX}${suffix}`] = encodeHeaderValue(str);
+    }
+    if (isPlainObject(value)) collectParamHeaders(schema.properties, value, out);
+  }
 }
 
 export interface StandardHeaderInput {

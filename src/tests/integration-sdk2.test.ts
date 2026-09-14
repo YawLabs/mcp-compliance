@@ -5,7 +5,9 @@ import { localhostHostValidation, localhostOriginValidation, toNodeHandler } fro
 import { createMcpHandler, type McpHttpHandler, McpServer } from "@modelcontextprotocol/server";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
+import { REASON_PREFIX } from "../detect.js";
 import { runComplianceSuite } from "../runner.js";
+import { AUTO_DETECT_NOTE_PREFIX } from "../spec.js";
 import type { ComplianceReport, TransportTarget } from "../types.js";
 import { resultOf } from "./helpers/modern-fixture.js";
 
@@ -31,18 +33,8 @@ const SDK2_STDIO_FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "fixtur
 /** Optional checks every HTTP run on plain loopback fails regardless of the server. */
 const LOCALHOST_INHERENT = ["security-auth-required", "security-rate-limiting", "security-tls-required"];
 
-/**
- * The SDK's `localhostOriginValidation()` guard (the README-prescribed
- * front for a hand-wired node:http server, and what the Express/Hono/
- * Fastify app factories apply by default) answers a rejected Origin with
- * 403 and `{"jsonrpc":"2.0","error":{"code":-32000,...},"id":null}` without
- * reading the body, so the two guard rejections the suite provokes
- * (security-origin-validation, the CORS preflight) carry `id: null` for a
- * request whose id was readable. JSON-RPC reserves null for an id that
- * could not be detected; the post-hoc echo check flags it. A judgement
- * call on the SDK's side (reject before parsing), so pinned, not disputed.
- */
-const SDK_GUARD_OPTIONAL_DEVIATIONS = ["error-id-echo"];
+/** The auto-detection note every run against the SDK opens with. */
+const AUTO_DETECT_NOTE = `${AUTO_DETECT_NOTE_PREFIX}2026-07-28 (${REASON_PREFIX}supportedVersions [2026-07-28]). Pin with --spec-version to override.`;
 
 /**
  * The SDK server declares tools/resources/prompts but no `completions`
@@ -80,53 +72,23 @@ const SDK_LEGACY_REQUIRED_DEVIATIONS = ["transport-batch-reject"];
 
 /**
  * Over stdio in the default `legacy: 'serve'` mode, ANY claim-less message
- * (no `_meta["io.modelcontextprotocol/protocolVersion"]`) received before
- * the connection is pinned flips the whole connection to the legacy era
- * for the rest of the process -- even after a successful modern
- * `server/discover` opening. The suite deliberately sends two such probes
- * (lifecycle-meta-required: no `_meta`; lifecycle-meta-protocol-version-
- * required: `_meta` without protocolVersion) because the modern spec says
- * they MUST be rejected with -32602 (basic/index#request-metadata). From
- * the flip onward the legacy instance serves every modern-envelope request:
- * `server/discover` becomes -32601, results lose `resultType` and the
- * caching hints, `subscriptions/listen` is unknown. The versioning page
- * (basic/versioning#backward-compatibility) keys a dual-era server's era to
- * "how the client opens" -- a modern `_meta` request or an `initialize` --
- * and says nothing about a later malformed message re-selecting the era.
- * `CLAIM_LESS_PROBES` names the two triggers; skipping just those two
- * yields a clean A (asserted below), which isolates the cause.
+ * (no `_meta["io.modelcontextprotocol/protocolVersion"]`) received while
+ * the connection is still deciding its era -- i.e. before any modern
+ * request other than `server/discover` -- flips the whole connection to
+ * the legacy era for the rest of the process. The versioning page
+ * (basic/versioning#backward-compatibility) keys a dual-era server's era
+ * to "how the client opens" (a modern `_meta` request or an `initialize`)
+ * and says nothing about a malformed non-initialize message re-selecting
+ * it, so the SDK is over-broad there. The suite copes rather than
+ * penalises: its two claim-less probes (lifecycle-meta-required: no
+ * `_meta`; lifecycle-meta-protocol-version-required: `_meta` without
+ * protocolVersion) run LATE, after the feature modules have pinned the
+ * process modern, where the SDK answers them with the -32602 the spec
+ * requires (basic/index#request-metadata). Asserted below by their
+ * details: had they run early, the flipped process would have answered
+ * -32601 and every modern-only check after them would have failed.
  */
 const CLAIM_LESS_PROBES = ["lifecycle-meta-required", "lifecycle-meta-protocol-version-required"];
-const SDK_STDIO_SERVE_FAILURES = {
-  required: [
-    "lifecycle-meta-client-info-optional",
-    "lifecycle-version-unsupported",
-    "tools-list-caching",
-    "resources-list-caching",
-    "resources-read-caching",
-    "prompts-list-caching",
-    "schema-result-type",
-  ],
-  optional: [
-    "lifecycle-removed-methods",
-    "lifecycle-subscriptions-listen",
-    "lifecycle-meta-tolerance",
-    "resources-templates-caching",
-    "stdio-unknown-method-recovers",
-    "stdio-cancellation",
-    "schema-wire-valid",
-  ],
-};
-
-/**
- * Over stdio with `legacy: 'reject'`, a claim-less request is answered with
- * -32022 whose `data` carries `supported` but no `requested` ("the request
- * did not name a protocol version"). The schema makes both required
- * (schema.ts UnsupportedProtocolVersionError.data.requested: string), so the
- * post-hoc wire validation flags those two replies. On HTTP the same
- * request gets -32602 instead and the schema check is clean.
- */
-const SDK_STDIO_REJECT_OPTIONAL_DEVIATIONS = ["schema-wire-valid"];
 
 /**
  * The legacy suite's injection checks flag any tool that echoes its input:
@@ -218,6 +180,17 @@ function expectFailingSets(report: ComplianceReport, required: string[], optiona
   });
 }
 
+/** The two claim-less probes drew a clean -32602 (no "expected -32602" warning). */
+function expectClaimLessProbesClean(report: ComplianceReport, status: string) {
+  expect(resultOf(report, "lifecycle-meta-required").details).toBe(
+    `server/discover without _meta: rejected with -32602${status}`,
+  );
+  expect(resultOf(report, "lifecycle-meta-protocol-version-required").details).toBe(
+    `server/discover without _meta protocolVersion: rejected with -32602${status}`,
+  );
+  expect(report.warnings.filter((w) => CLAIM_LESS_PROBES.some((id) => w.startsWith(`${id}:`)))).toEqual([]);
+}
+
 describe("SDK v2 over HTTP, default (dual-era) serving", () => {
   let mounted: Mounted;
   let report: ComplianceReport;
@@ -231,12 +204,10 @@ describe("SDK v2 over HTTP, default (dual-era) serving", () => {
     await unmount(mounted);
   });
 
-  it("auto resolves to 2026-07-28 with the header note", () => {
+  it("auto resolves to 2026-07-28 with the detection note", () => {
     expect(report.specVersion).toBe("2026-07-28");
     expect(report.serverInfo.protocolVersion).toBe("2026-07-28");
-    expect(
-      report.warnings.filter((w) => w.startsWith("Spec version auto-detected as 2026-07-28 (server/discover returned")),
-    ).toHaveLength(1);
+    expect(report.warnings.filter((w) => w === AUTO_DETECT_NOTE)).toHaveLength(1);
     expect(report.warnings.some((w) => w.includes("unreachable"))).toBe(false);
   });
 
@@ -257,8 +228,8 @@ describe("SDK v2 over HTTP, default (dual-era) serving", () => {
     expect(report.tests.some((t) => t.id === "lifecycle-completions")).toBe(false);
   });
 
-  it("fails exactly the localhost-inherent checks plus the documented SDK deviations", () => {
-    expectFailingSets(report, SDK_HTTP_REQUIRED_DEVIATIONS, [...LOCALHOST_INHERENT, ...SDK_GUARD_OPTIONAL_DEVIATIONS]);
+  it("fails exactly the localhost-inherent checks plus the documented SDK deviation", () => {
+    expectFailingSets(report, SDK_HTTP_REQUIRED_DEVIATIONS, LOCALHOST_INHERENT);
   });
 
   it("grades A on score; the single required miss keeps overall at fail", () => {
@@ -271,31 +242,33 @@ describe("SDK v2 over HTTP, default (dual-era) serving", () => {
   it("reports the served legacy handshake as dual-era in lifecycle-dual-era", () => {
     const dual = resultOf(report, "lifecycle-dual-era");
     expect(dual.passed, dual.details).toBe(true);
-    expect(dual.details).toMatch(/^dual-era: initialize answered with protocolVersion 2025-11-25/);
+    expect(dual.details).toBe(
+      "dual-era: initialize answered with protocolVersion 2025-11-25; legacy handshake served alongside 2026-07-28",
+    );
   });
 
-  // KNOWN GAP (runner, not SDK): the dual-era warning in
-  // src/suites/modern/index.ts is keyed only on `supportedVersions`
-  // containing 2025-11-25. The SDK advertises `["2026-07-28"]` -- the spec
-  // describes supportedVersions as the modern per-request versions the
-  // client "should choose one of ... for subsequent requests"
-  // (server/discover#discoverresult), so listing a legacy version there
-  // would be wrong -- while still serving `initialize`. The lifecycle-dual-
-  // era probe above sees that, but the warning that tells the user to
-  // re-run with --spec-version 2025-11-25 is never emitted. Flip to `it`
-  // once the warning also keys on the late initialize probe.
-  it.fails("the dual-era warning names --spec-version 2025-11-25", () => {
+  it("the dual-era warning names --spec-version 2025-11-25 although supportedVersions lists only 2026-07-28", () => {
+    // The SDK advertises `["2026-07-28"]` -- the spec describes
+    // supportedVersions as the modern per-request versions the client
+    // "should choose one of ... for subsequent requests" -- while still
+    // serving `initialize`; the warning keys on the served handshake.
     const dual = report.warnings.find((w) => w.startsWith("Server is dual-era"));
-    expect(dual, `warnings: ${JSON.stringify(report.warnings, null, 2)}`).toBeDefined();
-    expect(dual).toContain("--spec-version 2025-11-25");
+    expect(dual, `warnings: ${JSON.stringify(report.warnings, null, 2)}`).toBe(
+      "Server is dual-era (also serves the legacy initialize handshake); this run graded 2026-07-28. Re-run with --spec-version 2025-11-25 to test the legacy handshake.",
+    );
   });
 
-  it("only warns about the auto-detection and the oversized-input observation", () => {
+  it("the claim-less _meta probes draw a clean -32602 over HTTP", () => {
+    expectClaimLessProbesClean(report, " (HTTP 400)");
+  });
+
+  it("only warns about the auto-detection, the oversized-input observation and the dual era", () => {
     const prefixes = report.warnings.map((w) => w.split(":")[0]);
     expect(sorted(prefixes)).toEqual(
       sorted([
-        "Spec version auto-detected as 2026-07-28 (server/discover returned supportedVersions [2026-07-28]). Pin with --spec-version to override.",
+        AUTO_DETECT_NOTE.split(":")[0],
         "security-oversized-input",
+        "Server is dual-era (also serves the legacy initialize handshake); this run graded 2026-07-28. Re-run with --spec-version 2025-11-25 to test the legacy handshake.",
       ]),
     );
     expect(new Set(report.warnings).size).toBe(report.warnings.length);
@@ -360,16 +333,20 @@ describe("SDK v2 over HTTP, legacy: 'reject' (modern-only)", () => {
     expect(report.specVersion).toBe("2026-07-28");
     const dual = resultOf(report, "lifecycle-dual-era");
     expect(dual.passed, dual.details).toBe(true);
-    // -32022 "Unsupported protocol version: 2025-11-25" -- names a version,
-    // which is what the spec SHOULDs for legacy clients' diagnostics.
-    expect(dual.details).toMatch(/^modern-only: initialize rejected with -32022.*message names supported versions/);
+    // -32022 whose message only echoes the rejected 2025-11-25; the
+    // supported list lives in data.supported, which is where the spec's
+    // UnsupportedProtocolVersionError puts it -- credited from there.
+    expect(dual.details).toBe(
+      "modern-only: initialize rejected with -32022 (HTTP 400); data.supported names supported versions",
+    );
     expect(report.warnings.some((w) => w.startsWith("Server is dual-era"))).toBe(false);
     expect(report.warnings.some((w) => w.startsWith("lifecycle-dual-era:"))).toBe(false);
   });
 
   it("fails exactly the localhost-inherent checks plus the header deviation (a MUST in this mode)", () => {
     expect(report.tests).toHaveLength(HTTP_TEST_COUNT);
-    expectFailingSets(report, SDK_HTTP_REQUIRED_DEVIATIONS, [...LOCALHOST_INHERENT, ...SDK_GUARD_OPTIONAL_DEVIATIONS]);
+    expectFailingSets(report, SDK_HTTP_REQUIRED_DEVIATIONS, LOCALHOST_INHERENT);
+    expectClaimLessProbesClean(report, " (HTTP 400)");
   });
 });
 
@@ -383,42 +360,45 @@ describe("SDK v2 over stdio (serveStdio)", () => {
   const run = (env: Record<string, string> = {}, extra: Record<string, unknown> = {}) =>
     runComplianceSuite(target(env), { timeout: 5000, startupTimeout: 15_000, ...extra });
 
-  it("default (legacy: serve): auto resolves to 2026-07-28, then the claim-less probes flip the era", async () => {
+  it("default (legacy: serve): every test passes, A / 100, and the era survives the late claim-less probes", async () => {
     const report = await run();
     expect(report.specVersion).toBe("2026-07-28");
     expect(report.serverInfo.name).toBe("sdk2-stdio-server");
     expect(report.toolNames).toEqual(["echo"]);
     expect(report.tests).toHaveLength(STDIO_TEST_COUNT);
-    // The two probes themselves pass (a -32601 is still a rejection; the
-    // code mismatch is a warning), everything modern-only after them fails.
-    expect(resultOf(report, "lifecycle-meta-required").passed).toBe(true);
-    expect(resultOf(report, "lifecycle-meta-protocol-version-required").passed).toBe(true);
-    expectFailingSets(report, SDK_STDIO_SERVE_FAILURES.required, SDK_STDIO_SERVE_FAILURES.optional);
-    // The legacy instance that took over still answers initialize.
-    expect(resultOf(report, "lifecycle-dual-era").details).toMatch(
-      /^dual-era: initialize answered with protocolVersion 2025-11-25/,
-    );
-  }, 60_000);
-
-  it("default (legacy: serve): with only the two claim-less probes skipped the SDK grades A on every test", async () => {
-    const report = await run({}, { skip: CLAIM_LESS_PROBES });
-    expect(report.specVersion).toBe("2026-07-28");
-    expect(report.tests).toHaveLength(STDIO_TEST_COUNT - CLAIM_LESS_PROBES.length);
     expectFailingSets(report, [], []);
     expect(report.grade).toBe("A");
     expect(report.score).toBe(100);
     expect(report.overall).toBe("pass");
+    // Sent on the already-modern process: -32602, not the -32601 a flipped
+    // legacy instance would answer (see CLAIM_LESS_PROBES).
+    expectClaimLessProbesClean(report, "");
+    // The initialize probe went to a FRESH child, where a legacy client's
+    // opening is served: the suite's own process, pinned modern, would have
+    // rejected it with -32022 and mislabelled the server modern-only.
+    expect(resultOf(report, "lifecycle-dual-era").details).toBe(
+      "dual-era: initialize answered with protocolVersion 2025-11-25 on a fresh process; legacy handshake served alongside 2026-07-28",
+    );
+    expect(
+      report.warnings.some((w) => w.startsWith("Server is dual-era (also serves the legacy initialize handshake)")),
+    ).toBe(true);
   }, 60_000);
 
-  it("SDK2_LEGACY=reject: modern-only, every required test passes, initialize rejected with -32022", async () => {
+  it("SDK2_LEGACY=reject: modern-only, every test passes, initialize rejected with -32022 on a fresh process", async () => {
     const report = await run({ SDK2_LEGACY: "reject" });
     expect(report.specVersion).toBe("2026-07-28");
     expect(report.tests).toHaveLength(STDIO_TEST_COUNT);
-    const dual = resultOf(report, "lifecycle-dual-era");
-    expect(dual.details).toMatch(/^modern-only: initialize rejected with -32022.*message names supported versions/);
-    expectFailingSets(report, [], SDK_STDIO_REJECT_OPTIONAL_DEVIATIONS);
-    expect(resultOf(report, "schema-wire-valid").details).toMatch(/must have required property 'requested'/);
+    expect(resultOf(report, "lifecycle-dual-era").details).toBe(
+      "modern-only: initialize rejected with -32022 on a fresh process; data.supported names supported versions",
+    );
+    // With the claim-less probes late, the SDK answers them -32602 like the
+    // serve mode does; the -32022-without-`requested` replies that used to
+    // trip schema-wire-valid were an artifact of probing before the pin.
+    expectFailingSets(report, [], []);
+    expectClaimLessProbesClean(report, "");
+    expect(resultOf(report, "schema-wire-valid").details).toMatch(/no violations/);
     expect(report.grade).toBe("A");
+    expect(report.warnings.some((w) => w.startsWith("Server is dual-era"))).toBe(false);
   }, 60_000);
 
   it("pinned 2025-11-25: the legacy suite initializes and every required test passes", async () => {

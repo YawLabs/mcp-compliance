@@ -7,14 +7,25 @@ import {
   validateToolSchemas,
   validateToolTitles,
 } from "../../checks/validators.js";
-import { hasPrompts, hasResources, hasTools, type ModernSuiteContext } from "./context.js";
+import {
+  ensurePrompts,
+  ensureResources,
+  ensureTools,
+  hasPrompts,
+  hasResources,
+  hasTools,
+  type ModernSuiteContext,
+} from "./context.js";
 
 /**
  * Definition-shape tests of the 2026-07-28 suite (the six list-based
  * schema checks; the post-hoc wire checks live in posthoc.ts). They read
- * the lists the features module cached and never re-fetch: a null list
- * (the capability's `-list` test did not run under `--only`, or failed)
- * is reported as skipped, not as a defect of the definitions.
+ * the lists through the context's `ensure*` loaders, which return the
+ * list the features module cached or fetch it once on demand, so a
+ * `--only schema` (or `--only tools-schema`) run validates real
+ * definitions instead of skipping. A list stays null only when its
+ * `-list` call failed; that is reported as skipped, not as a defect of
+ * the definitions (the required `-list` test already fails the run).
  */
 
 interface Outcome {
@@ -26,7 +37,7 @@ const pass = (details: string): Outcome => ({ passed: true, details });
 const fail = (details: string): Outcome => ({ passed: false, details });
 
 function skipped(what: string): Outcome {
-  return pass(`skipped: no ${what} list available (the ${what}-list test did not run or failed)`);
+  return pass(`skipped: ${what}/list failed, no ${what} list to validate (see ${what}-list)`);
 }
 
 function showNames(names: string[], max = 5): string {
@@ -34,11 +45,11 @@ function showNames(names: string[], max = 5): string {
 }
 
 export async function runSchema(ctx: ModernSuiteContext): Promise<void> {
-  const { harness, state } = ctx;
+  const { harness } = ctx;
 
   if (hasTools(ctx)) {
     await harness.check("tools-schema", async () => {
-      const tools = state.tools;
+      const tools = await ensureTools(ctx);
       if (!tools) return skipped("tools");
       if (tools.length === 0) return pass("No tools to validate");
       const v = validateToolSchemas(tools);
@@ -48,7 +59,7 @@ export async function runSchema(ctx: ModernSuiteContext): Promise<void> {
     });
 
     await harness.check("tools-annotations", async () => {
-      const tools = state.tools;
+      const tools = await ensureTools(ctx);
       if (!tools) return skipped("tools");
       if (tools.length === 0) return pass("No tools to validate");
       const v = validateToolAnnotations(tools);
@@ -59,7 +70,7 @@ export async function runSchema(ctx: ModernSuiteContext): Promise<void> {
     });
 
     await harness.check("tools-title-field", async () => {
-      const tools = state.tools;
+      const tools = await ensureTools(ctx);
       if (!tools) return skipped("tools");
       if (tools.length === 0) return pass("No tools to validate");
       const v = validateToolTitles(tools);
@@ -74,7 +85,7 @@ export async function runSchema(ctx: ModernSuiteContext): Promise<void> {
     });
 
     await harness.check("tools-output-schema", async () => {
-      const tools = state.tools;
+      const tools = await ensureTools(ctx);
       if (!tools) return skipped("tools");
       if (tools.length === 0) return pass("No tools to validate");
       const v = validateToolOutputSchemas(tools);
@@ -87,7 +98,7 @@ export async function runSchema(ctx: ModernSuiteContext): Promise<void> {
 
   if (hasPrompts(ctx)) {
     await harness.check("prompts-schema", async () => {
-      const prompts = state.prompts;
+      const prompts = await ensurePrompts(ctx);
       if (!prompts) return skipped("prompts");
       if (prompts.length === 0) return pass("No prompts to validate");
       const v = validatePromptSchemas(prompts);
@@ -99,7 +110,7 @@ export async function runSchema(ctx: ModernSuiteContext): Promise<void> {
 
   if (hasResources(ctx)) {
     await harness.check("resources-schema", async () => {
-      const resources = state.resources;
+      const resources = await ensureResources(ctx);
       if (!resources) return skipped("resources");
       if (resources.length === 0) return pass("No resources to validate");
       const v = validateResourceSchemas(resources);

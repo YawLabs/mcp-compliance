@@ -38,7 +38,10 @@ export const STACK_TRACE_PATTERNS = [
   /panicked\s+at\s+'/i, // Rust
   /node_modules\//, // Node.js module paths (filesystem layout leak)
   /\/usr\/local\/|\/home\/|\/root\//, // Unix absolute paths
-  /[A-Z]:\\[\w\s.-]+\\[\w\s.-]+/, // Windows absolute paths (drive + 2+ segments)
+  // Windows absolute paths (drive + 2+ segments). The samples the suites
+  // scan are JSON-serialised, so each backslash usually arrives doubled
+  // (`C:\\Users\\svc`); `\\{1,2}` matches the raw and the escaped form.
+  /[A-Z]:\\{1,2}[\w\s.-]+\\{1,2}[\w\s.-]+/,
   /jdbc:|mysql:\/\/|postgres(?:ql)?:\/\/|mongodb(?:\+srv)?:\/\//i, // DB connection strings
 ];
 
@@ -47,9 +50,13 @@ export const INTERNAL_IP_PATTERNS = [
   /\b172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/,
   /\b192\.168\.\d{1,3}\.\d{1,3}\b/,
   /\b127\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
+  /\b169\.254\.\d{1,3}\.\d{1,3}\b/, // IPv4 link-local, incl. the cloud metadata service
   /\b::1\b/, // IPv6 loopback
   /\bfe80:/i, // IPv6 link-local
   /\bf[cd][0-9a-f]{2}:/i, // IPv6 unique local (fc00::/fd00::)
+  // Internal hostnames (db01.corp.internal, cache.lan). The lookahead keeps
+  // a dotted file name such as settings.local.json from matching.
+  /\b[\w-]+\.(internal|local|corp|lan|intranet)\b(?!\.\w)/i,
 ];
 
 /**

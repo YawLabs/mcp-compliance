@@ -1,13 +1,14 @@
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { describe, expect, it } from "vitest";
 import { getTestDefinitionMap } from "../definitions/index.js";
 import { createHarness } from "../harness.js";
 import { createModernClient, type ModernClient } from "../modern/client.js";
-import { createRecorder } from "../recorder.js";
+import { createRecorder, type Recorder } from "../recorder.js";
 import { MODERN_SPEC_VERSION, specBaseFor } from "../spec.js";
 import { createModernState, type ModernState, type ModernSuiteContext } from "../suites/modern/context.js";
 import { runPostHoc } from "../suites/modern/posthoc.js";
 import { createHttpTransport } from "../transport/http.js";
-import type { Transport } from "../transport/index.js";
+import type { Transport, TransportKind } from "../transport/index.js";
 import { createStdioTransport } from "../transport/stdio.js";
 import type { TestResult } from "../types.js";
 import { MODERN_FIXTURE, passedIds, runModern, startHttpFixture, stdioFixture } from "./helpers/modern-fixture.js";
@@ -23,6 +24,11 @@ import { MODERN_FIXTURE, passedIds, runModern, startHttpFixture, stdioFixture } 
  * fixture process, issues the one call that provokes the violation, and
  * then runs `runPostHoc` over the recording -- the recorder, client and
  * transport are the production ones, only the trigger is scripted.
+ *
+ * Shapes the fixture cannot produce (a gateway's non-JSON-RPC 401 body,
+ * a null-id -32600 at HTTP 200, a reply to a client notification that
+ * arrives after the next request went out) come from a node:http stub
+ * or a hand-scripted recorder, scanned by the same `runPostHoc`.
  */
 
 const POSTHOC_IDS = [
@@ -48,14 +54,19 @@ const SHORT_TIMEOUT = 1500;
 
 const EMPTY_STATE: ModernState = createModernState();
 
-function makeContext(transport: Transport): ModernSuiteContext {
+interface ContextOptions {
+  clientCapabilities?: Record<string, unknown>;
+  state?: Partial<ModernState>;
+}
+
+function makeContext(transport: Transport, opts: ContextOptions = {}): ModernSuiteContext {
   const harness = createHarness({
     definitions: getTestDefinitionMap(MODERN_SPEC_VERSION),
     specBase: specBaseFor(MODERN_SPEC_VERSION),
     transportKind: transport.kind,
   });
   const recorder = createRecorder();
-  transport.onMessage((m) => recorder.recordReceived(m));
+  transport.onMessage((m, meta) => recorder.recordReceived(m, meta));
   let id = 1000;
   const client = createModernClient({
     transport,
@@ -63,7 +74,7 @@ function makeContext(transport: Transport): ModernSuiteContext {
     nextId: () => id++,
     timeout: TIMEOUT,
     protocolVersion: MODERN_SPEC_VERSION,
-    clientCapabilities: { elicitation: {} },
+    clientCapabilities: opts.clientCapabilities ?? { elicitation: {} },
     clientInfo: { name: "mcp-compliance-test", version: "0.0.0" },
   });
   return {
@@ -79,11 +90,20 @@ function makeContext(transport: Transport): ModernSuiteContext {
     displayUrl: transport.kind === "http" ? "http://fixture" : "stdio://modern-fixture",
     detection: undefined,
     hasAuth: false,
-    state: { ...EMPTY_STATE },
+    state: { ...EMPTY_STATE, ...opts.state },
   };
 }
 
 type Kind = "stdio" | "http";
+
+function collect(ctx: ModernSuiteContext): Record<string, TestResult> {
+  const out: Record<string, TestResult> = {};
+  for (const r of ctx.harness.tests) out[r.id] = r;
+  for (const id of POSTHOC_IDS) {
+    if (!out[id]) throw new Error(`${id} did not run`);
+  }
+  return out;
+}
 
 /**
  * Spawn the fixture with `breaks`, let `trigger` put traffic on the
@@ -111,12 +131,7 @@ async function scanAfter(
     const ctx = makeContext(transport);
     await trigger(ctx.client);
     await runPostHoc(ctx);
-    const out: Record<string, TestResult> = {};
-    for (const r of ctx.harness.tests) out[r.id] = r;
-    for (const id of POSTHOC_IDS) {
-      if (!out[id]) throw new Error(`${id} did not run`);
-    }
-    return out;
+    return collect(ctx);
   } finally {
     await stop();
   }
@@ -147,6 +162,89 @@ function expectPassed(results: Record<string, TestResult>, ids: string[]) {
   }
 }
 
+/**
+ * A transport nothing talks to: for scans over a hand-scripted recorder
+ * (the post-hoc checks never touch the transport, only `kind`).
+ */
+function inertTransport(kind: TransportKind): Transport {
+  const refuse = async () => {
+    throw new Error("inert transport");
+  };
+  return {
+    kind,
+    request: refuse,
+    notify: refuse,
+    stream: refuse,
+    onMessage: () => () => {},
+    close: async () => {},
+    setSessionId() {},
+    setProtocolVersion() {},
+    getSessionId: () => null,
+    getProtocolVersion: () => null,
+  };
+}
+
+/** Build a context over `kind`, script its recorder, scan it. */
+async function scanRecording(
+  kind: Kind,
+  script: (recorder: Recorder) => void,
+  opts: ContextOptions = {},
+): Promise<{ results: Record<string, TestResult>; warnings: string[] }> {
+  const ctx = makeContext(inertTransport(kind), opts);
+  script(ctx.recorder);
+  await runPostHoc(ctx);
+  return { results: collect(ctx), warnings: ctx.harness.warnings };
+}
+
+/** A minimal node:http MCP endpoint whose every POST is answered by `handler`. */
+async function stubHttp(
+  handler: (req: IncomingMessage, res: ServerResponse, body: string) => void,
+): Promise<{ url: string; stop: () => Promise<void> }> {
+  const server: Server = createServer((req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk: string) => {
+      body += chunk;
+    });
+    req.on("end", () => handler(req, res, body));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  return {
+    url: `http://127.0.0.1:${port}/mcp`,
+    stop: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
+  res.writeHead(status, { "Content-Type": "application/json", ...headers });
+  res.end(JSON.stringify(body));
+}
+
+async function scanStub(
+  handler: (req: IncomingMessage, res: ServerResponse, body: string) => void,
+  trigger: (client: ModernClient) => Promise<void>,
+): Promise<{ results: Record<string, TestResult>; warnings: string[] }> {
+  const stub = await stubHttp(handler);
+  try {
+    const ctx = makeContext(createHttpTransport({ url: stub.url }));
+    await trigger(ctx.client);
+    await runPostHoc(ctx);
+    return { results: collect(ctx), warnings: ctx.harness.warnings };
+  } finally {
+    await stub.stop();
+  }
+}
+
+const DISCOVER_RESULT = {
+  resultType: "complete",
+  supportedVersions: [MODERN_SPEC_VERSION],
+  capabilities: {},
+  ttlMs: 1000,
+  cacheScope: "public",
+};
+
 describe("2026-07-28 post-hoc tests: the real suite over the clean fixture", () => {
   it("all eight pass over stdio (full suite, no --only)", async () => {
     const report = await runModern(stdioFixture().target);
@@ -176,7 +274,7 @@ describe("2026-07-28 post-hoc tests: the real suite over the clean fixture", () 
     expect(details["error-id-echo"]).toMatch(/^no error responses to id-bearing requests recorded/);
     expect(details["error-retired-codes"]).toMatch(/^0 error responses scanned/);
     expect(details["schema-result-type"]).toMatch(
-      /^(no results recorded|1 result scanned; every one carries a string resultType)/,
+      /^(no results recorded|1 result scanned; every resultType is complete or input_required)/,
     );
     expect(details["schema-no-input-required-on-lists"]).toMatch(
       /^[01] results? scanned; no input_required result observed/,
@@ -278,12 +376,12 @@ describe("2026-07-28 post-hoc tests: each check goes red under its fixture knob"
     const rt = results["schema-result-type"] as TestResult;
     expect(rt.passed).toBe(false);
     expect(rt.details).toMatch(
-      /2 of 2 results lack a string resultType; first: server\/discover \(resultType undefined\)/,
+      /2 of 2 results lack a valid resultType; first: server\/discover \(resultType undefined\)/,
     );
     const wire = results["schema-wire-valid"] as TestResult;
     expect(wire.passed).toBe(false);
     expect(wire.details).toMatch(
-      /2 of 2 server messages violate the 2026-07-28 schema: server\/discover: DiscoverResult at \/result: must have required property 'resultType'/,
+      /2 of 2 server messages violate the 2026-07-28 schema \(2 distinct violations\): server\/discover: DiscoverResult at \/result: must have required property 'resultType'/,
     );
     expectPassed(
       results,
@@ -315,7 +413,7 @@ describe("2026-07-28 post-hoc tests: each check goes red under its fixture knob"
     const r = results["schema-input-required-shape"] as TestResult;
     expect(r.passed).toBe(false);
     expect(r.details).toMatch(
-      /1 of 1 input_required result malformed; first \(tools\/call\): neither inputRequests nor requestState present/,
+      /1 of 1 input_required result violates the MRTR server requirements; first \(tools\/call\): neither inputRequests nor requestState present/,
     );
     // tools/call is an MRTR method, so the placement check is unaffected.
     expectPassed(results, ["schema-no-input-required-on-lists", "schema-result-type", "error-id-echo"]);
@@ -333,29 +431,308 @@ describe("2026-07-28 post-hoc tests: each check goes red under its fixture knob"
     expectPassed(results, ["schema-no-input-required-on-lists", "schema-result-type", "error-id-echo"]);
   });
 
-  it("no-caching: schema-wire-valid alone catches a missing CacheableResult field (http)", async () => {
+  it("ignore-client-capabilities: schema-input-required-shape fails when the server requests an undeclared capability", async () => {
+    // The suite declares only `elicitation`; under the knob needs_sampling
+    // skips its -32021 gate and returns a sampling/createMessage input
+    // request the client never said it could serve (mrtr server req. 6).
+    const results = await scanAfter("http", ["ignore-client-capabilities"], (client) =>
+      fire(client, "tools/call", { name: "needs_sampling", arguments: {} }),
+    );
+    const r = results["schema-input-required-shape"] as TestResult;
+    expect(r.passed).toBe(false);
+    expect(r.details).toMatch(
+      /1 of 1 input_required result violates the MRTR server requirements; first \(tools\/call\): server requested sampling\/createMessage although the client declared only elicitation/,
+    );
+    // The result is otherwise well-formed: placement, resultType and the wire schema are all green.
+    expectPassed(results, ["schema-no-input-required-on-lists", "schema-result-type", "schema-wire-valid"]);
+  });
+
+  it("no-caching: schema-wire-valid groups repeated violations and overflows distinct ones to a warning (http)", async () => {
     // Not one of the eight's own knobs; it shows the wire check does more
-    // than repeat schema-result-type, and that the overflow goes to a warning.
-    const http = await startHttpFixture({ breaks: ["no-caching"] });
+    // than repeat schema-result-type, that identical violations collapse
+    // into one "xN" entry, and that the distinct ones beyond the inline
+    // three go to a warning. Combined with no-result-type every result is
+    // wrong, so each of the nine methods called forms its own group.
+    const http = await startHttpFixture({ breaks: ["no-caching", "no-result-type"] });
     const transport = createHttpTransport({ url: http.url });
     try {
       const ctx = makeContext(transport);
-      for (let i = 0; i < 9; i++) await fire(ctx.client, "server/discover");
+      for (let i = 0; i < 3; i++) await fire(ctx.client, "server/discover");
+      await fire(ctx.client, "tools/list");
+      await fire(ctx.client, "tools/call", { name: "echo", arguments: { message: "hi" } });
+      await fire(ctx.client, "prompts/list");
+      await fire(ctx.client, "prompts/get", { name: "simple" });
+      await fire(ctx.client, "resources/list");
+      await fire(ctx.client, "resources/read", { uri: "test://static-text" });
+      await fire(ctx.client, "resources/templates/list");
+      await fire(ctx.client, "completion/complete", {
+        ref: { type: "ref/prompt", name: "greet" },
+        argument: { name: "name", value: "A" },
+      });
       await runPostHoc(ctx);
       const wire = ctx.harness.tests.find((t) => t.id === "schema-wire-valid") as TestResult;
       expect(wire.passed).toBe(false);
-      // ajv reports the two missing CacheableResult fields in its own order; one is inline, the other is the "+1 more".
+      // Eleven messages, nine distinct (method, first error) groups; the three discovers collapse into one.
       expect(wire.details).toMatch(
-        /^9 of 9 server messages violate the 2026-07-28 schema: server\/discover: DiscoverResult at \/result: must have required property '(ttlMs|cacheScope)' \(\+1 more\)/,
+        /^11 of 11 server messages violate the 2026-07-28 schema \(9 distinct violations\): server\/discover x3: DiscoverResult at \/result: must have required property '\w+' \(\+\d more\) \| tools\/list: /,
       );
-      // Three inline, five in the warning, one more counted.
       expect(wire.details.split(" | ")).toHaveLength(3);
+      expect(wire.details).not.toMatch(/server\/discover.*server\/discover/);
+      // Five more groups in the warning, one beyond it; the message count is what is left after the inline groups.
       const warning = ctx.harness.warnings.find((w) => w.startsWith("schema-wire-valid: 6 more message(s)"));
       expect(warning, ctx.harness.warnings.join("\n")).toBeDefined();
-      expect(warning).toMatch(/\(and 1 more\)$/);
-      expect(ctx.harness.tests.find((t) => t.id === "schema-result-type")?.passed).toBe(true);
+      expect(warning?.split(" | ")).toHaveLength(5);
+      expect(warning).toMatch(/\(and 1 more distinct violation\(s\)\)$/);
+      expect(warning).toMatch(/prompts\/get: /);
+      expect(ctx.harness.tests.find((t) => t.id === "schema-result-type")?.passed).toBe(false);
     } finally {
       await http.stop();
     }
+  });
+});
+
+describe("2026-07-28 post-hoc tests: error-id-echo and schema-wire-valid on transport-level rejections", () => {
+  /** Whatever the request, answer 401 with the body an SDK bearer-auth middleware or an API gateway writes. */
+  const unauthorized = (_req: IncomingMessage, res: ServerResponse) =>
+    sendJson(
+      res,
+      401,
+      { error: "invalid_token", error_description: "The access token expired" },
+      {
+        "WWW-Authenticate": 'Bearer resource_metadata="http://127.0.0.1/.well-known/oauth-protected-resource"',
+      },
+    );
+
+  it("a non-JSON-RPC 401 body is not an id-echo offender and not a schema violation (noted once)", async () => {
+    const { results } = await scanStub(unauthorized, async (client) => {
+      await fire(client, "server/discover");
+      await fire(client, "tools/list");
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed, echo.details).toBe(true);
+    expect(echo.details).toBe(
+      "no error responses to id-bearing requests recorded (exempt: 2 non-JSON-RPC error bodies not counted)",
+    );
+    const wire = results["schema-wire-valid"] as TestResult;
+    expect(wire.passed, wire.details).toBe(true);
+    expect(wire.details).toBe(
+      "no server messages to validate (2 non-JSON-RPC bodies on transport-level rejections not validated (HTTP 401 x2))",
+    );
+    expectPassed(results, POSTHOC_IDS);
+  });
+
+  it("a JSON-RPC null-id error on a 401/403 is exempt from error-id-echo (the id was never read)", async () => {
+    const guard = (_req: IncomingMessage, res: ServerResponse) =>
+      sendJson(res, 403, { jsonrpc: "2.0", id: null, error: { code: -32000, message: "Forbidden: bad origin" } });
+    const { results } = await scanStub(guard, (client) => fire(client, "server/discover"));
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed, echo.details).toBe(true);
+    expect(echo.details).toBe(
+      "no error responses to id-bearing requests recorded (exempt: 1 on transport-level rejections (HTTP 401/403/413/415/429))",
+    );
+    expectPassed(results, POSTHOC_IDS);
+  });
+
+  it("a null-id -32600 at HTTP 200 answering a well-formed request FAILS error-id-echo (the code exempts nothing)", async () => {
+    const strict = (_req: IncomingMessage, res: ServerResponse) =>
+      sendJson(res, 200, {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: "Invalid Request: _meta missing" },
+      });
+    const { results } = await scanStub(strict, (client) => fire(client, "server/discover", {}, { meta: false }));
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      "1 of 1 error response did not echo the request id; first: server/discover sent id 1000, reply carried null",
+    );
+  });
+
+  it.each([
+    -32700, -32600,
+  ])("a null-id %d on stdio answering a well-formed request FAILS error-id-echo", async (code) => {
+    const { results } = await scanRecording("stdio", (recorder) => {
+      recorder.recordSent({ id: 1000, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived({ jsonrpc: "2.0", id: null, error: { code, message: "cannot read" } });
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      "1 of 1 error response did not echo the request id; first: server/discover sent id 1000, reply carried null",
+    );
+    // A null id is modelled as omitted, which the schema allows: the wire check does not double-report it.
+    expect(results["schema-wire-valid"]?.passed, results["schema-wire-valid"]?.details).toBe(true);
+  });
+
+  it("a null-id error answering a raw probe stays exempt", async () => {
+    const { results } = await scanRecording("http", (recorder) => {
+      recorder.recordSent({ id: undefined, method: "", params: undefined, meta: undefined, raw: "{not json" });
+      recorder.recordReceived(
+        { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
+        { statusCode: 400 },
+      );
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed, echo.details).toBe(true);
+    expect(echo.details).toBe(
+      "no error responses to id-bearing requests recorded (exempt: 1 answering raw probes or client notifications)",
+    );
+  });
+});
+
+describe("2026-07-28 post-hoc tests: timeline attribution of a reply to a client notification", () => {
+  /**
+   * stdio-cancellation writes notifications/cancelled and, without
+   * waiting (a notification has no reply), server/discover. A server
+   * that wrongly answers the notification has that null-id error land
+   * AFTER the discover was sent -- the naive owner is the discover.
+   */
+  const notificationAnswered = (recorder: Recorder) => {
+    recorder.recordSent({
+      id: undefined,
+      method: "notifications/cancelled",
+      params: { requestId: 987654321 },
+      meta: undefined,
+    });
+    recorder.recordSent({ id: 1040, method: "server/discover", params: {}, meta: undefined });
+    recorder.recordReceived({ jsonrpc: "2.0", id: null, error: { code: -32601, message: "unknown request" } });
+    recorder.recordReceived({ jsonrpc: "2.0", id: 1040, result: DISCOVER_RESULT });
+  };
+
+  it("re-attributes the stray reply to the notification when the request also got its own id-matched reply", async () => {
+    const { results } = await scanRecording("stdio", notificationAnswered);
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed, echo.details).toBe(true);
+    expect(echo.details).toBe(
+      "no error responses to id-bearing requests recorded (exempt: 1 answering raw probes or client notifications)",
+    );
+    expectPassed(results, POSTHOC_IDS);
+  });
+
+  it("keeps the request as owner when it never received an id-matched reply (the stray IS its answer)", async () => {
+    const { results } = await scanRecording("stdio", (recorder) => {
+      recorder.recordSent({ id: undefined, method: "notifications/cancelled", params: {}, meta: undefined });
+      recorder.recordSent({ id: 1040, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived({ jsonrpc: "2.0", id: null, error: { code: -32601, message: "Method not found" } });
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      "1 of 1 error response did not echo the request id; first: server/discover sent id 1040, reply carried null",
+    );
+  });
+});
+
+describe("2026-07-28 post-hoc tests: schema-input-required-shape rules", () => {
+  const inputRequired = (inputRequests: Record<string, unknown>) => (recorder: Recorder) => {
+    recorder.recordSent({ id: 1000, method: "tools/call", params: { name: "t", arguments: {} }, meta: undefined });
+    recorder.recordReceived({
+      jsonrpc: "2.0",
+      id: 1000,
+      result: { resultType: "input_required", inputRequests, requestState: "s1" },
+    });
+  };
+
+  it("accepts roots/list without params when the client declared roots (ListRootsRequest.params is optional)", async () => {
+    const { results } = await scanRecording("http", inputRequired({ r: { method: "roots/list" } }), {
+      clientCapabilities: { elicitation: {}, roots: {} },
+    });
+    const r = results["schema-input-required-shape"] as TestResult;
+    expect(r.passed, r.details).toBe(true);
+    expect(r.details).toBe(
+      "1 input_required result observed, every one well-formed (inputRequests/requestState present, methods allowed and declared by the client [elicitation, roots], params present where required)",
+    );
+  });
+
+  it("requires params for elicitation/create and sampling/createMessage", async () => {
+    const { results } = await scanRecording("http", inputRequired({ e: { method: "elicitation/create" } }));
+    const r = results["schema-input-required-shape"] as TestResult;
+    expect(r.passed).toBe(false);
+    expect(r.details).toBe(
+      "1 of 1 input_required result violates the MRTR server requirements; first (tools/call): inputRequests.e.params is not an object (required for elicitation/create)",
+    );
+  });
+
+  it("fails roots/list when the client declared only elicitation, naming what was declared", async () => {
+    const { results } = await scanRecording("stdio", inputRequired({ r: { method: "roots/list" } }));
+    const r = results["schema-input-required-shape"] as TestResult;
+    expect(r.passed).toBe(false);
+    expect(r.details).toBe(
+      "1 of 1 input_required result violates the MRTR server requirements; first (tools/call): server requested roots/list although the client declared only elicitation",
+    );
+  });
+
+  it("names 'no capabilities' when the client declared none", async () => {
+    const { results } = await scanRecording(
+      "http",
+      inputRequired({ e: { method: "elicitation/create", params: { mode: "form", message: "?" } } }),
+      { clientCapabilities: {} },
+    );
+    const r = results["schema-input-required-shape"] as TestResult;
+    expect(r.passed).toBe(false);
+    expect(r.details).toMatch(/server requested elicitation\/create although the client declared no capabilities$/);
+  });
+});
+
+describe("2026-07-28 post-hoc tests: schema-result-type value set", () => {
+  const withResultTypes = (types: [string, unknown][]) => (recorder: Recorder) => {
+    let id = 1000;
+    for (const [method, resultType] of types) {
+      const rid = id++;
+      recorder.recordSent({ id: rid, method, params: {}, meta: undefined });
+      const base = method === "tools/call" ? { content: [{ type: "text", text: "x" }] } : {};
+      recorder.recordReceived({ jsonrpc: "2.0", id: rid, result: { ...base, resultType } });
+    }
+  };
+
+  it("fails a resultType outside complete/input_required when no extension is advertised", async () => {
+    const { results, warnings } = await scanRecording(
+      "http",
+      withResultTypes([
+        ["server/discover", "complete"],
+        ["tools/list", "ok"],
+        ["tools/call", "done"],
+      ]),
+    );
+    const r = results["schema-result-type"] as TestResult;
+    expect(r.passed).toBe(false);
+    expect(r.details).toBe(
+      '2 of 3 results lack a valid resultType; first: tools/list (resultType "ok" is neither complete nor input_required and no extension is advertised)',
+    );
+    expect(warnings.filter((w) => w.startsWith("schema-result-type"))).toEqual([]);
+  });
+
+  it("still fails a missing or non-string resultType", async () => {
+    const { results } = await scanRecording("stdio", withResultTypes([["tools/list", 7]]));
+    const r = results["schema-result-type"] as TestResult;
+    expect(r.passed).toBe(false);
+    expect(r.details).toBe("1 of 1 result lacks a valid resultType; first: tools/list (resultType 7)");
+  });
+
+  it("accepts an extension value with a warning naming it when the server advertises extensions", async () => {
+    const { results, warnings } = await scanRecording(
+      "http",
+      withResultTypes([
+        ["server/discover", "complete"],
+        ["tools/call", "task"],
+        ["tools/call", "task"],
+      ]),
+      { state: { capabilities: { tools: {}, extensions: { "io.modelcontextprotocol/tasks": {} } } } },
+    );
+    const r = results["schema-result-type"] as TestResult;
+    expect(r.passed, r.details).toBe(true);
+    expect(r.details).toBe(
+      '3 results scanned; every resultType is complete, input_required, or an extension value ("task"; see warning)',
+    );
+    expect(warnings.filter((w) => w.startsWith("schema-result-type"))).toEqual([
+      'schema-result-type: resultType "task" on tools/call is not a core value; accepted because the server advertises extensions (io.modelcontextprotocol/tasks) -- verify one of them defines it.',
+    ]);
+  });
+
+  it("an empty extensions object advertises nothing", async () => {
+    const { results } = await scanRecording("http", withResultTypes([["tools/list", "ok"]]), {
+      state: { capabilities: { extensions: {} } },
+    });
+    expect(results["schema-result-type"]?.passed).toBe(false);
   });
 });

@@ -1,7 +1,7 @@
 import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
 import { JSONRPC_ERROR_CODES, META } from "../../modern/meta.js";
 import type { StdioTransport } from "../../transport/stdio.js";
-import { hasTools, type ModernSuiteContext } from "./context.js";
+import { ensureTools, type ModernSuiteContext } from "./context.js";
 
 /**
  * Stdio-only tests of the 2026-07-28 suite. The catalog gates every id
@@ -14,6 +14,23 @@ import { hasTools, type ModernSuiteContext } from "./context.js";
 
 /** Same probe the 2025-11-25 suite uses: Latin-1 accent, CJK, an astral-plane emoji. */
 const UNICODE_PROBE = "héllo 世界 🚀";
+/** The probe's first word: present intact when only the astral/CJK part was lost. */
+const UNICODE_PROBE_LATIN1_WORD = "héllo";
+/** What a UTF-8 byte stream decoded as Latin-1 makes of the first word ("hÃ©llo"). */
+const UNICODE_PROBE_MISDECODED = Buffer.from(UNICODE_PROBE_LATIN1_WORD, "utf8").toString("latin1");
+/**
+ * The probe with every non-ASCII character dropped, up to the space that
+ * follows its first word ("hllo "): the skeleton a stripping decoder
+ * leaves. The space keeps it out of base64 blobs.
+ */
+const UNICODE_PROBE_STRIPPED = Array.from(UNICODE_PROBE)
+  .filter((c) => c.charCodeAt(0) < 128)
+  .join("")
+  .replace(/ +$/, " ");
+/** What a decoder substitutes for bytes it could not decode. */
+const REPLACEMENT_CHARACTER = "\uFFFD";
+/** Argument names a tool most plausibly echoes, in order of preference. */
+const ECHO_ARGUMENT_NAMES = ["message", "text", "input", "query"] as const;
 const BOGUS_METHOD = "this/method/does/not/exist-xyzzy";
 /** A request id the suite never issues (the counter starts at 1000 and never reaches this). */
 const UNKNOWN_CANCEL_ID = 987654321;
@@ -76,21 +93,65 @@ function firstText(res: RpcResponse): string {
   return brief(result ?? res.body);
 }
 
+interface UnicodeTool {
+  name: string;
+  inputSchema: unknown;
+  /** The argument names to carry the probe in. */
+  args: string[];
+}
+
+/** The string-typed properties of a tool's inputSchema whose names suggest an echo path. */
+function echoArguments(inputSchema: unknown): string[] {
+  if (!isObject(inputSchema) || !isObject(inputSchema.properties)) return [];
+  const props = inputSchema.properties;
+  return ECHO_ARGUMENT_NAMES.filter((name) => {
+    const p = props[name];
+    return isObject(p) && (p.type === "string" || (Array.isArray(p.type) && p.type.includes("string")));
+  });
+}
+
 /**
  * The tool to push the unicode probe through: a tool literally named
- * `echo` when the server has one, else the first listed tool (the
- * 2025-11-25 suite's choice). Null when the tools list is not available
- * -- undeclared capability, or the features module did not run under an
- * `--only` filter.
+ * `echo` when the server has one; else the first tool with a string
+ * property named message/text/input/query, so the echo path is real;
+ * else the first listed tool (the 2025-11-25 suite's choice), which may
+ * not echo anything -- the verdict then rests on the envelope probe.
+ * Null when the server declares no tools or the list is unavailable.
  */
-function pickUnicodeTool(ctx: ModernSuiteContext): { name: string; inputSchema: unknown } | null {
-  if (!hasTools(ctx)) return null;
-  const tools = ctx.state.tools;
+async function pickUnicodeTool(ctx: ModernSuiteContext): Promise<UnicodeTool | null> {
+  const tools = await ensureTools(ctx);
   if (!tools || tools.length === 0) return null;
-  const byName = (name: string) => tools.find((t) => isObject(t) && t.name === name);
-  const tool = byName("echo") ?? tools[0];
-  if (!isObject(tool) || typeof tool.name !== "string") return null;
-  return { name: tool.name, inputSchema: tool.inputSchema };
+  const named = tools.filter((t): t is Record<string, unknown> => isObject(t) && typeof t.name === "string");
+  const tool =
+    named.find((t) => t.name === "echo") ?? named.find((t) => echoArguments(t.inputSchema).length > 0) ?? named[0];
+  if (!tool) return null;
+  const declared = echoArguments(tool.inputSchema);
+  return {
+    name: tool.name as string,
+    inputSchema: tool.inputSchema,
+    args: declared.length > 0 ? declared : [...ECHO_ARGUMENT_NAMES],
+  };
+}
+
+/**
+ * Evidence that a reply MANGLED the probe, or undefined when the probe is
+ * merely absent (the tool did not echo its input). Absence proves
+ * nothing: a `get_time` tool answers "12:00" whatever it was sent.
+ */
+function manglingEvidence(serialized: string): string | undefined {
+  if (serialized.includes(REPLACEMENT_CHARACTER)) return "the reply carries U+FFFD replacement characters";
+  if (serialized.includes(UNICODE_PROBE_MISDECODED)) {
+    return `the reply carries the probe decoded as Latin-1 (${escapeNonAscii(UNICODE_PROBE_MISDECODED)})`;
+  }
+  if (serialized.includes(UNICODE_PROBE_LATIN1_WORD) || serialized.includes(UNICODE_PROBE_STRIPPED)) {
+    return "the reply carries the probe with its CJK/emoji characters dropped";
+  }
+  return undefined;
+}
+
+/** Non-ASCII as \uXXXX escapes, so a mis-decoded sample survives the ASCII details. */
+function escapeNonAscii(text: string): string {
+  return text.replace(/[^\x20-\x7e]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
@@ -138,40 +199,44 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
   });
 
   // ── stdio-unicode ──────────────────────────────────────────────
-  // Same shape as the 2025-11-25 test: push the probe through a tool
-  // when one is available and demand it back byte-for-byte; otherwise
-  // carry it in the discover envelope's clientInfo name, where the only
-  // observable is that the server parsed the request and answered.
+  // Same pass criteria as the 2025-11-25 test: push the probe through a
+  // tool when one is available and pass when it comes back byte-for-byte;
+  // fail only on EVIDENCE of mangling (U+FFFD, a Latin-1 mis-decode, the
+  // non-ASCII characters stripped, a -32700). A reply that merely lacks
+  // the probe means the tool did not echo its input -- an arbitrary
+  // first tool rarely does -- so the verdict then rests on the discover
+  // envelope: the probe rides in clientInfo.name, and the server parsing
+  // and answering that request is the round-trip verified.
   await harness.check("stdio-unicode", async () => {
     let note = "";
-    const tool = pickUnicodeTool(ctx);
+    const tool = await pickUnicodeTool(ctx);
     if (tool) {
       const res = await client.rpc(
         "tools/call",
-        {
-          name: tool.name,
-          arguments: { message: UNICODE_PROBE, text: UNICODE_PROBE, input: UNICODE_PROBE, query: UNICODE_PROBE },
-        },
+        { name: tool.name, arguments: Object.fromEntries(tool.args.map((arg) => [arg, UNICODE_PROBE])) },
         { toolInputSchema: tool.inputSchema },
       );
-      if (JSON.stringify(res.body).includes(UNICODE_PROBE)) {
+      const serialized = JSON.stringify(res.body);
+      if (serialized.includes(UNICODE_PROBE)) {
         return { passed: true, details: `tools/call ${tool.name} reproduced the CJK/emoji probe byte-for-byte` };
       }
       const err = errorOf(res.body);
-      if (!err) {
-        // The tool produced output and the characters are gone: this is
-        // the decoding defect the test exists for.
-        return {
-          passed: false,
-          details: `tools/call ${tool.name} answered without the probe characters (got ${firstText(res)})`,
-        };
-      }
-      if (err.code === JSONRPC_ERROR_CODES.PARSE_ERROR) {
+      if (err?.code === JSONRPC_ERROR_CODES.PARSE_ERROR) {
         return { passed: false, details: `tools/call ${tool.name} with a CJK/emoji argument -> -32700 parse error` };
       }
-      // The tool rejected the arguments (unknown args, schema mismatch):
-      // nothing echoed, so fall through to the envelope probe.
-      note = `tools/call ${tool.name} rejected the probe (JSON-RPC error ${err.code}); `;
+      const mangled = manglingEvidence(serialized);
+      if (mangled) {
+        return {
+          passed: false,
+          details: `tools/call ${tool.name} mangled the CJK/emoji probe: ${mangled} (got ${firstText(res)})`,
+        };
+      }
+      // Rejected (unknown args, schema mismatch) or answered without
+      // reflecting its arguments: nothing to compare, so the envelope
+      // probe decides.
+      note = err
+        ? `tools/call ${tool.name} rejected the probe (JSON-RPC error ${err.code}); `
+        : `tools/call ${tool.name} did not echo the probe; `;
     }
 
     const res = await client.rpc("server/discover", undefined, {
@@ -190,12 +255,20 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
         details: `${note}server/discover with a CJK/emoji clientInfo name -> non-JSON-RPC reply`,
       };
     }
-    if (JSON.stringify(res.body).includes(UNICODE_PROBE)) {
+    const serialized = JSON.stringify(res.body);
+    if (serialized.includes(UNICODE_PROBE)) {
       return { passed: true, details: `${note}server/discover reproduced the CJK/emoji clientInfo name byte-for-byte` };
+    }
+    const mangled = manglingEvidence(serialized);
+    if (mangled) {
+      return {
+        passed: false,
+        details: `${note}server/discover mangled the CJK/emoji clientInfo name: ${mangled}`,
+      };
     }
     return {
       passed: true,
-      details: `${note}server/discover accepted a request whose clientInfo name carries CJK/emoji (no echo path to verify byte-for-byte)`,
+      details: `${note}envelope round-trip verified: server/discover accepted a request whose clientInfo name carries CJK/emoji (no echo path to compare byte-for-byte)`,
     };
   });
 

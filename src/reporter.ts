@@ -1,5 +1,6 @@
 import chalk from "chalk";
 import { findTestDefinition } from "./definitions/index.js";
+import { REASON_PREFIX } from "./detect.js";
 import { AUTO_DETECT_NOTE_PREFIX, isSpecVersion, LEGACY_SPEC_VERSION, type SpecVersion, specBaseFor } from "./spec.js";
 import type { ComplianceReport, Grade, TestResult } from "./types.js";
 
@@ -32,15 +33,26 @@ const CATEGORY_ORDER = ["transport", "lifecycle", "tools", "resources", "prompts
  * note says which spec revision `auto` picked and why; it belongs in the
  * header, not in a list of problems. Returns the note's explanation (the
  * part in parentheses) so the header can say e.g.
- * "2026-07-28 (auto-detected: server/discover returned ...)".
+ * "2026-07-28 (auto-detected from server/discover: supportedVersions [..])".
+ *
+ * The runner's reasons all start with "server/discover -> "; that prefix
+ * is folded into the label so the terminal line stays within 80 columns
+ * for the common shapes (the pin hint lives in --help, not here). A
+ * reason without the prefix (an older report) is shown verbatim.
  */
 function splitSpecNote(report: ComplianceReport): { specNote: string | null; warnings: string[] } {
   const idx = report.warnings.findIndex((w) => w.startsWith(AUTO_DETECT_NOTE_PREFIX));
   if (idx === -1) return { specNote: null, warnings: report.warnings };
   const note = report.warnings[idx];
   const reason = /\((.*)\)\. Pin with/.exec(note)?.[1] ?? "";
+  let specNote = "auto-detected";
+  if (reason.startsWith(REASON_PREFIX)) {
+    specNote = `auto-detected from server/discover: ${reason.slice(REASON_PREFIX.length)}`;
+  } else if (reason) {
+    specNote = `auto-detected: ${reason}`;
+  }
   return {
-    specNote: reason ? `auto-detected: ${reason}` : "auto-detected",
+    specNote,
     warnings: report.warnings.filter((_, i) => i !== idx),
   };
 }
@@ -124,7 +136,7 @@ export function formatTerminal(report: ComplianceReport): string {
   out.push(chalk.dim(`  Target:   ${report.url}`));
   const { specNote, warnings } = splitSpecNote(report);
   out.push(chalk.dim(`  Spec:     ${report.specVersion}  ·  Tool v${report.toolVersion}  ·  ${report.timestamp}`));
-  if (specNote) out.push(chalk.dim(`            ${specNote}; pin with --spec-version`));
+  if (specNote) out.push(chalk.dim(`            ${specNote}`));
   out.push("");
 
   // Big grade block letter + side-by-side summary
@@ -163,7 +175,13 @@ export function formatTerminal(report: ComplianceReport): string {
   // Failed tests — full detail
   const catalog = catalogVersionOf(report);
   const failed = report.tests.filter((t) => !t.passed);
-  if (failed.length > 0) {
+  if (report.summary.total === 0) {
+    // Nothing ran: --only/--skip matched nothing in the resolved catalog
+    // (the runner's filter warning below names the miss). Grade F /
+    // FAIL is "nothing to attest"; it must not read as a clean pass.
+    out.push(`  ${chalk.yellow.bold("! No tests ran -- check --only/--skip (see warnings)")}`);
+    out.push("");
+  } else if (failed.length > 0) {
     out.push(chalk.bold.red(`  FAILED TESTS (${failed.length})`));
     out.push(chalk.dim(`  ${RULE}`));
     for (const t of failed) {

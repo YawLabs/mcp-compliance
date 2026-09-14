@@ -137,11 +137,28 @@ describe("2026-07-28 stdio-unicode: tools/call branch over a real fixture proces
     for (const id of STDIO_IDS) expect(outcome(ctx, id).passed, `${id}: ${outcome(ctx, id).details}`).toBe(true);
   });
 
-  it("fails when the server strips non-ASCII (unicode-broken knob)", async () => {
+  it("fetches tools/list itself when the capability is declared but no list is cached (--only shape)", async () => {
+    const transport = createStdioTransport({ command: process.execPath, args: [MODERN_FIXTURE] });
+    try {
+      const ctx = makeContext(transport, { capabilities: { tools: {} } });
+      await runStdio(ctx);
+      const unicode = outcome(ctx, "stdio-unicode");
+      expect(unicode.passed, unicode.details).toBe(true);
+      // The tools/call branch ran (so the verdict does not depend on the features module having run first).
+      expect(unicode.details).toMatch(/tools\/call echo reproduced the CJK\/emoji probe byte-for-byte/);
+      expect(ctx.state.toolNames).toContain("echo");
+    } finally {
+      await transport.close();
+    }
+  });
+
+  it("fails when the server strips non-ASCII (unicode-broken knob): the ASCII skeleton is evidence of mangling", async () => {
     const ctx = await runWithTools(["unicode-broken"]);
     const unicode = outcome(ctx, "stdio-unicode");
     expect(unicode.passed).toBe(false);
-    expect(unicode.details).toMatch(/answered without the probe characters/);
+    expect(unicode.details).toMatch(
+      /tools\/call echo mangled the CJK\/emoji probe: the reply carries the probe with its CJK\/emoji characters dropped \(got "hllo {2}"\)/,
+    );
     // The knob only touches echo: the other three stay green.
     for (const id of STDIO_IDS.filter((i) => i !== "stdio-unicode")) {
       expect(outcome(ctx, id).passed, `${id}: ${outcome(ctx, id).details}`).toBe(true);
@@ -159,12 +176,16 @@ type Answer = "result" | "error" | "silent" | "crash";
 
 interface FakeScript {
   answer: (method: string, id: JsonRpcId, n: number) => Answer;
+  /** The `result` object for an answer of "result"; default: a minimal DiscoverResult. */
+  result?: (method: string, params: unknown) => Record<string, unknown>;
   onNotify?: (method: string, fake: FakeStdio) => void;
 }
 
 interface FakeStdio extends Transport {
   exited: boolean;
   exitCode: number | null;
+  /** Every request as sent: [method, params]. */
+  calls: [string, unknown][];
   emit(message: unknown): void;
 }
 
@@ -175,11 +196,13 @@ function fakeStdio(script: FakeScript): FakeStdio {
     kind: "stdio",
     exited: false,
     exitCode: null,
+    calls: [],
     emit(message) {
       for (const l of listeners) l(message, {});
     },
-    async request(method, _params, nextId, init): Promise<TransportResponse> {
+    async request(method, params, nextId, init): Promise<TransportResponse> {
       const id = nextId();
+      fake.calls.push([method, params]);
       if (fake.exited) throw new Error(`stdio transport: server crashed with exit code ${fake.exitCode}`);
       const answer = script.answer(method, id, count++);
       if (answer === "crash") {
@@ -194,7 +217,14 @@ function fakeStdio(script: FakeScript): FakeStdio {
       const body =
         answer === "error"
           ? { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } }
-          : { jsonrpc: "2.0", id, result: { resultType: "complete", supportedVersions: [MODERN_SPEC_VERSION] } };
+          : {
+              jsonrpc: "2.0",
+              id,
+              result: script.result?.(method, params) ?? {
+                resultType: "complete",
+                supportedVersions: [MODERN_SPEC_VERSION],
+              },
+            };
       fake.emit(body);
       return { body, requestId: id };
     },
@@ -285,6 +315,92 @@ describe("2026-07-28 stdio tests: scripted misbehaviour (no fixture knob exists 
     const r = outcome(ctx, "stdio-cancellation");
     expect(r.passed).toBe(false);
     expect(r.details).toMatch(/got no reply \(server exited \(code 2\)\)/);
+  });
+
+  /** The clock-server shape from the review: one no-arg tool that answers "12:00" whatever it is sent. */
+  const CLOCK_TOOLS: Record<string, unknown>[] = [
+    { name: "get_time", inputSchema: { type: "object", properties: {}, additionalProperties: true } },
+  ];
+
+  /**
+   * stdio-unicode on servers whose tools do not echo their input, or
+   * whose echo mangles it. The fake answers server/discover with a
+   * DiscoverResult and tools/call with a scripted text; ctx.state carries
+   * the tools list so no tools/list round-trip is needed.
+   */
+  function unicodeFake(text: string, tools: Record<string, unknown>[] = CLOCK_TOOLS) {
+    const fake = fakeStdio({
+      answer: (method) => (method === "server/discover" || method === "tools/call" ? "result" : "error"),
+      result: (method) =>
+        method === "tools/call"
+          ? { resultType: "complete", content: [{ type: "text", text }] }
+          : { resultType: "complete", supportedVersions: [MODERN_SPEC_VERSION] },
+    });
+    const ctx = makeContext(fake, {
+      capabilities: { tools: {} },
+      tools,
+      toolNames: tools.map((t) => t.name as string),
+    });
+    return { fake, ctx };
+  }
+
+  it("stdio-unicode passes on a conformant server whose only tool does not echo its input (clock-server shape)", async () => {
+    const { fake, ctx } = unicodeFake("12:00");
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-unicode");
+    expect(r.passed, r.details).toBe(true);
+    expect(r.details).toMatch(
+      /^tools\/call get_time did not echo the probe; envelope round-trip verified: server\/discover accepted a request whose clientInfo name carries CJK\/emoji/,
+    );
+    // The tool WAS called (with the probe under every candidate name, since the schema names none).
+    const call = fake.calls.find(([m]) => m === "tools/call") as [string, { arguments: Record<string, string> }];
+    expect(call).toBeDefined();
+    expect(Object.keys(call[1].arguments).sort()).toEqual(["input", "message", "query", "text"]);
+  });
+
+  it("stdio-unicode prefers a tool with a string message/text/input/query property over the first tool", async () => {
+    const tools: Record<string, unknown>[] = [
+      ...CLOCK_TOOLS,
+      {
+        name: "search",
+        inputSchema: { type: "object", properties: { query: { type: "string" }, limit: { type: "integer" } } },
+      },
+    ];
+    const { fake, ctx } = unicodeFake("no results for héllo 世界 🚀", tools);
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-unicode");
+    expect(r.passed, r.details).toBe(true);
+    expect(r.details).toMatch(/^tools\/call search reproduced the CJK\/emoji probe byte-for-byte/);
+    const call = fake.calls.find(([m]) => m === "tools/call") as [string, { name: string; arguments: unknown }];
+    expect(call[1].name).toBe("search");
+    // Only the declared echo argument is sent, so a strict schema does not reject the probe.
+    expect(call[1].arguments).toEqual({ query: "héllo 世界 🚀" });
+  });
+
+  it.each([
+    [
+      "U+FFFD replacement characters",
+      "h\uFFFDllo \uFFFD\uFFFD \uFFFD",
+      /the reply carries U\+FFFD replacement characters/,
+    ],
+    [
+      "a Latin-1 mis-decode",
+      Buffer.from("héllo 世界 🚀", "utf8").toString("latin1"),
+      /the reply carries the probe decoded as Latin-1 \(h\\u00c3\\u00a9llo\)/,
+    ],
+    [
+      "the non-ASCII characters stripped",
+      "hllo  ",
+      /the reply carries the probe with its CJK\/emoji characters dropped/,
+    ],
+    ["only the Latin-1 word surviving", "héllo", /the reply carries the probe with its CJK\/emoji characters dropped/],
+  ])("stdio-unicode fails on evidence of mangling: %s", async (_label, text, pattern) => {
+    const { ctx } = unicodeFake(text);
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-unicode");
+    expect(r.passed).toBe(false);
+    expect(r.details).toMatch(/^tools\/call get_time mangled the CJK\/emoji probe: /);
+    expect(r.details).toMatch(pattern);
   });
 
   it("stdio-cancellation fails when the server answers the notification", async () => {

@@ -1,13 +1,18 @@
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   acknowledgmentProblem,
+  acknowledgmentSurplus,
   evaluateProgress,
   listenFilterFor,
+  supportedVersionsNamedIn,
   unsupportedVersionDataProblems,
 } from "../suites/modern/lifecycle.js";
 import type { ComplianceReport, TransportTarget } from "../types.js";
 import {
   type HttpFixture,
+  LEGACY_ECHO_FIXTURE,
   passedIds,
   resultOf,
   runModern,
@@ -20,9 +25,15 @@ import {
  * through the real runner against the modern fixture over stdio AND HTTP.
  * Every id passes on the clean fixture; then, knob by knob, the fixture is
  * broken and the test that guards that rule is shown to go red. A check
- * that has never been seen failing is a hypothesis.
+ * that has never been seen failing is a hypothesis. Branches the fixture
+ * has no knob for are driven by a node:http stub at the bottom.
  */
 
+/**
+ * Report order. The two claim-less _meta probes run LATE (after the
+ * feature lists, right before the initialize probe): on a dual-era stdio
+ * server they would otherwise re-select the era of the whole process.
+ */
 const IDS = [
   "lifecycle-discover",
   "lifecycle-discover-versions",
@@ -33,8 +44,6 @@ const IDS = [
   "lifecycle-capabilities",
   "lifecycle-server-info",
   "lifecycle-instructions",
-  "lifecycle-meta-required",
-  "lifecycle-meta-protocol-version-required",
   "lifecycle-meta-client-capabilities-required",
   "lifecycle-meta-client-info-optional",
   "lifecycle-version-unsupported",
@@ -44,7 +53,15 @@ const IDS = [
   "lifecycle-meta-tolerance",
   "lifecycle-completions",
   "lifecycle-progress-token",
+  "lifecycle-meta-required",
+  "lifecycle-meta-protocol-version-required",
   "lifecycle-dual-era",
+];
+
+const META_REJECTION_IDS = [
+  "lifecycle-meta-required",
+  "lifecycle-meta-protocol-version-required",
+  "lifecycle-meta-client-capabilities-required",
 ];
 
 type Kind = "stdio" | "http";
@@ -101,7 +118,7 @@ for (const kind of KINDS) {
       await http?.stop();
     });
 
-    it("passes every lifecycle test on the clean fixture", async () => {
+    it("passes every lifecycle test on the clean fixture, in catalog order with the claim-less probes late", async () => {
       const report = await runModern(target, { only: IDS });
       expect(passedIds(report, IDS)).toEqual(allPass(IDS));
       expect(report.tests.map((t) => t.id)).toEqual(IDS);
@@ -115,15 +132,46 @@ for (const kind of KINDS) {
         "prompts",
         "completions",
       ]);
-      // The initialize probe is informational: modern-only, and the fixture names its version.
-      expect(resultOf(report, "lifecycle-dual-era").details).toMatch(/^modern-only: initialize rejected with -32601/);
+      // The initialize probe is informational: modern-only, and the fixture
+      // names its version in the message (it sends no data.supported). On
+      // stdio the probe went to a fresh child, and says so.
+      expect(resultOf(report, "lifecycle-dual-era").details).toBe(
+        kind === "http"
+          ? "modern-only: initialize rejected with -32601 (HTTP 404); message names supported versions"
+          : "modern-only: initialize rejected with -32601 on a fresh process; message names supported versions",
+      );
       expect(resultOf(report, "lifecycle-subscriptions-listen").details).toMatch(/^Acknowledged subscription/);
       expect(resultOf(report, "lifecycle-removed-methods").details).toMatch(/^ping -32601/);
-      // Feature lists are not filled by a lifecycle-only run: the progress test skips honestly.
-      expect(resultOf(report, "lifecycle-progress-token").details).toMatch(/^skipped: no tools available/);
+      // A lifecycle-only run still measures the server: the feature lists
+      // are fetched on demand, so progress and completions probe real
+      // tools / prompts instead of skipping.
+      expect(resultOf(report, "lifecycle-progress-token").details).toMatch(
+        /^3 notifications\/progress echoed token "compliance-progress-1" with increasing progress \(1, 2, 3\)$/,
+      );
+      expect(resultOf(report, "lifecycle-completions").details).toBe(
+        'Returned 2 completion(s) for prompt "greet" argument "name"',
+      );
+      // The late claim-less probes drew the code the spec requires, cleanly.
+      expect(resultOf(report, "lifecycle-meta-required").details).toBe(
+        `server/discover without _meta: rejected with -32602${kind === "http" ? " (HTTP 400)" : ""}`,
+      );
     });
 
-    it("no-discover: every test that reads the DiscoverResult fails", async () => {
+    it("--only lifecycle (the category) exercises the same real probes", async () => {
+      const report = await runModern(target, { only: ["lifecycle"] });
+      // The category also owns the post-hoc log-level check (posthoc.ts).
+      expect(report.tests.map((t) => t.id)).toEqual([...IDS, "lifecycle-log-level-gating"]);
+      expect(passedIds(report, IDS)).toEqual(allPass(IDS));
+      expect(resultOf(report, "lifecycle-progress-token").details).toMatch(/^3 notifications\/progress echoed token/);
+      expect(resultOf(report, "lifecycle-completions").details).toMatch(
+        /^Returned 2 completion\(s\) for prompt "greet"/,
+      );
+      // The lists were fetched once for the run and published to the report.
+      expect(report.toolCount).toBe(11);
+      expect(report.promptCount).toBe(2);
+    });
+
+    it("no-discover: every test that reads the DiscoverResult fails, and no rejection is attributable", async () => {
       const report = await runBroken(kind, ["no-discover"], IDS);
       expectFailed(report, "lifecycle-discover", /JSON-RPC error -32601/);
       expectFailed(report, "lifecycle-discover-versions");
@@ -135,6 +183,19 @@ for (const kind of KINDS) {
       // A well-formed error envelope is still valid JSON-RPC with the id echoed.
       expectPassed(report, "lifecycle-jsonrpc");
       expectPassed(report, "lifecycle-id-match");
+      // The server rejects the CONFORMANT discover with -32601 too, so a
+      // rejection of the malformed variants proves nothing: not evaluable.
+      const status = kind === "http" ? " (HTTP 404)" : "";
+      for (const id of META_REJECTION_IDS) {
+        expectFailed(
+          report,
+          id,
+          new RegExp(
+            `^server/discover without _meta[a-zA-Z ]*: not evaluable: the conformant server/discover was itself rejected with -32601${status.replace(/[()]/g, "\\$&")}, so this rejection proves nothing about the injected defect$`,
+          ),
+        );
+      }
+      expect(lifecycleWarnings(report).filter((w) => w.startsWith("lifecycle-meta-"))).toEqual([]);
       // No capabilities -> completions is gated out of the report entirely.
       expect(report.tests.some((t) => t.id === "lifecycle-completions")).toBe(false);
       expect(report.serverInfo.protocolVersion).toBeNull();
@@ -167,12 +228,7 @@ for (const kind of KINDS) {
     });
 
     it("accept-missing-meta: the three _meta rejection tests fail on a served result", async () => {
-      const ids = [
-        "lifecycle-meta-required",
-        "lifecycle-meta-protocol-version-required",
-        "lifecycle-meta-client-capabilities-required",
-        "lifecycle-meta-client-info-optional",
-      ];
+      const ids = [...META_REJECTION_IDS, "lifecycle-meta-client-info-optional"];
       const report = await runBroken(kind, ["accept-missing-meta"], ids);
       expectFailed(report, "lifecycle-meta-required", /server returned a result/);
       expectFailed(report, "lifecycle-meta-protocol-version-required", /server returned a result/);
@@ -242,10 +298,10 @@ for (const kind of KINDS) {
       expectFailed(report, "lifecycle-jsonrpc", kind === "http" ? /does not echo request id/ : /no response/);
     });
 
-    it("initialize-ok: the dual-era probe reports a served legacy handshake", async () => {
+    it("initialize-ok: the dual-era probe reports a served legacy handshake and the suite warns", async () => {
       const report = await runBroken(kind, ["initialize-ok"], ["lifecycle-dual-era", "lifecycle-discover-versions"]);
-      expect(expectPassed(report, "lifecycle-dual-era").details).toMatch(
-        /^dual-era: initialize answered with protocolVersion 2025-11-25/,
+      expect(expectPassed(report, "lifecycle-dual-era").details).toBe(
+        `dual-era: initialize answered with protocolVersion 2025-11-25${kind === "stdio" ? " on a fresh process" : ""}; legacy handshake served alongside 2026-07-28`,
       );
       expectPassed(report, "lifecycle-discover-versions");
       expect(report.warnings.some((w) => w.startsWith("Server is dual-era"))).toBe(true);
@@ -254,11 +310,11 @@ for (const kind of KINDS) {
     it("initialize-vague: a rejection that names no version passes with a warning", async () => {
       const report = await runBroken(kind, ["initialize-vague"], ["lifecycle-dual-era"]);
       expect(expectPassed(report, "lifecycle-dual-era").details).toMatch(
-        /^modern-only: initialize rejected with -32601.*\(see warning\)/,
+        /^modern-only: initialize rejected with -32601.*\(see warning\)$/,
       );
       expect(lifecycleWarnings(report)).toEqual([
         expect.stringMatching(
-          /^lifecycle-dual-era: initialize rejected with -32601 but the message names no supported protocol version/,
+          /^lifecycle-dual-era: initialize rejected with -32601 but neither the message nor data\.supported names a supported protocol version \(spec SHOULD\)/,
         ),
       ]);
     });
@@ -294,6 +350,195 @@ describe("modern lifecycle over http only", () => {
     } finally {
       await http.stop();
     }
+  });
+});
+
+describe("a legacy-only server pinned to 2026-07-28 (echo fixture over stdio)", () => {
+  it("fails the _meta rejection tests as not evaluable instead of crediting its blanket -32601", async () => {
+    const target: TransportTarget = { type: "stdio", command: process.execPath, args: [LEGACY_ECHO_FIXTURE] };
+    const report = await runModern(target, { only: ["lifecycle-discover", ...META_REJECTION_IDS] });
+    expectFailed(report, "lifecycle-discover", /JSON-RPC error -32601/);
+    for (const id of META_REJECTION_IDS) {
+      expectFailed(
+        report,
+        id,
+        /: not evaluable: the conformant server\/discover was itself rejected with -32601, so this rejection proves nothing about the injected defect$/,
+      );
+    }
+    // No "rejected with -32601 (expected -32602)" warning either: nothing was credited.
+    expect(lifecycleWarnings(report)).toEqual([]);
+    expect(report.summary.requiredPassed).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stub servers for the branches the fixture has no knob for
+// ---------------------------------------------------------------------------
+
+type StubReply = { status: number; body: unknown } | { sse: unknown[] };
+type StubRoute = (method: string, msg: Record<string, any>) => StubReply;
+
+/** A minimal 2026-07-28 HTTP server: `route` answers each POST by method. */
+async function startModernStub(route: StubRoute): Promise<{ url: string; close(): Promise<void> }> {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    let text = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk: string) => {
+      text += chunk;
+    });
+    req.on("end", () => {
+      let msg: Record<string, any> = {};
+      try {
+        msg = JSON.parse(text);
+      } catch {}
+      if (msg.id === undefined) {
+        res.writeHead(202).end();
+        return;
+      }
+      const reply = route(String(msg.method), msg);
+      if ("sse" in reply) {
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+        for (const frame of reply.sse) res.write(`event: message\ndata: ${JSON.stringify(frame)}\n\n`);
+        // Held open until the client closes, like a real listen stream.
+        req.on("close", () => res.end());
+        return;
+      }
+      res.writeHead(reply.status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(reply.body));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}/mcp`,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+const SUB = "io.modelcontextprotocol/subscriptionId";
+
+function discoverReply(id: unknown, capabilities: Record<string, unknown>): StubReply {
+  return {
+    status: 200,
+    body: {
+      jsonrpc: "2.0",
+      id,
+      result: {
+        resultType: "complete",
+        supportedVersions: ["2026-07-28"],
+        capabilities,
+        ttlMs: 0,
+        cacheScope: "public",
+        _meta: { "io.modelcontextprotocol/serverInfo": { name: "stub", version: "0" } },
+      },
+    },
+  };
+}
+
+const notFound = (id: unknown, method: string): StubReply => ({
+  status: 404,
+  body: { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } },
+});
+
+describe("lifecycle-subscriptions-listen: an acknowledgment that honours more than was requested", () => {
+  it("passes with a warning naming the surplus entries", async () => {
+    const stub = await startModernStub((method, msg) => {
+      if (method === "server/discover") return discoverReply(msg.id, { tools: { listChanged: true } });
+      if (method === "subscriptions/listen") {
+        return {
+          sse: [
+            {
+              jsonrpc: "2.0",
+              method: "notifications/subscriptions/acknowledged",
+              params: {
+                _meta: { [SUB]: msg.id },
+                notifications: { toolsListChanged: true, promptsListChanged: true, resourceSubscriptions: ["x://y"] },
+              },
+            },
+          ],
+        };
+      }
+      return notFound(msg.id, method);
+    });
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-subscriptions-listen"] });
+      const r = expectPassed(report, "lifecycle-subscriptions-listen");
+      expect(r.details).toMatch(/^Acknowledged subscription \d+ first; honoured .* \(see warning\)$/);
+      expect(lifecycleWarnings(report)).toEqual([
+        'lifecycle-subscriptions-listen: acknowledgment honours promptsListChanged: true (not requested), resourceSubscriptions "x://y" (not requested); the listen request did not ask for that, so the server may send notifications outside the requested filter',
+      ]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("lifecycle-dual-era: where a rejected initialize names the supported versions", () => {
+  const rejectInitialize = (error: Record<string, unknown>) =>
+    startModernStub((method, msg) => {
+      if (method === "server/discover") return discoverReply(msg.id, {});
+      if (method === "initialize") return { status: 400, body: { jsonrpc: "2.0", id: msg.id, error } };
+      return notFound(msg.id, method);
+    });
+
+  it("a message that only echoes the requested 2025-11-25 names nothing: warning", async () => {
+    const stub = await rejectInitialize({ code: -32022, message: "Unsupported protocol version: 2025-11-25" });
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-dual-era"] });
+      expect(expectPassed(report, "lifecycle-dual-era").details).toBe(
+        "modern-only: initialize rejected with -32022 (HTTP 400) (see warning)",
+      );
+      expect(lifecycleWarnings(report)).toEqual([
+        'lifecycle-dual-era: initialize rejected with -32022 but neither the message nor data.supported names a supported protocol version (spec SHOULD): "Unsupported protocol version: 2025-11-25"',
+      ]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("the spec's own UnsupportedProtocolVersionError shape (dateless message, data.supported) satisfies the SHOULD", async () => {
+    const stub = await rejectInitialize({
+      code: -32022,
+      message: "Unsupported protocol version",
+      data: { supported: ["2026-07-28"], requested: "2025-11-25" },
+    });
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-dual-era"] });
+      expect(expectPassed(report, "lifecycle-dual-era").details).toBe(
+        "modern-only: initialize rejected with -32022 (HTTP 400); data.supported names supported versions",
+      );
+      expect(lifecycleWarnings(report)).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("supportedVersionsNamedIn (the lifecycle-dual-era SHOULD)", () => {
+  it("credits data.supported, a message date other than the requested one, or both", () => {
+    expect(supportedVersionsNamedIn({ message: "Unsupported protocol version: 2025-11-25" })).toBeNull();
+    expect(supportedVersionsNamedIn({ message: "initialize is not supported" })).toBeNull();
+    expect(supportedVersionsNamedIn({ message: "nope", data: { supported: [] } })).toBeNull();
+    expect(supportedVersionsNamedIn({ message: "nope", data: { supported: [20260728] } })).toBeNull();
+    expect(supportedVersionsNamedIn({ message: "nope", data: { supported: "2026-07-28" } })).toBeNull();
+    expect(supportedVersionsNamedIn({ message: "This server speaks MCP 2026-07-28" })).toBe(
+      "message names supported versions",
+    );
+    expect(supportedVersionsNamedIn({ message: "nope", data: { supported: ["2026-07-28"] } })).toBe(
+      "data.supported names supported versions",
+    );
+    expect(
+      supportedVersionsNamedIn({
+        message: "Unsupported 2025-11-25; use 2026-07-28",
+        data: { supported: ["2026-07-28"] },
+      }),
+    ).toBe("message and data.supported name supported versions");
+    // The version the probe requested is configurable; a message naming only it still names nothing.
+    expect(supportedVersionsNamedIn({ message: "not 2030-01-01" }, "2030-01-01")).toBeNull();
   });
 });
 
@@ -372,7 +617,6 @@ describe("unsupportedVersionDataProblems (lifecycle-version-unsupported data rul
 });
 
 describe("acknowledgmentProblem (the first frame lifecycle-subscriptions-listen accepts)", () => {
-  const SUB = "io.modelcontextprotocol/subscriptionId";
   const ack = (subscriptionId: unknown, notifications: unknown = {}) => ({
     jsonrpc: "2.0",
     method: "notifications/subscriptions/acknowledged",
@@ -406,6 +650,38 @@ describe("acknowledgmentProblem (the first frame lifecycle-subscriptions-listen 
       "Acknowledgment has no notifications object naming the honoured filter",
     );
     expect(acknowledgmentProblem(ack(1001, ["toolsListChanged"]), 1001)).toMatch(/no notifications object/);
+  });
+});
+
+describe("acknowledgmentSurplus (what an ack honours beyond the requested filter)", () => {
+  const requested = { toolsListChanged: true, resourceSubscriptions: ["a://b"] };
+
+  it("is empty for a subset, an equal set, and explicit false", () => {
+    expect(acknowledgmentSurplus({}, requested)).toEqual([]);
+    expect(acknowledgmentSurplus({ toolsListChanged: true }, requested)).toEqual([]);
+    expect(acknowledgmentSurplus({ toolsListChanged: true, resourceSubscriptions: ["a://b"] }, requested)).toEqual([]);
+    expect(acknowledgmentSurplus({ toolsListChanged: false, promptsListChanged: false }, requested)).toEqual([]);
+    expect(acknowledgmentSurplus({ resourceSubscriptions: [] }, requested)).toEqual([]);
+  });
+
+  it("names a true boolean, a URI, or a mistyped value the request did not include", () => {
+    expect(
+      acknowledgmentSurplus(
+        { toolsListChanged: true, promptsListChanged: true, resourceSubscriptions: ["a://b", "x://y"] },
+        requested,
+      ),
+    ).toEqual(["promptsListChanged: true (not requested)", 'resourceSubscriptions "x://y" (not requested)']);
+    expect(acknowledgmentSurplus({ toolsListChanged: "yes", bogus: 1 }, requested)).toEqual([
+      'toolsListChanged: "yes" (expected a boolean)',
+      "bogus: 1 (expected a boolean)",
+    ]);
+    expect(acknowledgmentSurplus({ resourceSubscriptions: "a://b" }, requested)).toEqual([
+      'resourceSubscriptions "a://b" (expected an array of URIs)',
+    ]);
+    // Nothing requested at all: any true is surplus.
+    expect(acknowledgmentSurplus({ resourcesListChanged: true }, {})).toEqual([
+      "resourcesListChanged: true (not requested)",
+    ]);
   });
 });
 

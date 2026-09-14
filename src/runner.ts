@@ -16,7 +16,14 @@ import {
   VALID_CONTENT_TYPES,
 } from "./checks/patterns.js";
 import { getTestDefinitionMap } from "./definitions/index.js";
-import { buildDiscoverProbe, classifyDiscoverResponse, type DetectionResult, detectSpecVersion } from "./detect.js";
+import {
+  buildDiscoverProbe,
+  classifyDiscoverResponse,
+  type DetectionResult,
+  type DetectOptions,
+  detectSpecVersion,
+  REASON_PREFIX,
+} from "./detect.js";
 import { createHarness, supportsTransportByDefinition } from "./harness.js";
 import { readPackageVersion } from "./pkg-version.js";
 import { assembleReport } from "./report.js";
@@ -31,7 +38,7 @@ import {
 import { runModernSuite } from "./suites/modern/index.js";
 import { createHttpTransport } from "./transport/http.js";
 import type { Transport, TransportResponse } from "./transport/index.js";
-import { createStdioTransport } from "./transport/stdio.js";
+import { createStdioTransport, type StdioTransport } from "./transport/stdio.js";
 import type { ComplianceReport, TestDefinition, TestResult, TransportTarget } from "./types.js";
 import { TEST_DEFINITIONS } from "./types.js";
 
@@ -71,6 +78,97 @@ export const SPEC_BASE = specBaseFor(LEGACY_SPEC_VERSION);
 function createIdCounter(start = 0) {
   let id = start;
   return () => ++id;
+}
+
+/**
+ * undici rejects an `AbortSignal.timeout()` with a DOMException named
+ * `TimeoutError`; its own deadlines reject with `HeadersTimeoutError` /
+ * `BodyTimeoutError`. A refused connection or DNS failure is a plain
+ * Error with an errno code (ECONNREFUSED, ENOTFOUND) and no such name.
+ */
+function isTimeoutError(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return typeof name === "string" && /timeout/i.test(name);
+}
+
+function formatSeconds(ms: number): string {
+  return ms % 1000 === 0 ? `${ms / 1000}s` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+/**
+ * How long the stdio era probe may sit unanswered before `onStatus`
+ * tells the user what the wait is. A server that answers the probe
+ * (result or error) does so in milliseconds; only a 2025-11-25 server
+ * that IGNORES unknown pre-initialize methods reaches this.
+ */
+const STDIO_PROBE_STATUS_DELAY_MS = 2000;
+
+/**
+ * The stdio era probe with a status hook: nothing has been printed since
+ * "Testing stdio:..." and the probe may take the whole startup budget,
+ * so ~2s in say what is being waited on and how to skip it.
+ */
+async function detectStdioEra(
+  transport: Transport,
+  opts: DetectOptions & { onStatus?: (message: string) => void },
+): Promise<DetectionResult> {
+  const timer = opts.onStatus
+    ? setTimeout(() => {
+        opts.onStatus?.(
+          `Probing spec era (server/discover, up to ${formatSeconds(opts.timeout)}). A ${LEGACY_SPEC_VERSION} server that ignores unknown methods takes the whole startup timeout; --spec-version ${LEGACY_SPEC_VERSION} skips the probe.`,
+        );
+      }, STDIO_PROBE_STATUS_DELAY_MS)
+    : null;
+  try {
+    return await detectSpecVersion(transport, opts);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * The stderr a dead child left behind. The 'exit' event that rejected the
+ * probe can land before the parent has read the pipe (a crashing Node
+ * prints its stack, then exits; the two completions are not ordered), so
+ * give the stream a moment to drain before quoting it.
+ */
+async function settledStderr(dead: StdioTransport): Promise<string> {
+  const deadline = Date.now() + 200;
+  while (!dead.stderrTail().trim() && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  await new Promise((r) => setTimeout(r, 20));
+  return dead.stderrTail();
+}
+
+/**
+ * The last few meaningful stderr lines of a stdio child, one line, for a
+ * warning. Drops stack-frame lines ("    at ...") and bare punctuation so
+ * the line that names the cause (e.g. "Error: unhandled method
+ * server/discover") survives ahead of the frames that follow it.
+ */
+function summarizeStderr(tail: string): string {
+  const lines = tail
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !/^at\s/.test(l) && /[A-Za-z0-9]/.test(l));
+  return lines
+    .slice(-3)
+    .map((l) => (l.length > 160 ? `${l.slice(0, 157)}...` : l))
+    .join(" | ");
+}
+
+/** Collapse whitespace (a transport error carries a multi-line stderr tail) and cap the length for a details string. */
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 3)}...` : flat;
+}
+
+/** The probe answer in a pinned-run warning: "a DiscoverResult (...)" or the raw shape ("JSON-RPC error -32601"). */
+function describeProbeAnswer(d: DetectionResult): string {
+  if (d.discover) return `a DiscoverResult (supportedVersions [${(d.supportedVersions ?? []).join(", ")}])`;
+  const rest = d.reason.startsWith(REASON_PREFIX) ? d.reason.slice(REASON_PREFIX.length) : d.reason;
+  return rest.replace(/, legacy$/, "");
 }
 
 /**
@@ -212,8 +310,22 @@ export interface RunOptions {
   only?: string[];
   /** Skip tests matching these category names or test IDs */
   skip?: string[];
-  /** Preflight connectivity check timeout in milliseconds (default: min(timeout, 10000)) */
+  /**
+   * HTTP only: deadline for the preflight request, in milliseconds
+   * (default: min(timeout, 10000)). The preflight body is the era probe,
+   * so under `specVersion: "auto"` a preflight that TIMES OUT (as
+   * opposed to a refused connection) is re-probed once within
+   * `startupTimeout` before the run defaults to 2025-11-25.
+   */
   preflightTimeout?: number;
+  /**
+   * Optional callback for human-facing status lines while the runner is
+   * waiting on something no test has started yet -- today the stdio era
+   * probe, which fires this ~2s in when a 2025-11-25 server that ignores
+   * unknown methods is silently costing the whole startup timeout. Not
+   * part of the report; the CLI prints it dim to stderr in terminal mode.
+   */
+  onStatus?: (message: string) => void;
   /**
    * Maximum number of parallel-safe tests in flight at once. Default 1
    * (strictly sequential — matches pre-0.12 behavior). Tests are only
@@ -285,7 +397,11 @@ export async function runComplianceSuite(
           verbose: resolvedTarget.verbose,
         })
       : null;
-  const transport: Transport =
+  // Reassigned once, and only on stdio: when the era probe kills the child
+  // (a legacy server that exits on an unknown pre-initialize request) the
+  // suite runs against a fresh instance; `finally` closes whichever is
+  // current.
+  let transport: Transport =
     resolvedTarget.type === "http"
       ? createHttpTransport({
           url: resolvedTarget.url,
@@ -310,6 +426,19 @@ export async function runComplianceSuite(
         : `stdio:${resolvedTarget.command}${resolvedTarget.args?.length ? ` ${resolvedTarget.args.join(" ")}` : ""}`;
 
     const clientInfo = { name: "mcp-compliance", version: TOOL_VERSION };
+    const requested: SpecVersionOption = options.specVersion ?? "auto";
+
+    // Use high start offset for the main ID counter to avoid collision with transport test hardcoded IDs
+    const nextId = createIdCounter(1000);
+    const timeout = options.timeout || 15000;
+    // Startup budget covers the first exchange: the stdio era probe, the
+    // legacy initialize + initialized notification, and on HTTP the era
+    // re-probe after a preflight timeout. Cold `npx @pkg serve` targets
+    // can take 20-40s to resolve and exec the package before the MCP loop
+    // runs; a 15s request timeout would fire before the first byte.
+    // Default to max(timeout, 60000).
+    const startupTimeout = options.startupTimeout ?? Math.max(timeout, 60000);
+    const preflightTimeout = options.preflightTimeout ?? Math.min(timeout, 10000);
 
     // Preflight connectivity check — fail fast instead of running all tests
     // against an unreachable server. HTTP-only: a quick request catches DNS,
@@ -321,13 +450,17 @@ export async function runComplianceSuite(
     // The preflight body is the spec's era probe — a modern
     // `server/discover` with full `_meta` and headers — so on HTTP one
     // round-trip answers both "is it up" and "which era does it speak".
-    // Any HTTP response at all counts as reachable; only a thrown error
-    // (connect refused, DNS, TLS, timeout) marks the server unreachable.
+    // Any HTTP response at all counts as reachable. A thrown error is
+    // split two ways: a TIMEOUT (the server may just be cold; under
+    // `auto` the probe is retried within the startup budget below) and a
+    // connection failure (refused, DNS, TLS), which marks the server
+    // unreachable right away.
     let serverReachable = true;
     let preflightResponse: TransportResponse | null = null;
+    let preflightTimedOut = false;
+    let preflightError = "";
     if (resolvedTarget.type === "http") {
       try {
-        const preflightTimeout = options.preflightTimeout ?? Math.min(options.timeout || 15000, 10000);
         const probe = buildDiscoverProbe(clientInfo);
         const preflight = await request(resolvedTarget.url, {
           method: "POST",
@@ -353,25 +486,14 @@ export async function runComplianceSuite(
           }
         }
         preflightResponse = { body, requestId: 0, statusCode: preflight.statusCode, headers: {} };
-      } catch {
+      } catch (err: unknown) {
         serverReachable = false;
+        preflightTimedOut = isTimeoutError(err);
+        preflightError = err instanceof Error ? err.message : String(err);
       }
     }
 
     const preWarnings: string[] = [];
-    if (!serverReachable) {
-      preWarnings.push(
-        `Server at ${displayUrl} is unreachable — all tests will fail. Check the URL or command and ensure the server is running.`,
-      );
-    }
-    // Use high start offset for the main ID counter to avoid collision with transport test hardcoded IDs
-    const nextId = createIdCounter(1000);
-    const timeout = options.timeout || 15000;
-    // Startup budget covers initialize + initialized notification. Cold
-    // `npx @pkg serve` targets can take 20-40s to resolve and exec the
-    // package before the MCP loop runs; a 15s request timeout would fire
-    // before the first byte. Default to max(timeout, 60000).
-    const startupTimeout = options.startupTimeout ?? Math.max(timeout, 60000);
 
     // ── Spec version resolution ──────────────────────────────────────
     // `auto` classifies the spec's own era probe (a modern
@@ -379,20 +501,84 @@ export async function runComplianceSuite(
     // it is the first exchange and shares the startup budget. An
     // unreachable HTTP server takes the legacy default, so today's
     // "everything fails" report shape is preserved.
-    const requested: SpecVersionOption = options.specVersion ?? "auto";
     let detection: DetectionResult | undefined;
     let resolvedSpec: SpecVersion;
+    let reprobedAfterTimeout = false;
+    if (requested === "auto" && resolvedTarget.type === "http" && preflightTimedOut) {
+      // The preflight deadline is short by design (min(timeout, 10s)) and
+      // a modern server on a cold start can miss it; the legacy path gave
+      // that server the whole startup budget for `initialize`, so give
+      // the era probe the same budget before defaulting to 2025-11-25.
+      reprobedAfterTimeout = true;
+      options.onStatus?.(
+        `Preflight got no reply within ${preflightTimeout}ms; re-sending the era probe (server/discover, up to ${formatSeconds(startupTimeout)}) before defaulting to ${LEGACY_SPEC_VERSION}.`,
+      );
+      const retry = await detectSpecVersion(transport, {
+        nextId,
+        timeout: startupTimeout,
+        clientInfo,
+        signal: options.signal,
+      });
+      if (retry.responded) {
+        serverReachable = true;
+        detection = retry;
+      }
+    }
+    if (!serverReachable) {
+      preWarnings.push(
+        preflightTimedOut
+          ? `Server at ${displayUrl} did not answer the preflight within ${preflightTimeout}ms${reprobedAfterTimeout ? ` or the era probe within ${startupTimeout}ms` : ""}; treating it as unreachable -- every test that needs the server will fail. A slow cold start needs a higher --preflight-timeout${reprobedAfterTimeout ? " / --startup-timeout" : ""}.`
+          : `Server at ${displayUrl} is unreachable (${preflightError}) -- every test that needs the server will fail. Check the URL or command and ensure the server is running.`,
+      );
+    }
     if (requested === "auto" && serverReachable) {
-      detection =
-        resolvedTarget.type === "http"
-          ? classifyDiscoverResponse(preflightResponse)
-          : await detectSpecVersion(transport, { nextId, timeout: startupTimeout, clientInfo, signal: options.signal });
+      if (!detection) {
+        detection =
+          resolvedTarget.type === "http"
+            ? classifyDiscoverResponse(preflightResponse)
+            : await detectStdioEra(transport, {
+                nextId,
+                timeout: startupTimeout,
+                clientInfo,
+                signal: options.signal,
+                onStatus: options.onStatus,
+              });
+      }
       resolvedSpec = detection.version;
       preWarnings.push(
         `${AUTO_DETECT_NOTE_PREFIX}${resolvedSpec} (${detection.reason}). Pin with --spec-version to override.`,
       );
+      // A legacy server whose dispatcher throws on an unknown method dies
+      // on the probe. The transport already rejected the probe with the
+      // exit diagnostic (detectSpecVersion folds that into "no response");
+      // say so, and give the suite a live child instead of a dead one.
+      if (transport.kind === "stdio" && (transport as StdioTransport).exited) {
+        const dead = transport as StdioTransport;
+        const tail = summarizeStderr(await settledStderr(dead));
+        const why =
+          detection.era === "legacy"
+            ? ` A ${LEGACY_SPEC_VERSION} server must tolerate unknown pre-initialize requests (answer with a JSON-RPC error or ignore them, never exit); pin --spec-version ${LEGACY_SPEC_VERSION} to skip the probe.`
+            : "";
+        preWarnings.push(
+          `Server exited (code ${dead.exitCode}) after the ${MODERN_SPEC_VERSION} era probe (server/discover)${tail ? `; last stderr: ${tail}` : ""}. The suite spawned a fresh instance.${why}`,
+        );
+        await transport.close().catch(() => {});
+        transport = spawnStdio() as Transport;
+      }
     } else {
       resolvedSpec = requested === "auto" ? LEGACY_SPEC_VERSION : requested;
+      // A pinned HTTP run still sent the probe as its preflight; when the
+      // answer belongs to the OTHER era, say so -- a pinned 2025-11-25 run
+      // against a modern-only server otherwise fails 20 tests whose
+      // headline ("lifecycle-init: ...") never mentions 2026-07-28.
+      if (requested !== "auto" && preflightResponse) {
+        const seen = classifyDiscoverResponse(preflightResponse);
+        if (seen.version !== requested && !seen.eraUndetermined) {
+          preWarnings.push(
+            `Server answered the ${MODERN_SPEC_VERSION} server/discover probe with ${describeProbeAnswer(seen)}; this run is pinned to ${requested}. Re-run with --spec-version ${seen.version} (or auto) to grade it.`,
+          );
+        }
+      }
     }
 
     // `--only` / `--skip` values that match nothing in the resolved
@@ -692,6 +878,9 @@ export async function runComplianceSuite(
     // ── 2. LIFECYCLE SETUP (always runs) ─────────────────────────────
 
     let initRes: any = null;
+    // Why the handshake produced no response at all (transport error:
+    // timeout, crashed child, refused connection); lifecycle-init prints it.
+    let initError: string | null = null;
     const initStart = Date.now();
     try {
       // Declare all three client capabilities so servers see us as a
@@ -734,8 +923,9 @@ export async function runComplianceSuite(
           transport.setProtocolVersion(result.protocolVersion);
         }
       }
-    } catch {
-      // Init failed — lifecycle tests will report the failure
+    } catch (err: unknown) {
+      // Init failed — lifecycle-init reports the failure with this reason.
+      initError = err instanceof Error ? err.message : String(err);
     }
 
     // Warn if initialize crossed the per-request timeout. The server
@@ -773,9 +963,25 @@ export async function runComplianceSuite(
       true,
       "basic/lifecycle#initialization",
       async () => {
-        if (!initRes) return { passed: false, details: "Initialize request failed" };
+        if (!initRes) {
+          return { passed: false, details: `Initialize request failed: ${oneLine(initError ?? "no response", 400)}` };
+        }
         const result = initRes.body?.result;
-        if (!result) return { passed: false, details: "No result in response" };
+        if (!result) {
+          // A modern-only server answers initialize with a JSON-RPC error
+          // that (per spec SHOULD) names the versions it does speak; that
+          // message is the one diagnostic a pinned legacy run can show.
+          const err = initRes.body?.error;
+          if (err && typeof err === "object") {
+            const code = typeof err.code === "number" ? err.code : "?";
+            const message = typeof err.message === "string" ? err.message : "";
+            return {
+              passed: false,
+              details: `Initialize answered with JSON-RPC error ${code}${message ? `: ${oneLine(message, 300)}` : ""}${initRes.statusCode !== 200 ? ` (HTTP ${initRes.statusCode})` : ""}`,
+            };
+          }
+          return { passed: false, details: "No result in response" };
+        }
         return { passed: !!result.protocolVersion, details: `Protocol: ${result.protocolVersion || "missing"}` };
       },
     );

@@ -629,29 +629,61 @@ describe("per-spec catalog lookups", () => {
   });
 });
 
+/** Visible width of a terminal line: ANSI colour codes (ESC [ ... m) stripped. */
+function visibleWidth(line: string): number {
+  const esc = String.fromCharCode(27);
+  return line.split(esc).reduce((acc, part, i) => acc + (i === 0 ? part : part.replace(/^\[[0-9;]*m/, "")), "").length;
+}
+
 describe("auto-detection note placement", () => {
   const note =
-    "Spec version auto-detected as 2026-07-28 (server/discover returned supportedVersions [2026-07-28]). Pin with --spec-version to override.";
+    "Spec version auto-detected as 2026-07-28 (server/discover -> supportedVersions [2026-07-28]). Pin with --spec-version to override.";
   const report = makeReport({ specVersion: "2026-07-28", warnings: [note, 'Resource "x" missing description'] });
 
   it("terminal: the note sits under Spec:, not in WARNINGS, and the count excludes it", () => {
     const out = formatTerminal(report);
-    expect(out).toContain(
-      "auto-detected: server/discover returned supportedVersions [2026-07-28]; pin with --spec-version",
-    );
+    expect(out).toContain("            auto-detected from server/discover: supportedVersions [2026-07-28]");
+    // The pin hint lives in --help; it is not repeated on the header line.
+    expect(out).not.toContain("pin with --spec-version");
     expect(out).toContain("WARNINGS (1)");
     expect(out).not.toContain("! Spec version auto-detected");
   });
 
+  it.each([
+    ["modern, one version", "server/discover -> supportedVersions [2026-07-28]"],
+    ["legacy, -32601", "server/discover -> JSON-RPC error -32601, legacy"],
+    ["legacy, silent", "server/discover -> no response, legacy"],
+    ["legacy, HTTP 404", "server/discover -> HTTP 404, legacy"],
+    ["modern error", "server/discover -> modern error -32022"],
+  ])("terminal: the header line for %s fits in 80 columns", (_label, reason) => {
+    const out = formatTerminal(
+      makeReport({
+        warnings: [`Spec version auto-detected as 2026-07-28 (${reason}). Pin with --spec-version to override.`],
+      }),
+    );
+    const line = out.split("\n").find((l) => l.includes("auto-detected from server/discover"));
+    expect(line).toBeDefined();
+    expect(visibleWidth(line as string), line).toBeLessThanOrEqual(80);
+  });
+
   it("markdown and html: the note is appended to the spec line and dropped from the warnings", () => {
     const md = formatMarkdown(report);
-    expect(md).toContain(
-      "- **Spec:** 2026-07-28 (auto-detected: server/discover returned supportedVersions [2026-07-28])",
-    );
+    expect(md).toContain("- **Spec:** 2026-07-28 (auto-detected from server/discover: supportedVersions [2026-07-28])");
     expect(md).not.toContain("- Spec version auto-detected");
     const html = formatHtml(report);
-    expect(html).toContain("Spec 2026-07-28 (auto-detected: server/discover returned supportedVersions [2026-07-28])");
+    expect(html).toContain("Spec 2026-07-28 (auto-detected from server/discover: supportedVersions [2026-07-28])");
     expect(html).toContain("Warnings (1)");
+  });
+
+  it("a note whose reason lacks the server/discover prefix (an older report) is shown verbatim", () => {
+    const old = makeReport({
+      warnings: [
+        "Spec version auto-detected as 2025-11-25 (server/discover probe got no response; treating the server as legacy). Pin with --spec-version to override.",
+      ],
+    });
+    const out = formatTerminal(old);
+    expect(out).toContain("auto-detected: server/discover probe got no response; treating the server as legacy");
+    expect(out).not.toContain("WARNINGS");
   });
 
   it("json keeps the note as a warning for machine consumers", () => {
@@ -662,5 +694,34 @@ describe("auto-detection note placement", () => {
     const out = formatTerminal(makeReport({ warnings: ["only a real warning"] }));
     expect(out).not.toContain("auto-detected");
     expect(out).toContain("WARNINGS (1)");
+  });
+});
+
+describe("empty run (nothing matched --only/--skip)", () => {
+  const empty = makeReport({
+    score: 0,
+    grade: "F",
+    overall: "fail",
+    summary: { total: 0, passed: 0, failed: 0, required: 0, requiredPassed: 0 },
+    categories: {},
+    tests: [],
+    warnings: ['Filter value(s) "lifecycle-init" match no test id or category in the 2026-07-28 catalog'],
+  });
+
+  it("terminal: says no tests ran instead of 'All tests passed'", () => {
+    const out = formatTerminal(empty);
+    expect(out).toContain("No tests ran -- check --only/--skip (see warnings)");
+    expect(out).not.toContain("All tests passed");
+    expect(out).toContain("WARNINGS (1)");
+    expect(out).toContain('"lifecycle-init"');
+  });
+
+  it("terminal: a run where every test passed still says so", () => {
+    const allPass = makeReport({
+      summary: { total: 1, passed: 1, failed: 0, required: 1, requiredPassed: 1 },
+      tests: [makeReport().tests[0]],
+    });
+    expect(formatTerminal(allPass)).toContain("All tests passed");
+    expect(formatTerminal(allPass)).not.toContain("No tests ran");
   });
 });

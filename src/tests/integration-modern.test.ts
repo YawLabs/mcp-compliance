@@ -187,7 +187,7 @@ for (const ex of EXPECTED) {
 
     it("warns with the auto-detect note (once, first) and nothing is duplicated", () => {
       expect(report.warnings[0]).toBe(
-        `${AUTO_DETECT_NOTE_PREFIX}2026-07-28 (server/discover returned supportedVersions [2026-07-28]). Pin with --spec-version to override.`,
+        `${AUTO_DETECT_NOTE_PREFIX}2026-07-28 (server/discover -> supportedVersions [2026-07-28]). Pin with --spec-version to override.`,
       );
       expect(report.warnings.filter((w) => w.startsWith(AUTO_DETECT_NOTE_PREFIX))).toHaveLength(1);
       expect(new Set(report.warnings).size).toBe(report.warnings.length);

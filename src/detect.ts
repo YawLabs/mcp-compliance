@@ -32,8 +32,23 @@ export interface DetectOptions {
 export interface DetectionResult {
   version: SpecVersion;
   era: "modern" | "legacy";
-  /** Human-readable reason, stable wording (goes into report warnings). */
+  /**
+   * Human-readable reason, stable wording (goes into report warnings).
+   * Always starts with `REASON_PREFIX` ("server/discover -> ") and is
+   * kept short: the terminal header prints it on one line after
+   * "auto-detected from server/discover: ", so the part after the prefix
+   * should stay near 30 columns for the common shapes.
+   */
   reason: string;
+  /** Whether the server sent ANY response to the probe (false = timeout, crash, transport error). */
+  responded: boolean;
+  /**
+   * True when the probe was refused before the server could show its
+   * era (HTTP 401/403): the legacy default applies, but it says nothing
+   * about the server, so callers must not report it as "the server is
+   * legacy" or suggest re-pinning based on it.
+   */
+  eraUndetermined?: boolean;
   /**
    * The probe response when the server answered with a DiscoverResult.
    * Seeds serverInfo/capabilities so the modern suite does not repeat
@@ -43,6 +58,9 @@ export interface DetectionResult {
   /** `supportedVersions` from a DiscoverResult, when present. */
   supportedVersions?: string[];
 }
+
+/** Every `DetectionResult.reason` starts with this; formatters may strip it. */
+export const REASON_PREFIX = "server/discover -> ";
 
 const MODERN_CODES = new Set<number>(Object.values(MODERN_ERROR_CODES));
 
@@ -59,7 +77,8 @@ export function classifyDiscoverResponse(res: TransportResponse | null): Detecti
     return {
       version: LEGACY_SPEC_VERSION,
       era: "legacy",
-      reason: "server/discover probe got no response; treating the server as legacy",
+      responded: false,
+      reason: `${REASON_PREFIX}no response, legacy`,
     };
   }
   const body = res.body as { result?: unknown; error?: { code?: unknown } } | undefined;
@@ -75,7 +94,8 @@ export function classifyDiscoverResponse(res: TransportResponse | null): Detecti
     return {
       version: MODERN_SPEC_VERSION,
       era: "modern",
-      reason: `server/discover returned supportedVersions [${supportedVersions.join(", ")}]`,
+      responded: true,
+      reason: `${REASON_PREFIX}supportedVersions [${supportedVersions.join(", ")}]`,
       discover: res,
       supportedVersions,
     };
@@ -85,7 +105,21 @@ export function classifyDiscoverResponse(res: TransportResponse | null): Detecti
     return {
       version: MODERN_SPEC_VERSION,
       era: "modern",
-      reason: `server/discover probe returned modern error code ${code}`,
+      responded: true,
+      reason: `${REASON_PREFIX}modern error ${code}`,
+    };
+  }
+  if (res.statusCode === 401 || res.statusCode === 403) {
+    // Refused before the era could show (whatever the body says):
+    // neither modern nor legacy is observable without credentials. The
+    // legacy default still applies (spec: a 4xx without a modern error
+    // body falls back to initialize).
+    return {
+      version: LEGACY_SPEC_VERSION,
+      era: "legacy",
+      responded: true,
+      eraUndetermined: true,
+      reason: `${REASON_PREFIX}HTTP ${res.statusCode} (authentication required -- pass --auth); era not determinable, using ${LEGACY_SPEC_VERSION}`,
     };
   }
   const detail =
@@ -93,11 +127,12 @@ export function classifyDiscoverResponse(res: TransportResponse | null): Detecti
       ? `JSON-RPC error ${code}`
       : res.statusCode !== undefined && res.statusCode !== 200
         ? `HTTP ${res.statusCode}`
-        : "a non-modern response";
+        : "non-modern response";
   return {
     version: LEGACY_SPEC_VERSION,
     era: "legacy",
-    reason: `server/discover probe returned ${detail}; treating the server as legacy`,
+    responded: true,
+    reason: `${REASON_PREFIX}${detail}, legacy`,
   };
 }
 

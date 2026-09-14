@@ -315,17 +315,26 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
       // Every message the child writes while the stream is open is
       // delivered; the caller filters by subscriptionId / progressToken.
       // The stream ends when the response carrying `id` arrives, when the
-      // timeout elapses, or on close().
+      // timeout elapses, when the child exits, or on close().
       const queue: unknown[] = [];
       let done = false;
+      /** The response carrying `id` arrived: the server considers the request finished. */
+      let answered = false;
+      let exit: { code: number | null; signal: string | null } | undefined;
+      let cancelSent = false;
       let wake: (() => void) | null = null;
       let timer: NodeJS.Timeout | null = null;
       let unsubscribe: () => void = () => {};
+      const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+        exit = { code, signal };
+        finish();
+      };
       const finish = () => {
         if (done) return;
         done = true;
         if (timer) clearTimeout(timer);
         unsubscribe();
+        child.removeListener("exit", onExit);
         init.signal?.removeEventListener("abort", finish);
         wake?.();
       };
@@ -334,10 +343,14 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
         queue.push(msg);
         const m = msg as { id?: unknown };
         const isResponse = m && typeof m === "object" && m.id === id;
+        if (isResponse) answered = true;
         wake?.();
         if (isResponse) finish();
       });
       timer = setTimeout(finish, init.timeout);
+      // A child that dies mid-stream ends the stream now, not at the
+      // timeout; `exit` tells the caller why the iterator completed.
+      child.once("exit", onExit);
       if (init.signal?.aborted) finish();
       else init.signal?.addEventListener("abort", finish, { once: true });
       try {
@@ -362,11 +375,19 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
       return {
         requestId: id,
         messages: iterate(),
+        get exit() {
+          return exit;
+        },
         async close() {
-          if (done) return;
           finish();
           // The spec's stdio teardown for a held-open request is a
           // client-side notifications/cancelled naming the request id.
+          // The request is still live on the server whenever its response
+          // has not arrived -- after the timer fired or an abort as much as
+          // on an early close -- so the cancel keys on `answered`, not on
+          // `done`. Nothing to cancel once the child is gone.
+          if (cancelSent || answered || exited) return;
+          cancelSent = true;
           try {
             await writeLine(
               JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }),

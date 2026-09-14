@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runComplianceSuite } from "../runner.js";
-import { MODERN_FIXTURE, stdioFixture } from "./helpers/modern-fixture.js";
+import { LEGACY_SILENT_FIXTURE, MODERN_FIXTURE, stdioFixture } from "./helpers/modern-fixture.js";
 
 /**
  * `--spec-version` on the CLI. index.ts calls `program.parse()` at module
@@ -178,6 +178,86 @@ describe("mcp-compliance benchmark --spec-version", () => {
     expect(run.stdout).toContain("0 succeeded");
     expect(run.stdout).toMatch(/first failure: JSON-RPC error -32\d{3}/);
   }, 120_000);
+});
+
+describe("mcp-compliance test: terminal-mode diagnostics", () => {
+  let help: Run;
+  let emptyRun: Run;
+  let silentRun: Run;
+  let silentJsonRun: Run;
+
+  beforeAll(async () => {
+    [help, emptyRun, silentRun, silentJsonRun] = await Promise.all([
+      cli(["test", "--help"]),
+      // The old --only help example: lifecycle-init is a 2025-11-25 id and
+      // the modern fixture auto-detects as 2026-07-28, so nothing matches.
+      cli(["test", "--no-color", "--only", "lifecycle-init", "--startup-timeout", "10000", "node", MODERN_FIXTURE]),
+      // A silent legacy server costs the whole startup timeout on the era
+      // probe; terminal mode says so on stderr ~2s in.
+      cli([
+        "test",
+        "--no-color",
+        "--only",
+        "lifecycle-init",
+        "--startup-timeout",
+        "3000",
+        "node",
+        LEGACY_SILENT_FIXTURE,
+      ]),
+      // Machine-readable output must stay clean: no status line at all.
+      cli([
+        "test",
+        "--format",
+        "json",
+        "--only",
+        "lifecycle-init",
+        "--startup-timeout",
+        "3000",
+        "node",
+        LEGACY_SILENT_FIXTURE,
+      ]),
+    ]);
+  }, 180_000);
+
+  it("--help: the --only example uses ids present in both catalogs, and the timeout flags say what they bound", () => {
+    expect(help.code, help.stderr).toBe(0);
+    expect(help.stdout).toContain("transport-post,lifecycle-jsonrpc");
+    expect(help.stdout).not.toContain("transport-post,lifecycle-init");
+    const flat = help.stdout.replace(/\s+/g, " ");
+    expect(flat).toContain("--preflight-timeout <ms> HTTP only: deadline for the preflight server/discover request");
+    expect(flat).toContain("re-probes once within --startup-timeout");
+    expect(flat).toContain(
+      "--startup-timeout <ms> Budget for the server's first reply: the stdio era probe under auto",
+    );
+  });
+
+  it("an empty filtered run prints 'No tests ran', not 'All tests passed'", () => {
+    expect(emptyRun.code, emptyRun.stderr).toBe(0);
+    expect(emptyRun.stdout).toContain("No tests ran -- check --only/--skip (see warnings)");
+    expect(emptyRun.stdout).not.toContain("All tests passed");
+    expect(emptyRun.stdout).toContain(
+      'Filter value(s) "lifecycle-init" match no test id or category in the 2026-07-28 catalog',
+    );
+  });
+
+  it("terminal mode prints the era-probe status line to stderr while a silent legacy server is probed", () => {
+    expect(silentRun.code, silentRun.stderr).toBe(0);
+    expect(silentRun.stderr).toContain(
+      "Probing spec era (server/discover, up to 3s). A 2025-11-25 server that ignores unknown methods takes the whole startup timeout; --spec-version 2025-11-25 skips the probe.",
+    );
+    expect(silentRun.stdout).not.toContain("Probing spec era");
+    expect(silentRun.stdout).toContain("auto-detected from server/discover: no response, legacy");
+  });
+
+  it("--format json: no status line on either stream; stdout is the report alone", () => {
+    expect(silentJsonRun.code, silentJsonRun.stderr).toBe(0);
+    expect(silentJsonRun.stderr).not.toContain("Probing spec era");
+    const report = JSON.parse(silentJsonRun.stdout) as { specVersion: string; warnings: string[] };
+    expect(report.specVersion).toBe("2025-11-25");
+    expect(report.warnings).toContain(
+      "Spec version auto-detected as 2025-11-25 (server/discover -> no response, legacy). Pin with --spec-version to override.",
+    );
+  });
 });
 
 describe("runComplianceSuite specVersion option (what the CLI passes through)", () => {
