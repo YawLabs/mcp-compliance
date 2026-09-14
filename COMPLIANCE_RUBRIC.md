@@ -1,7 +1,7 @@
 # @yawlabs/mcp-compliance Testing Methodology
 
 **Version:** 2.0.0
-**Date:** 2026-09-13
+**Date:** 2026-09-14
 **MCP Spec Compatibility:** [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) and [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28)
 **License:** [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 **Maintained by:** [Yaw Labs / mcp-compliance](https://github.com/YawLabs/mcp-compliance)
@@ -137,7 +137,8 @@ Tests can be filtered by category name or individual test ID:
 - **Include list** (`only`): If provided, only tests whose category or ID appears in the list will run.
 - **Exclude list** (`skip`): If provided, tests whose category or ID appears in the list will be skipped.
 - Filtering **does not change test requirements**. A required test that is filtered out simply does not appear in results -- it does not count as failed.
-- Filter values are matched against the catalog of the revision being graded. A value that matches no id or category in that catalog is reported as a warning (ids from the other revision, such as `lifecycle-init` on a 2026-07-28 run, are the usual cause) rather than silently producing an empty run.
+- Filter values are matched against the catalog of the revision being graded. A value that matches no id or category in that catalog is reported as a warning (ids from the other revision, such as `lifecycle-init` on a 2026-07-28 run, are the usual cause) rather than silently producing an empty run; the terminal report then says "No tests ran" instead of "All tests passed".
+- In the 2026-07-28 suite a filtered run still measures the server: the `tools/list`, `resources/list`, `prompts/list` and `resources/templates/list` results that a filtered-out feature test would have cached are fetched once on demand by whichever rule needs them, so `--only security`, `--only schema` or `--only lifecycle` exercise the real checks instead of skip-passing. A rule skip-passes only when the server does not declare the capability or the list call itself failed (which the required `-list` rule reports).
 
 ### 1.5 Execution Model per Spec Revision
 
@@ -154,11 +155,11 @@ One run grades exactly one specification revision; the report's `specVersion` na
 
 **Revision selection (`--spec-version`):**
 
-- `auto` (the default) follows the spec's own rules for dual-era clients. The tool sends one conformant modern `server/discover` (on HTTP it doubles as the preflight connectivity check, so detection costs no extra round-trip; on stdio it is the first exchange and shares the startup timeout). A `DiscoverResult`, or a JSON-RPC error with a modern code (`-32020`, `-32021`, `-32022`), selects 2026-07-28. **Anything else** -- `-32601`, `-32000`, a 400 "not initialized", a 404, HTML, or no reply within the timeout -- selects 2025-11-25. The fallback is deliberately not keyed to one error code. An unreachable server is graded as 2025-11-25 so every test fails visibly.
-- A server that answers both eras (the SDK 2.0 default) is graded as 2026-07-28; the report carries a warning naming the other era and how to pin it.
-- `2025-11-25` or `2026-07-28` pins the catalog without probing. The report always stamps the **resolved** revision, never `auto`.
+- `auto` (the default) follows the spec's own rules for dual-era clients. The tool sends one conformant modern `server/discover` (on HTTP it doubles as the preflight connectivity check, so detection costs no extra round-trip and is bounded by the preflight timeout -- a preflight that times out is re-probed once within the startup timeout before the run defaults to 2025-11-25; on stdio it is the first exchange and is bounded by the startup timeout). A `DiscoverResult`, or a JSON-RPC error with a modern code (`-32020`, `-32021`, `-32022`), selects 2026-07-28. **Anything else** -- `-32601`, `-32000`, a 400 "not initialized", a 404, HTML, or no reply within the timeout -- selects 2025-11-25; a 401/403 with no modern error body also selects 2025-11-25 but the note says the era could not be determined (pass `--auth`). The fallback is deliberately not keyed to one error code. An unreachable server is graded as 2025-11-25 so every test that needs the server fails; the modern post-hoc scans fail too when nothing was received, rather than passing over an empty recording. A legacy stdio server that exits on the probe is reported (exit code, stderr tail, the `--spec-version 2025-11-25` hint) and the legacy suite runs against a fresh instance.
+- A server that answers both eras (the SDK 2.0 default) is graded as 2026-07-28; the report carries a warning naming the other era and how to pin it (keyed on `supportedVersions` listing 2025-11-25 **or** the `lifecycle-dual-era` probe being served an `InitializeResult`).
+- `2025-11-25` or `2026-07-28` pins the catalog without probing. On HTTP the preflight still is a modern `server/discover`, so a pinned run whose server answered in the other era gets a warning saying so. The report always stamps the **resolved** revision, never `auto`.
 
-**Modern-suite execution order:** transport probes (each a `server/discover` with one deliberate defect), then the discover-result lifecycle rules, then the `_meta` rejection rules and the unsupported-version probe, then capability-gated tools / resources / prompts, errors, schema, security, and finally the post-hoc scans over the recording. On stdio the informational `lifecycle-dual-era` probe runs last, because answering a legacy `initialize` may pin a dual-era process to legacy semantics.
+**Modern-suite execution order:** the setup `server/discover` and the discover-result lifecycle rules, the early `_meta` probes (`lifecycle-meta-client-capabilities-required`, `lifecycle-meta-client-info-optional`, the unsupported-version probe), the removed-method probes, `lifecycle-capability-handlers-match`, `lifecycle-subscriptions-listen` and `lifecycle-meta-tolerance`; then the capability-gated tools / resources / prompts rules; then the transport header probes (each a `server/discover` with one deliberate defect); then errors, schema, security and the stdio-only rules; then the late lifecycle block -- `lifecycle-completions`, `lifecycle-progress-token`, the two claim-less `_meta` probes (`lifecycle-meta-required`, `lifecycle-meta-protocol-version-required`, which on a dual-era stdio server would otherwise re-select the era before the process is pinned modern) and, last on both transports, the informational `lifecycle-dual-era` probe (sent to a fresh process on stdio, because a dual-era server selects its era per process and the suite's own process is already modern); and finally the post-hoc scans over the recording.
 
 ---
 
@@ -1196,7 +1197,7 @@ Counts: transport 20 (16 HTTP + 4 stdio), lifecycle 22, tools 6, resources 8, pr
 
 ### 3b.1 transport -- Transport Validation (20 tests)
 
-Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard headers plus `_meta`) rather than `ping`, so the only defect in each probe is the one under test. There is no session and no initialization handshake: every request is independent, so nothing here is "pre-init" or "post-init". 15 rules are HTTP-only (`transports: ["http"]`), 4 are stdio-only, and `transport-no-server-requests` is a post-hoc scan of the recording that runs on both transports (the design counts it with the HTTP group, hence "16 HTTP + 4 stdio").
+Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard headers plus `_meta`) rather than `ping`, so the only defect in each probe is the one under test. There is no session and no initialization handshake: every request is independent, so nothing here is "pre-init" or "post-init". 15 rules are HTTP-only (`transports: ["http"]`), 4 are stdio-only, and `transport-no-server-requests` is a post-hoc scan of the recording that runs on both transports (the design counts it with the HTTP group, hence "16 HTTP + 4 stdio"). The standard-header rejection rules are **attributable**: a 400 is credited only when the conformant `server/discover` was served, so a server that rejects everything (a legacy-only server pinned to this catalog) fails them as "not evaluable" instead of passing.
 
 ---
 
@@ -1314,9 +1315,9 @@ Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard
 - **Default required:** Yes
 - **Transports:** http
 - **Spec reference:** [basic/transports/streamable-http#protocol-version-header](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#protocol-version-header)
-- **Description:** Sends a server/discover whose body is complete but whose MCP-Protocol-Version header is omitted. Every POST MUST carry the header, and a server that does not serve pre-2025-06-18 clients MUST reject its absence with HTTP 400 and a -32020 HeaderMismatch error. 400 is the hard requirement; a missing or different error code is reported as a warning.
-- **Pass criteria:** HTTP 400 for a complete server/discover body sent without the MCP-Protocol-Version header; a body without error code -32020 is reported as a warning.
-- **Fail criteria:** Any status other than 400.
+- **Description:** Sends a server/discover whose body is complete but whose MCP-Protocol-Version header is omitted. Every POST MUST carry the header, and a server that does not serve pre-2025-06-18 clients MUST reject its absence with HTTP 400 and a -32020 HeaderMismatch error. 400 is the hard requirement; a missing or different error code is reported as a warning. A 400 is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable.
+- **Pass criteria:** HTTP 400 for a complete server/discover body sent without the MCP-Protocol-Version header, credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); a body without error code -32020 is reported as a warning.
+- **Fail criteria:** Any status other than 400, or a 400 from a server whose conformant server/discover was itself rejected or unanswered.
 
 ---
 
@@ -1327,8 +1328,8 @@ Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard
 - **Transports:** http
 - **Spec reference:** [basic/transports/streamable-http#protocol-version-header](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#protocol-version-header)
 - **Description:** Sends MCP-Protocol-Version: 2026-07-28 with _meta protocolVersion 1999-01-01. The header value MUST match the _meta field, and on a mismatch the server MUST respond 400 Bad Request with a -32020 HeaderMismatch error; both the status and the code are checked here.
-- **Pass criteria:** HTTP 400 and a JSON-RPC error with code -32020 when the header says 2026-07-28 and _meta says 1999-01-01.
-- **Fail criteria:** A status other than 400, an error code other than -32020, or a result.
+- **Pass criteria:** HTTP 400 and a JSON-RPC error with code -32020 when the header says 2026-07-28 and _meta says 1999-01-01, credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable).
+- **Fail criteria:** A status other than 400, an error code other than -32020, a result, or a 400 from a server whose conformant server/discover was itself rejected.
 
 ---
 
@@ -1338,9 +1339,9 @@ Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard
 - **Default required:** Yes
 - **Transports:** http
 - **Spec reference:** [basic/transports/streamable-http#server-validation](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#server-validation)
-- **Description:** Sends a valid server/discover body without the Mcp-Method header. Mcp-Method is REQUIRED on every request; a missing standard header is a validation failure and the server MUST answer HTTP 400 with a -32020 HeaderMismatch error. 400 is the hard requirement; the -32020 code is checked as a warning because an intermediary may reject with a bare 400.
-- **Pass criteria:** HTTP 400 for a valid server/discover body sent without the Mcp-Method header; a missing or different error code is reported as a warning.
-- **Fail criteria:** Any status other than 400.
+- **Description:** Sends a valid server/discover body without the Mcp-Method header. Mcp-Method is REQUIRED on every request; a missing standard header is a validation failure and the server MUST answer HTTP 400 with a -32020 HeaderMismatch error. 400 is the hard requirement; the -32020 code is checked as a warning because an intermediary may reject with a bare 400. A 400 is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable.
+- **Pass criteria:** HTTP 400 for a valid server/discover body sent without the Mcp-Method header, credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); a missing or different error code is reported as a warning.
+- **Fail criteria:** Any status other than 400, or a 400 from a server whose conformant server/discover was itself rejected or unanswered.
 
 ---
 
@@ -1350,9 +1351,9 @@ Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard
 - **Default required:** Yes
 - **Transports:** http
 - **Spec reference:** [basic/transports/streamable-http#server-validation](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#server-validation)
-- **Description:** Sends a server/discover body with Mcp-Method: tools/list. A header that does not match the corresponding body value MUST be rejected with HTTP 400 and a -32020 HeaderMismatch error, because a gateway routing on the header and a server executing on the body would otherwise disagree. 400 is required; -32020 is a warning.
-- **Pass criteria:** HTTP 400 when Mcp-Method: tools/list is sent on a server/discover body; a missing -32020 code is reported as a warning.
-- **Fail criteria:** Any status other than 400 (the request was routed on one value and executed on another).
+- **Description:** Sends a server/discover body with Mcp-Method: tools/list. A header that does not match the corresponding body value MUST be rejected with HTTP 400 and a -32020 HeaderMismatch error, because a gateway routing on the header and a server executing on the body would otherwise disagree. 400 is required; -32020 is a warning. A 400 is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable.
+- **Pass criteria:** HTTP 400 when Mcp-Method: tools/list is sent on a server/discover body, credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); a missing -32020 code is reported as a warning.
+- **Fail criteria:** Any status other than 400 (the request was routed on one value and executed on another), or a 400 from a server whose conformant server/discover was itself rejected.
 
 ---
 
@@ -1362,9 +1363,9 @@ Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard
 - **Default required:** No
 - **Transports:** http
 - **Spec reference:** [basic/transports/streamable-http#server-validation](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#server-validation)
-- **Description:** Sends a resources/read (or prompts/get) whose Mcp-Name header names a different resource or prompt than the body. Mcp-Name is REQUIRED on tools/call, resources/read and prompts/get and MUST match params.uri or params.name after Base64 sentinel decoding, so the server MUST answer 400 + -32020. Skipped when the server exposes no resource or prompt to read.
-- **Pass criteria:** HTTP 400 for a resources/read or prompts/get whose Mcp-Name header names a different object than the body; a missing -32020 code is reported as a warning. Skipped when the server exposes no resource or prompt to read.
-- **Fail criteria:** Any status other than 400.
+- **Description:** Sends a resources/read of the first listed resource (else a prompts/get of the first prompt without required arguments) whose Mcp-Name header names a different resource or prompt than the body. Mcp-Name is REQUIRED on tools/call, resources/read and prompts/get and MUST match params.uri or params.name after Base64 sentinel decoding, so the server MUST answer 400 + -32020; the 400 is credited only when the conformant server/discover was served. The resource and prompt lists are fetched on demand when the feature tests did not run; skipped only when the server declares neither capability, the list calls failed, or nothing listed can be read by name alone.
+- **Pass criteria:** HTTP 400 for a resources/read of the first listed resource (else a prompts/get of the first prompt without required arguments) whose Mcp-Name header names a different object than the body, credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); a missing -32020 code is reported as a warning. The lists are fetched on demand; skipped when the server declares neither resources nor prompts, the list calls failed, or nothing listed is readable by name alone.
+- **Fail criteria:** Any status other than 400, or a 400 from a server whose conformant server/discover was itself rejected.
 
 ---
 
@@ -1387,7 +1388,7 @@ Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard
 - **Spec reference:** [basic/transports#messages](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports#messages)
 - **Description:** Post-hoc scan of every message the server sent during the run (JSON bodies, SSE frames, stdio lines) for a frame carrying both method and id, i.e. a server-to-client JSON-RPC request. No such direction exists in 2026-07-28: sampling, elicitation and roots MUST travel inside an InputRequiredResult (MRTR), and the server MUST NOT send independent requests on a response stream or to stdout.
 - **Pass criteria:** No recorded server message on any response stream or on stdout carries both method and id.
-- **Fail criteria:** At least one server-to-client JSON-RPC request was observed during the run.
+- **Fail criteria:** At least one server-to-client JSON-RPC request was observed during the run. Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest.
 
 ---
 
@@ -1409,9 +1410,9 @@ Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard
 - **Default required:** No
 - **Transports:** stdio
 - **Spec reference:** [basic/transports#messages](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports#messages)
-- **Description:** Sends a request whose parameters contain CJK and emoji characters and verifies the response reproduces them byte-for-byte. JSON-RPC messages MUST be UTF-8 encoded on every transport; this catches latin-1 or platform-default decoding of stdin.
-- **Pass criteria:** CJK and emoji characters sent in request parameters come back byte-for-byte in the response.
-- **Fail criteria:** Any character is replaced, dropped, or mis-decoded.
+- **Description:** Calls a tool with CJK and emoji characters in its string arguments -- a tool named echo, else the first tool with a string property named message, text, input or query, else the first tool (tools/list is fetched on demand) -- and passes when the reply reproduces them byte-for-byte. Fails on evidence of mangling: U+FFFD replacement characters, a Latin-1 mis-decode, the non-ASCII characters stripped, or a -32700 parse error. A tool that merely does not echo its input proves nothing, so the verdict then rests on a server/discover whose clientInfo name carries the same characters: the server parsing and answering it is the round-trip verified, and rejecting or mangling it fails. JSON-RPC messages MUST be UTF-8 encoded on every transport; this catches latin-1 or platform-default decoding of stdin.
+- **Pass criteria:** The chosen tool (one named echo, else the first with a string property named message/text/input/query, else the first tool; tools/list fetched on demand) reproduces the CJK/emoji probe byte-for-byte; or, when the tool merely does not echo its input, a server/discover whose clientInfo name carries the probe is answered with a result.
+- **Fail criteria:** The tool reply or the discover reply shows mangling (U+FFFD, a Latin-1 mis-decode, the non-ASCII characters stripped), the tool call draws -32700, or the discover carrying the probe in clientInfo is rejected or answered with a non-JSON-RPC reply.
 
 ---
 
@@ -1435,13 +1436,13 @@ Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard
 - **Spec reference:** [basic/transports/stdio#cancellation](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio#cancellation)
 - **Description:** Writes a notifications/cancelled referencing a request id that was never issued, then a server/discover. On stdio notifications/cancelled is the only cancellation signal and servers MAY ignore one for an unknown or completed request; the discover that follows must still be answered and nothing may be emitted in reply to the notification.
 - **Pass criteria:** A notifications/cancelled for an unknown requestId produces no reply and the server/discover sent after it is answered normally.
-- **Fail criteria:** Any message emitted in reply to the notification, or the follow-up server/discover is unanswered.
+- **Fail criteria:** Any message emitted in reply to the notification, the follow-up server/discover is unanswered, or the process exits.
 
 ---
 
 ### 3b.2 lifecycle -- Protocol Lifecycle (22 tests)
 
-Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelope. The suite validates the discover result (versions, capabilities, caching hints, serverInfo), then sends deliberately incomplete envelopes (no `_meta`, no `protocolVersion`, no `clientCapabilities`, no `clientInfo`, an unsupported version) and checks the server rejects exactly the ones the spec says it must. Three rules are post-hoc scans of the recording (`lifecycle-log-level-gating`) or informational probes (`lifecycle-dual-era`, `lifecycle-removed-methods`).
+Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelope. The suite validates the discover result (versions, capabilities, caching hints, serverInfo), then sends deliberately incomplete envelopes (no `_meta`, no `protocolVersion`, no `clientCapabilities`, no `clientInfo`, an unsupported version) and checks the server rejects exactly the ones the spec says it must; like the header rules, a rejection is credited only when the conformant discover was served. The two claim-less probes (`lifecycle-meta-required`, `lifecycle-meta-protocol-version-required`) run late, after the feature tests, because a dual-era stdio server that has not yet been pinned modern treats a claim-less message as a legacy opening. Three rules are post-hoc scans of the recording (`lifecycle-log-level-gating`) or informational probes (`lifecycle-dual-era`, which on stdio goes to a fresh process and runs last; `lifecycle-removed-methods`).
 
 ---
 
@@ -1549,9 +1550,9 @@ Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelo
 - **Category:** lifecycle
 - **Default required:** Yes
 - **Spec reference:** [basic/index#meta](https://modelcontextprotocol.io/specification/2026-07-28/basic/index#meta)
-- **Description:** Sends server/discover with params carrying no _meta at all (on HTTP the headers are still correct). protocolVersion and clientCapabilities are required on every request, so the request is malformed and the server MUST reject it with -32602 Invalid params; on HTTP the status MUST be 400. A rejection with a different code is reported as a warning; a result fails, because the server is inferring version and capabilities from nowhere.
-- **Pass criteria:** A server/discover with no params._meta draws a JSON-RPC error (HTTP 400 on HTTP); code -32602 is expected and any other code is reported as a warning.
-- **Fail criteria:** A result is returned, or on HTTP the error arrives with a status other than 400.
+- **Description:** Sends server/discover with params carrying no _meta at all (on HTTP the headers are still correct). protocolVersion and clientCapabilities are required on every request, so the request is malformed and the server MUST reject it with -32602 Invalid params; on HTTP the status MUST be 400. A rejection with a different code is reported as a warning; a result fails, because the server is inferring version and capabilities from nowhere. Runs late, after the feature tests: a dual-era stdio server that is still deciding its era treats a claim-less message as a legacy opening, and by then a modern request has pinned the process. Not evaluable -- and failed -- when the conformant server/discover was itself rejected, since the rejection then proves nothing about the missing _meta.
+- **Pass criteria:** A server/discover with no params._meta draws a JSON-RPC error (HTTP 400 on HTTP), credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); code -32602 is expected and any other code is reported as a warning. Runs after the feature tests so a dual-era stdio server is already pinned modern.
+- **Fail criteria:** A result is returned, on HTTP the error arrives with a status other than 400, or the conformant server/discover was itself rejected or unanswered (not evaluable).
 
 ---
 
@@ -1560,9 +1561,9 @@ Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelo
 - **Category:** lifecycle
 - **Default required:** Yes
 - **Spec reference:** [basic/index#meta](https://modelcontextprotocol.io/specification/2026-07-28/basic/index#meta)
-- **Description:** Sends server/discover whose _meta carries clientCapabilities and clientInfo but no protocolVersion (on HTTP the MCP-Protocol-Version header is present and correct). The field is required, so the server MUST answer -32602 Invalid params and, on HTTP, status 400. A rejection with another code (-32020 is the common one) passes with a warning; a result fails.
-- **Pass criteria:** A _meta without protocolVersion draws a JSON-RPC error (HTTP 400 on HTTP); -32602 is expected and another code (typically -32020) is reported as a warning.
-- **Fail criteria:** A result is returned, or on HTTP the error arrives with a status other than 400.
+- **Description:** Sends server/discover whose _meta carries clientCapabilities and clientInfo but no protocolVersion (on HTTP the MCP-Protocol-Version header is present and correct). The field is required, so the server MUST answer -32602 Invalid params and, on HTTP, status 400. A rejection with another code (-32020 is the common one) passes with a warning; a result fails. Runs late, after the feature tests, for the same reason as lifecycle-meta-required. Not evaluable -- and failed -- when the conformant server/discover was itself rejected.
+- **Pass criteria:** A _meta without protocolVersion draws a JSON-RPC error (HTTP 400 on HTTP), credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); -32602 is expected and another code (typically -32020) is reported as a warning. Runs after the feature tests.
+- **Fail criteria:** A result is returned, on HTTP the error arrives with a status other than 400, or the conformant server/discover was itself rejected or unanswered (not evaluable).
 
 ---
 
@@ -1571,9 +1572,9 @@ Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelo
 - **Category:** lifecycle
 - **Default required:** Yes
 - **Spec reference:** [basic/index#meta](https://modelcontextprotocol.io/specification/2026-07-28/basic/index#meta)
-- **Description:** Sends server/discover whose _meta has protocolVersion and clientInfo but no clientCapabilities. Capabilities are per-request input the server MUST NOT infer from prior requests, so the field is required even when empty; the server MUST answer -32602 (HTTP 400). Serving the request as if {} had been sent fails.
-- **Pass criteria:** A _meta without clientCapabilities draws a JSON-RPC error (HTTP 400 on HTTP); -32602 is expected and another code is reported as a warning.
-- **Fail criteria:** The request is served as if {} had been sent, or on HTTP the error arrives with a status other than 400.
+- **Description:** Sends server/discover whose _meta has protocolVersion and clientInfo but no clientCapabilities. Capabilities are per-request input the server MUST NOT infer from prior requests, so the field is required even when empty; the server MUST answer -32602 (HTTP 400). Serving the request as if {} had been sent fails. Not evaluable -- and failed -- when the conformant server/discover was itself rejected, since the rejection then proves nothing about the missing field.
+- **Pass criteria:** A _meta without clientCapabilities draws a JSON-RPC error (HTTP 400 on HTTP), credited only when the conformant server/discover was served (a server that rejects everything fails as not evaluable); -32602 is expected and another code is reported as a warning.
+- **Fail criteria:** The request is served as if {} had been sent, on HTTP the error arrives with a status other than 400, or the conformant server/discover was itself rejected or unanswered (not evaluable).
 
 ---
 
@@ -1615,9 +1616,9 @@ Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelo
 - **Category:** lifecycle
 - **Default required:** No
 - **Spec reference:** [basic/versioning#backward-compatibility-with-initialization-based-versions](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning#backward-compatibility-with-initialization-based-versions)
-- **Description:** Sends a legacy initialize request (2025-11-25 shape, no modern _meta, legacy headers on HTTP) and reports which era the server speaks: a result means dual-era, an error means modern-only. Both outcomes pass; the test is informational. A modern-only server SHOULD name its supported versions in the error it returns to initialize, and one that does not draws a warning. Runs last on stdio because answering initialize may pin a dual-era process to legacy semantics.
-- **Pass criteria:** Always, on either classification: a result to legacy initialize is reported as dual-era, an error as modern-only; an error that does not name the supported versions is reported as a warning.
-- **Fail criteria:** Only when the probe could not be classified at all (no response within the timeout).
+- **Description:** Sends a legacy initialize request (2025-11-25 shape, no modern _meta, legacy headers on HTTP) and reports which era the server speaks: a result means dual-era, an error means modern-only. Both outcomes pass; the test is informational, and no response passes with a warning (era undetermined) -- the only failure is a stdio server that exits on the request. On stdio the probe goes to a fresh process, because a dual-era server selects its era from how the client opens and the suite's own process is already modern. A modern-only server SHOULD name its supported versions in the error -- in data.supported (the UnsupportedProtocolVersionError shape) or in the message -- and one that names none (a message that only echoes the rejected 2025-11-25 does not count) draws a warning. Runs last.
+- **Pass criteria:** On every classified outcome: a result to the legacy initialize (sent to a fresh process on stdio) is reported as dual-era, an error as modern-only; an error that names no supported version -- neither in data.supported nor as a date other than the requested 2025-11-25 in the message -- is reported as a warning, and no response passes with a warning (era undetermined).
+- **Fail criteria:** Only when a stdio server exits after the legacy initialize request; no response passes with a warning.
 
 ---
 
@@ -1637,9 +1638,9 @@ Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelo
 - **Category:** lifecycle
 - **Default required:** No
 - **Spec reference:** [basic/patterns/subscriptions#acknowledgment](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions#acknowledgment)
-- **Description:** When any listChanged or subscribe capability is declared, opens a subscriptions/listen stream requesting the matching notification types and reads the first frame. It MUST be notifications/subscriptions/acknowledged carrying _meta['io.modelcontextprotocol/subscriptionId'] equal to the listen request's id and a notifications object naming the subset the server honours; no other notification may precede it. When nothing is advertised, either the acknowledgment or -32601 passes.
-- **Pass criteria:** With a listChanged or subscribe capability declared, the first frame on a subscriptions/listen stream is notifications/subscriptions/acknowledged carrying _meta subscriptionId equal to the request id and a notifications object; with nothing advertised, either that acknowledgment or -32601 passes.
-- **Fail criteria:** Any other frame first, a subscriptionId that differs from the request id, a missing notifications object, or an error other than -32601 when nothing is advertised.
+- **Description:** When any listChanged or subscribe capability is declared, opens a subscriptions/listen stream requesting the matching notification types and reads the first frame. It MUST be notifications/subscriptions/acknowledged carrying _meta['io.modelcontextprotocol/subscriptionId'] equal to the listen request's id and a notifications object naming the subset the server honours; no other notification may precede it. When nothing is advertised, either the acknowledgment or -32601 passes. An acknowledgment that honours a notification type or URI the request did not include passes with a warning: the server may send notifications outside the requested filter.
+- **Pass criteria:** With a listChanged or subscribe capability declared, the first frame on a subscriptions/listen stream is notifications/subscriptions/acknowledged carrying _meta subscriptionId equal to the request id and a notifications object; an acknowledgment that honours a type or URI the request did not include passes with a warning. With nothing advertised, either that acknowledgment or -32601 passes.
+- **Fail criteria:** Any other frame first, a subscriptionId that differs from the request id, a missing notifications object, an error other than -32601 when nothing is advertised, no acknowledgment within the listen timeout, or a stdio server that exits before acknowledging.
 
 ---
 
@@ -1650,7 +1651,7 @@ Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelo
 - **Spec reference:** [server/utilities/logging#per-request-log-level](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#per-request-log-level)
 - **Description:** Post-hoc scan of the recording: every notifications/message the server sent is traced to the request it arrived with, and that request must have carried _meta['io.modelcontextprotocol/logLevel']. The server MUST NOT emit notifications/message for a request that did not set a log level; a log frame on a request that never opted in, or on a subscriptions/listen stream, fails.
 - **Pass criteria:** Every recorded notifications/message arrived on the response to a request that carried _meta['io.modelcontextprotocol/logLevel'].
-- **Fail criteria:** A notifications/message on a request that set no logLevel, or on a subscriptions/listen stream.
+- **Fail criteria:** A notifications/message on a request that set no logLevel, or on a subscriptions/listen stream. Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest.
 
 ---
 
@@ -1670,9 +1671,9 @@ Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelo
 - **Category:** lifecycle
 - **Default required:** No (required at runtime when `completions` is declared)
 - **Spec reference:** [server/utilities/completion#requesting-completions](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/completion#requesting-completions)
-- **Description:** If the server declares the completions capability, sends completion/complete for the first prompt or resource-template argument and expects a result with a completion.values array (empty is fine). Servers that declare the capability must serve the method; skipped when the capability is absent.
-- **Pass criteria:** When the completions capability is declared, completion/complete for the first prompt or resource-template argument returns a result with a completion.values array (empty allowed); skipped otherwise.
-- **Fail criteria:** A JSON-RPC error, or a result without completion.values as an array.
+- **Description:** If the server declares the completions capability, sends completion/complete for the first listed prompt argument, else the first resource-template variable (prompts/list and resources/templates/list are fetched on demand), else a placeholder ref where -32602 is acceptable, and expects a result with a completion.values array (empty is fine). Servers that declare the capability must serve the method; skipped when the capability is absent.
+- **Pass criteria:** When the completions capability is declared, completion/complete for the first listed prompt argument (else the first resource-template variable; prompts/list and resources/templates/list are fetched on demand) returns a result with a completion.values array (empty allowed); with nothing listed a placeholder ref is probed, where -32602 also passes. Skipped when the capability is absent.
+- **Fail criteria:** A JSON-RPC error (other than -32602 for the placeholder probe), or a result without completion.values as an array.
 
 ---
 
@@ -1681,15 +1682,15 @@ Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelo
 - **Category:** lifecycle
 - **Default required:** No
 - **Spec reference:** [basic/patterns/progress#progress-flow](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/progress#progress-flow)
-- **Description:** Calls the first tool with _meta.progressToken set and reads the whole response. Progress is optional, so a call with no notifications/progress passes; but any progress notification that does arrive MUST carry the same token and its progress value MUST increase with each notification. A foreign token or a non-increasing value fails.
-- **Pass criteria:** tools/call with _meta.progressToken completes, and every notifications/progress observed for it carries the same token with a strictly increasing progress value (no notifications at all also passes).
-- **Fail criteria:** A progress notification carrying a foreign token, or a progress value that does not increase.
+- **Description:** Calls the first tool without required arguments (preferring one whose name or description mentions progress, else the first listed tool) with _meta.progressToken set and reads the whole response; tools/list is fetched on demand when the tools tests did not run, and the test is skipped when the server declares no tools or tools/list failed. Progress is optional, so a call with no notifications/progress passes; but any progress notification that does arrive MUST carry the same token and its progress value MUST increase with each notification. A foreign token or a non-increasing value fails.
+- **Pass criteria:** tools/call of the first tool without required arguments (tools/list fetched on demand) with _meta.progressToken completes, and every notifications/progress observed for it carries the same token with a strictly increasing progress value (no notifications at all also passes). Skipped when the server declares no tools or tools/list failed.
+- **Fail criteria:** A progress notification carrying a foreign token, a non-numeric or non-increasing progress value, or no response to the call.
 
 ---
 
 ### 3b.3 tools -- Tool Operations (6 tests)
 
-Only present in the report when the discover result declares the `tools` capability; every rule is then required at runtime except `tools-list-deterministic-order` and `tools-pagination`. `tools/call` may now answer with an MRTR `input_required` result instead of content.
+Only present in the report when the discover result declares the `tools` capability; every rule is then required at runtime except `tools-list-deterministic-order` and `tools-pagination`. `tools/call` may now answer with an MRTR `input_required` result instead of content. The feature tests do not check `resultType: 'complete'` themselves; the post-hoc `schema-result-type` scan does, over every result.
 
 ---
 
@@ -1731,9 +1732,9 @@ Only present in the report when the discover result declares the `tools` capabil
 - **Category:** tools
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#calling-tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#calling-tools)
-- **Description:** Calls the first tool with empty arguments and validates the result shape: resultType 'complete' with a content array, or resultType 'input_required' (an MRTR InputRequiredResult) with inputRequests and/or requestState. A -32602 Invalid params error for a tool that needs arguments also passes. Required at runtime when the tools capability is declared.
-- **Pass criteria:** Calling the first tool with empty arguments returns resultType 'complete' with a content array, resultType 'input_required' with inputRequests and/or requestState, or a -32602 error for missing arguments.
-- **Fail criteria:** A result without resultType, a complete result without a content array, an input_required result with neither field, or an error other than -32602.
+- **Description:** Calls the first tool whose inputSchema declares no required properties (else the first tool) with empty arguments and validates the result shape: a content array whose items each carry a type (isError: true with content also passes), or resultType 'input_required' (an MRTR InputRequiredResult) with inputRequests entries of the { method, params } shape and/or a string requestState. A JSON-RPC error passes -- -32602 (or -32600) as the expected answer for a tool that needs arguments, any other code noted as a protocol error in the details. resultType 'complete' is not checked here; schema-result-type scans every result post-hoc. Required at runtime when the tools capability is declared.
+- **Pass criteria:** Calling the first tool without required properties (else the first tool) with empty arguments returns a content array whose items each carry a type (isError: true included), an input_required result with well-formed inputRequests and/or a string requestState, or a JSON-RPC error (-32602/-32600 as the expected answer for a tool that needs arguments; any other code is noted as a protocol error). resultType 'complete' is left to schema-result-type.
+- **Fail criteria:** No result object, a non-input_required result without a content array, a content item without a type, or an input_required result with neither field or a malformed inputRequests entry.
 
 ---
 
@@ -1761,7 +1762,7 @@ Only present in the report when the discover result declares the `tools` capabil
 
 ### 3b.4 resources -- Resource Operations (8 tests)
 
-Only present when the `resources` capability is declared. New in this revision: caching hints on every cacheable result, and `resources-not-found`, which fails the retired `-32002` code.
+Only present when the `resources` capability is declared. New in this revision: caching hints on every cacheable result, and `resources-not-found`, which fails the retired `-32002` code (any code other than `-32602` passes with a warning).
 
 ---
 
@@ -1792,9 +1793,9 @@ Only present when the `resources` capability is declared. New in this revision: 
 - **Category:** resources
 - **Default required:** No (required at runtime when `resources` is declared)
 - **Spec reference:** [server/resources#reading-resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources#reading-resources)
-- **Description:** Reads the first listed resource and validates the result: resultType 'complete' with a contents array whose items carry uri and either text or blob, or resultType 'input_required' with a valid InputRequiredResult. An empty contents array for a resource the server itself listed passes with a warning. Required at runtime when the resources capability is declared.
-- **Pass criteria:** Reading the first listed resource returns resultType 'complete' with contents items carrying uri and text or blob, or resultType 'input_required' with a valid InputRequiredResult; an empty contents array passes with a warning.
-- **Fail criteria:** A JSON-RPC error, a result without resultType, or contents items missing uri or both text and blob.
+- **Description:** Reads the first listed resource that has a uri and validates the result: a contents array whose items carry uri and either text or blob, or resultType 'input_required' with a valid InputRequiredResult (inputRequests entries of the { method, params } shape and/or a string requestState). A JSON-RPC error for a resource the server itself listed fails, and an empty contents array passes with a warning. resultType 'complete' is not checked here; schema-result-type scans every result post-hoc. Required at runtime when the resources capability is declared.
+- **Pass criteria:** Reading the first listed resource that has a uri returns a contents array whose items carry uri and text or blob, or an input_required result with a valid InputRequiredResult shape; an empty contents array passes with a warning. resultType 'complete' is left to schema-result-type.
+- **Fail criteria:** A JSON-RPC error, no result object, no contents array, a contents item missing uri or both text and blob, or a malformed input_required result.
 
 ---
 
@@ -1814,9 +1815,9 @@ Only present when the `resources` capability is declared. New in this revision: 
 - **Category:** resources
 - **Default required:** No (required at runtime when `resources` is declared)
 - **Spec reference:** [server/resources#error-handling](https://modelcontextprotocol.io/specification/2026-07-28/server/resources#error-handling)
-- **Description:** Reads a URI that does not exist and expects a JSON-RPC error. Servers MUST return -32602 Invalid params for a missing resource and MUST NOT return an empty contents array; the retired -32002 code fails because implementations of this revision MUST NOT emit it. data.uri naming the missing resource is a SHOULD, reported as a warning when absent. Required at runtime when the resources capability is declared.
-- **Pass criteria:** Reading a nonexistent URI draws a JSON-RPC error with code -32602; a missing data.uri is reported as a warning.
-- **Fail criteria:** A result (including an empty contents array), the retired code -32002, or any code other than -32602.
+- **Description:** Reads a URI that does not exist and expects a JSON-RPC error. Servers MUST return -32602 Invalid params for a missing resource and MUST NOT return an empty contents array: a result of any shape fails, and so does the retired -32002 code, which implementations of this revision MUST NOT emit. Any other error code passes with a warning naming the expected -32602 (-32603 is tolerated because a resolver that throws on the unknown test:// scheme may conformantly answer an internal error). data.uri naming the missing resource is a SHOULD, reported as a warning when absent. Required at runtime when the resources capability is declared.
+- **Pass criteria:** Reading a nonexistent URI draws a JSON-RPC error: -32602 passes cleanly, and any other code except -32002 (for example -32603 from a resolver that throws on the unknown scheme) passes with a warning naming the expected -32602; a missing data.uri is reported as a warning.
+- **Fail criteria:** A result of any shape (including an empty contents array or input_required), or the retired code -32002.
 
 ---
 
@@ -1886,9 +1887,9 @@ Only present when the `prompts` capability is declared.
 - **Category:** prompts
 - **Default required:** No (required at runtime when `prompts` is declared)
 - **Spec reference:** [server/prompts#getting-a-prompt](https://modelcontextprotocol.io/specification/2026-07-28/server/prompts#getting-a-prompt)
-- **Description:** Gets the first listed prompt with empty arguments and validates the result: resultType 'complete' with a messages array whose items have a role of user or assistant and a content block, or resultType 'input_required' with a valid InputRequiredResult. A -32602 error for a prompt whose required arguments are missing also passes. Required at runtime when the prompts capability is declared.
-- **Pass criteria:** Getting the first listed prompt returns resultType 'complete' with a messages array whose items have role user or assistant and a content block, resultType 'input_required' with a valid InputRequiredResult, or a -32602 error for missing required arguments.
-- **Fail criteria:** A result without resultType, a missing or malformed messages array, or an error other than -32602.
+- **Description:** Gets the first listed prompt with no required arguments (else the first prompt, with each required argument filled by the placeholder 'test') and validates the result: a messages array whose items have a role of user or assistant and a content object, or resultType 'input_required' with a valid InputRequiredResult (inputRequests entries of the { method, params } shape and/or a string requestState). A -32602 (or -32600) error for a prompt that rejects the arguments also passes; any other JSON-RPC error fails. resultType 'complete' is not checked here; schema-result-type scans every result post-hoc. Required at runtime when the prompts capability is declared.
+- **Pass criteria:** Getting the first prompt without required arguments (else the first prompt, its required arguments filled with the placeholder 'test') returns a messages array whose items have role user or assistant and a content object, an input_required result with a valid InputRequiredResult shape, or a -32602/-32600 error. resultType 'complete' is left to schema-result-type.
+- **Fail criteria:** A JSON-RPC error other than -32602/-32600, no result object, a missing or malformed messages array, or a malformed input_required result.
 
 ---
 
@@ -1905,7 +1906,7 @@ Only present when the `prompts` capability is declared.
 
 ### 3b.6 errors -- Error Handling (12 tests)
 
-Error tests send conformant envelopes so the error under test comes from the server's own dispatch, not from `_meta` validation. `error-unknown-method` now expects HTTP 404 on the JSON-RPC error. Two rules are post-hoc scans of every error recorded during the run.
+Error tests send conformant envelopes so the error under test comes from the server's own dispatch, not from `_meta` validation. `error-unknown-method` now expects HTTP 404 on the JSON-RPC error. Two rules are post-hoc scans of every JSON-RPC error recorded during the run; a non-JSON-RPC body on a transport-level rejection (an auth gate's `{"error":"invalid_token"}` on 401) is not counted.
 
 ---
 
@@ -2028,9 +2029,9 @@ Error tests send conformant envelopes so the error under test comes from the ser
 - **Category:** errors
 - **Default required:** No
 - **Spec reference:** [basic/index#error-responses](https://modelcontextprotocol.io/specification/2026-07-28/basic/index#error-responses)
-- **Description:** Post-hoc scan of every JSON-RPC error the server sent during the run: each one answering a request whose id was readable MUST carry that same id. Errors for unparsable bodies (parse errors, malformed envelopes) are exempt because the id could not be read; a null or missing id on the reply to a well-formed request fails.
-- **Pass criteria:** Every recorded error that answers a request with a readable id carries that same id; parse and malformed-envelope errors are exempt.
-- **Fail criteria:** An error with a null or missing id in reply to a well-formed request.
+- **Description:** Post-hoc scan of every JSON-RPC error response (an error object with a numeric code) the server sent during the run: each one answering a request whose id was readable MUST carry that same id. Exempt: replies to the suite's raw malformed-body probes and to client notifications (there is no id to echo), and transport-level rejections answered before the JSON-RPC layer read the request (HTTP 401/403/413/415/429, whose body need not be JSON-RPC at all). A null or missing id on the reply to a well-formed request fails whatever the error code, -32600 and -32700 included.
+- **Pass criteria:** Every recorded JSON-RPC error response (an error object with a numeric code) that answers an id-bearing request carries that same id. Exempt: replies to the suite's raw probes and client notifications, and bodies on HTTP 401/403/413/415/429 transport-level rejections; non-JSON-RPC error bodies are not counted.
+- **Fail criteria:** A JSON-RPC error with a null or missing id in reply to a well-formed request, whatever the error code (-32600 and -32700 included). Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest.
 
 ---
 
@@ -2040,14 +2041,14 @@ Error tests send conformant envelopes so the error under test comes from the ser
 - **Default required:** No
 - **Spec reference:** [basic/index#error-codes](https://modelcontextprotocol.io/specification/2026-07-28/basic/index#error-codes)
 - **Description:** Post-hoc scan of every error the server sent for the codes retired in 2026-07-28: -32002 (resource not found, replaced by -32602) and -32042 (URL elicitation required, replaced by MRTR). Implementations of this revision MUST NOT emit either; any occurrence fails.
-- **Pass criteria:** No recorded error carries code -32002 or -32042.
-- **Fail criteria:** Any occurrence of either code.
+- **Pass criteria:** No recorded JSON-RPC error carries code -32002 or -32042.
+- **Fail criteria:** Any occurrence of either code. Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest.
 
 ---
 
 ### 3b.7 schema -- Schema Validation (10 tests)
 
-Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `tools-output-schema`, `prompts-schema`, `resources-schema`) validate cached list results and are capability-gated. The four post-hoc rules scan every server message the Recorder captured: `resultType` on every result, `input_required` only on MRTR methods, well-formed `InputRequiredResult`s, and full validation against the vendored 2026-07-28 JSON schema.
+Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `tools-output-schema`, `prompts-schema`, `resources-schema`) validate the list results -- cached by the feature tests, or fetched once on demand when those did not run (`--only schema`) -- and are capability-gated. The four post-hoc rules scan every server message the Recorder captured: `resultType` on every result (`complete` or `input_required`, or an extension value only when an `extensions` capability is advertised), `input_required` only on MRTR methods, well-formed `InputRequiredResult`s whose methods the client declared support for, and full validation against the vendored 2026-07-28 JSON schema.
 
 ---
 
@@ -2056,8 +2057,8 @@ Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `to
 - **Category:** schema
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#tool](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#tool)
-- **Description:** Validates every listed tool has a name (1-128 characters of [A-Za-z0-9_.-], the SHOULD-level naming rule) and an inputSchema that is a JSON Schema object with type 'object'. inputSchema MUST be a valid JSON Schema object, not null.
-- **Pass criteria:** Every listed tool has a name matching [A-Za-z0-9_.-]{1,128} and an inputSchema object with type 'object'.
+- **Description:** Validates every listed tool has a name (1-128 characters of [A-Za-z0-9_.-], the SHOULD-level naming rule) and an inputSchema that is a JSON Schema object with type 'object'. inputSchema MUST be a valid JSON Schema object, not null. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.
+- **Pass criteria:** Every listed tool has a name matching [A-Za-z0-9_.-]{1,128} and an inputSchema object with type 'object'. The list is fetched on demand under --only; skipped (as passed) only when tools/list failed.
 - **Fail criteria:** Any tool with a missing or malformed name, or an inputSchema that is absent, null, or not type 'object'.
 
 ---
@@ -2067,8 +2068,8 @@ Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `to
 - **Category:** schema
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#tool](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#tool)
-- **Description:** If a tool carries annotations, validates that readOnlyHint, destructiveHint, idempotentHint and openWorldHint are booleans when present and that title, when present, is a string. Clients MUST treat annotations as untrusted hints, so a wrong type is a definition bug rather than a security control.
-- **Pass criteria:** On every tool that carries annotations, readOnlyHint, destructiveHint, idempotentHint and openWorldHint are booleans when present and title is a string when present.
+- **Description:** If a tool carries annotations, validates that readOnlyHint, destructiveHint, idempotentHint and openWorldHint are booleans when present and that title, when present, is a string. Clients MUST treat annotations as untrusted hints, so a wrong type is a definition bug rather than a security control. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.
+- **Pass criteria:** On every tool that carries annotations, readOnlyHint, destructiveHint, idempotentHint and openWorldHint are booleans when present and title is a string when present. The list is fetched on demand under --only; skipped (as passed) only when tools/list failed.
 - **Fail criteria:** Any annotation hint with a non-boolean value, or a non-string annotations.title.
 
 ---
@@ -2078,9 +2079,9 @@ Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `to
 - **Category:** schema
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#tool](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#tool)
-- **Description:** Checks whether listed tools carry the optional title field, the human-readable display name clients prefer over name. Passes when every tool has a string title; tools without one are listed in the details.
-- **Pass criteria:** Every listed tool has a string title.
-- **Fail criteria:** Any tool without a string title (the offenders are named in the details).
+- **Description:** Checks whether listed tools carry the optional title field, the human-readable display name clients prefer over name. A title that is present must be a string; tools without one are listed in the details but do not fail. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.
+- **Pass criteria:** Every listed tool that has a title has a string one; tools without a title are named in the details but still pass. The list is fetched on demand under --only; skipped (as passed) only when tools/list failed.
+- **Fail criteria:** Any tool whose title is present but not a string.
 
 ---
 
@@ -2089,8 +2090,8 @@ Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `to
 - **Category:** schema
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#output-schema](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#output-schema)
-- **Description:** For tools that declare outputSchema, validates it is a JSON Schema object (a non-null object; type, $ref or a composition keyword may describe any JSON value). Unlike 2025-11-25 the root is no longer restricted to type 'object': array, string and other roots are valid because structuredContent may be any JSON value.
-- **Pass criteria:** Every declared outputSchema is a non-null JSON Schema object; any root type is accepted.
+- **Description:** For tools that declare outputSchema, validates it is a JSON Schema object (a non-null object; type, $ref or a composition keyword may describe any JSON value). Unlike 2025-11-25 the root is no longer restricted to type 'object': array, string and other roots are valid because structuredContent may be any JSON value. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.
+- **Pass criteria:** Every declared outputSchema is a non-null JSON Schema object; any root type is accepted. The list is fetched on demand under --only; skipped (as passed) only when tools/list failed.
 - **Fail criteria:** An outputSchema that is null, not an object, or otherwise not a JSON Schema object.
 
 ---
@@ -2100,8 +2101,8 @@ Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `to
 - **Category:** schema
 - **Default required:** No (required at runtime when `prompts` is declared)
 - **Spec reference:** [server/prompts#prompt](https://modelcontextprotocol.io/specification/2026-07-28/server/prompts#prompt)
-- **Description:** Validates every listed prompt has a string name and that each entry in an arguments array has a name. Prompt arguments are matched by name in prompts/get and completion/complete, so a nameless argument is unreachable.
-- **Pass criteria:** Every listed prompt has a string name and every entry in its arguments array has a name.
+- **Description:** Validates every listed prompt has a string name and that each entry in an arguments array has a name. Prompt arguments are matched by name in prompts/get and completion/complete, so a nameless argument is unreachable. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.
+- **Pass criteria:** Every listed prompt has a string name and every entry in its arguments array has a name. The list is fetched on demand under --only; skipped (as passed) only when prompts/list failed.
 - **Fail criteria:** A prompt without a string name, or an argument without a name.
 
 ---
@@ -2111,8 +2112,8 @@ Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `to
 - **Category:** schema
 - **Default required:** No (required at runtime when `resources` is declared)
 - **Spec reference:** [server/resources#resource](https://modelcontextprotocol.io/specification/2026-07-28/server/resources#resource)
-- **Description:** Validates every listed resource has a parseable URI and a string name. Custom URI schemes MUST conform to RFC 3986; an unparseable uri cannot be passed back to resources/read.
-- **Pass criteria:** Every listed resource has a parseable absolute URI and a string name.
+- **Description:** Validates every listed resource has a parseable URI and a string name. Custom URI schemes MUST conform to RFC 3986; an unparseable uri cannot be passed back to resources/read. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.
+- **Pass criteria:** Every listed resource has a parseable absolute URI and a string name. The list is fetched on demand under --only; skipped (as passed) only when resources/list failed.
 - **Fail criteria:** An unparseable uri, or a missing or non-string name.
 
 ---
@@ -2122,9 +2123,9 @@ Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `to
 - **Category:** schema
 - **Default required:** Yes
 - **Spec reference:** [basic/index#result-responses](https://modelcontextprotocol.io/specification/2026-07-28/basic/index#result-responses)
-- **Description:** Post-hoc scan of every JSON-RPC result the server sent during the run: each result MUST include a string resultType ('complete', 'input_required', or a value defined by an advertised extension). A result with no resultType is what a 2025-11-25 server returns and fails here.
-- **Pass criteria:** Every recorded JSON-RPC result carries a string resultType.
-- **Fail criteria:** Any result without a string resultType.
+- **Description:** Post-hoc scan of every JSON-RPC result the server sent during the run: each result MUST include a string resultType that is 'complete' or 'input_required'. Any other value passes, with a warning naming it, only when server/discover advertised an extensions capability that could define it; without one it fails, since a resultType the client does not recognize MUST be treated as invalid. A result with no resultType is what a 2025-11-25 server returns and fails here (the reply to the suite's own legacy initialize probe is exempt).
+- **Pass criteria:** Every recorded JSON-RPC result (the reply to the suite's legacy initialize probe exempt) carries resultType 'complete' or 'input_required'; another string value passes with a warning only when server/discover advertised a non-empty extensions capability.
+- **Fail criteria:** A result with no string resultType, or a value other than complete/input_required while no extension is advertised. Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest.
 
 ---
 
@@ -2135,7 +2136,7 @@ Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `to
 - **Spec reference:** [basic/patterns/mrtr#supported-requests](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr#supported-requests)
 - **Description:** Post-hoc scan of every result with resultType 'input_required', traced back to the request that produced it. Servers MAY return an InputRequiredResult only for tools/call, prompts/get and resources/read and MUST NOT on any other request; an input_required result on server/discover, a list method, completion/complete or subscriptions/listen fails.
 - **Pass criteria:** Every recorded input_required result answers tools/call, prompts/get, or resources/read.
-- **Fail criteria:** An input_required result on server/discover, a list method, completion/complete, subscriptions/listen, or any other method.
+- **Fail criteria:** An input_required result on server/discover, a list method, completion/complete, subscriptions/listen, or any other method. Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest.
 
 ---
 
@@ -2144,9 +2145,9 @@ Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `to
 - **Category:** schema
 - **Default required:** No
 - **Spec reference:** [basic/patterns/mrtr#server-requirements-basic-workflow](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr#server-requirements-basic-workflow)
-- **Description:** Post-hoc, opportunistic check of every input_required result observed: it MUST include at least one of inputRequests or requestState; each inputRequests value must be an object whose method is elicitation/create, sampling/createMessage or roots/list with a params object; requestState, when present, must be a string. Passes vacuously when no input_required result was seen.
-- **Pass criteria:** Every observed input_required result has inputRequests and/or requestState; each inputRequests value is an object whose method is elicitation/create, sampling/createMessage or roots/list with a params object; requestState is a string when present. Passes vacuously when none was observed.
-- **Fail criteria:** An input_required result missing both fields, a malformed inputRequests entry, or a non-string requestState.
+- **Description:** Post-hoc, opportunistic check of every input_required result observed against the MRTR server requirements: it MUST include at least one of inputRequests or requestState; each inputRequests value must be an object whose method is elicitation/create, sampling/createMessage or roots/list, with a params object for elicitation/create and sampling/createMessage (ListRootsRequest.params is optional); the client capability each method needs (elicitation, sampling, roots) MUST have been declared by the client -- this suite declares only elicitation, so a sampling/createMessage or roots/list input request fails; requestState, when present, must be a string. Passes vacuously when no input_required result was seen.
+- **Pass criteria:** Every observed input_required result has inputRequests and/or requestState; each inputRequests value is an object whose method is elicitation/create, sampling/createMessage or roots/list and whose client capability the suite declared (elicitation only), with a params object for elicitation/create and sampling/createMessage; requestState is a string when present. Passes vacuously when none was observed.
+- **Fail criteria:** An input_required result missing both fields, an entry with an unknown method, a method whose client capability was not declared (sampling/createMessage, roots/list), a missing params object where required, or a non-string requestState. Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest.
 
 ---
 
@@ -2155,15 +2156,15 @@ Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `to
 - **Category:** schema
 - **Default required:** No
 - **Spec reference:** [basic/index#schema](https://modelcontextprotocol.io/specification/2026-07-28/basic/index#schema)
-- **Description:** Post-hoc validation of every recorded server message against the vendored 2026-07-28 JSON schema, dispatching by method for notifications, by resultType plus the originating request's method for results, and by error code for errors. The TypeScript schema is the source of truth for every message; the details list the first offending messages with their validation errors.
-- **Pass criteria:** Every recorded server message validates against the vendored 2026-07-28 JSON schema for its message type.
-- **Fail criteria:** Any message that fails schema validation (the first offenders and their errors are listed in the details).
+- **Description:** Post-hoc validation of every recorded server message against the vendored 2026-07-28 JSON schema, dispatching by method for notifications, by resultType plus the originating request's method for results, and by error code for errors. Replies to the suite's raw malformed-body probes and to its legacy initialize probe are skipped, an error's id: null is treated as omitted (error-id-echo judges whether null was earned), and non-JSON-RPC bodies on transport-level rejections (HTTP 401/403/413/415/429) are noted, not validated. The TypeScript schema is the source of truth for every message; the details list the distinct violations, grouped by originating method and first schema error with a count, and overflow the rest to a warning.
+- **Pass criteria:** Every recorded server message validates against the vendored 2026-07-28 JSON schema for its message type; replies to raw probes and to the legacy initialize are skipped, an error's id: null is treated as omitted, and non-JSON-RPC bodies on HTTP 401/403/413/415/429 are noted rather than validated.
+- **Fail criteria:** Any other message that fails schema validation (the details list the distinct violations grouped by originating method and first schema error, with counts; the overflow goes to a warning). Also fails when no server message was received during the run (an unreachable server): the scan then has nothing to attest.
 
 ---
 
 ### 3b.8 security -- Security Validation (21 tests)
 
-Same coverage as 2025-11-25 minus the two session-id rules (there are no sessions). Auth and transport-security probes use a conformant `server/discover` with modern headers so credentials are the only variable; injection tests mirror `x-mcp-header` parameters into `Mcp-Param-*` headers so the request stays valid.
+Same coverage as 2025-11-25 minus the two session-id rules (there are no sessions). Auth and transport-security probes use a conformant `server/discover` with modern headers so credentials are the only variable; `security-auth-required`, `security-www-authenticate` and `security-oauth-metadata` probe with or without `--auth`, and only `security-auth-malformed` and `security-token-in-uri` need a credential. The four injection rules share **one** target: the first tool with a string argument, read-only tools preferred, destructive tools skipped while an alternative exists, its other required arguments filled with placeholders, and `x-mcp-header` parameters mirrored into `Mcp-Param-*` headers so the request stays valid. Tool-dependent rules fetch `tools/list` on demand, so `--only security` measures the server. All rules stay optional (severity `warning`); the post-hoc scans fail rather than pass when the recording is empty.
 
 ---
 
@@ -2173,9 +2174,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Default required:** No
 - **Transports:** http
 - **Spec reference:** [basic/authorization#token-handling](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#token-handling)
-- **Description:** Sends a fully conformant server/discover with the Authorization header removed and expects HTTP 401 (403 also passes). Servers acting as OAuth 2.1 resource servers MUST answer missing or invalid tokens with 401. Without --auth the test fails, reporting that the server accepted an unauthenticated request.
-- **Pass criteria:** A conformant server/discover with the Authorization header removed draws HTTP 401 (403 also passes). Requires --auth.
-- **Fail criteria:** Any other status, or the run has no --auth (the server accepted an unauthenticated request).
+- **Description:** Sends a fully conformant server/discover with the Authorization header removed and expects HTTP 401 (403 also passes). Servers acting as OAuth 2.1 resource servers MUST answer missing or invalid tokens with 401. The probe is sent with or without --auth: a 401 passes either way (without --auth the details suggest passing it to exercise the rest of the auth tests), and a 2xx fails as an accepted unauthenticated request.
+- **Pass criteria:** A conformant server/discover with the Authorization header removed draws HTTP 401 or 403 (probed with or without --auth), or the connection is refused.
+- **Fail criteria:** Any other status: the server accepted an unauthenticated request (the details say when no --auth was provided).
 
 ---
 
@@ -2185,8 +2186,8 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Default required:** No
 - **Transports:** http
 - **Spec reference:** [basic/authorization/authorization-server-discovery#protected-resource-metadata-discovery-requirements](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery#protected-resource-metadata-discovery-requirements)
-- **Description:** When the unauthenticated server/discover yields 401, checks for a WWW-Authenticate header. Servers MUST implement one of two discovery mechanisms, and the header form (Bearer resource_metadata="...") is the one clients try first; a 401 with no challenge leaves the client unable to locate the authorization server. Skipped when no 401 was observed.
-- **Pass criteria:** The 401 observed by security-auth-required carries a WWW-Authenticate header. Skipped when no 401 was observed.
+- **Description:** When the unauthenticated server/discover yields 401 (with or without --auth), checks for a WWW-Authenticate header. Servers MUST implement one of two discovery mechanisms, and the header form (Bearer resource_metadata="...") is the one clients try first; a 401 with no challenge leaves the client unable to locate the authorization server, and a challenge without resource_metadata passes with a warning. Skipped when no 401 was observed.
+- **Pass criteria:** The 401 observed on the unauthenticated server/discover carries a WWW-Authenticate header (a challenge without resource_metadata passes with a warning). Skipped when no 401 was observed (a 403 or a served request).
 - **Fail criteria:** A 401 with no WWW-Authenticate header.
 
 ---
@@ -2197,9 +2198,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Default required:** No
 - **Transports:** http
 - **Spec reference:** [basic/authorization#token-handling](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#token-handling)
-- **Description:** Sends a conformant server/discover with Authorization: Bearer <garbage> and expects HTTP 401 (403 also passes). Servers MUST validate access tokens, including their audience, and invalid or expired tokens MUST receive 401; a server that only checks that the header is present fails.
-- **Pass criteria:** Authorization: Bearer <garbage> on a conformant server/discover draws HTTP 401 (403 also passes).
-- **Fail criteria:** Any other status (the token was not validated).
+- **Description:** Sends two conformant server/discover requests in place of the configured credential: Authorization: Bearer aW52YWxpZC10b2tlbg, a well-formed token no authorization server issued, which MUST draw HTTP 401 (403 also passes); and a value outside the RFC 6750 b64token grammar, a malformed authorization request that the spec's error table lets a server answer with 400 Bad Request as well as 401 or 403. Servers MUST validate access tokens, including their audience. A server that accepts either credential fails, and so does one answering the well-formed invalid token with anything but 401/403; the details name both outcomes. Requires --auth: without a credential the server accepts, rejecting invalid ones proves nothing.
+- **Pass criteria:** In place of the configured credential, Authorization: Bearer aW52YWxpZC10b2tlbg (well-formed, unissued) draws HTTP 401 or 403 and a value outside the RFC 6750 b64token grammar draws 400, 401 or 403 (a refused connection also passes). Requires --auth; skipped otherwise.
+- **Fail criteria:** Either credential is accepted (2xx), the well-formed invalid token draws a status other than 401/403, or the malformed credential draws a status other than 400/401/403.
 
 ---
 
@@ -2221,9 +2222,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Default required:** No
 - **Transports:** http
 - **Spec reference:** [basic/authorization/authorization-server-discovery#authorization-server-location](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery#authorization-server-location)
-- **Description:** Fetches /.well-known/oauth-protected-resource (root first, then the endpoint-path variant) and validates a JSON document with resource and a non-empty authorization_servers array. MCP servers MUST implement RFC 9728 Protected Resource Metadata and the document MUST name at least one authorization server. A legacy /.well-known/oauth-authorization-server hit passes with a warning.
-- **Pass criteria:** /.well-known/oauth-protected-resource (root, then the endpoint-path variant) returns JSON with resource and a non-empty authorization_servers array; a legacy /.well-known/oauth-authorization-server hit passes with a warning.
-- **Fail criteria:** Neither document is served, or the document lacks resource or a non-empty authorization_servers.
+- **Description:** Locates RFC 9728 Protected Resource Metadata in the order clients must try it: the resource_metadata URL from the WWW-Authenticate challenge on the unauthenticated server/discover when present, then /.well-known/oauth-protected-resource followed by the endpoint path, then the root /.well-known/oauth-protected-resource. Validates a JSON document with resource and a non-empty authorization_servers array, and warns when resource is not the MCP endpoint URL in canonical form (RFC 9728 section 3.3). MCP servers MUST implement one of the two discovery mechanisms and the document MUST name at least one authorization server. A legacy /.well-known/oauth-authorization-server hit passes with a warning. Runs without --auth when the unauthenticated request drew 401/403; skipped when the server requires no auth.
+- **Pass criteria:** In order, the resource_metadata URL from the WWW-Authenticate challenge (when present), /.well-known/oauth-protected-resource followed by the endpoint path, then the root, returns JSON with resource and a non-empty authorization_servers array (a resource that is not the MCP endpoint in canonical form passes with a warning); a legacy /.well-known/oauth-authorization-server hit passes with a warning. Runs without --auth when the unauthenticated request drew 401/403; skipped when the server requires no auth.
+- **Fail criteria:** No candidate serves the document and no legacy metadata exists, a served document lacks resource or a non-empty authorization_servers, or every candidate is unreachable.
 
 ---
 
@@ -2234,8 +2235,8 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Transports:** http
 - **Spec reference:** [basic/authorization#token-requirements](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#token-requirements)
 - **Description:** Sends a conformant server/discover with the Authorization header removed and the configured token placed in the URL query string (?access_token=...) and expects HTTP 401. Access tokens MUST NOT be included in the URI query string; a server that accepts them there teaches clients to leak tokens into logs and Referer headers. Requires --auth.
-- **Pass criteria:** A server/discover with the token moved from the Authorization header to the ?access_token= query parameter draws HTTP 401. Requires --auth.
-- **Fail criteria:** Any status other than 401 (the query-string token was honoured).
+- **Pass criteria:** A server/discover with the token moved from the Authorization header to the ?access_token= query parameter draws HTTP 401 or 403, a non-2xx status, or a JSON-RPC error. Requires --auth.
+- **Fail criteria:** A 2xx result or non-error body (the query-string token was honoured).
 
 ---
 
@@ -2246,8 +2247,8 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Transports:** http
 - **Spec reference:** [basic/transports/streamable-http#security-%26-endpoint](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#security-%26-endpoint)
 - **Description:** Sends a conformant server/discover with an Origin header from a plausible web app and inspects Access-Control-Allow-Origin on the response. A wildcard (*) on an endpoint that accepts bearer credentials lets any page drive the server from a browser; specific origins, or no CORS headers at all, pass.
-- **Pass criteria:** Access-Control-Allow-Origin on the server/discover response is absent or names a specific origin.
-- **Fail criteria:** Access-Control-Allow-Origin: * is returned.
+- **Pass criteria:** Access-Control-Allow-Origin on the OPTIONS preflight and on the server/discover response is absent or names a specific origin.
+- **Fail criteria:** Access-Control-Allow-Origin: * is returned, or the foreign Origin is reflected back.
 
 ---
 
@@ -2258,8 +2259,8 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Transports:** http
 - **Spec reference:** [basic/transports/streamable-http#security-%26-endpoint](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#security-%26-endpoint)
 - **Description:** Sends a fully valid server/discover (correct headers and _meta) with Origin: https://evil-rebinding-attack.example.com so that the origin is the only defect, and expects HTTP 403. Servers MUST validate Origin on all incoming connections and MUST respond 403 Forbidden when it is present and invalid; that is the DNS-rebinding defence for locally bound servers.
-- **Pass criteria:** A fully valid server/discover with Origin: https://evil-rebinding-attack.example.com draws HTTP 403.
-- **Fail criteria:** Any status other than 403 (the origin was not validated).
+- **Pass criteria:** A fully valid server/discover with Origin: https://evil-rebinding-attack.example.com draws HTTP 403 (401 or another 4xx/5xx also counts as rejected).
+- **Fail criteria:** A 2xx status (the origin was not validated), or a 1xx/3xx status.
 
 ---
 
@@ -2268,9 +2269,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Category:** security
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#security-considerations](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations)
-- **Description:** Calls each tool with OS command-injection payloads ('; cat /etc/passwd', '$(whoami)', backticks) in every string argument, mirroring x-mcp-header parameters into Mcp-Param-* headers so the request stays valid, and inspects results for evidence of execution (passwd lines, usernames, shell errors). Servers MUST validate all tool inputs; a tool that echoes the payload back unexecuted passes.
-- **Pass criteria:** No tool result or error shows evidence of executing an injected shell payload (passwd lines, usernames, shell errors).
-- **Fail criteria:** Any response containing evidence of execution.
+- **Description:** Calls one tool with OS command-injection payloads ('; cat /etc/passwd', '$(whoami)', backticks) in one string argument: the first tool declaring a string argument, preferring tools annotated readOnlyHint and skipping tools annotated destructiveHint while an alternative exists (a warning names any skipped tool; when every candidate is destructive the first is probed and a warning says so). The tool's other required arguments are filled with schema-typed placeholders so the payload reaches the handler (also warned), and x-mcp-header parameters are mirrored into Mcp-Param-* headers so the request stays valid. Results are inspected for evidence of execution (passwd lines, usernames, shell errors) and the details count what came back: rejected (isError or rejection wording -- the only outcome counted as a defence), returned without evidence of execution, and never reached the tool (a JSON-RPC or transport error). Servers MUST validate all tool inputs; a tool that echoes the payload back unexecuted passes.
+- **Pass criteria:** No result from the single target -- the first tool with a string argument, read-only tools preferred, destructive tools skipped while an alternative exists, other required arguments filled with placeholders -- shows evidence of executing an injected shell payload (passwd lines, usernames, shell errors) without rejection wording or isError; the details count rejected, benign and never-reached payloads.
+- **Fail criteria:** Any result containing evidence of execution that is not also a rejection.
 
 ---
 
@@ -2279,9 +2280,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Category:** security
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#security-considerations](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations)
-- **Description:** Calls each tool with SQL-injection payloads (' OR 1=1 --, UNION SELECT, stacked statements) in string arguments, with any x-mcp-header parameters mirrored into headers, and inspects results and errors for database error text or unexpected row dumps. Servers MUST validate all tool inputs and sanitise tool outputs.
-- **Pass criteria:** No tool result or error contains database error text or unexpected row dumps for the SQL payloads.
-- **Fail criteria:** Any response containing database error text or dumped rows.
+- **Description:** Calls the same single target as security-command-injection with SQL-injection payloads (' OR 1=1 --, UNION SELECT, stacked statements), other required arguments filled with placeholders and x-mcp-header parameters mirrored into headers, and inspects results for database error text or unexpected row dumps. The details count rejected, benign and never-reached outcomes; only rejections count as a defence. Servers MUST validate all tool inputs and sanitise tool outputs.
+- **Pass criteria:** No result from the same single target contains database error text or unexpected row dumps for the SQL payloads without rejection wording or isError.
+- **Fail criteria:** Any result containing database error text or dumped rows that is not also a rejection.
 
 ---
 
@@ -2290,9 +2291,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Category:** security
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#security-considerations](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations)
-- **Description:** Calls each tool with path-traversal payloads (../../etc/passwd, ..\\..\\windows\\system.ini, URL-encoded variants) in string arguments, headers mirrored for x-mcp-header parameters, and inspects results for file contents outside the tool's scope. Servers MUST validate inputs and, for file:// resources, MUST sanitise paths to prevent directory traversal.
-- **Pass criteria:** No tool result contains file contents from outside the tool's scope for the traversal payloads.
-- **Fail criteria:** Any response containing out-of-scope file contents.
+- **Description:** Calls one tool with path-traversal payloads (../../etc/passwd, ..\\..\\windows\\system.ini, URL-encoded variants) in one string argument, preferring an argument whose name suggests a path (path, file, dir, folder; then url, uri, href, endpoint, host) searched across the candidates in the same read-only-first, destructive-last order as security-command-injection, otherwise the shared injection target; other required arguments are filled with placeholders and x-mcp-header parameters mirrored. Inspects results for file contents outside the tool's scope and counts rejected, benign and never-reached outcomes. Servers MUST validate inputs and, for file:// resources, MUST sanitise paths to prevent directory traversal.
+- **Pass criteria:** No result from the target (a path-named string argument when one exists, else a URL-named one, else the shared injection target) contains file contents from outside the tool's scope for the traversal payloads without rejection wording or isError.
+- **Fail criteria:** Any result containing out-of-scope file contents that is not also a rejection.
 
 ---
 
@@ -2301,9 +2302,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Category:** security
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#security-considerations](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations)
-- **Description:** For tools whose schema suggests a URL argument, submits internal targets (169.254.169.254 metadata, 127.0.0.1, 10.x, 172.16-31.x, 192.168.x, localhost) and inspects results for cloud-metadata or internal-service responses. Servers MUST validate all tool inputs; fetching internal addresses on a caller's behalf is server-side request forgery.
-- **Pass criteria:** No URL-taking tool returns cloud-metadata or internal-service content for the internal targets; passes vacuously when no tool takes a URL.
-- **Fail criteria:** Any response containing metadata or internal-service content.
+- **Description:** Submits internal targets (the 169.254.169.254 metadata service, 127.0.0.1, [::1], 10.0.0.1) to one string argument, preferring one whose name suggests a URL (url, uri, href, endpoint, host, link; then path, file, dir) searched across the candidates in the same read-only-first, destructive-last order as security-command-injection; when no such argument exists the shared injection target is used, so the details always name the tool.argument probed. Other required arguments are filled with placeholders and x-mcp-header parameters mirrored. Inspects results for cloud-metadata or internal-service responses and counts rejected, benign and never-reached outcomes. Servers MUST validate all tool inputs; fetching internal addresses on a caller's behalf is server-side request forgery.
+- **Pass criteria:** No result from the target (a URL-named string argument when one exists, else a path-named one, else the shared injection target) contains cloud-metadata or internal-service content for the internal targets without rejection wording or isError.
+- **Fail criteria:** Any result containing metadata or internal-service content that is not also a rejection.
 
 ---
 
@@ -2312,9 +2313,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Category:** security
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#security-considerations](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations)
-- **Description:** Calls the first tool with a string argument of roughly 1 MB, far beyond what any reasonable tool needs, and expects a prompt rejection: HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport. A completed result passes with a warning (the server survived), while a 5xx, a timeout or a broken stdio frame fails. Skipped when the server declares no tools.
-- **Pass criteria:** A roughly 1 MB string argument draws HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport; a completed result passes with a warning. Skipped when the server declares no tools.
-- **Fail criteria:** A 5xx status, a timeout, or a broken stdio frame.
+- **Description:** Calls a tool with a string argument of roughly 1 MB in the first string argument that is not header-mirrored (an x-mcp-header value would also travel in an Mcp-Param-* header and measure the header limit instead of the body; such an argument is used only when no other exists, and the details say so; a tool with no string argument at all gets the value as 'data'), far beyond what any reasonable tool needs, and expects a prompt rejection: HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport. A completed result passes with a warning (the server survived), while a 5xx, a timeout or a broken stdio frame fails. Skipped when the server declares no tools.
+- **Pass criteria:** A roughly 1 MB string in the first string argument that is not header-mirrored (a mirrored one only when no other exists, noted in the details) draws HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport; a completed result passes with a warning, and so does a reply that overflowed the runner's stdio line buffer. Skipped when the server declares no tools.
+- **Fail criteria:** A 5xx status, a timeout, a broken stdio frame, or a stdio child that dies.
 
 ---
 
@@ -2323,9 +2324,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Category:** security
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#security-considerations](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations)
-- **Description:** Calls the first tool with arguments that include properties its inputSchema does not define and verifies the server either rejects them (-32602) or ignores them, without a 5xx or a crash. Servers MUST validate tool inputs; unknown properties reaching internal functions are a classic parameter-injection vector. Skipped when the server declares no tools.
-- **Pass criteria:** Arguments with properties the inputSchema does not define are rejected with -32602 or ignored, with a normal response. Skipped when the server declares no tools.
-- **Fail criteria:** A 5xx status, a crash, or a hang.
+- **Description:** Calls the first tool with arguments that include properties its inputSchema does not define and verifies the server either rejects them (-32602) or ignores them, without a 5xx or a crash (a dropped connection, or a stdio child that exits). A call that merely times out is inconclusive and passes with a warning. Servers MUST validate tool inputs; unknown properties reaching internal functions are a classic parameter-injection vector. Skipped when the server declares no tools.
+- **Pass criteria:** Arguments with properties the first tool's inputSchema does not define are rejected with a JSON-RPC error or ignored with a normal result; a call that times out passes with a warning (inconclusive). Skipped when the server declares no tools.
+- **Fail criteria:** A 5xx status, a malformed response, a stdio child that exits, or a dropped connection.
 
 ---
 
@@ -2357,7 +2358,7 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#security-considerations](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations)
 - **Description:** Scans tool names, descriptions and parameter descriptions for prompt-injection patterns ('ignore previous instructions', 'system prompt', hidden Unicode such as zero-width and bidi controls, long Base64 runs). Tool text is rendered into the model context, so an injection here reaches every user of the server.
-- **Pass criteria:** No tool name, description, or parameter description matches a prompt-injection pattern (instruction overrides, hidden Unicode, long Base64 runs).
+- **Pass criteria:** No tool name, title, description, or parameter description matches a prompt-injection pattern (instruction overrides, hidden Unicode, long Base64 runs in prose).
 - **Fail criteria:** Any match (the tool and pattern are named in the details).
 
 ---
@@ -2378,8 +2379,8 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Category:** security
 - **Default required:** No
 - **Spec reference:** [basic/index#error-responses](https://modelcontextprotocol.io/specification/2026-07-28/basic/index#error-responses)
-- **Description:** Triggers a range of failures (unknown method, malformed _meta, missing params, unknown tool, garbage cursor) with conformant envelopes so the errors come from the server's own handlers rather than the transport layer, then scans error messages and data for stack traces, file paths, module names and framework internals. Error responses MAY carry data, but internals in it map the server for an attacker.
-- **Pass criteria:** No triggered error's message or data contains a stack trace, file path, module name, or framework internal.
+- **Description:** Triggers a range of failures (unknown method, malformed _meta, missing params, unknown tool, garbage cursor, and on HTTP an unparsable body) with conformant envelopes so the errors come from the server's own handlers rather than the transport layer, then scans every distinct error response the run received -- once each -- for stack traces, file paths (Unix and Windows, including the JSON-escaped form), module names, framework internals and database connection strings. Error responses MAY carry data, but internals in it map the server for an attacker.
+- **Pass criteria:** No distinct error response (each scanned once) contains a stack trace, a file path (Unix or Windows, raw or JSON-escaped), a module name, a framework internal or a database connection string that is not an echo of the request.
 - **Fail criteria:** Any such leak found.
 
 ---
@@ -2389,9 +2390,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Category:** security
 - **Default required:** No
 - **Spec reference:** [basic/index#error-responses](https://modelcontextprotocol.io/specification/2026-07-28/basic/index#error-responses)
-- **Description:** Scans the same error responses for private IPv4 ranges (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x) and internal hostnames. Request bodies carry the full modern _meta so the errors originate from deeper layers such as upstream connectors, which is where addressing leaks.
-- **Pass criteria:** No triggered error contains a private IPv4 address or an internal hostname.
-- **Fail criteria:** Any private address or internal hostname found.
+- **Description:** Scans the same error responses for private and link-local IPv4 ranges (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x), IPv6 loopback, link-local and unique-local addresses, and internal hostnames (*.internal, *.local, *.corp, *.lan, *.intranet). Request bodies carry the full modern _meta so the errors originate from deeper layers such as upstream connectors, which is where addressing leaks.
+- **Pass criteria:** No distinct error response contains a private or link-local IPv4 address (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x), an IPv6 loopback, link-local or unique-local address, or an internal hostname (*.internal, *.local, *.corp, *.lan, *.intranet) that is not an echo of the request.
+- **Fail criteria:** Any such address or hostname found.
 
 ---
 
@@ -2401,9 +2402,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Default required:** No
 - **Transports:** http
 - **Spec reference:** [server/tools#security-considerations](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations)
-- **Description:** Sends a burst of 50 rapid server/discover requests and checks whether the server answers any of them with HTTP 429 Too Many Requests. Servers MUST rate limit tool invocations and SHOULD rate limit log and progress traffic; a burst that draws no 429 fails, and so does one where most responses are 5xx (the server should throttle, not fall over).
-- **Pass criteria:** At least one HTTP 429 among 50 rapid server/discover requests.
-- **Fail criteria:** No 429 in the burst, or more than 25 of the 50 responses are 5xx.
+- **Description:** Sends a burst of 50 rapid tools/call requests to the first tool annotated readOnlyHint that declares no required arguments and checks whether the server answers any of them with HTTP 429 Too Many Requests; the details name the method bursted. Servers MUST rate limit tool invocations and SHOULD rate limit log and progress traffic; a burst that draws no 429 fails, and so does one where most responses are 5xx (the server should throttle, not fall over). When no such tool exists, server/discover is bursted instead; discovery is cacheable and nothing requires throttling it, so a quiet burst then passes with a warning that tool invocations could not be exercised.
+- **Pass criteria:** At least one HTTP 429 among 50 rapid tools/call requests to the first readOnlyHint tool that declares no required arguments (tools/list fetched on demand); when no such tool exists, 50 rapid server/discover requests that draw no 429 pass with a warning.
+- **Fail criteria:** No 429 in a tools/call burst, or more than 25 of the 50 responses are 5xx (whichever method was bursted).
 
 ---
 
@@ -2416,7 +2417,7 @@ The file `mcp-compliance-rules.json` provides a machine-readable catalog of all 
 ```json
 {
   "specVersion": "2.0.0",
-  "specDate": "2026-09-13",
+  "specDate": "2026-09-14",
   "mcpSpecCompatibility": ["2025-11-25", "2026-07-28"],
   "categories": [ { "id": "transport", "name": "Transport Validation", "description": "...", "scope": "..." } ],
   "rules": [

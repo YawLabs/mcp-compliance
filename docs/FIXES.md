@@ -282,6 +282,8 @@ if (!auth?.startsWith('Bearer ')) {
 
 Skip this for stdio servers (no external caller) or tightly-scoped internal HTTP servers.
 
+On 2026-07-28 the probe is sent with or without `--auth`: a 401/403 passes either way, so the failure is always a real `HTTP 200, result -- server accepted unauthenticated request`. The sibling `security-auth-malformed` sends two credentials in place of yours -- a well-formed token no authorization server issued (`Bearer aW52YWxpZC10b2tlbg`), which MUST draw 401, and a value outside the RFC 6750 `b64token` grammar, for which the spec's error table allows `400 Bad Request` as well as 401 -- so a strict bearer parser that answers 400 for garbage is no longer marked as "accepted". And `security-oauth-metadata` follows the `resource_metadata` URL from your `WWW-Authenticate` challenge first, then `/.well-known/oauth-protected-resource<endpoint path>`, then the root, so a metadata document at a non-well-known URL is found as long as the challenge names it.
+
 ### `security-rate-limiting` — Rate limiting is enforced (HTTP only)
 
 **Failure:** server processed 50 rapid requests without throttling.
@@ -293,7 +295,7 @@ import rateLimit from 'express-rate-limit';
 app.use('/mcp', rateLimit({ windowMs: 60_000, max: 100 }));
 ```
 
-Tune windows to your workload.
+Tune windows to your workload. The 2025-11-25 suite bursts `ping`; the 2026-07-28 suite bursts `tools/call` against your first `readOnlyHint` tool that needs no arguments (the spec's MUST is on tool invocations), and only falls back to `server/discover` when you expose no such tool -- in which case a quiet burst passes with a warning instead of failing, since nothing requires throttling discovery. A limiter scoped to `tools/call` therefore passes the modern check even though it leaves discovery open.
 
 ### `security-command-injection` — Resists command injection
 
@@ -314,6 +316,8 @@ execFile('convert', [userPath, 'output.png']);
 2. Validate inputs against an allowlist before using them. If a parameter is supposed to be a filename, reject strings with `&`, `|`, `;`, backticks, or `$()`.
 
 If the test is a false positive (your server DID block the payload but the error message echoed it back), check that your error responses start with something like `"Access denied"` or `"Permission denied"` — the heuristic recognizes those as defense signals.
+
+On 2026-07-28 the four injection tests share **one** target: the first tool that declares a string argument, preferring tools annotated `readOnlyHint` and skipping tools annotated `destructiveHint` while an alternative exists (the report warns which tool was skipped, or that every candidate was destructive and one was probed anyway -- run those against a disposable dataset). The tool's other required arguments are filled with schema-typed placeholders so the payload actually reaches the handler, and the details count what came back: `Tested 5 payload(s) against lookup.q: 0 rejected, 5 returned without evidence of execution, 0 never reached the tool`. Only rejections (isError or rejection wording) count as a defence; an echo is benign, and a `-32602` for a payload that never reached the tool is neither.
 
 ### `security-path-traversal` — Resists path traversal
 
@@ -410,7 +414,10 @@ try {
 
 Everything below is specific to the 2026-07-28 suite. The shape that ties these together: there is **no session and no handshake**. Every request is self-describing (`params._meta` carries the protocol version and client capabilities; on HTTP the standard headers mirror the body), `server/discover` is how a client learns what you serve, and every result says what kind of result it is. Most first-run failures on a freshly upgraded server come from one of three places: the `_meta` envelope is not validated, results are missing the new required fields (`resultType`, `ttlMs`, `cacheScope`), or legacy handlers (`ping`, `logging/setLevel`, `resources/subscribe`) are still registered.
 
-If you use the official SDK 2.0 (`@modelcontextprotocol/server`), all of the below is handled by the framework; these recipes are for hand-rolled servers and for SDK 1.x servers that added `server/discover` by hand.
+If you use the official SDK 2.0 (`@modelcontextprotocol/server`), all of the below is handled by the framework; these recipes are for hand-rolled servers and for SDK 1.x servers that added `server/discover` by hand. Two SDK 2.0.0 behaviours are worth knowing before you read your first report:
+
+- **HTTP:** `createMcpHandler` serves a modern request (full `_meta`) that omits the `MCP-Protocol-Version` header with a 200 `DiscoverResult`, in both `legacy: 'stateless'` and `legacy: 'reject'` (a missing `Mcp-Method` is rejected 400/-32020 as expected). The spec says every POST MUST carry the header and a server that does not serve pre-2025-06-18 clients MUST reject its absence, so `transport-header-version-required` (required) **fails on SDK 2.0 servers by design** -- the suite grades the spec, not the SDK. Expect exactly that one required failure (plus the three localhost-inherent optional ones: no auth, no TLS, no 429) on an otherwise clean SDK 2.0 HTTP server.
+- **stdio:** `serveStdio` with the default `legacy: 'serve'` pins the *process* to an era from the first message it can classify -- and it classifies ANY message without a `_meta` protocolVersion claim as a legacy opening, not just `initialize`. The suite therefore runs its two claim-less `_meta` probes (`lifecycle-meta-required`, `lifecycle-meta-protocol-version-required`) late, after its own modern `tools/list` has pinned the process modern, and sends the `lifecycle-dual-era` `initialize` to a **fresh** process; on a default SDK 2.0 stdio server all three now pass cleanly (`rejected with -32602`, `dual-era: initialize answered with protocolVersion 2025-11-25 on a fresh process`). The interop hazard is real for other clients, though: a modern client that sends one malformed request to such a server before any pinning request loses the modern era for the process lifetime. `legacy: 'reject'` never selects the legacy era; a claim-less request before the process is pinned modern draws `-32022` there, and `-32602` afterwards.
 
 ### `lifecycle-discover` — server/discover returns DiscoverResult (required)
 
@@ -434,7 +441,7 @@ handlers['server/discover'] = () => ({
 
 ### `lifecycle-meta-required`, `lifecycle-meta-protocol-version-required`, `lifecycle-meta-client-capabilities-required` — Rejects malformed `_meta` (required)
 
-**Failure:** `expected JSON-RPC error, got result` -- the server served a request that had no `_meta`, or a `_meta` missing `protocolVersion` or `clientCapabilities`.
+**Failure:** `server returned a result (expected JSON-RPC error -32602)` -- the server served a request that had no `_meta`, or a `_meta` missing `protocolVersion` or `clientCapabilities`. A different failure shape, `not evaluable: the conformant server/discover was itself rejected with -32601, so this rejection proves nothing about the injected defect`, means the server rejects *everything* (typically a legacy-only server pinned to 2026-07-28): fix `lifecycle-discover` first, these three follow.
 
 **Fix:** validate the envelope on **every** request, `server/discover` included, before dispatch. Both keys are required; `clientInfo` is optional (`lifecycle-meta-client-info-optional` fails you if you reject its absence). Do not default the missing fields and do not fill `protocolVersion` in from the HTTP header:
 
@@ -477,7 +484,7 @@ Order matters on HTTP: check the header/`_meta` mismatch first (next recipe), th
 
 ### `transport-header-version-required`, `transport-header-version-mismatch`, `transport-header-method-required`, `transport-header-method-mismatch`, `transport-header-name-mismatch` — Rejects missing or mismatched standard headers (HTTP; required except `-name-`)
 
-**Failure:** `expected HTTP 400, got 200` -- the server ran a request whose `MCP-Protocol-Version` or `Mcp-Method` header was missing, or disagreed with the body.
+**Failure:** `HTTP 200, result (expected HTTP 400)` -- the server ran a request whose `MCP-Protocol-Version` or `Mcp-Method` header was missing, or disagreed with the body. As with the `_meta` rules, a 400 is credited only when the conformant `server/discover` was served; a server that answers every request with 400 fails these as `not evaluable`.
 
 **Fix:** every POST carries `MCP-Protocol-Version` (must equal `_meta` protocolVersion) and `Mcp-Method` (must equal the body's `method`); `tools/call`, `resources/read` and `prompts/get` also carry `Mcp-Name` (must equal `params.name` / `params.uri`, after Base64-sentinel decoding). Validate before dispatch and reject with 400 + `-32020`:
 
@@ -498,7 +505,7 @@ const named = { 'tools/call': 'name', 'prompts/get': 'name', 'resources/read': '
 if (named && decodeHeaderValue(h('Mcp-Name') ?? '') !== msg.params?.[named]) return mismatch('Mcp-Name');
 ```
 
-Read headers through your framework's case-insensitive accessor; `transport-header-case-insensitive` sends them in lowercase and expects a normal result. The legacy "no header means 2025-03-26" fallback applies only to requests whose body carries no modern `_meta`.
+Read headers through your framework's case-insensitive accessor; `transport-header-case-insensitive` sends them in lowercase and expects a normal result. The legacy "no header means 2025-03-26" fallback applies only to requests whose body carries no modern `_meta` -- which is exactly the cell `@modelcontextprotocol/server` 2.0.0 gets wrong (see the SDK note at the top of this section): it serves the header-less modern request as 2026-07-28, so it fails `transport-header-version-required` until the SDK adds the check.
 
 ### `lifecycle-discover-caching`, `tools-list-caching`, `resources-list-caching`, `resources-read-caching`, `prompts-list-caching`, `resources-templates-caching` — Caching hints (required when the capability is declared)
 
@@ -579,7 +586,7 @@ handlers['resources/read'] = ({ uri }) => {
 };
 ```
 
-`data.uri` is a SHOULD; omitting it passes with a warning. Grep your codebase for `-32002` and `-32042`.
+`data.uri` is a SHOULD; omitting it passes with a warning. So does any code other than `-32602` and `-32002` (a resolver that throws `-32603` on the unknown `test://` scheme, say): `nonexistent URI -> JSON-RPC error -32603 (expected -32602; see warnings)` is a pass with a warning, not a failure. Grep your codebase for `-32002` and `-32042`.
 
 ### `lifecycle-subscriptions-listen` — subscriptions/listen acknowledges first
 
@@ -617,24 +624,29 @@ Never send `notifications/message` on a `subscriptions/listen` stream.
 
 ### `lifecycle-dual-era` — Legacy initialize probe (informational)
 
-**Not a failure**, but two things it surfaces:
+**Not a failure** (the only way to fail it is a stdio server that exits on the request; no response passes with a warning), but two things it surfaces:
 
-- A **modern-only** server SHOULD name its supported versions in the error it returns to `initialize`; a bare `-32601` draws a warning. Legacy clients have no fall-forward mechanism, so that message is the only diagnostic they will ever see:
+- A **modern-only** server SHOULD name its supported versions in the error it returns to `initialize`, either in `data.supported` (the `-32022` UnsupportedProtocolVersionError shape, which is canonical) or in the message. A bare `-32601`, or a message that only echoes the version the client asked for (`Unsupported protocol version: 2025-11-25`) with no `data.supported`, draws the warning `initialize rejected with -32601 but neither the message nor data.supported names a supported protocol version (spec SHOULD)`. Legacy clients have no fall-forward mechanism, so that error is the only diagnostic they will ever see:
 
   ```ts
   handlers['initialize'] = undefined;
   if (msg.method === 'initialize') {
-    return reply(400, { jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'This server speaks MCP 2026-07-28 only; initialize is not supported' } });
+    return reply(400, {
+      jsonrpc: '2.0', id: msg.id,
+      error: { code: -32022, message: 'This server speaks MCP 2026-07-28 only; initialize is not supported', data: { supported: ['2026-07-28'], requested: msg.params?.protocolVersion } },
+    });
   }
   ```
 
-- A **dual-era** server (answers `initialize` too) is graded as 2026-07-28 under `--spec-version auto`, with a warning. Its legacy side is not graded in that run; use `--spec-version 2025-11-25` for that. If the modern side was an afterthought, expect the caching-hint, `resultType` and `_meta` recipes above to be the first failures.
+  The details then read `modern-only: initialize rejected with -32022; message and data.supported name supported versions`.
+
+- A **dual-era** server (answers `initialize` too) is graded as 2026-07-28 under `--spec-version auto`, with a warning -- fired when `supportedVersions` lists 2025-11-25 *or* when this probe is served an `InitializeResult`, which is how an SDK 2.0 server (modern-only `supportedVersions`, `initialize` still served) gets it. On stdio the probe opens a **fresh process**, because a dual-era server selects its era from how the client opens and the suite's own process is already pinned modern; the details say so (`dual-era: initialize answered with protocolVersion 2025-11-25 on a fresh process; legacy handshake served alongside 2026-07-28`). Its legacy side is not graded in that run; use `--spec-version 2025-11-25` for that. If the modern side was an afterthought, expect the caching-hint, `resultType` and `_meta` recipes above to be the first failures.
 
 ---
 
 ## Stuck after applying a fix?
 
 1. Re-run with `--verbose` to see each test as it runs.
-2. Use `--only <test-id>` to iterate on one test at a time.
+2. Use `--only <test-id>` to iterate on one test at a time. On 2026-07-28 the tools/resources/prompts lists a filtered-out test would have cached are fetched on demand, so a single test still measures the server; if the report says `No tests ran -- check --only/--skip`, the id belongs to the other catalog (`--list --spec-version <date>` shows the valid ones).
 3. Compare before/after with `mcp-compliance diff baseline.json current.json`.
 4. File an issue on [YawLabs/mcp-compliance](https://github.com/YawLabs/mcp-compliance/issues) if the test output doesn't clearly point at the fix. We treat opaque error messages as bugs in this tool.

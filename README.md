@@ -19,7 +19,7 @@ MCP servers are multiplying fast — but most ship without compliance testing. B
 
 This tool solves that:
 
-- **Two spec revisions, one tool** — 88 tests for MCP 2025-11-25 (the `initialize` + session era) and 103 tests for MCP 2026-07-28 (stateless, per-request `_meta`, `server/discover`, caching hints, MRTR). Both cover the same 8 categories: transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security. HTTP-specific tests (CORS, TLS, header validation, rate limiting) are gated out on stdio: the 2025-11-25 suite runs 85 tests on HTTP and ~75 on stdio, the 2026-07-28 suite 99 and 75.
+- **Two spec revisions, one tool** — 88 tests for MCP 2025-11-25 (the `initialize` + session era) and 103 tests for MCP 2026-07-28 (stateless, per-request `_meta`, `server/discover`, caching hints, MRTR). Both cover the same 8 categories: transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security. HTTP-specific tests (CORS, TLS, header validation, rate limiting) are gated out on stdio: the 2025-11-25 suite runs 85 tests on HTTP and 55 on stdio, the 2026-07-28 suite 99 and 75.
 - **Auto-detected revision** — one `server/discover` probe tells the tool which era the server speaks; dual-era servers are graded against 2026-07-28 with a warning. Pin either revision with `--spec-version`. See [Spec version](#spec-version).
 - **Capability-driven** — tests adapt to what the server declares. If it says it supports tools, tool tests become required. No false failures for features the server doesn't claim.
 - **Graded scoring** — A-F letter grade with a weighted score (required tests 70%, optional 30%). One number to communicate compliance.
@@ -120,20 +120,25 @@ mcp-compliance test https://my-server.com/mcp
 mcp-compliance test https://my-server.com/mcp --spec-version 2026-07-28
 mcp-compliance test https://my-server.com/mcp --spec-version 2025-11-25
 
-# --list never connects, so name the catalog you want to preview (defaults to 2025-11-25)
+# --list never connects: under auto (the default) it prints every catalog in its own
+# section; --spec-version <date> previews just that one
 mcp-compliance test --list --spec-version 2026-07-28 --transport stdio
 ```
 
-How `auto` decides, following the spec's own rules for dual-era clients: the tool sends one conformant 2026-07-28 `server/discover` (on HTTP it doubles as the preflight connectivity check, so detection costs no extra round-trip; on stdio it is the first exchange and shares `--startup-timeout`). A `DiscoverResult`, or a JSON-RPC error with a modern code (`-32020`, `-32021`, `-32022`), selects **2026-07-28**. Anything else — `-32601`, `-32000`, a 400 "not initialized", a 404, an HTML page, or no reply within the timeout — selects **2025-11-25**. The fallback is deliberately not keyed to a single error code; a legacy server that ignores unknown methods is still classified correctly, just after the timeout. An unreachable server is graded as 2025-11-25 so every test fails visibly.
+How `auto` decides, following the spec's own rules for dual-era clients: the tool sends one conformant 2026-07-28 `server/discover` (on HTTP it doubles as the preflight connectivity check, so detection costs no extra round-trip; on stdio it is the first exchange). A `DiscoverResult`, or a JSON-RPC error with a modern code (`-32020`, `-32021`, `-32022`), selects **2026-07-28**. Anything else — `-32601`, `-32000`, a 400 "not initialized", a 404, an HTML page, or no reply within the timeout — selects **2025-11-25**; a 401/403 with no modern error body also lands on 2025-11-25, and the note says the era could not be determined (pass `--auth`). The fallback is deliberately not keyed to a single error code; a legacy server that ignores unknown methods is still classified correctly, just after the timeout. The report header names the reason (`auto-detected from server/discover: supportedVersions [2026-07-28]`, `... JSON-RPC error -32601, legacy`, `... no response, legacy`) and the JSON `warnings` carry the same note (`Spec version auto-detected as <v> (server/discover -> <reason>). Pin with --spec-version to override.`). An unreachable server is graded as 2025-11-25 so every test that needs the server fails (the 2026-07-28 post-hoc scans fail too when nothing was received, rather than passing over an empty recording).
 
-A server that answers both eras (the default for servers built on the official SDK 2.0) is graded as **2026-07-28**, and the report carries a warning naming the other era and how to pin it. To grade its legacy side too, run again with `--spec-version 2025-11-25`. The report's `specVersion` is always the **resolved** revision, never `auto`.
+Two budgets bound the probe. On **stdio** it is bounded by `--startup-timeout`, and in terminal mode a dim status line appears on stderr after ~2 s naming the wait and the `--spec-version 2025-11-25` skip, so a legacy server that stays silent on unknown methods does not look like a hang. If the child exits on the probe (a legacy server whose dispatcher throws on unknown pre-`initialize` methods), the report warns with the exit code and stderr tail, spawns a fresh instance and grades it as 2025-11-25. On **HTTP** the probe is the preflight and is bounded by `--preflight-timeout`; a preflight that times out is re-probed once within `--startup-timeout` before the run defaults to 2025-11-25, so a slow cold start is graded in its real era instead of as unreachable.
+
+A server that answers both eras (the default for servers built on the official SDK 2.0) is graded as **2026-07-28**, and the report carries a warning naming the other era and how to pin it — keyed on `supportedVersions` listing 2025-11-25 *or* on the informational `lifecycle-dual-era` probe being served an `InitializeResult` (SDK 2.0 servers advertise only modern versions yet still serve `initialize`; on stdio that probe goes to a fresh process, since a dual-era server pins its era per process). To grade its legacy side too, run again with `--spec-version 2025-11-25`. The report's `specVersion` is always the **resolved** revision, never `auto`.
+
+A pinned run runs the named catalog whatever the server answers, with two honest side notes. On HTTP the preflight is still a modern `server/discover`, so a pinned run whose server plainly answered in the *other* era gets a warning (`Server answered the 2026-07-28 server/discover probe with a DiscoverResult ...; this run is pinned to 2025-11-25. Re-run with --spec-version 2026-07-28 (or auto) to grade it`). And a legacy-only server pinned to 2026-07-28 fails `lifecycle-discover` *and* the six `_meta` / standard-header rejection tests as **not evaluable**: a server that rejects the conformant `server/discover` proves nothing by also rejecting a malformed variant, so those required tests are failed rather than credited.
 
 Two things to know when you rely on `auto` in CI:
 
 - **The grade can move without a config change.** The day your server upgrades to an SDK that speaks 2026-07-28, `auto` switches suites: different test ids, different required set, a new baseline. Pin `--spec-version` (or `"specVersion"` in the config file) if you want the suite to change only when you say so.
 - **`diff` refuses to compare reports from different revisions** (ids are only comparable within one catalog) and tells you which `--spec-version` to pin. SARIF uploads are tracked per revision (`automationDetails.id` is `mcp-compliance/<specVersion>/`), so a switch opens a fresh set of alerts rather than closing the old ones silently.
 
-`--only` / `--skip` values are matched against the catalog that was resolved; a value that matches nothing in it (say `lifecycle-init` on a 2026-07-28 run) is reported as a warning instead of silently producing an empty run.
+`--only` / `--skip` values are matched against the catalog that was resolved; a value that matches nothing in it (say `lifecycle-init` on a 2026-07-28 run) is reported as a warning instead of silently producing an empty run, and an empty run prints `No tests ran -- check --only/--skip` rather than `All tests passed`. In the 2026-07-28 suite a filtered run still measures the server: the `tools/list` / `resources/list` / `prompts/list` results that a filtered-out feature test would have cached are fetched once on demand by whichever test needs them, so `--only security`, `--only schema` or `--only lifecycle` exercise the real checks instead of skip-passing.
 
 ### Options
 
@@ -143,7 +148,7 @@ Two things to know when you rely on `auto` in CI:
 | `--format <format>` | both | Output format: `terminal`, `json`, `sarif`, `github`, `markdown`, or `html` (default: `terminal`) |
 | `--config <path>` | both | Load defaults from a config file (default: `mcp-compliance.config.json` in cwd) |
 | `--output <file>` | both | Write a local SVG badge to the given path after the run |
-| `--list` | both | Print test IDs that would run given current filters, then exit (no connection; pair with `--spec-version` to pick the catalog, default `2025-11-25`) |
+| `--list` | both | Print test IDs that would run given current filters, then exit (no connection; with `--spec-version auto`, the default, every catalog is listed in its own section, and `--spec-version <date>` previews one) |
 | `--transport <kind>` | both | Filter by `http` or `stdio` (only used with `--list` when no target is provided) |
 | `--strict` | both | Exit with code 1 on any required test failure (for CI) |
 | `--min-grade <grade>` | both | Exit with code 1 if grade is below this threshold (`A`–`F`) |
@@ -153,8 +158,8 @@ Two things to know when you rely on `auto` in CI:
 | `--env-file <path>` | stdio | Load env vars from a file (one `KEY=VALUE` per line) |
 | `--cwd <dir>` | stdio | Working directory for the stdio command |
 | `--timeout <ms>` | both | Per-request timeout in milliseconds after the initial exchange (default: `15000`) |
-| `--startup-timeout <ms>` | both | Deadline for the first exchange — the `initialize` handshake or the `server/discover` probe (default: `max(--timeout, 60000)`; covers cold `npx` cache fetches before a stdio server starts) |
-| `--preflight-timeout <ms>` | HTTP | Preflight connectivity check timeout (HTTP only; the preflight request is also the spec-version probe) |
+| `--startup-timeout <ms>` | both | Budget for the server's first reply: the stdio era probe under `auto`, the 2025-11-25 `initialize` handshake on either transport, and on HTTP the second era probe sent when the preflight times out (default: `max(--timeout, 60000)`; covers cold `npx` cache fetches before a stdio server starts) |
+| `--preflight-timeout <ms>` | HTTP | Deadline for the preflight `server/discover` request, which under `auto` is also the era probe; a timeout here re-probes once within `--startup-timeout` before the run defaults to 2025-11-25 (default: `min(--timeout, 10000)`) |
 | `--retries <n>` | both | Number of retries for failed tests (default: `0`) |
 | `--only <items>` | both | Only run tests matching these categories or test IDs (comma-separated) |
 | `--skip <items>` | both | Skip tests matching these categories or test IDs (comma-separated) |
@@ -416,7 +421,7 @@ stdio-only (3):
 
 ## What the 103 tests check (2026-07-28)
 
-The 2026-07-28 catalog grades the stateless, per-request `_meta` era: `server/discover` instead of `initialize`, no sessions, caching hints on every cacheable result, `resultType` on every result, MRTR `input_required` results instead of server-initiated requests, and `-32602` for missing resources. Ids shared with the 2025-11-25 list are semantically identical checks; a check whose pass criteria changed carries a new id, so `diff` refuses to compare reports across revisions. Post-hoc tests scan a recording of every message the server sent during the run.
+The 2026-07-28 catalog grades the stateless, per-request `_meta` era: `server/discover` instead of `initialize`, no sessions, caching hints on every cacheable result, `resultType` on every result, MRTR `input_required` results instead of server-initiated requests, and `-32602` for missing resources. Ids shared with the 2025-11-25 list are semantically identical checks; a check whose pass criteria changed carries a new id, so `diff` refuses to compare reports across revisions. Post-hoc tests scan a recording of every message the server sent during the run (and fail, rather than pass vacuously, when nothing was received). The `_meta` and standard-header rejection tests are attributable: a rejection is credited only when the conformant `server/discover` was served, so a legacy-only server pinned to this catalog fails them as "not evaluable". The four injection tests probe a single (tool, argument) target — read-only tools preferred, destructive tools skipped while an alternative exists, other required arguments filled with placeholders — and report how many payloads were rejected, returned without evidence of execution, or never reached the tool.
 
 <details>
 <summary><strong>Transport (20 tests)</strong></summary>
@@ -699,6 +704,10 @@ await runComplianceSuite('https://my-server.com/mcp', {
     // passed, details, durationMs, specRef. Push it to your client.
     sendToClient(result);
   },
+  // Pre-test status lines: the stdio era probe still waiting after ~2 s,
+  // or an HTTP preflight timeout being re-probed within startupTimeout.
+  // The CLI prints these dimmed on stderr in terminal mode only.
+  onStatus: (message) => sendToClient({ status: message }),
 });
 ```
 

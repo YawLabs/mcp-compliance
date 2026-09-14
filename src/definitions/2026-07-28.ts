@@ -158,7 +158,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: true,
     specRef: "basic/transports/streamable-http#protocol-version-header",
     description:
-      "Sends a server/discover whose body is complete but whose MCP-Protocol-Version header is omitted. Every POST MUST carry the header, and a server that does not serve pre-2025-06-18 clients MUST reject its absence with HTTP 400 and a -32020 HeaderMismatch error. 400 is the hard requirement; a missing or different error code is reported as a warning.",
+      "Sends a server/discover whose body is complete but whose MCP-Protocol-Version header is omitted. Every POST MUST carry the header, and a server that does not serve pre-2025-06-18 clients MUST reject its absence with HTTP 400 and a -32020 HeaderMismatch error. 400 is the hard requirement; a missing or different error code is reported as a warning. A 400 is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable.",
     recommendation:
       "Validate MCP-Protocol-Version before dispatch. When it is absent, respond 400 with a JSON-RPC error { code: -32020 } echoing the request id. Only apply the 2025-03-26 legacy fallback for header-less requests whose body carries no modern _meta.",
     transports: ["http"],
@@ -182,7 +182,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: true,
     specRef: "basic/transports/streamable-http#server-validation",
     description:
-      "Sends a valid server/discover body without the Mcp-Method header. Mcp-Method is REQUIRED on every request; a missing standard header is a validation failure and the server MUST answer HTTP 400 with a -32020 HeaderMismatch error. 400 is the hard requirement; the -32020 code is checked as a warning because an intermediary may reject with a bare 400.",
+      "Sends a valid server/discover body without the Mcp-Method header. Mcp-Method is REQUIRED on every request; a missing standard header is a validation failure and the server MUST answer HTTP 400 with a -32020 HeaderMismatch error. 400 is the hard requirement; the -32020 code is checked as a warning because an intermediary may reject with a bare 400. A 400 is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable.",
     recommendation:
       "Treat Mcp-Method as required and answer 400 + { code: -32020 } when it is missing. Do not silently fall back to the body's method field -- the header exists so gateways can route without parsing the body.",
     transports: ["http"],
@@ -194,7 +194,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: true,
     specRef: "basic/transports/streamable-http#server-validation",
     description:
-      "Sends a server/discover body with Mcp-Method: tools/list. A header that does not match the corresponding body value MUST be rejected with HTTP 400 and a -32020 HeaderMismatch error, because a gateway routing on the header and a server executing on the body would otherwise disagree. 400 is required; -32020 is a warning.",
+      "Sends a server/discover body with Mcp-Method: tools/list. A header that does not match the corresponding body value MUST be rejected with HTTP 400 and a -32020 HeaderMismatch error, because a gateway routing on the header and a server executing on the body would otherwise disagree. 400 is required; -32020 is a warning. A 400 is credited only when the conformant server/discover was served; a server that rejects everything fails this test as not evaluable.",
     recommendation:
       "Validate every mirrored header (Mcp-Method, Mcp-Name, Mcp-Param-*) against the parsed body before dispatch and reject any difference with 400 + -32020. The body is the source of truth; never execute on the header alone.",
     transports: ["http"],
@@ -206,7 +206,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/transports/streamable-http#server-validation",
     description:
-      "Sends a resources/read (or prompts/get) whose Mcp-Name header names a different resource or prompt than the body. Mcp-Name is REQUIRED on tools/call, resources/read and prompts/get and MUST match params.uri or params.name after Base64 sentinel decoding, so the server MUST answer 400 + -32020. Skipped when the server exposes no resource or prompt to read.",
+      "Sends a resources/read of the first listed resource (else a prompts/get of the first prompt without required arguments) whose Mcp-Name header names a different resource or prompt than the body. Mcp-Name is REQUIRED on tools/call, resources/read and prompts/get and MUST match params.uri or params.name after Base64 sentinel decoding, so the server MUST answer 400 + -32020; the 400 is credited only when the conformant server/discover was served. The resource and prompt lists are fetched on demand when the feature tests did not run; skipped only when the server declares neither capability, the list calls failed, or nothing listed can be read by name alone.",
     recommendation:
       "Decode a =?base64?...?= Mcp-Name value, then compare it to params.name (tools/call, prompts/get) or params.uri (resources/read). Reject a mismatch with 400 and -32020 before touching the named object.",
     transports: ["http"],
@@ -255,7 +255,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/transports#messages",
     description:
-      "Sends a request whose parameters contain CJK and emoji characters and verifies the response reproduces them byte-for-byte. JSON-RPC messages MUST be UTF-8 encoded on every transport; this catches latin-1 or platform-default decoding of stdin.",
+      "Calls a tool with CJK and emoji characters in its string arguments -- a tool named echo, else the first tool with a string property named message, text, input or query, else the first tool (tools/list is fetched on demand) -- and passes when the reply reproduces them byte-for-byte. Fails on evidence of mangling: U+FFFD replacement characters, a Latin-1 mis-decode, the non-ASCII characters stripped, or a -32700 parse error. A tool that merely does not echo its input proves nothing, so the verdict then rests on a server/discover whose clientInfo name carries the same characters: the server parsing and answering it is the round-trip verified, and rejecting or mangling it fails. JSON-RPC messages MUST be UTF-8 encoded on every transport; this catches latin-1 or platform-default decoding of stdin.",
     recommendation:
       "Decode stdin and encode stdout as UTF-8 explicitly (process.stdin.setEncoding('utf8') in Node; reconfigure sys.stdin/sys.stdout with encoding='utf-8' in Python). Do not rely on the platform default, which is a legacy code page on Windows.",
     transports: ["stdio"],
@@ -395,7 +395,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: true,
     specRef: "basic/index#meta",
     description:
-      "Sends server/discover with params carrying no _meta at all (on HTTP the headers are still correct). protocolVersion and clientCapabilities are required on every request, so the request is malformed and the server MUST reject it with -32602 Invalid params; on HTTP the status MUST be 400. A rejection with a different code is reported as a warning; a result fails, because the server is inferring version and capabilities from nowhere.",
+      "Sends server/discover with params carrying no _meta at all (on HTTP the headers are still correct). protocolVersion and clientCapabilities are required on every request, so the request is malformed and the server MUST reject it with -32602 Invalid params; on HTTP the status MUST be 400. A rejection with a different code is reported as a warning; a result fails, because the server is inferring version and capabilities from nowhere. Runs late, after the feature tests: a dual-era stdio server that is still deciding its era treats a claim-less message as a legacy opening, and by then a modern request has pinned the process. Not evaluable -- and failed -- when the conformant server/discover was itself rejected, since the rejection then proves nothing about the missing _meta.",
     recommendation:
       "Validate params._meta before dispatch: require 'io.modelcontextprotocol/protocolVersion' and 'io.modelcontextprotocol/clientCapabilities' on every request, server/discover included. Return { code: -32602 } with HTTP 400 and do not default the missing fields.",
   },
@@ -406,7 +406,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: true,
     specRef: "basic/index#meta",
     description:
-      "Sends server/discover whose _meta carries clientCapabilities and clientInfo but no protocolVersion (on HTTP the MCP-Protocol-Version header is present and correct). The field is required, so the server MUST answer -32602 Invalid params and, on HTTP, status 400. A rejection with another code (-32020 is the common one) passes with a warning; a result fails.",
+      "Sends server/discover whose _meta carries clientCapabilities and clientInfo but no protocolVersion (on HTTP the MCP-Protocol-Version header is present and correct). The field is required, so the server MUST answer -32602 Invalid params and, on HTTP, status 400. A rejection with another code (-32020 is the common one) passes with a warning; a result fails. Runs late, after the feature tests, for the same reason as lifecycle-meta-required. Not evaluable -- and failed -- when the conformant server/discover was itself rejected.",
     recommendation:
       "Require 'io.modelcontextprotocol/protocolVersion' in every request's _meta and reject its absence with -32602 / HTTP 400. Do not fill it in from the HTTP header -- the body is the source of truth and the header only mirrors it.",
   },
@@ -417,7 +417,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: true,
     specRef: "basic/index#meta",
     description:
-      "Sends server/discover whose _meta has protocolVersion and clientInfo but no clientCapabilities. Capabilities are per-request input the server MUST NOT infer from prior requests, so the field is required even when empty; the server MUST answer -32602 (HTTP 400). Serving the request as if {} had been sent fails.",
+      "Sends server/discover whose _meta has protocolVersion and clientInfo but no clientCapabilities. Capabilities are per-request input the server MUST NOT infer from prior requests, so the field is required even when empty; the server MUST answer -32602 (HTTP 400). Serving the request as if {} had been sent fails. Not evaluable -- and failed -- when the conformant server/discover was itself rejected, since the rejection then proves nothing about the missing field.",
     recommendation:
       "Require 'io.modelcontextprotocol/clientCapabilities' on every request and reject its absence with -32602 / HTTP 400. Clients send {} when they have nothing to declare; treat absence and {} differently.",
   },
@@ -461,9 +461,9 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/versioning#backward-compatibility-with-initialization-based-versions",
     description:
-      "Sends a legacy initialize request (2025-11-25 shape, no modern _meta, legacy headers on HTTP) and reports which era the server speaks: a result means dual-era, an error means modern-only. Both outcomes pass; the test is informational. A modern-only server SHOULD name its supported versions in the error it returns to initialize, and one that does not draws a warning. Runs last on stdio because answering initialize may pin a dual-era process to legacy semantics.",
+      "Sends a legacy initialize request (2025-11-25 shape, no modern _meta, legacy headers on HTTP) and reports which era the server speaks: a result means dual-era, an error means modern-only. Both outcomes pass; the test is informational, and no response passes with a warning (era undetermined) -- the only failure is a stdio server that exits on the request. On stdio the probe goes to a fresh process, because a dual-era server selects its era from how the client opens and the suite's own process is already modern. A modern-only server SHOULD name its supported versions in the error -- in data.supported (the UnsupportedProtocolVersionError shape) or in the message -- and one that names none (a message that only echoes the rejected 2025-11-25 does not count) draws a warning. Runs last.",
     recommendation:
-      "If you only implement 2026-07-28, reject initialize with a JSON-RPC error whose message lists your supported versions (e.g. 'This server speaks MCP 2026-07-28; initialize is not supported'). Legacy clients have no fall-forward mechanism, so that message may be the only diagnostic they see.",
+      "If you only implement 2026-07-28, reject initialize with a JSON-RPC error that lists your supported versions -- -32022 with data.supported ['2026-07-28'] is the canonical shape, and naming the version in the message (e.g. 'This server speaks MCP 2026-07-28; initialize is not supported') also satisfies the SHOULD. Legacy clients have no fall-forward mechanism, so that error may be the only diagnostic they see.",
   },
   {
     id: "lifecycle-capability-handlers-match",
@@ -483,7 +483,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/patterns/subscriptions#acknowledgment",
     description:
-      "When any listChanged or subscribe capability is declared, opens a subscriptions/listen stream requesting the matching notification types and reads the first frame. It MUST be notifications/subscriptions/acknowledged carrying _meta['io.modelcontextprotocol/subscriptionId'] equal to the listen request's id and a notifications object naming the subset the server honours; no other notification may precede it. When nothing is advertised, either the acknowledgment or -32601 passes.",
+      "When any listChanged or subscribe capability is declared, opens a subscriptions/listen stream requesting the matching notification types and reads the first frame. It MUST be notifications/subscriptions/acknowledged carrying _meta['io.modelcontextprotocol/subscriptionId'] equal to the listen request's id and a notifications object naming the subset the server honours; no other notification may precede it. When nothing is advertised, either the acknowledgment or -32601 passes. An acknowledgment that honours a notification type or URI the request did not include passes with a warning: the server may send notifications outside the requested filter.",
     recommendation:
       "Implement subscriptions/listen as a long-lived response (an SSE stream on HTTP; tagged by subscriptionId on stdio). Send the acknowledgment first, with the request id as the subscription id and the filter you accepted, then keep the stream open until the client closes it.",
   },
@@ -517,7 +517,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/utilities/completion#requesting-completions",
     description:
-      "If the server declares the completions capability, sends completion/complete for the first prompt or resource-template argument and expects a result with a completion.values array (empty is fine). Servers that declare the capability must serve the method; skipped when the capability is absent.",
+      "If the server declares the completions capability, sends completion/complete for the first listed prompt argument, else the first resource-template variable (prompts/list and resources/templates/list are fetched on demand), else a placeholder ref where -32602 is acceptable, and expects a result with a completion.values array (empty is fine). Servers that declare the capability must serve the method; skipped when the capability is absent.",
     recommendation:
       "When you declare completions, implement completion/complete and return at least { completion: { values: [], hasMore: false } }. Reference prompts by name and resource templates by uriTemplate exactly as listed.",
   },
@@ -528,7 +528,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/patterns/progress#progress-flow",
     description:
-      "Calls the first tool with _meta.progressToken set and reads the whole response. Progress is optional, so a call with no notifications/progress passes; but any progress notification that does arrive MUST carry the same token and its progress value MUST increase with each notification. A foreign token or a non-increasing value fails.",
+      "Calls the first tool without required arguments (preferring one whose name or description mentions progress, else the first listed tool) with _meta.progressToken set and reads the whole response; tools/list is fetched on demand when the tools tests did not run, and the test is skipped when the server declares no tools or tools/list failed. Progress is optional, so a call with no notifications/progress passes; but any progress notification that does arrive MUST carry the same token and its progress value MUST increase with each notification. A foreign token or a non-increasing value fails.",
     recommendation:
       "Copy _meta.progressToken from the request into every notifications/progress you emit for it, send them on that request's response stream before the final result, and make progress strictly increasing (total is optional).",
   },
@@ -574,7 +574,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "Calls the first tool with empty arguments and validates the result shape: resultType 'complete' with a content array, or resultType 'input_required' (an MRTR InputRequiredResult) with inputRequests and/or requestState. A -32602 Invalid params error for a tool that needs arguments also passes. Required at runtime when the tools capability is declared.",
+      "Calls the first tool whose inputSchema declares no required properties (else the first tool) with empty arguments and validates the result shape: a content array whose items each carry a type (isError: true with content also passes), or resultType 'input_required' (an MRTR InputRequiredResult) with inputRequests entries of the { method, params } shape and/or a string requestState. A JSON-RPC error passes -- -32602 (or -32600) as the expected answer for a tool that needs arguments, any other code noted as a protocol error in the details. resultType 'complete' is not checked here; schema-result-type scans every result post-hoc. Required at runtime when the tools capability is declared.",
     recommendation:
       "Return { resultType: 'complete', content: [{ type: 'text', text }], isError?: boolean } for a completed call, or { resultType: 'input_required', inputRequests, requestState } when you need elicitation or sampling. Report missing arguments with -32602 rather than an empty content array.",
   },
@@ -631,7 +631,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/resources#reading-resources",
     description:
-      "Reads the first listed resource and validates the result: resultType 'complete' with a contents array whose items carry uri and either text or blob, or resultType 'input_required' with a valid InputRequiredResult. An empty contents array for a resource the server itself listed passes with a warning. Required at runtime when the resources capability is declared.",
+      "Reads the first listed resource that has a uri and validates the result: a contents array whose items carry uri and either text or blob, or resultType 'input_required' with a valid InputRequiredResult (inputRequests entries of the { method, params } shape and/or a string requestState). A JSON-RPC error for a resource the server itself listed fails, and an empty contents array passes with a warning. resultType 'complete' is not checked here; schema-result-type scans every result post-hoc. Required at runtime when the resources capability is declared.",
     recommendation:
       "Return { resultType: 'complete', contents: [{ uri, mimeType, text | blob }], ttlMs, cacheScope } and make each item's uri the one that was requested (or a child of it for directory reads).",
   },
@@ -653,7 +653,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/resources#error-handling",
     description:
-      "Reads a URI that does not exist and expects a JSON-RPC error. Servers MUST return -32602 Invalid params for a missing resource and MUST NOT return an empty contents array; the retired -32002 code fails because implementations of this revision MUST NOT emit it. data.uri naming the missing resource is a SHOULD, reported as a warning when absent. Required at runtime when the resources capability is declared.",
+      "Reads a URI that does not exist and expects a JSON-RPC error. Servers MUST return -32602 Invalid params for a missing resource and MUST NOT return an empty contents array: a result of any shape fails, and so does the retired -32002 code, which implementations of this revision MUST NOT emit. Any other error code passes with a warning naming the expected -32602 (-32603 is tolerated because a resolver that throws on the unknown test:// scheme may conformantly answer an internal error). data.uri naming the missing resource is a SHOULD, reported as a warning when absent. Required at runtime when the resources capability is declared.",
     recommendation:
       "Answer unknown URIs with { code: -32602, message: 'Resource not found', data: { uri } }. Replace any -32002 constant left over from 2025-11-25 and never return contents: [] for a URI you cannot resolve.",
   },
@@ -720,7 +720,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/prompts#getting-a-prompt",
     description:
-      "Gets the first listed prompt with empty arguments and validates the result: resultType 'complete' with a messages array whose items have a role of user or assistant and a content block, or resultType 'input_required' with a valid InputRequiredResult. A -32602 error for a prompt whose required arguments are missing also passes. Required at runtime when the prompts capability is declared.",
+      "Gets the first listed prompt with no required arguments (else the first prompt, with each required argument filled by the placeholder 'test') and validates the result: a messages array whose items have a role of user or assistant and a content object, or resultType 'input_required' with a valid InputRequiredResult (inputRequests entries of the { method, params } shape and/or a string requestState). A -32602 (or -32600) error for a prompt that rejects the arguments also passes; any other JSON-RPC error fails. resultType 'complete' is not checked here; schema-result-type scans every result post-hoc. Required at runtime when the prompts capability is declared.",
     recommendation:
       "Return { resultType: 'complete', messages: [{ role, content: { type: 'text', text } }] }. Report missing required arguments with -32602 Invalid params, not an empty messages array.",
   },
@@ -858,9 +858,9 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/index#error-responses",
     description:
-      "Post-hoc scan of every JSON-RPC error the server sent during the run: each one answering a request whose id was readable MUST carry that same id. Errors for unparsable bodies (parse errors, malformed envelopes) are exempt because the id could not be read; a null or missing id on the reply to a well-formed request fails.",
+      "Post-hoc scan of every JSON-RPC error response (an error object with a numeric code) the server sent during the run: each one answering a request whose id was readable MUST carry that same id. Exempt: replies to the suite's raw malformed-body probes and to client notifications (there is no id to echo), and transport-level rejections answered before the JSON-RPC layer read the request (HTTP 401/403/413/415/429, whose body need not be JSON-RPC at all). A null or missing id on the reply to a well-formed request fails whatever the error code, -32600 and -32700 included.",
     recommendation:
-      "Copy the request id into every error response, including the validation failures (-32602, -32020, -32022) you produce before dispatch. Use id: null only when the body could not be parsed at all.",
+      "Copy the request id into every error response, including the validation failures (-32602, -32020, -32022) you produce before dispatch. Use id: null only when the body could not be parsed at all. An auth gate or proxy that rejects with 401/403 before reading the body is not held to this.",
   },
   {
     id: "error-retired-codes",
@@ -882,7 +882,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#tool",
     description:
-      "Validates every listed tool has a name (1-128 characters of [A-Za-z0-9_.-], the SHOULD-level naming rule) and an inputSchema that is a JSON Schema object with type 'object'. inputSchema MUST be a valid JSON Schema object, not null.",
+      "Validates every listed tool has a name (1-128 characters of [A-Za-z0-9_.-], the SHOULD-level naming rule) and an inputSchema that is a JSON Schema object with type 'object'. inputSchema MUST be a valid JSON Schema object, not null. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.",
     recommendation:
       "Give every tool a name matching [A-Za-z0-9_.-]{1,128} and an inputSchema of { type: 'object', ... }. Use { type: 'object', additionalProperties: false } for tools with no parameters.",
   },
@@ -893,7 +893,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#tool",
     description:
-      "If a tool carries annotations, validates that readOnlyHint, destructiveHint, idempotentHint and openWorldHint are booleans when present and that title, when present, is a string. Clients MUST treat annotations as untrusted hints, so a wrong type is a definition bug rather than a security control.",
+      "If a tool carries annotations, validates that readOnlyHint, destructiveHint, idempotentHint and openWorldHint are booleans when present and that title, when present, is a string. Clients MUST treat annotations as untrusted hints, so a wrong type is a definition bug rather than a security control. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.",
     recommendation:
       "Keep annotation hints boolean and put the display name in the tool's top-level title (annotations.title is the lowest-precedence fallback). Remove annotations you do not mean.",
   },
@@ -904,7 +904,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#tool",
     description:
-      "Checks whether listed tools carry the optional title field, the human-readable display name clients prefer over name. Passes when every tool has a string title; tools without one are listed in the details.",
+      "Checks whether listed tools carry the optional title field, the human-readable display name clients prefer over name. A title that is present must be a string; tools without one are listed in the details but do not fail. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.",
     recommendation:
       "Add a short human-readable title to each tool. Display precedence is title, then annotations.title, then name.",
   },
@@ -915,7 +915,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#output-schema",
     description:
-      "For tools that declare outputSchema, validates it is a JSON Schema object (a non-null object; type, $ref or a composition keyword may describe any JSON value). Unlike 2025-11-25 the root is no longer restricted to type 'object': array, string and other roots are valid because structuredContent may be any JSON value.",
+      "For tools that declare outputSchema, validates it is a JSON Schema object (a non-null object; type, $ref or a composition keyword may describe any JSON value). Unlike 2025-11-25 the root is no longer restricted to type 'object': array, string and other roots are valid because structuredContent may be any JSON value. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.",
     recommendation:
       "Declare outputSchema as a JSON Schema describing structuredContent, using whatever root type fits. Make sure structuredContent actually conforms -- servers MUST provide structured results that match the declared schema.",
   },
@@ -926,7 +926,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/prompts#prompt",
     description:
-      "Validates every listed prompt has a string name and that each entry in an arguments array has a name. Prompt arguments are matched by name in prompts/get and completion/complete, so a nameless argument is unreachable.",
+      "Validates every listed prompt has a string name and that each entry in an arguments array has a name. Prompt arguments are matched by name in prompts/get and completion/complete, so a nameless argument is unreachable. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.",
     recommendation: "Give every prompt a name and every argument a name (plus description and required where useful).",
   },
   {
@@ -936,7 +936,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/resources#resource",
     description:
-      "Validates every listed resource has a parseable URI and a string name. Custom URI schemes MUST conform to RFC 3986; an unparseable uri cannot be passed back to resources/read.",
+      "Validates every listed resource has a parseable URI and a string name. Custom URI schemes MUST conform to RFC 3986; an unparseable uri cannot be passed back to resources/read. The list is fetched on demand when the corresponding feature tests did not run (--only schema); skipped only when that list call failed.",
     recommendation:
       "Ensure each resource has a valid absolute URI (scheme://...) and a name. Add mimeType, title and description where you can.",
   },
@@ -947,9 +947,9 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: true,
     specRef: "basic/index#result-responses",
     description:
-      "Post-hoc scan of every JSON-RPC result the server sent during the run: each result MUST include a string resultType ('complete', 'input_required', or a value defined by an advertised extension). A result with no resultType is what a 2025-11-25 server returns and fails here.",
+      "Post-hoc scan of every JSON-RPC result the server sent during the run: each result MUST include a string resultType that is 'complete' or 'input_required'. Any other value passes, with a warning naming it, only when server/discover advertised an extensions capability that could define it; without one it fails, since a resultType the client does not recognize MUST be treated as invalid. A result with no resultType is what a 2025-11-25 server returns and fails here (the reply to the suite's own legacy initialize probe is exempt).",
     recommendation:
-      "Add resultType: 'complete' to every successful result, including subscriptions/listen closures and otherwise-empty results. Use 'input_required' only for InputRequiredResult.",
+      "Add resultType: 'complete' to every successful result, including subscriptions/listen closures and otherwise-empty results. Use 'input_required' only for InputRequiredResult, and any extension value only after advertising that extension in server/discover capabilities.",
   },
   {
     id: "schema-no-input-required-on-lists",
@@ -969,7 +969,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/patterns/mrtr#server-requirements-basic-workflow",
     description:
-      "Post-hoc, opportunistic check of every input_required result observed: it MUST include at least one of inputRequests or requestState; each inputRequests value must be an object whose method is elicitation/create, sampling/createMessage or roots/list with a params object; requestState, when present, must be a string. Passes vacuously when no input_required result was seen.",
+      "Post-hoc, opportunistic check of every input_required result observed against the MRTR server requirements: it MUST include at least one of inputRequests or requestState; each inputRequests value must be an object whose method is elicitation/create, sampling/createMessage or roots/list, with a params object for elicitation/create and sampling/createMessage (ListRootsRequest.params is optional); the client capability each method needs (elicitation, sampling, roots) MUST have been declared by the client -- this suite declares only elicitation, so a sampling/createMessage or roots/list input request fails; requestState, when present, must be a string. Passes vacuously when no input_required result was seen.",
     recommendation:
       "Build InputRequiredResult as { resultType: 'input_required', inputRequests: { key: { method, params } }, requestState }. Only request capabilities the client declared, and treat requestState as attacker-controlled on the retry.",
   },
@@ -980,7 +980,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/index#schema",
     description:
-      "Post-hoc validation of every recorded server message against the vendored 2026-07-28 JSON schema, dispatching by method for notifications, by resultType plus the originating request's method for results, and by error code for errors. The TypeScript schema is the source of truth for every message; the details list the first offending messages with their validation errors.",
+      "Post-hoc validation of every recorded server message against the vendored 2026-07-28 JSON schema, dispatching by method for notifications, by resultType plus the originating request's method for results, and by error code for errors. Replies to the suite's raw malformed-body probes and to its legacy initialize probe are skipped, an error's id: null is treated as omitted (error-id-echo judges whether null was earned), and non-JSON-RPC bodies on transport-level rejections (HTTP 401/403/413/415/429) are noted, not validated. The TypeScript schema is the source of truth for every message; the details list the distinct violations, grouped by originating method and first schema error with a count, and overflow the rest to a warning.",
     recommendation:
       "Compare your response types against schema.ts for the methods you implement and validate responses in your own tests with the published schema.json. Common misses: no resultType, no ttlMs/cacheScope on cacheable results, priority outside 0-1, and unknown content types.",
   },
@@ -993,7 +993,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization#token-handling",
     description:
-      "Sends a fully conformant server/discover with the Authorization header removed and expects HTTP 401 (403 also passes). Servers acting as OAuth 2.1 resource servers MUST answer missing or invalid tokens with 401. Without --auth the test fails, reporting that the server accepted an unauthenticated request.",
+      "Sends a fully conformant server/discover with the Authorization header removed and expects HTTP 401 (403 also passes). Servers acting as OAuth 2.1 resource servers MUST answer missing or invalid tokens with 401. The probe is sent with or without --auth: a 401 passes either way (without --auth the details suggest passing it to exercise the rest of the auth tests), and a 2xx fails as an accepted unauthenticated request.",
     recommendation:
       "Require a Bearer token on every request to the MCP endpoint and answer 401 (with WWW-Authenticate) when it is missing. Authorization is per-request input in 2026-07-28; there is no session to carry it.",
     transports: ["http"],
@@ -1005,7 +1005,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization/authorization-server-discovery#protected-resource-metadata-discovery-requirements",
     description:
-      'When the unauthenticated server/discover yields 401, checks for a WWW-Authenticate header. Servers MUST implement one of two discovery mechanisms, and the header form (Bearer resource_metadata="...") is the one clients try first; a 401 with no challenge leaves the client unable to locate the authorization server. Skipped when no 401 was observed.',
+      'When the unauthenticated server/discover yields 401 (with or without --auth), checks for a WWW-Authenticate header. Servers MUST implement one of two discovery mechanisms, and the header form (Bearer resource_metadata="...") is the one clients try first; a 401 with no challenge leaves the client unable to locate the authorization server, and a challenge without resource_metadata passes with a warning. Skipped when no 401 was observed.',
     recommendation:
       'Set WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource" (optionally with scope) on every 401, and serve that metadata document at the advertised URL.',
     transports: ["http"],
@@ -1017,9 +1017,9 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization#token-handling",
     description:
-      "Sends a conformant server/discover with Authorization: Bearer <garbage> and expects HTTP 401 (403 also passes). Servers MUST validate access tokens, including their audience, and invalid or expired tokens MUST receive 401; a server that only checks that the header is present fails.",
+      "Sends two conformant server/discover requests in place of the configured credential: Authorization: Bearer aW52YWxpZC10b2tlbg, a well-formed token no authorization server issued, which MUST draw HTTP 401 (403 also passes); and a value outside the RFC 6750 b64token grammar, a malformed authorization request that the spec's error table lets a server answer with 400 Bad Request as well as 401 or 403. Servers MUST validate access tokens, including their audience. A server that accepts either credential fails, and so does one answering the well-formed invalid token with anything but 401/403; the details name both outcomes. Requires --auth: without a credential the server accepts, rejecting invalid ones proves nothing.",
     recommendation:
-      "Validate the token signature, expiry and audience (RFC 8707) on every request before dispatch. Answer 401 for anything that does not verify and 403 for a valid token lacking the required scope.",
+      "Validate the token signature, expiry and audience (RFC 8707) on every request before dispatch. Answer 401 for a well-formed token that does not verify, 403 for a valid token lacking the required scope, and 400 (invalid_request) or 401 for a credential that is not even syntactically a bearer token.",
     transports: ["http"],
   },
   {
@@ -1041,9 +1041,9 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization/authorization-server-discovery#authorization-server-location",
     description:
-      "Fetches /.well-known/oauth-protected-resource (root first, then the endpoint-path variant) and validates a JSON document with resource and a non-empty authorization_servers array. MCP servers MUST implement RFC 9728 Protected Resource Metadata and the document MUST name at least one authorization server. A legacy /.well-known/oauth-authorization-server hit passes with a warning.",
+      "Locates RFC 9728 Protected Resource Metadata in the order clients must try it: the resource_metadata URL from the WWW-Authenticate challenge on the unauthenticated server/discover when present, then /.well-known/oauth-protected-resource followed by the endpoint path, then the root /.well-known/oauth-protected-resource. Validates a JSON document with resource and a non-empty authorization_servers array, and warns when resource is not the MCP endpoint URL in canonical form (RFC 9728 section 3.3). MCP servers MUST implement one of the two discovery mechanisms and the document MUST name at least one authorization server. A legacy /.well-known/oauth-authorization-server hit passes with a warning. Runs without --auth when the unauthenticated request drew 401/403; skipped when the server requires no auth.",
     recommendation:
-      "Publish { resource: '<canonical server URI>', authorization_servers: ['https://as.example.com'] } at /.well-known/oauth-protected-resource (root, or /.well-known/oauth-protected-resource/<endpoint path>). Point the WWW-Authenticate resource_metadata parameter at the same URL.",
+      "Publish { resource: '<canonical MCP endpoint URI>', authorization_servers: ['https://as.example.com'] } at /.well-known/oauth-protected-resource/<endpoint path> or at the root, and point the WWW-Authenticate resource_metadata parameter at that document (it may live anywhere; the challenge URL is tried first).",
     transports: ["http"],
   },
   {
@@ -1091,7 +1091,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Calls each tool with OS command-injection payloads ('; cat /etc/passwd', '$(whoami)', backticks) in every string argument, mirroring x-mcp-header parameters into Mcp-Param-* headers so the request stays valid, and inspects results for evidence of execution (passwd lines, usernames, shell errors). Servers MUST validate all tool inputs; a tool that echoes the payload back unexecuted passes.",
+      "Calls one tool with OS command-injection payloads ('; cat /etc/passwd', '$(whoami)', backticks) in one string argument: the first tool declaring a string argument, preferring tools annotated readOnlyHint and skipping tools annotated destructiveHint while an alternative exists (a warning names any skipped tool; when every candidate is destructive the first is probed and a warning says so). The tool's other required arguments are filled with schema-typed placeholders so the payload reaches the handler (also warned), and x-mcp-header parameters are mirrored into Mcp-Param-* headers so the request stays valid. Results are inspected for evidence of execution (passwd lines, usernames, shell errors) and the details count what came back: rejected (isError or rejection wording -- the only outcome counted as a defence), returned without evidence of execution, and never reached the tool (a JSON-RPC or transport error). Servers MUST validate all tool inputs; a tool that echoes the payload back unexecuted passes.",
     recommendation:
       "Never build shell strings from tool arguments. Use execFile/spawn with an argument array, parameterised APIs, or a strict allowlist, and return a tool error for anything outside the expected shape.",
   },
@@ -1102,7 +1102,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Calls each tool with SQL-injection payloads (' OR 1=1 --, UNION SELECT, stacked statements) in string arguments, with any x-mcp-header parameters mirrored into headers, and inspects results and errors for database error text or unexpected row dumps. Servers MUST validate all tool inputs and sanitise tool outputs.",
+      "Calls the same single target as security-command-injection with SQL-injection payloads (' OR 1=1 --, UNION SELECT, stacked statements), other required arguments filled with placeholders and x-mcp-header parameters mirrored into headers, and inspects results for database error text or unexpected row dumps. The details count rejected, benign and never-reached outcomes; only rejections count as a defence. Servers MUST validate all tool inputs and sanitise tool outputs.",
     recommendation:
       "Use parameterised queries or prepared statements everywhere and never concatenate arguments into SQL. Return a generic tool error for database failures rather than the driver's message.",
   },
@@ -1113,7 +1113,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Calls each tool with path-traversal payloads (../../etc/passwd, ..\\\\..\\\\windows\\\\system.ini, URL-encoded variants) in string arguments, headers mirrored for x-mcp-header parameters, and inspects results for file contents outside the tool's scope. Servers MUST validate inputs and, for file:// resources, MUST sanitise paths to prevent directory traversal.",
+      "Calls one tool with path-traversal payloads (../../etc/passwd, ..\\\\..\\\\windows\\\\system.ini, URL-encoded variants) in one string argument, preferring an argument whose name suggests a path (path, file, dir, folder; then url, uri, href, endpoint, host) searched across the candidates in the same read-only-first, destructive-last order as security-command-injection, otherwise the shared injection target; other required arguments are filled with placeholders and x-mcp-header parameters mirrored. Inspects results for file contents outside the tool's scope and counts rejected, benign and never-reached outcomes. Servers MUST validate inputs and, for file:// resources, MUST sanitise paths to prevent directory traversal.",
     recommendation:
       "Resolve every path against a fixed base directory and reject results that escape it (path.resolve, then check the normalised result starts with the base). Reject '..' segments and null bytes outright.",
   },
@@ -1124,7 +1124,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "For tools whose schema suggests a URL argument, submits internal targets (169.254.169.254 metadata, 127.0.0.1, 10.x, 172.16-31.x, 192.168.x, localhost) and inspects results for cloud-metadata or internal-service responses. Servers MUST validate all tool inputs; fetching internal addresses on a caller's behalf is server-side request forgery.",
+      "Submits internal targets (the 169.254.169.254 metadata service, 127.0.0.1, [::1], 10.0.0.1) to one string argument, preferring one whose name suggests a URL (url, uri, href, endpoint, host, link; then path, file, dir) searched across the candidates in the same read-only-first, destructive-last order as security-command-injection; when no such argument exists the shared injection target is used, so the details always name the tool.argument probed. Other required arguments are filled with placeholders and x-mcp-header parameters mirrored. Inspects results for cloud-metadata or internal-service responses and counts rejected, benign and never-reached outcomes. Servers MUST validate all tool inputs; fetching internal addresses on a caller's behalf is server-side request forgery.",
     recommendation:
       "Resolve the hostname and reject private, loopback, link-local and metadata addresses before connecting (and re-check after redirects). Prefer an allowlist of permitted hosts for outbound fetches.",
   },
@@ -1135,7 +1135,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Calls the first tool with a string argument of roughly 1 MB, far beyond what any reasonable tool needs, and expects a prompt rejection: HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport. A completed result passes with a warning (the server survived), while a 5xx, a timeout or a broken stdio frame fails. Skipped when the server declares no tools.",
+      "Calls a tool with a string argument of roughly 1 MB in the first string argument that is not header-mirrored (an x-mcp-header value would also travel in an Mcp-Param-* header and measure the header limit instead of the body; such an argument is used only when no other exists, and the details say so; a tool with no string argument at all gets the value as 'data'), far beyond what any reasonable tool needs, and expects a prompt rejection: HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport. A completed result passes with a warning (the server survived), while a 5xx, a timeout or a broken stdio frame fails. Skipped when the server declares no tools.",
     recommendation:
       "Enforce a request body limit (e.g. 1 MB) at the HTTP layer and return 413, and add maxLength to string properties in inputSchema so oversized arguments fail validation with -32602 before reaching the tool.",
   },
@@ -1146,7 +1146,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Calls the first tool with arguments that include properties its inputSchema does not define and verifies the server either rejects them (-32602) or ignores them, without a 5xx or a crash. Servers MUST validate tool inputs; unknown properties reaching internal functions are a classic parameter-injection vector. Skipped when the server declares no tools.",
+      "Calls the first tool with arguments that include properties its inputSchema does not define and verifies the server either rejects them (-32602) or ignores them, without a 5xx or a crash (a dropped connection, or a stdio child that exits). A call that merely times out is inconclusive and passes with a warning. Servers MUST validate tool inputs; unknown properties reaching internal functions are a classic parameter-injection vector. Skipped when the server declares no tools.",
     recommendation:
       "Validate arguments against inputSchema with additionalProperties: false, or strip unknown properties before use. Never spread raw arguments into internal calls.",
   },
@@ -1205,7 +1205,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/index#error-responses",
     description:
-      "Triggers a range of failures (unknown method, malformed _meta, missing params, unknown tool, garbage cursor) with conformant envelopes so the errors come from the server's own handlers rather than the transport layer, then scans error messages and data for stack traces, file paths, module names and framework internals. Error responses MAY carry data, but internals in it map the server for an attacker.",
+      "Triggers a range of failures (unknown method, malformed _meta, missing params, unknown tool, garbage cursor, and on HTTP an unparsable body) with conformant envelopes so the errors come from the server's own handlers rather than the transport layer, then scans every distinct error response the run received -- once each -- for stack traces, file paths (Unix and Windows, including the JSON-escaped form), module names, framework internals and database connection strings. Error responses MAY carry data, but internals in it map the server for an attacker.",
     recommendation:
       "Return generic messages for unexpected failures and log the detail server-side. Strip stack traces, absolute paths and dependency names from every error's message and data before it leaves the process.",
   },
@@ -1216,7 +1216,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/index#error-responses",
     description:
-      "Scans the same error responses for private IPv4 ranges (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x) and internal hostnames. Request bodies carry the full modern _meta so the errors originate from deeper layers such as upstream connectors, which is where addressing leaks.",
+      "Scans the same error responses for private and link-local IPv4 ranges (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x), IPv6 loopback, link-local and unique-local addresses, and internal hostnames (*.internal, *.local, *.corp, *.lan, *.intranet). Request bodies carry the full modern _meta so the errors originate from deeper layers such as upstream connectors, which is where addressing leaks.",
     recommendation:
       "Sanitise upstream connection errors before surfacing them (replace host:port with a generic 'upstream unavailable'). Configure your reverse proxy not to forward internal addressing into error bodies.",
   },
@@ -1227,9 +1227,9 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Sends a burst of 50 rapid server/discover requests and checks whether the server answers any of them with HTTP 429 Too Many Requests. Servers MUST rate limit tool invocations and SHOULD rate limit log and progress traffic; a burst that draws no 429 fails, and so does one where most responses are 5xx (the server should throttle, not fall over).",
+      "Sends a burst of 50 rapid tools/call requests to the first tool annotated readOnlyHint that declares no required arguments and checks whether the server answers any of them with HTTP 429 Too Many Requests; the details name the method bursted. Servers MUST rate limit tool invocations and SHOULD rate limit log and progress traffic; a burst that draws no 429 fails, and so does one where most responses are 5xx (the server should throttle, not fall over). When no such tool exists, server/discover is bursted instead; discovery is cacheable and nothing requires throttling it, so a quiet burst then passes with a warning that tool invocations could not be exercised.",
     recommendation:
-      "Apply a per-client (IP or token) limiter in front of the MCP endpoint and answer 429 with Retry-After when it is exceeded. Rate-limit tools/call separately from discovery.",
+      "Apply a per-client (IP or token) limiter to tools/call and answer 429 with Retry-After when it is exceeded; a limiter in front of the whole endpoint satisfies the check too. Expose at least one read-only tool that needs no arguments if you want the burst to measure tool invocations rather than discovery.",
     transports: ["http"],
   },
 ];

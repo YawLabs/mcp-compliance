@@ -26,29 +26,32 @@ Both catalogs use the same 8 categories, so the report schema (`schemaVersion: "
 
 `auto` implements the spec's own algorithm for dual-era clients ([versioning: backward compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning#backward-compatibility-with-initialization-based-versions)):
 
-1. Send one **conformant 2026-07-28 `server/discover`** -- full `_meta`, and on HTTP the `MCP-Protocol-Version` and `Mcp-Method` headers. On HTTP this request *is* the preflight connectivity check, so detection adds no round-trip; on stdio it is the first exchange and shares `--startup-timeout`.
+1. Send one **conformant 2026-07-28 `server/discover`** -- full `_meta`, and on HTTP the `MCP-Protocol-Version` and `Mcp-Method` headers. On HTTP this request *is* the preflight connectivity check, so detection adds no round-trip and is bounded by `--preflight-timeout`; a preflight that times out (as opposed to a refused connection or DNS failure) is re-sent once within `--startup-timeout` before the run defaults to 2025-11-25, so a modern server on a cold start is graded in its real era. On stdio it is the first exchange and is bounded by `--startup-timeout`; in terminal mode a dim status line names the wait after ~2 s.
 2. Classify the reply:
    - a `DiscoverResult` (`supportedVersions` array) -> **2026-07-28**
    - a JSON-RPC error with a modern-only code (`-32020` HeaderMismatch, `-32021` MissingRequiredClientCapability, `-32022` UnsupportedProtocolVersion) -> **2026-07-28**
-   - **anything else** -> **2025-11-25**: `-32601`, `-32000`, a 400 "not initialized", a 404 from an HTTP+SSE server, an HTML page, a connection failure, or **no reply within the timeout**.
+   - an HTTP 401/403 without a modern error body -> **2025-11-25**, but the note says the era could not be determined and to pass `--auth`
+   - **anything else** -> **2025-11-25**: `-32601`, `-32000`, a 400 "not initialized", a 404 from an HTTP+SSE server, an HTML page, a connection failure, or **no reply within the budget**.
 
-The fallback is deliberately not keyed to a single error code. A legacy server that answers unknown pre-init methods with `-32601` and one that ignores them entirely are both classified as 2025-11-25; the second one just takes the startup timeout to get there.
+The fallback is deliberately not keyed to a single error code. A legacy server that answers unknown pre-init methods with `-32601` and one that ignores them entirely are both classified as 2025-11-25; the second one just takes the startup timeout to get there. A legacy stdio server whose dispatcher *exits* on the unknown method is classified the same way, but the report says so (`Server exited (code N) after the 2026-07-28 era probe (server/discover); last stderr: ...`), suggests pinning `--spec-version 2025-11-25` to skip the probe, and grades a freshly spawned instance rather than the dead one.
+
+The reason is stamped into the report header (`auto-detected from server/discover: supportedVersions [2026-07-28]`, `... JSON-RPC error -32601, legacy`, `... no response, legacy`) and into `warnings` as `Spec version auto-detected as <v> (server/discover -> <reason>). Pin with --spec-version to override.`
 
 The detection probe's `DiscoverResult` is reused as the modern suite's discover response (serverInfo, capabilities, supportedVersions), so a 2026-07-28 run does not repeat the request.
 
 ### Dual-era servers
 
-A server that answers both `server/discover` and `initialize` -- the default for servers built on `@modelcontextprotocol/server` 2.0 -- is graded as **2026-07-28**. The report carries a warning naming the other era and how to pin it. Nothing in the 2026-07-28 run exercises the legacy path except the informational `lifecycle-dual-era` probe; to grade the legacy side, run again with `--spec-version 2025-11-25`.
+A server that answers both `server/discover` and `initialize` -- the default for servers built on `@modelcontextprotocol/server` 2.0 -- is graded as **2026-07-28**. The report carries a warning naming the other era and how to pin it: `Server is dual-era (also advertises 2025-11-25)` when `supportedVersions` lists the legacy revision, or `Server is dual-era (also serves the legacy initialize handshake)` when only the `lifecycle-dual-era` probe was served an `InitializeResult` -- the SDK 2.0 case, since it advertises only modern versions yet still serves `initialize`. Nothing in the 2026-07-28 run exercises the legacy path except that informational probe, whose details read `dual-era: initialize answered with protocolVersion 2025-11-25 on a fresh process; ...` on stdio (a dual-era stdio server pins its era per process, so the probe opens a second one) or `modern-only: initialize rejected with -32022; data.supported names supported versions` for a modern-only server. To grade the legacy side, run again with `--spec-version 2025-11-25`.
 
 ### Unreachable servers
 
-If the server cannot be reached at all, `auto` resolves to 2025-11-25 and the run proceeds so that every test fails visibly (the previous behaviour, preserved).
+If the server cannot be reached at all, `auto` resolves to 2025-11-25 and the run proceeds so that every test that needs the server fails (the previous behaviour, preserved; the warning names the connection error, or the two timeouts that elapsed).
 
 ### Pinning
 
-`--spec-version 2025-11-25` or `--spec-version 2026-07-28` skips the probe and runs the named catalog regardless of what the server would have answered. A modern-only server graded as 2025-11-25 fails `lifecycle-init` and most of what follows; a legacy-only server graded as 2026-07-28 fails `lifecycle-discover`. Both are useful: they answer "does this server still speak the old revision" and "is it ready for the new one".
+`--spec-version 2025-11-25` or `--spec-version 2026-07-28` skips the probe and runs the named catalog regardless of what the server would have answered. A modern-only server graded as 2025-11-25 fails `lifecycle-init` (whose details now quote the server's answer: `Initialize answered with JSON-RPC error -32601: Method not found: initialize. This server speaks MCP 2026-07-28 ... (HTTP 404)`) and most of what follows; a legacy-only server graded as 2026-07-28 fails `lifecycle-discover` and, as **not evaluable**, the six `_meta` / standard-header rejection tests -- a server that rejects the conformant request proves nothing by also rejecting a malformed one, so those required tests are failed rather than credited. Both pins are useful: they answer "does this server still speak the old revision" and "is it ready for the new one". On HTTP the preflight is still a modern `server/discover`, so a pinned run whose server answered in the other era carries a warning (`Server answered the 2026-07-28 server/discover probe with a DiscoverResult (supportedVersions [...]); this run is pinned to 2025-11-25. Re-run with --spec-version 2026-07-28 (or auto) to grade it`); a 401/403 never triggers it.
 
-`--list` never connects, so `auto` is meaningless there; it previews the 2025-11-25 catalog unless `--spec-version` names the other one.
+`--list` never connects, so `auto` cannot probe there: it prints every catalog in its own section, and `--spec-version <date>` previews just that one.
 
 ## What flips when your server upgrades
 
@@ -68,7 +71,7 @@ Pinning to `2025-11-25` is also the right move for a server that must keep servi
 - **`diff` refuses to compare reports from different spec revisions.** Ids are only comparable within one catalog (a reused id means the same check; a changed check has a new id), so comparing across revisions would silently misreport renamed checks as regressions or fixes. The error names both versions and tells you to pin `--spec-version <baseline's>` on the current run. In a CI job that stores a baseline and diffs each run, pin the same revision on both sides.
 - **SARIF uploads are tracked per revision.** The SARIF run carries `automationDetails.id = "mcp-compliance/<specVersion>/"`, so GitHub Code Scanning treats the two suites as separate analyses: a switch opens a fresh set of alerts for the new revision instead of closing every 2025-11-25 alert as "fixed".
 - **The GitHub Action** takes `spec-version` (default `auto`) and exposes the resolved value as the `spec-version` output. The action runs the suite more than once (SARIF, JSON, visible output); it resolves the revision from the JSON pass and pins the others to it so one flaky probe cannot make the passes disagree.
-- **`benchmark`** is spec-aware too: it warms up and probes with `server/discover` on 2026-07-28 (there is no `ping`), and with `initialize` + `ping` on 2025-11-25.
+- **`benchmark`** is spec-aware too: on 2026-07-28 it sends one unmeasured `server/discover` warm-up (under `auto` the detection probe is that warm-up; a pinned run sends it explicitly, so a stdio child's boot never lands in the first timed sample) and then measures `server/discover` (there is no `ping`); on 2025-11-25 it warms up with `initialize` and measures `ping`.
 
 ## Consumer guidance
 

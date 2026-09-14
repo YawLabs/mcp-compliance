@@ -44,6 +44,25 @@ out explicitly here.
   catalog-schema change that makes this a major bump). A new
   `src/tests/catalog-parity.test.ts` keeps both files and the README in lock-step
   with the code's catalogs.
+- **`RunOptions.onStatus` and a pre-test status line.** The runner reports what it
+  is waiting on before the first test: the stdio era probe still unanswered after
+  2 s (`Probing spec era (server/discover, up to 60s). A 2025-11-25 server that
+  ignores unknown methods takes the whole startup timeout; --spec-version
+  2025-11-25 skips the probe.`) and an HTTP preflight timeout being re-probed. The
+  CLI prints these dimmed on stderr in terminal mode only; `json`, `sarif`,
+  `github`, `markdown` and `html` output is untouched.
+- **Pinned runs say when the server speaks the other era.** On HTTP the preflight
+  is still a modern `server/discover`, so `--spec-version 2025-11-25` against a
+  modern-only server (or `2026-07-28` against a legacy one) now carries `Server
+  answered the 2026-07-28 server/discover probe with a DiscoverResult
+  (supportedVersions [...]); this run is pinned to 2025-11-25. Re-run with
+  --spec-version 2026-07-28 (or auto) to grade it.` A 401/403 never triggers it.
+  `lifecycle-init` also quotes the server's JSON-RPC error instead of the bare
+  "No result in response".
+- **`DetectionResult.responded` / `eraUndetermined`** and the exported
+  `REASON_PREFIX` (`server/discover -> `) on every detection reason; a 401/403
+  on the probe reads `HTTP 401 (authentication required -- pass --auth); era not
+  determinable, using 2025-11-25` instead of claiming the server is legacy.
 
 ### Changed
 - **`--spec-version` defaults to `auto`, which changes what existing users get.**
@@ -77,9 +96,116 @@ out explicitly here.
 - `--only` / `--skip` values that match no test id or category in the resolved
   catalog now produce a warning naming the miss (and the `--list --spec-version`
   command to see valid ids) instead of silently running an empty or partial suite
-  and grading it F.
+  and grading it F. An empty filtered run prints `No tests ran -- check
+  --only/--skip (see warnings)` instead of `All tests passed`, and the `--only`
+  help example uses ids that exist in both catalogs.
+- **`--only` runs measure instead of skipping (2026-07-28).** The `tools/list`,
+  `resources/list`, `prompts/list` and `resources/templates/list` results that a
+  filtered-out feature test would have cached are fetched once on demand by
+  whichever test needs them, so `--only security`, `--only schema`, `--only
+  lifecycle` and `--only transport` exercise the real checks (ten security tests,
+  the six definition checks, `lifecycle-progress-token`, `lifecycle-completions`
+  and `transport-header-name-mismatch` used to skip-pass and grade A). A test
+  skip-passes only when the capability is undeclared or the list call itself
+  failed, and its details say which.
+- **`--preflight-timeout` bounds the HTTP era probe; `--startup-timeout` bounds
+  the stdio one.** Under `auto` a preflight that times out (as opposed to a
+  refused connection) is re-probed once within `--startup-timeout` before the run
+  defaults to 2025-11-25, so a modern server on a cold start is graded in its
+  real era instead of as unreachable. Against a server that accepts and never
+  answers, `auto` now spends preflight + startup timeout before the legacy suite
+  starts. Both help strings say which probe they bound.
+- **Detection reasons fit the terminal header.** `auto-detected from
+  server/discover: supportedVersions [2026-07-28]` / `JSON-RPC error -32601,
+  legacy` / `no response, legacy` replace the sentence-long notes; the JSON
+  warning keeps the `Spec version auto-detected as <v> (...)` shape.
+- **Leak patterns widened (both suites).** `security-error-no-internal-ip` now
+  matches 169.254.x and internal hostnames (`*.internal`, `*.local`, `*.corp`,
+  `*.lan`, `*.intranet`), and `security-error-no-stacktrace` matches Windows
+  paths in their JSON-escaped form (`C:\\Users\\svc\\app`), which every scanned
+  sample is. Strictly wider detection; the 2025-11-25 catalog text is unchanged.
+- **Injection tests probe one target (2026-07-28).** The four injection tests
+  send their payloads to a single (tool, argument): the first tool with a string
+  argument, `readOnlyHint` tools preferred, `destructiveHint` tools skipped while
+  an alternative exists, other required arguments filled with schema-typed
+  placeholders so the payload reaches the handler, and `x-mcp-header` arguments
+  mirrored. The details count rejected / benign / never-reached payloads and
+  claim "server defended" only when every payload was rejected.
 
 ### Fixed
+- **False verdicts in the 2026-07-28 suite, found by an adversarial review of the
+  branch before release:**
+  - The two claim-less `_meta` probes ran early and flipped the reference SDK's
+    stdio server (`serveStdio`, default `legacy: 'serve'`) to the legacy era
+    mid-run, failing 14 downstream checks; they now run after the suite's own
+    modern requests have pinned the process, and SDK 2.0 stdio grades A.
+  - The six `_meta` / standard-header rejection tests credited *any* rejection,
+    so a legacy-only server pinned to 2026-07-28 passed six required tests it has
+    no implementation for; they now fail as `not evaluable` when the conformant
+    `server/discover` was itself rejected.
+  - `lifecycle-dual-era` labelled a dual-era SDK 2.0 stdio server "modern-only"
+    (the probe hit the already-pinned process) and credited an error message that
+    only echoed the requested version; on stdio the probe now goes to a fresh
+    process, and the SHOULD is satisfied by `data.supported` or a message naming
+    a version other than the requested one. The dual-era warning also fires for
+    SDK 2.0 servers, which serve `initialize` without advertising 2025-11-25.
+  - `error-id-echo` and `schema-wire-valid` failed a server whose auth gate or
+    proxy answers 401/403/413/415/429 with a non-JSON-RPC body (the official
+    SDK's `requireBearerAuth` writes `{"error":"invalid_token"}`), and
+    `error-id-echo` exempted every null-id `-32600`/`-32700` reply by code even
+    on well-formed requests; the status now decides, not the code.
+  - `schema-result-type` accepted any string; it now requires `complete` or
+    `input_required` unless an `extensions` capability is advertised (then other
+    values pass with a warning naming them). `schema-input-required-shape`
+    demanded `params` on `roots/list` (optional in the schema) and never
+    enforced the client-capability MUST NOT; it now does both.
+  - `stdio-unicode` failed any server whose picked tool does not echo its input;
+    it now fails only on evidence of mangling and otherwise falls back to the
+    discover envelope round-trip, preferring a tool with a `message`/`text`/
+    `input`/`query` argument.
+  - `security-auth-malformed` failed a server that answers RFC 6750's
+    `invalid_request` 400 to a syntactically invalid credential; it now pins the
+    401 with a well-formed invalid token and accepts 400/401/403 for garbage.
+  - `security-oauth-metadata` never fetched the `resource_metadata` URL from the
+    `WWW-Authenticate` challenge and probed root before path; it now follows the
+    spec's order (challenge URL, path, root) and warns when `resource` is not the
+    endpoint.
+  - `security-rate-limiting` bursted `server/discover` while citing the
+    tools/call MUST; it now bursts a read-only no-argument tool and passes with a
+    warning when only discovery could be bursted.
+  - `security-auth-required` asserted "server accepted unauthenticated requests"
+    without probing when `--auth` was absent, contradicting the 401 in the same
+    report; it, `security-www-authenticate` and `security-oauth-metadata` now
+    probe with or without `--auth`.
+  - `security-oversized-input` mirrored the 1 MB value into an `Mcp-Param-*`
+    header when the first string argument was `x-mcp-header`, measuring the
+    header limit instead of the body; `security-extra-params` reported a plain
+    timeout as "server may have crashed"; the leak scan double-counted every
+    probe response. All three corrected.
+- **`auto` graded a dead child.** A legacy stdio server whose dispatcher exits on
+  the unknown `server/discover` was classified correctly but the 2025-11-25 suite
+  then ran against the exited process and failed everything as "Initialize
+  request failed". The run now warns (`Server exited (code 1) after the
+  2026-07-28 era probe (server/discover); last stderr: ...`, with the
+  `--spec-version 2025-11-25` hint) and spawns a fresh instance.
+- **The unreachable-server warning claimed "all tests will fail"** while ~30
+  optional skip-passes (and, under a modern pin, four required post-hoc scans)
+  passed vacuously. The wording is now "every test that needs the server will
+  fail", and the eight modern post-hoc scans fail outright when no server
+  message was received.
+- **`benchmark --spec-version 2026-07-28` on stdio folded the child's boot into
+  the first measured sample** (max latency two orders of magnitude off versus an
+  `auto` run). A pinned modern run now sends one unmeasured `server/discover`
+  warm-up first, as the legacy path always did with `initialize`.
+- **stdio `stream()` did not end when the child exited** (it waited the full
+  timeout and `lifecycle-subscriptions-listen` reported "No acknowledgment"
+  instead of "server exited"), and `close()` skipped `notifications/cancelled`
+  once the timer had fired. Both fixed; `TransportStream.exit` exposes the exit.
+- **`Mcp-Param-*` mirroring only walked top-level `inputSchema.properties`;** it
+  now follows nested `properties` chains as the spec allows.
+- **`lifecycle-subscriptions-listen` accepted an acknowledgment honouring more
+  than was requested** (a filter-ignoring server); a surplus now passes with a
+  warning.
 - **`security-token-in-uri` never put the token in the URI.** The probe went through
   the transport, which ignores the URL it is handed and re-injects the configured
   `Authorization` header, so every authenticated server answered an ordinary
