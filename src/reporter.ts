@@ -1,7 +1,18 @@
 import chalk from "chalk";
-import { SPEC_BASE } from "./runner.js";
+import { findTestDefinition } from "./definitions/index.js";
+import { isSpecVersion, LEGACY_SPEC_VERSION, type SpecVersion, specBaseFor } from "./spec.js";
 import type { ComplianceReport, Grade, TestResult } from "./types.js";
-import { TEST_DEFINITIONS } from "./types.js";
+
+/**
+ * The catalog a report's ids belong to. A report always stamps the
+ * RESOLVED spec version, but a legacy report (older tool, or one written
+ * before `specVersion` existed) may carry an unknown or missing value;
+ * those ids are 2025-11-25 ids, so fall back to that catalog rather
+ * than throw.
+ */
+function catalogVersionOf(report: ComplianceReport): SpecVersion {
+  return isSpecVersion(report.specVersion) ? report.specVersion : LEGACY_SPEC_VERSION;
+}
 
 const CATEGORY_LABELS: Record<string, string> = {
   transport: "Transport",
@@ -130,6 +141,7 @@ export function formatTerminal(report: ComplianceReport): string {
   out.push("");
 
   // Failed tests — full detail
+  const catalog = catalogVersionOf(report);
   const failed = report.tests.filter((t) => !t.passed);
   if (failed.length > 0) {
     out.push(chalk.bold.red(`  FAILED TESTS (${failed.length})`));
@@ -140,7 +152,7 @@ export function formatTerminal(report: ComplianceReport): string {
         `  ${chalk.red("✗")} ${chalk.bold(t.name)}  ${chalk.dim(`[${t.id}]`)}  ${req}  ${chalk.dim(`${t.durationMs}ms`)}`,
       );
       out.push(`      ${t.details}`);
-      const def = TEST_DEFINITIONS.find((d) => d.id === t.id);
+      const def = findTestDefinition(catalog, t.id);
       if (def?.recommendation) {
         out.push(`      ${chalk.cyan(`→ ${def.recommendation}`)}`);
       }
@@ -205,16 +217,25 @@ export function formatJson(report: ComplianceReport): string {
 /**
  * Format report as SARIF (Static Analysis Results Interchange Format) v2.1.0.
  * Compatible with GitHub Code Scanning and other SARIF viewers.
+ *
+ * `runs[0].automationDetails.id` carries the spec version so Code
+ * Scanning tracks each spec suite as its own analysis category: a
+ * server that moves from the 2025-11-25 suite to the 2026-07-28 suite
+ * (auto-detection, or an SDK upgrade) opens a second alert history
+ * instead of closing every 2025 alert and re-opening it under an id
+ * whose pass criteria changed.
  */
 export function formatSarif(report: ComplianceReport): string {
+  const catalog = catalogVersionOf(report);
+  const specBase = specBaseFor(catalog);
   const rules = report.tests.map((t) => {
-    const def = TEST_DEFINITIONS.find((d) => d.id === t.id);
+    const def = findTestDefinition(catalog, t.id);
     return {
       id: t.id,
       name: t.name,
       shortDescription: { text: t.name },
       fullDescription: { text: def?.description || t.details },
-      helpUri: t.specRef || `${SPEC_BASE}/basic`,
+      helpUri: t.specRef || `${specBase}/basic`,
       properties: {
         category: t.category,
         required: t.required,
@@ -225,7 +246,7 @@ export function formatSarif(report: ComplianceReport): string {
   const results = report.tests
     .filter((t) => !t.passed)
     .map((t) => {
-      const def = TEST_DEFINITIONS.find((d) => d.id === t.id);
+      const def = findTestDefinition(catalog, t.id);
       return {
         ruleId: t.id,
         level: t.required ? "error" : "warning",
@@ -260,6 +281,12 @@ export function formatSarif(report: ComplianceReport): string {
             informationUri: "https://github.com/YawLabs/mcp-compliance",
             rules,
           },
+        },
+        // The trailing "/" follows GitHub's category convention: the id
+        // is a prefix, so two uploads from the same workflow stay
+        // separate analyses when their spec versions differ.
+        automationDetails: {
+          id: `mcp-compliance/${report.specVersion || catalog}/`,
         },
         results,
         invocations: [

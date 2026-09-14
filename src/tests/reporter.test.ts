@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { formatGithub, formatJson, formatMarkdown, formatSarif, formatTerminal } from "../reporter.js";
-import type { ComplianceReport } from "../types.js";
+import { formatGithub, formatHtml, formatJson, formatMarkdown, formatSarif, formatTerminal } from "../reporter.js";
+import type { ComplianceReport, TestResult } from "../types.js";
 
 function makeReport(overrides: Partial<ComplianceReport> = {}): ComplianceReport {
   return {
@@ -483,5 +483,148 @@ describe("formatTerminal — stdio targets", () => {
     const output = formatTerminal(makeReport({ url: "stdio:node ./server.js" }));
     expect(output).not.toContain("[![MCP Compliant]");
     expect(output).toContain("--output");
+  });
+});
+
+/**
+ * Per-spec catalogs. A report's ids belong to the catalog of the spec
+ * version it was produced with: a 2026-only id must get its recommendation
+ * under a 2026 report and NOT under a 2025 one, and a shared id must get
+ * the recommendation of the report's own era.
+ */
+describe("per-spec catalog lookups", () => {
+  const discoverFailure: TestResult = {
+    id: "lifecycle-discover",
+    name: "server/discover returns DiscoverResult",
+    category: "lifecycle",
+    passed: false,
+    required: true,
+    details: "-32601 method not found",
+    durationMs: 12,
+  };
+  const postFailure: TestResult = {
+    id: "transport-post",
+    name: "HTTP POST accepted",
+    category: "transport",
+    passed: false,
+    required: true,
+    details: "HTTP 404",
+    durationMs: 8,
+  };
+
+  function modernReport(overrides: Partial<ComplianceReport> = {}): ComplianceReport {
+    return makeReport({
+      specVersion: "2026-07-28",
+      serverInfo: {
+        protocolVersion: "2026-07-28",
+        name: "modern-server",
+        version: "2.0.0",
+        capabilities: { tools: {} },
+      },
+      tests: [discoverFailure],
+      ...overrides,
+    });
+  }
+
+  describe("formatSarif", () => {
+    it("stamps automationDetails.id with the report's spec version (trailing slash)", () => {
+      expect(JSON.parse(formatSarif(modernReport())).runs[0].automationDetails).toEqual({
+        id: "mcp-compliance/2026-07-28/",
+      });
+      expect(JSON.parse(formatSarif(makeReport())).runs[0].automationDetails).toEqual({
+        id: "mcp-compliance/2025-11-25/",
+      });
+    });
+
+    it("keeps the existing invocation properties next to automationDetails", () => {
+      const run = JSON.parse(formatSarif(modernReport())).runs[0];
+      expect(run.invocations[0].properties.specVersion).toBe("2026-07-28");
+      expect(run.invocations[0].properties.protocolVersion).toBe("2026-07-28");
+      expect(run.invocations[0].properties.serverName).toBe("modern-server");
+    });
+
+    it("falls back to the spec base of the report's version when a result has no specRef", () => {
+      const modernRule = JSON.parse(formatSarif(modernReport())).runs[0].tool.driver.rules[0];
+      expect(modernRule.helpUri).toBe("https://modelcontextprotocol.io/specification/2026-07-28/basic");
+      const legacyRule = JSON.parse(formatSarif(makeReport())).runs[0].tool.driver.rules[0];
+      expect(legacyRule.helpUri).toBe("https://modelcontextprotocol.io/specification/2025-11-25/basic");
+    });
+
+    it("prefers the result's own absolute specRef over the fallback", () => {
+      const ref = "https://modelcontextprotocol.io/specification/2026-07-28/server/discover#response";
+      const rule = JSON.parse(formatSarif(modernReport({ tests: [{ ...discoverFailure, specRef: ref }] }))).runs[0].tool
+        .driver.rules[0];
+      expect(rule.helpUri).toBe(ref);
+    });
+
+    it("gives a 2026-only id its recommendation and description under a 2026 report", () => {
+      const run = JSON.parse(formatSarif(modernReport())).runs[0];
+      expect(run.results[0].ruleId).toBe("lifecycle-discover");
+      expect(run.results[0].message.text).toContain("Fix: Implement a server/discover handler");
+      expect(run.tool.driver.rules[0].fullDescription.text).toContain("Servers MUST implement server/discover");
+    });
+
+    it("does not give a 2026-only id a recommendation under a 2025 report", () => {
+      // Same failing result, only the report's specVersion differs.
+      const run = JSON.parse(formatSarif(makeReport({ tests: [discoverFailure] }))).runs[0];
+      expect(run.results[0].ruleId).toBe("lifecycle-discover");
+      expect(run.results[0].message.text).toBe(discoverFailure.details);
+      expect(run.results[0].message.text).not.toContain("Fix:");
+      // With no catalog entry the rule description falls back to the details.
+      expect(run.tool.driver.rules[0].fullDescription.text).toBe(discoverFailure.details);
+    });
+
+    it("uses the report era's recommendation for an id shared by both catalogs", () => {
+      const modern = JSON.parse(formatSarif(modernReport({ tests: [postFailure] }))).runs[0].results[0].message.text;
+      const legacy = JSON.parse(formatSarif(makeReport({ tests: [postFailure] }))).runs[0].results[0].message.text;
+      expect(modern).toContain("answer a well-formed server/discover with 200");
+      expect(modern).not.toContain("Ensure your server listens for POST requests");
+      expect(legacy).toContain("Ensure your server listens for POST requests");
+      expect(legacy).not.toContain("server/discover");
+    });
+
+    it("treats a report with no specVersion as a 2025-11-25 report", () => {
+      const legacy = makeReport({ tests: [{ ...postFailure }] });
+      // Older reports predate the field; the reporter must not throw or lose recommendations.
+      const stripped = { ...legacy, specVersion: undefined } as unknown as ComplianceReport;
+      const run = JSON.parse(formatSarif(stripped)).runs[0];
+      expect(run.automationDetails.id).toBe("mcp-compliance/2025-11-25/");
+      expect(run.tool.driver.rules[0].helpUri).toBe("https://modelcontextprotocol.io/specification/2025-11-25/basic");
+      expect(run.results[0].message.text).toContain("Ensure your server listens for POST requests");
+    });
+
+    it("keeps an unrecognised specVersion in automationDetails but reads the 2025 catalog", () => {
+      const run = JSON.parse(formatSarif(makeReport({ specVersion: "2025-06-18", tests: [postFailure] }))).runs[0];
+      expect(run.automationDetails.id).toBe("mcp-compliance/2025-06-18/");
+      expect(run.results[0].message.text).toContain("Ensure your server listens for POST requests");
+    });
+  });
+
+  describe("formatTerminal", () => {
+    it("shows the 2026 recommendation for a 2026-only id under a 2026 report", () => {
+      const output = formatTerminal(modernReport());
+      expect(output).toContain("2026-07-28");
+      expect(output).toContain("→ Implement a server/discover handler");
+    });
+
+    it("shows no recommendation for a 2026-only id under a 2025 report", () => {
+      const output = formatTerminal(makeReport({ tests: [discoverFailure] }));
+      expect(output).toContain("-32601 method not found");
+      expect(output).not.toContain("→");
+    });
+
+    it("picks the report era's recommendation for a shared id", () => {
+      const modern = formatTerminal(modernReport({ tests: [postFailure] }));
+      const legacy = formatTerminal(makeReport({ tests: [postFailure] }));
+      expect(modern).toContain("answer a well-formed server/discover with 200");
+      expect(modern).not.toContain("Ensure your server listens for POST requests");
+      expect(legacy).toContain("Ensure your server listens for POST requests");
+      expect(legacy).not.toContain("server/discover");
+    });
+  });
+
+  it("markdown and html print the 2026 spec version unchanged", () => {
+    expect(formatMarkdown(modernReport())).toContain("- **Spec:** 2026-07-28");
+    expect(formatHtml(modernReport())).toContain("Spec 2026-07-28");
   });
 });
