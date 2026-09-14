@@ -1063,7 +1063,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     name: "CORS headers are restrictive",
     category: "security",
     required: false,
-    specRef: "basic/transports/streamable-http#security--endpoint",
+    specRef: "basic/transports/streamable-http#security-%26-endpoint",
     description:
       "Sends a conformant server/discover with an Origin header from a plausible web app and inspects Access-Control-Allow-Origin on the response. A wildcard (*) on an endpoint that accepts bearer credentials lets any page drive the server from a browser; specific origins, or no CORS headers at all, pass.",
     recommendation:
@@ -1075,7 +1075,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     name: "Validates Origin header",
     category: "security",
     required: false,
-    specRef: "basic/transports/streamable-http#security--endpoint",
+    specRef: "basic/transports/streamable-http#security-%26-endpoint",
     description:
       "Sends a fully valid server/discover (correct headers and _meta) with Origin: https://evil-rebinding-attack.example.com so that the origin is the only defect, and expects HTTP 403. Servers MUST validate Origin on all incoming connections and MUST respond 403 Forbidden when it is present and invalid; that is the DNS-rebinding defence for locally bound servers.",
     recommendation:

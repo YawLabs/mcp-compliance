@@ -2244,7 +2244,7 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Category:** security
 - **Default required:** No
 - **Transports:** http
-- **Spec reference:** [basic/transports/streamable-http#security--endpoint](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#security--endpoint)
+- **Spec reference:** [basic/transports/streamable-http#security-%26-endpoint](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#security-%26-endpoint)
 - **Description:** Sends a conformant server/discover with an Origin header from a plausible web app and inspects Access-Control-Allow-Origin on the response. A wildcard (*) on an endpoint that accepts bearer credentials lets any page drive the server from a browser; specific origins, or no CORS headers at all, pass.
 - **Pass criteria:** Access-Control-Allow-Origin on the server/discover response is absent or names a specific origin.
 - **Fail criteria:** Access-Control-Allow-Origin: * is returned.
@@ -2256,7 +2256,7 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Category:** security
 - **Default required:** No
 - **Transports:** http
-- **Spec reference:** [basic/transports/streamable-http#security--endpoint](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#security--endpoint)
+- **Spec reference:** [basic/transports/streamable-http#security-%26-endpoint](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#security-%26-endpoint)
 - **Description:** Sends a fully valid server/discover (correct headers and _meta) with Origin: https://evil-rebinding-attack.example.com so that the origin is the only defect, and expects HTTP 403. Servers MUST validate Origin on all incoming connections and MUST respond 403 Forbidden when it is present and invalid; that is the DNS-rebinding defence for locally bound servers.
 - **Pass criteria:** A fully valid server/discover with Origin: https://evil-rebinding-attack.example.com draws HTTP 403.
 - **Fail criteria:** Any status other than 403 (the origin was not validated).
