@@ -39,6 +39,8 @@ let serverUrl: string;
  * "stripped" requests carried on the wire.
  */
 const pingAuthHeaders: Array<string | undefined> = [];
+/** Request URLs of the same `ping` probes, so the token-in-URI probe is observable. */
+const pingUrls: string[] = [];
 
 function createTestMcpServer(): McpServer {
   const mcp = new McpServer({ name: "auth-test-server", version: "1.0.0" });
@@ -86,6 +88,7 @@ beforeAll(async () => {
         : undefined;
     if (rpcMethod === "ping") {
       pingAuthHeaders.push(auth);
+      pingUrls.push(req.url ?? "");
     }
 
     // Auth gate at the HTTP layer (the SDK transport does not do auth).
@@ -226,6 +229,7 @@ describe("integration — auth-stripping security tests against an auth-requirin
     // entirely). Before the fix, EVERY ping carried the valid token, so
     // this set would be empty and the test would fail.
     pingAuthHeaders.length = 0;
+    pingUrls.length = 0;
     await runComplianceSuite(serverUrl, { headers: authHeaders(), timeout: 3000 });
 
     const seen = JSON.stringify(pingAuthHeaders);
@@ -257,5 +261,30 @@ describe("integration — auth-stripping security tests against an auth-requirin
       const ok = h === undefined || h === VALID_TOKEN || (typeof h === "string" && h.includes("INVALID_GARBAGE_TOKEN"));
       expect(ok, `unexpected auth value on a ping probe: ${JSON.stringify(h)} (all: ${seen})`).toBe(true);
     }
+  }, 30000);
+
+  it("security-token-in-uri really sends the token in the query string and no Authorization header", async () => {
+    // Before the fix the probe went through the transport, which ignores
+    // the URL it was handed and re-injects the configured Authorization
+    // header, so the server saw an ordinary authenticated ping, answered
+    // 200, and the test reported a FALSE "accepted auth token in query
+    // string" failure on every server with auth.
+    pingAuthHeaders.length = 0;
+    pingUrls.length = 0;
+    const report = await runComplianceSuite(serverUrl, {
+      headers: authHeaders(),
+      timeout: 3000,
+      only: ["security-token-in-uri"],
+    });
+    const t = report.tests.find((x) => x.id === "security-token-in-uri");
+    expect(t?.passed, `security-token-in-uri details: ${t?.details}`).toBe(true);
+    expect(t?.details).toMatch(/401|403/);
+
+    const idx = pingUrls.findIndex((u) => u.includes("access_token="));
+    expect(
+      idx,
+      `no ping probe carried access_token in its URL; urls: ${JSON.stringify(pingUrls)}`,
+    ).toBeGreaterThanOrEqual(0);
+    expect(pingAuthHeaders[idx], "the token-in-URI probe must not also carry Authorization").toBeUndefined();
   }, 30000);
 });

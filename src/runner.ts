@@ -1136,64 +1136,6 @@ export async function runComplianceSuite(
       },
     );
 
-    // Progress token test — send request with _meta.progressToken and check for progress events
-    await test(
-      "lifecycle-progress-token",
-      "Supports progress tokens in requests",
-      "lifecycle",
-      false,
-      "basic/utilities#progress",
-      async () => {
-        if (!hasTools || toolNames.length === 0) {
-          return { passed: true, details: "No tools available for progress token test (skipped)" };
-        }
-        // Send a tools/call with _meta.progressToken via raw request to read SSE for progress events
-        const progressToken = "compliance-progress-test";
-        const reqBody = JSON.stringify({
-          jsonrpc: "2.0",
-          id: nextId(),
-          method: "tools/call",
-          params: {
-            name: toolNames[0],
-            arguments: {},
-            _meta: { progressToken },
-          },
-        });
-        try {
-          const res = await request(backendUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Accept: "text/event-stream",
-              ...buildHeaders(),
-            },
-            body: reqBody,
-            signal: AbortSignal.timeout(timeout),
-          });
-          const text = await res.body.text();
-          const rawCtProgress = res.headers["content-type"];
-          const ct = (Array.isArray(rawCtProgress) ? rawCtProgress[0] : rawCtProgress || "").toLowerCase();
-          // Check if any SSE events contain progress notifications
-          if (ct.includes("text/event-stream") && text.includes("notifications/progress")) {
-            return { passed: true, details: "Server sent progress notifications via SSE with progressToken" };
-          }
-          // Server may not support progress — that's acceptable, just note it
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            return {
-              passed: true,
-              details: "Server accepted request with progressToken (no progress events observed — optional)",
-            };
-          }
-          return { passed: true, details: `HTTP ${res.statusCode} — request with progressToken accepted` };
-        } catch {
-          return {
-            passed: true,
-            details: "Request with progressToken handled (no progress events observed — optional)",
-          };
-        }
-      },
-    );
-
     // Client capability awareness: we declare sampling/roots/elicitation
     // in our initialize (below) and verify the server accepts it. Full
     // bidirectional flow testing (server actually calling sampling/
@@ -1786,6 +1728,67 @@ export async function runComplianceSuite(
         },
       );
     }
+
+    // Progress token test — send request with _meta.progressToken and check
+    // for progress events. Lives after the tools section on purpose: it
+    // needs `toolNames`, which tools-list fills. It used to sit among the
+    // lifecycle tests and always saw an empty list, so it never ran.
+    await test(
+      "lifecycle-progress-token",
+      "Supports progress tokens in requests",
+      "lifecycle",
+      false,
+      "basic/utilities#progress",
+      async () => {
+        if (!hasTools || toolNames.length === 0) {
+          return { passed: true, details: "No tools available for progress token test (skipped)" };
+        }
+        // Send a tools/call with _meta.progressToken via raw request to read SSE for progress events
+        const progressToken = "compliance-progress-test";
+        const reqBody = JSON.stringify({
+          jsonrpc: "2.0",
+          id: nextId(),
+          method: "tools/call",
+          params: {
+            name: toolNames[0],
+            arguments: {},
+            _meta: { progressToken },
+          },
+        });
+        try {
+          const res = await request(backendUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+              ...buildHeaders(),
+            },
+            body: reqBody,
+            signal: AbortSignal.timeout(timeout),
+          });
+          const text = await res.body.text();
+          const rawCtProgress = res.headers["content-type"];
+          const ct = (Array.isArray(rawCtProgress) ? rawCtProgress[0] : rawCtProgress || "").toLowerCase();
+          // Check if any SSE events contain progress notifications
+          if (ct.includes("text/event-stream") && text.includes("notifications/progress")) {
+            return { passed: true, details: "Server sent progress notifications via SSE with progressToken" };
+          }
+          // Server may not support progress — that's acceptable, just note it
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            return {
+              passed: true,
+              details: "Server accepted request with progressToken (no progress events observed — optional)",
+            };
+          }
+          return { passed: true, details: `HTTP ${res.statusCode} — request with progressToken accepted` };
+        } catch {
+          return {
+            passed: true,
+            details: "Request with progressToken handled (no progress events observed — optional)",
+          };
+        }
+      },
+    );
 
     // ── 6. RESOURCES ─────────────────────────────────────────────────
 
@@ -2606,10 +2609,28 @@ export async function runComplianceSuite(
         }
         const uriWithToken = `${backendUrl}${backendUrl.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(token)}`;
         try {
-          // Send WITHOUT auth header, WITH token in URI
-          const noAuthHeaders: Record<string, string> = {};
+          // Send WITHOUT the Authorization header, WITH the token in the
+          // URI. This goes through undici directly: the transport is bound
+          // to the plain URL and re-injects the configured Authorization
+          // header on every request, which used to turn this probe into an
+          // ordinary authenticated call whose 2xx read as "accepted a token
+          // in the query string" — a false failure on every server with auth.
+          const noAuthHeaders: Record<string, string> = {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+          };
+          for (const [k, v] of Object.entries(userHeaders)) {
+            if (k.toLowerCase() !== "authorization") noAuthHeaders[k] = v;
+          }
           if (sessionId) noAuthHeaders["mcp-session-id"] = sessionId;
-          const res = await mcpRequest(uriWithToken, "ping", undefined, nextId, noAuthHeaders, timeout);
+          if (negotiatedProtocolVersion) noAuthHeaders["mcp-protocol-version"] = negotiatedProtocolVersion;
+          const res = await request(uriWithToken, {
+            method: "POST",
+            headers: noAuthHeaders,
+            body: JSON.stringify({ jsonrpc: "2.0", id: nextId(), method: "ping" }),
+            signal: AbortSignal.timeout(timeout),
+          });
+          await res.body.text();
           if (res.statusCode === 401 || res.statusCode === 403) {
             return { passed: true, details: `HTTP ${res.statusCode} (token in query string rejected)` };
           }

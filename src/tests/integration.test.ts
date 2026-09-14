@@ -152,6 +152,14 @@ describe("integration — full compliance suite against real server", () => {
     expect(report.tests.length).toBeGreaterThanOrEqual(71);
   }, 30000);
 
+  it("lifecycle-progress-token actually exercises a tool (it used to run before tools/list and always skip)", async () => {
+    const report = await runComplianceSuite(serverUrl, { timeout: 3000 });
+    const t = report.tests.find((x) => x.id === "lifecycle-progress-token");
+    expect(t).toBeDefined();
+    expect(t?.passed).toBe(true);
+    expect(t?.details).not.toMatch(/No tools available/);
+  }, 30000);
+
   it("has no preflight warning for reachable server", async () => {
     const report = await runComplianceSuite(serverUrl, { timeout: 3000 });
     expect(report.warnings.some((w) => w.includes("unreachable"))).toBe(false);
