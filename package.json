@@ -85,7 +85,8 @@
     "stdio",
     "claude-code",
     "cursor",
-    "ai"
+    "ai",
+    "ai-agents"
   ],
   "repository": {
     "type": "git",
