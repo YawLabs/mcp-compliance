@@ -7,6 +7,11 @@ Pre-1.0 releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 loosely — breaking changes can still land in a minor bump, but we'll call them
 out explicitly here.
 
+## [Unreleased]
+
+### Changed
+- npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
+
 ## [0.17.4] — 2026-09-13
 
 ### Fixed
