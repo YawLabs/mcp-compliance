@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import type { TestCategory } from "../types.js";
+import { MODERN_TEST_DEFINITIONS } from "../definitions/index.js";
+import { LEGACY_SPEC_VERSION, MODERN_SPEC_VERSION, type SpecVersion } from "../spec.js";
+import type { TestCategory, TestDefinition } from "../types.js";
 import { TEST_DEFINITIONS } from "../types.js";
 
 const VALID_CATEGORIES: TestCategory[] = [
@@ -122,55 +124,196 @@ describe("TEST_DEFINITIONS", () => {
   });
 });
 
-describe("README ↔ TEST_DEFINITIONS parity", () => {
-  // Regression guard: the per-category counts shown in the README's "What
-  // the N tests check" collapsible sections must match TEST_DEFINITIONS.
-  // Drift previously went unnoticed when capability-gated tests were added
-  // (transport went 13→16 when stdio-only tests landed; lifecycle 17→21
-  // when the capability/meta-tolerance tests landed). A failing test here
-  // is a signal to update the README at the same time.
-  // README uses sentence-case labels that differ from the TestCategory
-  // union ("errors" → "Error Handling", "schema" → "Schema Validation"),
-  // so explicit mapping beats a fancy auto-cased guess.
-  const README_LABELS: Record<TestCategory, string> = {
-    transport: "Transport",
-    lifecycle: "Lifecycle",
-    tools: "Tools",
-    resources: "Resources",
-    prompts: "Prompts",
-    errors: "Error Handling",
-    schema: "Schema Validation",
-    security: "Security",
-  };
+// Regression guard: the per-category counts shown in the README's "What
+// the N tests check (<spec>)" collapsible sections must match the catalog
+// for that spec version. Drift previously went unnoticed when
+// capability-gated tests were added (transport went 13→16 when stdio-only
+// tests landed; lifecycle 17→21 when the capability/meta-tolerance tests
+// landed). A failing test here is a signal to update the README at the
+// same time.
+//
+// The README has one such section per spec revision, each with the same
+// <details><summary> structure, so the counts are scoped to the section
+// whose heading names the revision — an unscoped `src.match` would only
+// ever see the first section and let the second drift silently.
+// README uses sentence-case labels that differ from the TestCategory
+// union ("errors" → "Error Handling", "schema" → "Schema Validation"),
+// so explicit mapping beats a fancy auto-cased guess.
+const README_LABELS: Record<TestCategory, string> = {
+  transport: "Transport",
+  lifecycle: "Lifecycle",
+  tools: "Tools",
+  resources: "Resources",
+  prompts: "Prompts",
+  errors: "Error Handling",
+  schema: "Schema Validation",
+  security: "Security",
+};
 
-  function readmeCountFor(category: TestCategory): number | null {
-    const readmePath = fileURLToPath(new URL("../../README.md", import.meta.url));
-    const src = readFileSync(readmePath, "utf8");
-    const label = README_LABELS[category];
-    const re = new RegExp(`<summary><strong>${label}\\s*\\((\\d+)\\s*tests?\\)</strong></summary>`);
-    const m = src.match(re);
-    return m ? Number.parseInt(m[1], 10) : null;
-  }
+const README_SRC = readFileSync(fileURLToPath(new URL("../../README.md", import.meta.url)), "utf8");
 
-  function runtimeCountFor(category: TestCategory): number {
-    return TEST_DEFINITIONS.filter((t) => t.category === category).length;
-  }
+/** The README section "## What the N tests check (<version>)", up to the next `## ` heading. */
+function readmeSectionFor(version: SpecVersion): { headingCount: number; body: string } | null {
+  const re = new RegExp(`^## What the (\\d+) tests check \\(${version}\\)$`, "m");
+  const m = README_SRC.match(re);
+  if (!m || m.index === undefined) return null;
+  const rest = README_SRC.slice(m.index + m[0].length);
+  const next = rest.search(/^## /m);
+  return { headingCount: Number.parseInt(m[1], 10), body: next === -1 ? rest : rest.slice(0, next) };
+}
 
-  for (const cat of VALID_CATEGORIES) {
-    it(`README section "${cat}" count matches TEST_DEFINITIONS`, () => {
-      const docCount = readmeCountFor(cat);
-      expect(docCount, `README missing "<summary><strong>${cat}...</strong>" header`).not.toBeNull();
-      expect(docCount).toBe(runtimeCountFor(cat));
+function readmeCountFor(body: string, category: TestCategory): number | null {
+  const label = README_LABELS[category];
+  const re = new RegExp(`<summary><strong>${label}\\s*\\((\\d+)\\s*tests?\\)</strong></summary>`);
+  const m = body.match(re);
+  return m ? Number.parseInt(m[1], 10) : null;
+}
+
+const README_CATALOGS: Array<{ version: SpecVersion; defs: TestDefinition[] }> = [
+  { version: LEGACY_SPEC_VERSION, defs: TEST_DEFINITIONS },
+  { version: MODERN_SPEC_VERSION, defs: MODERN_TEST_DEFINITIONS },
+];
+
+for (const { version, defs } of README_CATALOGS) {
+  describe(`README ↔ ${version} catalog parity`, () => {
+    const section = readmeSectionFor(version);
+
+    it(`README has a "What the N tests check (${version})" section`, () => {
+      expect(section, `README missing "## What the N tests check (${version})" heading`).not.toBeNull();
     });
-  }
 
-  it("README totals match TEST_DEFINITIONS total", () => {
-    let sum = 0;
+    it("section heading total matches the catalog length", () => {
+      expect(section?.headingCount).toBe(defs.length);
+    });
+
     for (const cat of VALID_CATEGORIES) {
-      const n = readmeCountFor(cat);
-      if (n != null) sum += n;
+      it(`README section "${cat}" count matches the catalog`, () => {
+        const docCount = section ? readmeCountFor(section.body, cat) : null;
+        expect(
+          docCount,
+          `README ${version} section missing "<summary><strong>${cat}...</strong>" header`,
+        ).not.toBeNull();
+        expect(docCount).toBe(defs.filter((t) => t.category === cat).length);
+      });
     }
-    expect(sum).toBe(TEST_DEFINITIONS.length);
+
+    it("README per-category totals sum to the catalog length", () => {
+      let sum = 0;
+      for (const cat of VALID_CATEGORIES) {
+        const n = section ? readmeCountFor(section.body, cat) : null;
+        if (n != null) sum += n;
+      }
+      expect(sum).toBe(defs.length);
+    });
+  });
+}
+
+describe("MODERN_TEST_DEFINITIONS", () => {
+  it("contains exactly 103 test definitions", () => {
+    expect(MODERN_TEST_DEFINITIONS).toHaveLength(103);
+  });
+
+  it("all IDs are unique", () => {
+    const ids = MODERN_TEST_DEFINITIONS.map((t) => t.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("all have valid categories", () => {
+    for (const def of MODERN_TEST_DEFINITIONS) {
+      expect(VALID_CATEGORIES).toContain(def.category);
+    }
+  });
+
+  it("all have non-empty names, descriptions, recommendations and specRefs", () => {
+    for (const def of MODERN_TEST_DEFINITIONS) {
+      expect(def.name.length, def.id).toBeGreaterThan(0);
+      expect(def.description.length, def.id).toBeGreaterThan(0);
+      expect(def.recommendation.length, def.id).toBeGreaterThan(0);
+      expect(def.specRef.length, def.id).toBeGreaterThan(0);
+    }
+  });
+
+  it("has correct category counts", () => {
+    const counts: Record<string, number> = {};
+    for (const def of MODERN_TEST_DEFINITIONS) {
+      counts[def.category] = (counts[def.category] || 0) + 1;
+    }
+    expect(counts.transport).toBe(20);
+    expect(counts.lifecycle).toBe(22);
+    expect(counts.tools).toBe(6);
+    expect(counts.resources).toBe(8);
+    expect(counts.prompts).toBe(4);
+    expect(counts.errors).toBe(12);
+    expect(counts.schema).toBe(10);
+    expect(counts.security).toBe(21);
+  });
+
+  it("has correct required test count", () => {
+    // Default required (before capability gating), 24: transport-post,
+    // transport-content-type, transport-batch-reject, the four
+    // transport-header-* MUSTs, transport-no-server-requests,
+    // lifecycle-discover(-versions,-caching), lifecycle-jsonrpc,
+    // lifecycle-id-match, lifecycle-capabilities, the four lifecycle-meta-*
+    // envelope rules, lifecycle-version-unsupported,
+    // lifecycle-log-level-gating, error-unknown-method, error-method-code,
+    // schema-result-type, schema-no-input-required-on-lists.
+    const required = MODERN_TEST_DEFINITIONS.filter((t) => t.required);
+    expect(required.length).toBe(24);
+  });
+
+  it("IDs match expected format (kebab-case)", () => {
+    for (const def of MODERN_TEST_DEFINITIONS) {
+      expect(def.id).toMatch(/^[a-z]+-[a-z0-9-]+$/);
+    }
+  });
+
+  it("specRefs are relative to the spec base (no scheme, no leading slash)", () => {
+    for (const def of MODERN_TEST_DEFINITIONS) {
+      expect(def.specRef, def.id).not.toMatch(/^https?:\/\//);
+      expect(def.specRef, def.id).not.toMatch(/^\//);
+    }
+  });
+
+  it("transports, when set, is a non-empty list of http/stdio", () => {
+    for (const def of MODERN_TEST_DEFINITIONS) {
+      if (def.transports === undefined) continue;
+      expect(def.transports.length, def.id).toBeGreaterThan(0);
+      for (const t of def.transports) expect(["http", "stdio"], def.id).toContain(t);
+    }
+  });
+
+  it("stdio-* tests are stdio-only and every other transport-category test is HTTP-only except the post-hoc scan", () => {
+    for (const def of MODERN_TEST_DEFINITIONS) {
+      if (def.id.startsWith("stdio-")) expect(def.transports, def.id).toEqual(["stdio"]);
+      else if (def.category === "transport" && def.id !== "transport-no-server-requests") {
+        expect(def.transports, def.id).toEqual(["http"]);
+      }
+    }
+  });
+
+  it("every id shared with the legacy catalog keeps the same category", () => {
+    const legacy = new Map(TEST_DEFINITIONS.map((t) => [t.id, t.category]));
+    const mismatched = MODERN_TEST_DEFINITIONS.filter((t) => legacy.has(t.id) && legacy.get(t.id) !== t.category).map(
+      (t) => `${t.id}: ${legacy.get(t.id)} → ${t.category}`,
+    );
+    expect(mismatched).toEqual([]);
+  });
+
+  it("does not carry ids for mechanisms 2026-07-28 removed", () => {
+    const ids = new Set(MODERN_TEST_DEFINITIONS.map((t) => t.id));
+    for (const gone of [
+      "lifecycle-init",
+      "lifecycle-ping",
+      "lifecycle-logging",
+      "lifecycle-reinit-reject",
+      "resources-subscribe",
+      "transport-session-id",
+      "transport-get",
+      "security-session-entropy",
+      "security-session-not-auth",
+    ]) {
+      expect(ids.has(gone), gone).toBe(false);
+    }
   });
 });
 

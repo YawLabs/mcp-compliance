@@ -2,16 +2,21 @@
 
 ## Where time goes today
 
-Run `mcp-compliance benchmark` against a fast stdio fixture: the whole 88-test suite completes in ~3 seconds. Rough breakdown:
+Run `mcp-compliance benchmark` against a fast stdio fixture: the whole 88-test 2025-11-25 suite completes in ~3 seconds. Rough breakdown:
 
 | Phase | Cost | Notes |
 |---|---|---|
 | Transport spawn / TCP handshake | 50–150 ms | Once per run |
-| Lifecycle handshake (initialize + notifications/initialized) | ~50 ms | Sequential — can't parallelize; must happen first |
+| Spec-version detection (`--spec-version auto`) | 0–1 round-trip | One modern `server/discover`. On HTTP it **is** the preflight request, so it costs nothing extra; on stdio it is the first exchange and its reply seeds the modern suite, so a modern server pays nothing extra either. A legacy stdio server that ignores unknown methods pays the startup timeout once. Pinning `--spec-version` skips it. |
+| Lifecycle handshake (initialize + notifications/initialized) | ~50 ms | 2025-11-25 only. Sequential — can't parallelize; must happen first |
 | Main test loop (82 independent tests × ~25 ms each) | ~2000 ms | **This is the bulk of the runtime** |
 | Cleanup / close | 50–200 ms | Sequential for correctness |
 
 **Takeaway:** the ~2 s of main-loop work is what parallel execution would address. Cut it to ~500 ms if we ran 4 tests in flight simultaneously. For a CI job that already takes minutes, the savings are noise. For a human dev loop (watch mode), it's the difference between "snappy" and "there's noticeable latency."
+
+### The 2026-07-28 suite is stateless
+
+The 103-test 2026-07-28 suite has no handshake, no session id and no negotiated version to carry between requests: every request is self-describing (`params._meta` + mirrored headers), so hazards 1 and 2 below do not exist there. It still runs sequentially by default, for three reasons that do survive the era change: the list caches (hazard 3), the server-side concurrency assumption (hazard 4), and the post-hoc rules -- `transport-no-server-requests`, `lifecycle-log-level-gating`, `error-id-echo`, `error-retired-codes` and the four `schema-*` scans run over a Recorder of every message the server sent, and they need every other test to have drained first. Only four modern tests are marked `parallelSafe` today (`lifecycle-string-id`, `lifecycle-server-info`, `lifecycle-instructions`, `lifecycle-meta-tolerance`); more of the discover-result and envelope-rejection tests are candidates once we have concurrency data from real servers. The `security-rate-limiting` burst (50 requests) is shared with the legacy suite and the header/`_meta` rejection probes are one round-trip each, so expect the modern suite's wall time to sit in the same few-second range against a comparable fixture; it has not been benchmarked separately yet.
 
 ## Why we haven't parallelized yet
 

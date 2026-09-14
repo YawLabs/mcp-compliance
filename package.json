@@ -2,7 +2,7 @@
   "name": "@yawlabs/mcp-compliance",
   "version": "0.17.3",
   "mcpName": "io.github.YawLabs/mcp-compliance",
-  "description": "MCP compliance testing: 88-test spec suite for any MCP server over HTTP or stdio, with A-F grading, a CLI, an MCP server, and CI output.",
+  "description": "MCP compliance testing: spec suites for MCP 2025-11-25 (88 tests) and 2026-07-28 (103 tests), auto-detected per server, for any MCP server over HTTP or stdio, with A-F grading, a CLI, an MCP server, and CI output.",
   "license": "MIT",
   "author": "Yaw Labs <contact@yaw.sh> (https://yaw.sh)",
   "type": "module",

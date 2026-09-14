@@ -4,6 +4,8 @@ Recipes for the most frequent test failures, grouped by category. Every recipe n
 
 Code samples use the official MCP TypeScript SDK where applicable and vanilla HTTP / stdio where not.
 
+The tool grades one spec revision per run (`report.specVersion`; see [the spec version policy](./SPEC_VERSION_MIGRATION.md)). The recipes up to [Stdio-specific](#stdio-specific) are written for the **2025-11-25** suite; ids that also exist in the 2026-07-28 catalog (`tools-schema`, `security-*`, `stdio-*`, `error-method-code`, ...) are the same check in both eras, so those recipes apply to both. Failures unique to the **2026-07-28** suite -- `server/discover`, `_meta`, header validation, caching hints, `resultType`, MRTR -- are in [2026-07-28 failures](#2026-07-28-failures).
+
 ---
 
 ## Transport
@@ -252,11 +254,11 @@ if (typeof msg.jsonrpc !== 'string' || typeof msg.method !== 'string') {
 
 ## Schema validation
 
-### `schema-tools-required-fields` — All tools have name and inputSchema (required)
+### `tools-schema` — All tools have name and inputSchema (second failure mode)
 
 **Failure:** `Tool at index 2 missing name field`.
 
-**Fix:** every entry in your tools list needs at minimum `name: string` and `inputSchema: {...}`. These aren't optional per spec.
+**Fix:** every entry in your tools list needs at minimum `name: string` and `inputSchema: {...}`. These aren't optional per spec. (The `type: "object"` wrapper failure of the same rule is covered under [Tools](#tools-schema--all-tools-have-valid-inputschema-required-when-tools-declared).)
 
 ---
 
@@ -401,6 +403,232 @@ try {
 }
 // loop continues; next line gets read
 ```
+
+---
+
+## 2026-07-28 failures
+
+Everything below is specific to the 2026-07-28 suite. The shape that ties these together: there is **no session and no handshake**. Every request is self-describing (`params._meta` carries the protocol version and client capabilities; on HTTP the standard headers mirror the body), `server/discover` is how a client learns what you serve, and every result says what kind of result it is. Most first-run failures on a freshly upgraded server come from one of three places: the `_meta` envelope is not validated, results are missing the new required fields (`resultType`, `ttlMs`, `cacheScope`), or legacy handlers (`ping`, `logging/setLevel`, `resources/subscribe`) are still registered.
+
+If you use the official SDK 2.0 (`@modelcontextprotocol/server`), all of the below is handled by the framework; these recipes are for hand-rolled servers and for SDK 1.x servers that added `server/discover` by hand.
+
+### `lifecycle-discover` — server/discover returns DiscoverResult (required)
+
+**Failure:** `-32601 Method not found` (the run also auto-detected as 2025-11-25 unless you pinned), or a result without `supportedVersions` / `capabilities`.
+
+**Fix:** implement `server/discover`. It must work with no prior request and is the first thing every modern client sends:
+
+```ts
+handlers['server/discover'] = () => ({
+  resultType: 'complete',
+  supportedVersions: ['2026-07-28'],
+  capabilities: { tools: { listChanged: true }, resources: {}, prompts: {} },
+  instructions: 'Optional guidance for the model.',
+  ttlMs: 3_600_000,
+  cacheScope: 'public',
+  _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'my-server', version: '1.0.0' } },
+});
+```
+
+`supportedVersions` is a list of date strings (`lifecycle-discover-versions`); list every revision you implement, e.g. `['2026-07-28', '2025-11-25']` for a dual-era server. `serverInfo` lives in `_meta`, not at the top level (`lifecycle-server-info`).
+
+### `lifecycle-meta-required`, `lifecycle-meta-protocol-version-required`, `lifecycle-meta-client-capabilities-required` — Rejects malformed `_meta` (required)
+
+**Failure:** `expected JSON-RPC error, got result` -- the server served a request that had no `_meta`, or a `_meta` missing `protocolVersion` or `clientCapabilities`.
+
+**Fix:** validate the envelope on **every** request, `server/discover` included, before dispatch. Both keys are required; `clientInfo` is optional (`lifecycle-meta-client-info-optional` fails you if you reject its absence). Do not default the missing fields and do not fill `protocolVersion` in from the HTTP header:
+
+```ts
+const META = 'io.modelcontextprotocol/';
+function validateMeta(msg) {
+  const meta = msg.params?._meta;
+  if (!meta || typeof meta !== 'object') return 'missing _meta';
+  if (typeof meta[`${META}protocolVersion`] !== 'string') return 'missing protocolVersion';
+  if (!meta[`${META}clientCapabilities`] || typeof meta[`${META}clientCapabilities`] !== 'object') return 'missing clientCapabilities';
+  return null;
+}
+// ...
+const problem = validateMeta(msg);
+if (problem) {
+  return reply(400, { jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: `Invalid params: ${problem}` } });
+}
+```
+
+`-32602` is the expected code; `-32020` passes with a warning. On HTTP the status must be 400. Unknown `_meta` keys must be tolerated (`lifecycle-meta-tolerance`) -- validate the reserved keys you read, never `additionalProperties: false`.
+
+### `lifecycle-version-unsupported` — Rejects unsupported protocol version (required)
+
+**Failure:** `expected -32022, got -32602` / `data.supported missing` / `HTTP 200`.
+
+**Fix:** after the envelope is well-formed, check the version against your list and answer with the dedicated error, including `data.supported` (identical to what `server/discover` advertises) and `data.requested`:
+
+```ts
+const SUPPORTED = ['2026-07-28'];
+const requested = meta[`${META}protocolVersion`];
+if (!SUPPORTED.includes(requested)) {
+  return reply(400, {
+    jsonrpc: '2.0', id: msg.id,
+    error: { code: -32022, message: 'Unsupported protocol version', data: { supported: SUPPORTED, requested } },
+  });
+}
+```
+
+Order matters on HTTP: check the header/`_meta` mismatch first (next recipe), then the version, so a mismatch is reported as `-32020` and an unknown version as `-32022`.
+
+### `transport-header-version-required`, `transport-header-version-mismatch`, `transport-header-method-required`, `transport-header-method-mismatch`, `transport-header-name-mismatch` — Rejects missing or mismatched standard headers (HTTP; required except `-name-`)
+
+**Failure:** `expected HTTP 400, got 200` -- the server ran a request whose `MCP-Protocol-Version` or `Mcp-Method` header was missing, or disagreed with the body.
+
+**Fix:** every POST carries `MCP-Protocol-Version` (must equal `_meta` protocolVersion) and `Mcp-Method` (must equal the body's `method`); `tools/call`, `resources/read` and `prompts/get` also carry `Mcp-Name` (must equal `params.name` / `params.uri`, after Base64-sentinel decoding). Validate before dispatch and reject with 400 + `-32020`:
+
+```ts
+function decodeHeaderValue(v) {
+  const m = /^=\?base64\?(.*)\?=$/.exec(v);
+  return m ? Buffer.from(m[1], 'base64').toString('utf8') : v;
+}
+const h = (name) => req.headers[name.toLowerCase()]; // Node lowercases header names; compare values exactly
+const mismatch = (what) =>
+  reply(400, { jsonrpc: '2.0', id: msg.id, error: { code: -32020, message: `Header mismatch: ${what}` } });
+
+if (!h('MCP-Protocol-Version')) return mismatch('MCP-Protocol-Version missing');
+if (h('MCP-Protocol-Version') !== meta[`${META}protocolVersion`]) return mismatch('MCP-Protocol-Version');
+if (!h('Mcp-Method')) return mismatch('Mcp-Method missing');
+if (h('Mcp-Method') !== msg.method) return mismatch('Mcp-Method');
+const named = { 'tools/call': 'name', 'prompts/get': 'name', 'resources/read': 'uri' }[msg.method];
+if (named && decodeHeaderValue(h('Mcp-Name') ?? '') !== msg.params?.[named]) return mismatch('Mcp-Name');
+```
+
+Read headers through your framework's case-insensitive accessor; `transport-header-case-insensitive` sends them in lowercase and expects a normal result. The legacy "no header means 2025-03-26" fallback applies only to requests whose body carries no modern `_meta`.
+
+### `lifecycle-discover-caching`, `tools-list-caching`, `resources-list-caching`, `resources-read-caching`, `prompts-list-caching`, `resources-templates-caching` — Caching hints (required when the capability is declared)
+
+**Failure:** `ttlMs missing` / `cacheScope "none" is not public|private` / `ttlMs -1`.
+
+**Fix:** every *complete* result of `server/discover`, `tools/list`, `resources/list`, `resources/templates/list`, `resources/read` and `prompts/list` carries both hints. `ttlMs` is an integer `>= 0` (`0` means "always re-fetch"; use it for volatile data rather than omitting the field), `cacheScope` is `'public'` or `'private'`:
+
+```ts
+const CACHE = { ttlMs: 300_000, cacheScope: 'public' };
+handlers['tools/list'] = () => ({ resultType: 'complete', tools, ...CACHE });
+handlers['resources/read'] = ({ uri }) => ({ resultType: 'complete', contents: read(uri), ttlMs: 0, cacheScope: 'private' });
+```
+
+Use `'private'` whenever the list or content depends on who is asking, and keep the same scope on every page of one list. `input_required` interim results carry no hints.
+
+### `schema-result-type` — Every result carries resultType (required)
+
+**Failure:** `3 result(s) without resultType: tools/list, tools/call, prompts/get`.
+
+**Fix:** add `resultType: 'complete'` to every successful result, including empty ones. `'input_required'` is reserved for `InputRequiredResult` (next recipe). A result without `resultType` is what a 2025-11-25 server returns, which is exactly what this rule catches:
+
+```ts
+function complete(result) { return { resultType: 'complete', ...result }; }
+handlers['prompts/list'] = () => complete({ prompts, ...CACHE });
+```
+
+### `transport-no-server-requests`, `schema-no-input-required-on-lists`, `schema-input-required-shape` — MRTR instead of server-initiated requests
+
+**Failure:** `server-to-client request observed: sampling/createMessage (id 7)` or `input_required result on tools/list`.
+
+**Fix:** 2026-07-28 has no server-to-client requests. Sampling, elicitation and roots travel *inside* the result of the request that needs them, and only for `tools/call`, `prompts/get` and `resources/read`:
+
+```ts
+// WRONG (2025-11-25): push a request onto the response stream and wait
+// RIGHT: return an InputRequiredResult and finish when the client retries
+handlers['tools/call'] = ({ name, arguments: args, inputResponses, requestState }) => {
+  if (name === 'ask' && !inputResponses?.answer) {
+    return {
+      resultType: 'input_required',
+      inputRequests: { answer: { method: 'elicitation/create', params: { mode: 'form', message: 'Which one?', requestedSchema: { type: 'object', properties: { choice: { type: 'string' } } } } } },
+      requestState: 'opaque-token-you-can-verify',
+    };
+  }
+  // the retry carries the client's answers in params.inputResponses (keyed like inputRequests)
+  // and echoes params.requestState verbatim
+  return { resultType: 'complete', content: [{ type: 'text', text: `you chose ${inputResponses.answer.content?.choice}` }] };
+};
+```
+
+Only request capabilities the client declared in its `clientCapabilities`, and treat `requestState` as attacker-controlled on the retry (HMAC or AEAD it if it influences authorization).
+
+### `lifecycle-removed-methods`, `error-unknown-method` — Removed methods and 404 (required for unknown methods)
+
+**Failure:** `ping returned a result` / `logging/setLevel returned a result` / `unknown method: HTTP 200` (passes with a warning).
+
+**Fix:** `ping`, `logging/setLevel`, `resources/subscribe` and `resources/unsubscribe` do not exist in 2026-07-28. Drop the handlers from the modern code path and let them fall through to `-32601`, and on HTTP answer unknown methods with status **404** together with the JSON-RPC error -- the body is what lets a modern client tell your 404 from a legacy HTTP+SSE server that has no MCP endpoint:
+
+```ts
+const handler = handlers[msg.method];
+if (!handler) {
+  return reply(404, { jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'Method not found' } });
+}
+```
+
+A dual-era server keeps the legacy handlers behind the `initialize` session only.
+
+### `resources-not-found`, `error-retired-codes` — Nonexistent resource returns -32602
+
+**Failure:** `expected -32602, got -32002 (retired)` or `empty contents for a nonexistent uri`.
+
+**Fix:** `-32002` was retired (so was `-32042`); a missing resource is `-32602 Invalid params`, and `contents: []` is never the answer for a URI you cannot resolve:
+
+```ts
+handlers['resources/read'] = ({ uri }) => {
+  const r = store.get(uri);
+  if (!r) throw { code: -32602, message: 'Resource not found', data: { uri } };
+  return { resultType: 'complete', contents: [{ uri, mimeType: r.mimeType, text: r.text }], ...CACHE };
+};
+```
+
+`data.uri` is a SHOULD; omitting it passes with a warning. Grep your codebase for `-32002` and `-32042`.
+
+### `lifecycle-subscriptions-listen` — subscriptions/listen acknowledges first
+
+**Failure:** `first frame was notifications/tools/list_changed, expected notifications/subscriptions/acknowledged` or `subscriptionId "abc" != request id 1042`.
+
+**Fix:** if you declare any `listChanged` or `subscribe` capability, implement `subscriptions/listen` as a long-lived response (an SSE stream on HTTP; frames tagged with the subscription id on stdio). The **first** frame is the acknowledgment, its subscription id is the listen request's own id, and `notifications` names the subset you honour:
+
+```ts
+// HTTP: res is a text/event-stream response kept open until the client closes it
+res.write(`event: message\ndata: ${JSON.stringify({
+  jsonrpc: '2.0',
+  method: 'notifications/subscriptions/acknowledged',
+  params: {
+    _meta: { 'io.modelcontextprotocol/subscriptionId': msg.id },
+    notifications: { 'notifications/tools/list_changed': {} },
+  },
+})}\n\n`);
+subscribers.add(res); // later list_changed notifications go here, never on a request's response stream
+```
+
+If you advertise nothing, `-32601` for `subscriptions/listen` is fine. The standalone HTTP GET stream is gone; answer GET with 405 (`transport-get-removed`).
+
+### `lifecycle-log-level-gating` — No log notifications without logLevel (required)
+
+**Failure:** `notifications/message on tools/call (id 1010) which set no logLevel`.
+
+**Fix:** there is no `logging/setLevel` and no global level. Log notifications are per request: emit `notifications/message` only on the response stream of a request whose `_meta` carried `io.modelcontextprotocol/logLevel`, and only at or above that level. Remove any default level left over from `logging/setLevel`:
+
+```ts
+const level = msg.params?._meta?.['io.modelcontextprotocol/logLevel']; // undefined = the client did not opt in
+const log = (lvl, data) => { if (level && rank(lvl) >= rank(level)) stream.notify('notifications/message', { level: lvl, data }); };
+```
+
+Never send `notifications/message` on a `subscriptions/listen` stream.
+
+### `lifecycle-dual-era` — Legacy initialize probe (informational)
+
+**Not a failure**, but two things it surfaces:
+
+- A **modern-only** server SHOULD name its supported versions in the error it returns to `initialize`; a bare `-32601` draws a warning. Legacy clients have no fall-forward mechanism, so that message is the only diagnostic they will ever see:
+
+  ```ts
+  handlers['initialize'] = undefined;
+  if (msg.method === 'initialize') {
+    return reply(400, { jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'This server speaks MCP 2026-07-28 only; initialize is not supported' } });
+  }
+  ```
+
+- A **dual-era** server (answers `initialize` too) is graded as 2026-07-28 under `--spec-version auto`, with a warning. Its legacy side is not graded in that run; use `--spec-version 2025-11-25` for that. If the modern side was an afterthought, expect the caching-hint, `resultType` and `_meta` recipes above to be the first failures.
 
 ---
 

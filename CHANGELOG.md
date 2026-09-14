@@ -9,7 +9,93 @@ out explicitly here.
 
 ## [Unreleased]
 
+### Added
+- **MCP 2026-07-28 support (#63).** A second test catalog, `MODERN_TEST_DEFINITIONS`
+  (103 tests in the same 8 categories: 20 transport, 22 lifecycle, 6 tools, 8
+  resources, 4 prompts, 12 errors, 10 schema, 21 security), and a stateless suite
+  for the per-request-`_meta` era: `server/discover` instead of `initialize`,
+  `_meta` and standard-header validation (`-32602`, `-32020`, `-32022`), caching
+  hints (`ttlMs` / `cacheScope`) on every cacheable result, `resultType` on every
+  result, `-32602` for missing resources, `subscriptions/listen` acknowledgment,
+  per-request log-level gating, MRTR `input_required` results, and rejection of
+  the removed `ping` / `logging/setLevel` / `resources/subscribe` methods. Eight
+  post-hoc tests scan a recording of every message the server sent, including a
+  full validation against the vendored 2026-07-28 JSON schema. Ids shared with the
+  2025-11-25 catalog are semantically identical checks; changed checks have new
+  ids (`lifecycle-discover`, `transport-get-removed`, `resources-not-found`, ...).
+- **`--spec-version auto|2025-11-25|2026-07-28`** on `test` and `benchmark`, a
+  `specVersion` key in the config file, a `specVersion` input on the
+  `mcp_compliance_test` MCP tool (and an optional one on `mcp_compliance_explain`,
+  which otherwise searches both catalogs), and a `spec-version` input + output on
+  the GitHub Action. `--list --spec-version` previews either catalog offline.
+- **Library API:** `SUPPORTED_SPEC_VERSIONS`, `SpecVersion`, `specBaseFor()`,
+  `getTestDefinitions(version)`, `findTestDefinition()`, `MODERN_TEST_DEFINITIONS`,
+  `detectSpecVersion()` / `classifyDiscoverResponse()`, and `RunOptions.specVersion`
+  / `PreviewOptions.specVersion`. `TEST_DEFINITIONS` is unchanged (the 2025-11-25
+  list). `SPEC_VERSION` and `SPEC_BASE` keep their 2025-11-25 values and are
+  deprecated in favour of `report.specVersion` + `specBaseFor()`.
+- **`benchmark` is spec-aware.** It measures `server/discover` on 2026-07-28 (there
+  is no `ping`) and `initialize` + `ping` on 2025-11-25; the result names the
+  `specVersion` and `method` measured.
+- **Methodology 2.0.0.** `COMPLIANCE_RUBRIC.md` gains an execution model per spec
+  revision (section 1.5), a 2026-07-28 rules section (3b), and modern-server
+  adoption notes; `mcp-compliance-rules.json` tags every rule with `specVersion`
+  and carries both catalogs (`mcpSpecCompatibility` is now an array, which is the
+  catalog-schema change that makes this a major bump). A new
+  `src/tests/catalog-parity.test.ts` keeps both files and the README in lock-step
+  with the code's catalogs.
+
+### Changed
+- **`--spec-version` defaults to `auto`, which changes what existing users get.**
+  Every run now starts with one conformant 2026-07-28 `server/discover` (on HTTP
+  it is the preflight request, so no extra round-trip; on stdio it is the first
+  exchange). A `DiscoverResult` or a modern error code selects the 2026-07-28
+  suite; anything else — including no reply within the startup timeout — selects
+  2025-11-25, so servers that exist today are graded exactly as before. The
+  behaviour change is for servers that later upgrade to an SDK speaking
+  2026-07-28: on the next run the same CI config switches suites (103 tests, 24
+  required by default, different ids, a warning in the report saying so) and the
+  grade can move. Pin `--spec-version 2025-11-25` to keep today's suite
+  byte-for-byte. Dual-era servers are graded as 2026-07-28 with a warning naming
+  the other era.
+- **`report.specVersion` is now a run-time value, not a tool-version constant.**
+  One tool version emits `"2025-11-25"` or `"2026-07-28"` (always the resolved
+  revision, never `"auto"`); consumers must read it before interpreting test ids.
+  The report schema is unchanged (`schemaVersion: "1"`).
+- **`diff` error text.** On a `specVersion` mismatch the message now names both
+  versions and tells you to re-run with `--spec-version <baseline's>` or take a
+  new baseline; the old advice to downgrade the tool no longer applies. The diff
+  summary and output name the spec version.
+- **SARIF runs carry `automationDetails.id = "mcp-compliance/<specVersion>/"`**
+  so GitHub Code Scanning tracks the two suites as separate analyses instead of
+  closing every 2025-11-25 alert when a server switches revisions.
+- **`ajv` and `ajv-formats` are runtime dependencies** (previously dev-only): the
+  2026-07-28 suite validates recorded server messages against the spec schema.
+- **Config forward-compatibility:** a config file that sets `specVersion` is
+  rejected as an unknown key by mcp-compliance < 0.18. Pin the tool version where
+  such a config is consumed.
+- `--only` / `--skip` values that match no test id or category in the resolved
+  catalog now produce a warning naming the miss (and the `--list --spec-version`
+  command to see valid ids) instead of silently running an empty or partial suite
+  and grading it F.
+
 ### Fixed
+- **`security-token-in-uri` never put the token in the URI.** The probe went through
+  the transport, which ignores the URL it is handed and re-injects the configured
+  `Authorization` header, so every authenticated server answered an ordinary
+  authenticated `ping` with 200 and the test reported a false "accepted auth token
+  in query string" failure. It now POSTs to `?access_token=<token>` with no
+  `Authorization` header.
+- **`lifecycle-progress-token` always skipped.** It ran among the lifecycle tests,
+  before `tools/list` had populated the tool names, so it always took the "No
+  tools available" branch. It now runs after the tools section and calls a real
+  tool.
+- **Config `format` accepted only `terminal`, `json`, `sarif`** (#67) and rejected
+  `github`, `markdown` and `html`, which the CLI accepts. The config loader now
+  takes every CLI format.
+- **`benchmark` counted JSON-RPC error replies as successful requests**, so a
+  server answering `-32601` to every probe reported error-path latency with
+  `failed: 0`. Error bodies are now failures.
 - **The launcher no longer spawns a nested oam when it is already running on oam.** A host that resolves this package's `bin` and launches `oam run bin/mcp-compliance.mjs` — Yaw MCP does, and so does oam's sidecar regression matrix — got a second runtime boot, because the launcher discovered and spawned oam without asking what it was already running on (measured on Windows: `oam.exe` with a nested `oam.exe` + `conhost.exe` underneath). When `process.versions.oam` clears the same 0.9.0 floor a discovered binary must, the CLI is now imported into the current process. Nothing is lost, since this launcher applies no sandbox; a host oam below the floor keeps the discovery path.
 - **The launcher no longer dies with a raw stack trace when `spawn` fails.** Node throws synchronously rather than emitting `error` for some unexecutable targets — notably a `.cmd`/`.bat` on Windows — and the `error` listener is registered *after* the `spawn` call, so it could never observe that throw. Both failure modes now route through one handler.
 - **Windows `PATH` discovery accepts `oam.exe` only**, instead of walking every `PATHEXT` entry and returning an `oam.cmd` Node cannot execute. A skipped shim is still **named** in the diagnostic, so an npm-style install no longer reports as "no oam binary was found".
