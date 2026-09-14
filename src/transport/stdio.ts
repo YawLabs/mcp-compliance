@@ -1,5 +1,12 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import type { Transport, TransportNotifyResult, TransportResponse } from "./index.js";
+import type {
+  JsonRpcId,
+  MessageListener,
+  Transport,
+  TransportNotifyResult,
+  TransportResponse,
+  TransportStream,
+} from "./index.js";
 
 export interface StdioTransportOptions {
   command: string;
@@ -30,12 +37,18 @@ export interface StdioTransport extends Transport {
   readonly exited: boolean;
   /** Exit code once the child has exited, null otherwise. */
   readonly exitCode: number | null;
+  /**
+   * Write one raw line to the child's stdin, bypassing JSON-RPC framing.
+   * Lets the malformed-message error tests (invalid JSON, invalid
+   * JSON-RPC) run over stdio the way they run over HTTP.
+   */
+  writeRaw(line: string): Promise<void>;
 }
 
 interface PendingRequest {
   resolve: (res: TransportResponse) => void;
   reject: (err: Error) => void;
-  id: number;
+  id: JsonRpcId;
   timer: NodeJS.Timeout;
 }
 
@@ -71,9 +84,20 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
   let exitCode: number | null = null;
   let spawnError: Error | null = null;
   let spawned = false;
-  const pending = new Map<number, PendingRequest>();
+  const pending = new Map<JsonRpcId, PendingRequest>();
+  const listeners = new Set<MessageListener>();
   let stdoutBuffer = "";
   let stderrBuffer = "";
+
+  function emit(message: unknown) {
+    for (const l of listeners) {
+      try {
+        l(message);
+      } catch {
+        // A listener must never break the transport.
+      }
+    }
+  }
 
   // Wait for the 'spawn' event before accepting writes. Without this,
   // request() called immediately after createStdioTransport() would
@@ -152,20 +176,21 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
       return;
     }
     if (!parsed || typeof parsed !== "object") return;
+    // Every parsed message — notifications included — is fanned out to
+    // onMessage listeners, so held-open streams and the modern suite's
+    // recorder see them. Only responses are matched to pending requests.
+    emit(parsed);
     const msg = parsed as { id?: number | string; jsonrpc?: string };
-    if (typeof msg.id === "number" && pending.has(msg.id)) {
+    if ((typeof msg.id === "number" || typeof msg.id === "string") && pending.has(msg.id)) {
       const p = pending.get(msg.id);
       if (!p) return;
       clearTimeout(p.timer);
       pending.delete(msg.id);
       p.resolve({ body: parsed, requestId: msg.id });
     }
-    // Only numeric ids are matched: the runner and benchmark allocate ids
-    // via numeric counters for stdio and `pending` is keyed by number. A
-    // server echoing a string id would time out here rather than resolve —
-    // but the suite never sends string ids over stdio (lifecycle-string-id
-    // is HTTP-only via STDIO_INCOMPATIBLE_IDS in runner.ts).
-    // Notifications (no id) and unmatched ids are dropped.
+    // Ids are matched by value AND type (a Map key): a server that
+    // answers a numeric id with the same digits as a string is not
+    // echoing the id, and its reply times out here as it should.
   }
 
   function rejectAllPending(err: Error) {
@@ -238,16 +263,43 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
       return new Promise<TransportResponse>((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
+          detach();
           reject(
             new Error(
               annotateWithStderr(`stdio transport: request timed out after ${init.timeout}ms (method=${method})`),
             ),
           );
         }, init.timeout);
-        pending.set(id, { resolve, reject, id, timer });
+        const onAbort = () => {
+          clearTimeout(timer);
+          pending.delete(id);
+          const reason = init.signal?.reason;
+          reject(reason instanceof Error ? reason : new Error("stdio transport: request aborted"));
+        };
+        const detach = () => init.signal?.removeEventListener("abort", onAbort);
+        if (init.signal) {
+          if (init.signal.aborted) {
+            onAbort();
+            return;
+          }
+          init.signal.addEventListener("abort", onAbort, { once: true });
+        }
+        pending.set(id, {
+          resolve: (res) => {
+            detach();
+            resolve(res);
+          },
+          reject: (err) => {
+            detach();
+            reject(err);
+          },
+          id,
+          timer,
+        });
         writeLine(body).catch((err: Error) => {
           clearTimeout(timer);
           pending.delete(id);
+          detach();
           reject(err);
         });
       });
@@ -256,6 +308,83 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
       const body = JSON.stringify({ jsonrpc: "2.0", method, ...(params ? { params } : {}) });
       await writeLine(body);
       return {};
+    },
+    async stream(method, params, nextId, init): Promise<TransportStream> {
+      const id: JsonRpcId = nextId();
+      const body = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} });
+      // Every message the child writes while the stream is open is
+      // delivered; the caller filters by subscriptionId / progressToken.
+      // The stream ends when the response carrying `id` arrives, when the
+      // timeout elapses, or on close().
+      const queue: unknown[] = [];
+      let done = false;
+      let wake: (() => void) | null = null;
+      let timer: NodeJS.Timeout | null = null;
+      let unsubscribe: () => void = () => {};
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        unsubscribe();
+        init.signal?.removeEventListener("abort", finish);
+        wake?.();
+      };
+      unsubscribe = transport.onMessage((msg) => {
+        if (done) return;
+        queue.push(msg);
+        const m = msg as { id?: unknown };
+        const isResponse = m && typeof m === "object" && m.id === id;
+        wake?.();
+        if (isResponse) finish();
+      });
+      timer = setTimeout(finish, init.timeout);
+      if (init.signal?.aborted) finish();
+      else init.signal?.addEventListener("abort", finish, { once: true });
+      try {
+        await writeLine(body);
+      } catch (err) {
+        finish();
+        throw err;
+      }
+      async function* iterate(): AsyncGenerator<unknown> {
+        while (true) {
+          if (queue.length > 0) {
+            yield queue.shift();
+            continue;
+          }
+          if (done) return;
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+          wake = null;
+        }
+      }
+      return {
+        requestId: id,
+        messages: iterate(),
+        async close() {
+          if (done) return;
+          finish();
+          // The spec's stdio teardown for a held-open request is a
+          // client-side notifications/cancelled naming the request id.
+          try {
+            await writeLine(
+              JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }),
+            );
+          } catch {
+            // child already gone
+          }
+        },
+      };
+    },
+    onMessage(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    writeRaw(line) {
+      return writeLine(line);
     },
     async close() {
       if (exited) return;

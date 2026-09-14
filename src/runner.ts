@@ -7,15 +7,39 @@ import { request } from "undici";
 // share the same code path. If you find yourself reaching for `request`
 // below the lifecycle gate, first check whether Transport.rawRequest /
 // rawPost already exposes what you need.
-import { computeScore } from "./grader.js";
+import { getTestDefinitionMap } from "./definitions/index.js";
+import { buildDiscoverProbe, classifyDiscoverResponse, type DetectionResult, detectSpecVersion } from "./detect.js";
+import { createHarness, supportsTransportByDefinition } from "./harness.js";
 import { readPackageVersion } from "./pkg-version.js";
+import { assembleReport } from "./report.js";
+import {
+  LEGACY_SPEC_VERSION,
+  MODERN_SPEC_VERSION,
+  type SpecVersion,
+  type SpecVersionOption,
+  specBaseFor,
+} from "./spec.js";
+import { runModernSuite } from "./suites/modern/index.js";
 import { createHttpTransport } from "./transport/http.js";
-import type { Transport } from "./transport/index.js";
+import type { Transport, TransportResponse } from "./transport/index.js";
 import { createStdioTransport } from "./transport/stdio.js";
 import type { ComplianceReport, TestDefinition, TestResult, TransportTarget } from "./types.js";
-import { REPORT_SCHEMA_VERSION, TEST_DEFINITIONS } from "./types.js";
+import { TEST_DEFINITIONS } from "./types.js";
 
+export { findTestDefinition, getTestDefinitions, MODERN_TEST_DEFINITIONS } from "./definitions/index.js";
+export { classifyDiscoverResponse, type DetectionResult, detectSpecVersion } from "./detect.js";
 export { computeGrade, computeScore } from "./grader.js";
+export { dedupAndCapWarnings } from "./harness.js";
+export {
+  DEFAULT_SPEC_VERSION,
+  LEGACY_SPEC_VERSION,
+  MODERN_SPEC_VERSION,
+  parseSpecVersionOption,
+  type SpecVersion,
+  type SpecVersionOption,
+  SUPPORTED_SPEC_VERSIONS,
+  specBaseFor,
+} from "./spec.js";
 export type { ComplianceReport, TestResult } from "./types.js";
 export { TEST_DEFINITIONS } from "./types.js";
 
@@ -23,8 +47,17 @@ const TEST_DEFINITIONS_MAP = new Map(TEST_DEFINITIONS.map((t) => [t.id, t]));
 
 const TOOL_VERSION = readPackageVersion(import.meta.url);
 
-export const SPEC_VERSION = "2025-11-25";
-export const SPEC_BASE = `https://modelcontextprotocol.io/specification/${SPEC_VERSION}`;
+/**
+ * The legacy (2025-11-25) spec version. Kept for library consumers that
+ * pinned against a single global; runs may now resolve to a different
+ * version (see `RunOptions.specVersion`), so read `report.specVersion`
+ * and use `specBaseFor(report.specVersion)` for spec links.
+ *
+ * @deprecated Use `LEGACY_SPEC_VERSION` / `SUPPORTED_SPEC_VERSIONS` and `specBaseFor()`.
+ */
+export const SPEC_VERSION: SpecVersion = LEGACY_SPEC_VERSION;
+/** @deprecated Use `specBaseFor(version)`. */
+export const SPEC_BASE = specBaseFor(LEGACY_SPEC_VERSION);
 
 const VALID_CONTENT_TYPES = ["text", "image", "audio", "resource", "resource_link"];
 
@@ -76,28 +109,6 @@ const INTERNAL_IP_PATTERNS = [
 function createIdCounter(start = 0) {
   let id = start;
   return () => ++id;
-}
-
-/**
- * Dedupe and cap a list of warnings, preserving insertion order and
- * appending a truncation sentinel when capped. Extracted so the cap
- * semantics can be unit-tested without spinning up a suite run.
- *
- * @internal Exported for testing.
- */
-export function dedupAndCapWarnings(warnings: readonly string[], max: number): string[] {
-  const seen = new Set<string>();
-  const deduped: string[] = [];
-  for (const w of warnings) {
-    if (seen.has(w)) continue;
-    seen.add(w);
-    deduped.push(w);
-  }
-  if (deduped.length > max) {
-    const truncated = deduped.length - max;
-    return [...deduped.slice(0, max), `... and ${truncated} more warning(s) suppressed`];
-  }
-  return deduped;
 }
 
 /**
@@ -173,23 +184,35 @@ export interface PreviewOptions {
   only?: string[];
   /** Exclude matching categories or test IDs. */
   skip?: string[];
+  /**
+   * Spec revision whose catalog to preview. Defaults to 2025-11-25.
+   * There is no `auto` here: a preview never connects, so it cannot
+   * detect the server's era.
+   */
+  specVersion?: SpecVersion;
 }
 
 /**
  * Return the set of TestDefinitions that would actually run given the
  * filters. Powers the CLI's --list flag without requiring a connection.
  * Capability-gated tests are still included — that gating happens after
- * the live initialize handshake and can't be predicted offline.
+ * the live handshake / discover and can't be predicted offline.
+ *
+ * Filter precedence mirrors the live run (`only` wins; `skip` is only
+ * consulted when `only` is empty) so `--list` predicts what will run.
  */
 export function previewTests(opts: PreviewOptions = {}): TestDefinition[] {
   const transport = opts.transport ?? "http";
-  return TEST_DEFINITIONS.filter((def) => {
-    if (!supportsTransport(def, transport)) return false;
+  const specVersion = opts.specVersion ?? LEGACY_SPEC_VERSION;
+  const supports = specVersion === LEGACY_SPEC_VERSION ? supportsTransport : supportsTransportByDefinition;
+  const defs = [...getTestDefinitionMap(specVersion).values()];
+  return defs.filter((def) => {
+    if (!supports(def, transport)) return false;
     if (opts.only?.length) {
-      if (!opts.only.includes(def.category) && !opts.only.includes(def.id)) return false;
+      return opts.only.includes(def.category) || opts.only.includes(def.id);
     }
     if (opts.skip?.length) {
-      if (opts.skip.includes(def.category) || opts.skip.includes(def.id)) return false;
+      return !opts.skip.includes(def.category) && !opts.skip.includes(def.id);
     }
     return true;
   });
@@ -248,6 +271,16 @@ export interface RunOptions {
    * stops the server from burning compute on a dropped client.
    */
   signal?: AbortSignal;
+  /**
+   * Which MCP specification revision to test against. `auto` (default)
+   * probes the server with a modern `server/discover` request and grades
+   * the newest era it speaks: a DiscoverResult or a recognised modern
+   * error (-32020/-32021/-32022) selects 2026-07-28, anything else —
+   * including no reply — selects 2025-11-25. A dual-era server is graded
+   * as 2026-07-28 and the report warns that the legacy side was not
+   * tested. The report's `specVersion` is always the RESOLVED version.
+   */
+  specVersion?: SpecVersionOption;
 }
 
 /**
@@ -307,36 +340,58 @@ export async function runComplianceSuite(
         ? resolvedTarget.url
         : `stdio:${resolvedTarget.command}${resolvedTarget.args?.length ? ` ${resolvedTarget.args.join(" ")}` : ""}`;
 
+    const clientInfo = { name: "mcp-compliance", version: TOOL_VERSION };
+
     // Preflight connectivity check — fail fast instead of running all tests
-    // against an unreachable server. HTTP-only: a quick ping catches DNS,
-    // TLS, and connection-refused failures before we burn through 80
-    // tests. For stdio there's no equivalent — spawn errors surface via
-    // the child 'error' event (handled by the transport) and the
-    // lifecycle-init test is the real reachability signal.
+    // against an unreachable server. HTTP-only: a quick request catches DNS,
+    // TLS, and connection-refused failures before we burn through the
+    // suite. For stdio there's no equivalent — spawn errors surface via
+    // the child 'error' event (handled by the transport) and the first
+    // exchange is the real reachability signal.
+    //
+    // The preflight body is the spec's era probe — a modern
+    // `server/discover` with full `_meta` and headers — so on HTTP one
+    // round-trip answers both "is it up" and "which era does it speak".
+    // Any HTTP response at all counts as reachable; only a thrown error
+    // (connect refused, DNS, TLS, timeout) marks the server unreachable.
     let serverReachable = true;
+    let preflightResponse: TransportResponse | null = null;
     if (resolvedTarget.type === "http") {
       try {
         const preflightTimeout = options.preflightTimeout ?? Math.min(options.timeout || 15000, 10000);
+        const probe = buildDiscoverProbe(clientInfo);
         const preflight = await request(resolvedTarget.url, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Accept: "application/json, text/event-stream",
+            ...probe.headers,
             ...userHeaders,
           },
-          body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "ping" }),
+          body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "server/discover", params: probe.params }),
           signal: AbortSignal.timeout(preflightTimeout),
         });
-        await preflight.body.text();
+        const text = await preflight.body.text();
+        const rawCt = preflight.headers["content-type"];
+        const ct = (Array.isArray(rawCt) ? rawCt[0] : rawCt || "").toLowerCase();
+        let body: unknown = null;
+        if (ct.includes("text/event-stream")) body = parseSSEResponse(text);
+        if (body === null) {
+          try {
+            body = JSON.parse(text);
+          } catch {
+            body = { _raw: text };
+          }
+        }
+        preflightResponse = { body, requestId: 0, statusCode: preflight.statusCode, headers: {} };
       } catch {
         serverReachable = false;
       }
     }
 
-    const tests: TestResult[] = [];
-    const warnings: string[] = [];
+    const preWarnings: string[] = [];
     if (!serverReachable) {
-      warnings.push(
+      preWarnings.push(
         `Server at ${displayUrl} is unreachable — all tests will fail. Check the URL or command and ensure the server is running.`,
       );
     }
@@ -348,7 +403,60 @@ export async function runComplianceSuite(
     // package before the MCP loop runs; a 15s request timeout would fire
     // before the first byte. Default to max(timeout, 60000).
     const startupTimeout = options.startupTimeout ?? Math.max(timeout, 60000);
-    const retries = options.retries || 0;
+
+    // ── Spec version resolution ──────────────────────────────────────
+    // `auto` classifies the spec's own era probe (a modern
+    // `server/discover`). On HTTP the preflight already sent it; on stdio
+    // it is the first exchange and shares the startup budget. An
+    // unreachable HTTP server takes the legacy default, so today's
+    // "everything fails" report shape is preserved.
+    const requested: SpecVersionOption = options.specVersion ?? "auto";
+    let detection: DetectionResult | undefined;
+    let resolvedSpec: SpecVersion;
+    if (requested === "auto" && serverReachable) {
+      detection =
+        resolvedTarget.type === "http"
+          ? classifyDiscoverResponse(preflightResponse)
+          : await detectSpecVersion(transport, { nextId, timeout: startupTimeout, clientInfo });
+      resolvedSpec = detection.version;
+      preWarnings.push(
+        `Spec version auto-detected as ${resolvedSpec} (${detection.reason}). Pin with --spec-version to override.`,
+      );
+    } else {
+      resolvedSpec = requested === "auto" ? LEGACY_SPEC_VERSION : requested;
+    }
+
+    if (resolvedSpec === MODERN_SPEC_VERSION) {
+      return await runModernSuite({
+        transport,
+        options,
+        nextId,
+        timeout,
+        startupTimeout,
+        backendUrl,
+        userHeaders,
+        displayUrl,
+        toolVersion: TOOL_VERSION,
+        detection,
+        warnings: preWarnings,
+      });
+    }
+
+    const harness = createHarness({
+      definitions: TEST_DEFINITIONS_MAP,
+      specBase: SPEC_BASE,
+      transportKind: transport.kind,
+      supportsTransport,
+      only: options.only,
+      skip: options.skip,
+      retries: options.retries,
+      concurrency: options.concurrency,
+      signal: options.signal,
+      onProgress: options.onProgress,
+      onTestComplete: options.onTestComplete,
+    });
+    const { tests, warnings, test, drainPool } = harness;
+    warnings.push(...preWarnings);
 
     // Session state — kept as locals for backwards-compat with existing
     // call sites that reference `sessionId`/`negotiatedProtocolVersion`
@@ -385,7 +493,8 @@ export async function runComplianceSuite(
         statusCode: res.statusCode ?? 200,
         body: res.body as any,
         headers: res.headers ?? {},
-        requestId: res.requestId,
+        // The legacy suite only ever allocates numeric ids.
+        requestId: res.requestId as number,
       };
     }
     async function mcpNotification(
@@ -405,18 +514,6 @@ export async function runComplianceSuite(
     const rpc = (method: string, params?: unknown) =>
       mcpRequest(backendUrl, method, params, nextId, buildHeaders(), timeout);
 
-    function shouldRun(id: string, category: string): boolean {
-      const def = TEST_DEFINITIONS_MAP.get(id);
-      if (!supportsTransport(def, transport.kind)) return false;
-      if (options.only && options.only.length > 0) {
-        return options.only.includes(category) || options.only.includes(id);
-      }
-      if (options.skip && options.skip.length > 0) {
-        return !options.skip.includes(category) && !options.skip.includes(id);
-      }
-      return true;
-    }
-
     const serverInfo = {
       protocolVersion: null as string | null,
       name: null as string | null,
@@ -429,97 +526,6 @@ export async function runComplianceSuite(
     let resourceNames: string[] = [];
     let promptCount = 0;
     let promptNames: string[] = [];
-
-    // Parallel execution pool. Tests marked `parallelSafe: true` in
-    // TEST_DEFINITIONS are queued here up to `concurrency` at a time.
-    // Sequential tests call `drainPool()` first to barrier against any
-    // pending parallel work, so order-dependent state (cachedToolsList,
-    // sessionId, etc.) stays consistent.
-    const concurrency = Math.max(1, options.concurrency ?? 1);
-    const inFlight = new Set<Promise<void>>();
-
-    async function drainPool(): Promise<void> {
-      while (inFlight.size > 0) {
-        await Promise.race(inFlight);
-      }
-    }
-
-    async function runTestFn(
-      id: string,
-      name: string,
-      category: TestResult["category"],
-      required: boolean,
-      specRef: string,
-      fn: () => Promise<{ passed: boolean; details: string }>,
-    ): Promise<void> {
-      const start = Date.now();
-      let lastResult = { passed: false, details: "" };
-
-      for (let attempt = 0; attempt <= retries; attempt++) {
-        try {
-          lastResult = await fn();
-          if (lastResult.passed) break;
-          if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
-          lastResult = { passed: false, details: `Error: ${message}` };
-          if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-        }
-      }
-
-      const result: TestResult = {
-        id,
-        name,
-        category,
-        required,
-        passed: lastResult.passed,
-        details: lastResult.details,
-        durationMs: Date.now() - start,
-        specRef: `${SPEC_BASE}/${specRef}`,
-      };
-      tests.push(result);
-      options.onProgress?.(id, lastResult.passed, lastResult.details);
-      options.onTestComplete?.(result);
-    }
-
-    async function test(
-      id: string,
-      name: string,
-      category: TestResult["category"],
-      required: boolean,
-      specRef: string,
-      fn: () => Promise<{ passed: boolean; details: string }>,
-    ): Promise<void> {
-      // Abort gate: if the caller's signal has fired, drop any pending
-      // parallel work and propagate the reason. We check at the top of
-      // every test() call so the first awaited test after abort returns
-      // immediately rather than waiting on the rest of the suite.
-      if (options.signal?.aborted) {
-        if (inFlight.size > 0) await drainPool().catch(() => {});
-        throw options.signal.reason ?? new Error("Aborted");
-      }
-
-      if (!shouldRun(id, category)) return;
-
-      const def = TEST_DEFINITIONS_MAP.get(id);
-      const eligible = concurrency > 1 && def?.parallelSafe === true;
-
-      if (!eligible) {
-        // Sequential path: barrier against any in-flight parallel tests
-        // first, then execute synchronously. Preserves the pre-0.12
-        // ordering semantics.
-        if (inFlight.size > 0) await drainPool();
-        await runTestFn(id, name, category, required, specRef, fn);
-        return;
-      }
-
-      // Parallel path: wait for a slot, then launch without awaiting.
-      while (inFlight.size >= concurrency) await Promise.race(inFlight);
-      const p = runTestFn(id, name, category, required, specRef, fn).finally(() => {
-        inFlight.delete(p);
-      });
-      inFlight.add(p);
-    }
 
     // ── 1. TRANSPORT (basic, pre-init) ───────────────────────────────
 
@@ -3395,38 +3401,17 @@ export async function runComplianceSuite(
     // last-declared test was parallel-safe we still have work in flight
     // when we get here. MUST happen before warning dedup/cap below —
     // draining can push more warnings.
-    if (inFlight.size > 0) await drainPool();
+    await drainPool();
 
-    // ── Dedup + cap warnings ─────────────────────────────────────────
-    // A server with, say, 60 tools all missing descriptions produces 60
-    // near-identical lines that crowd out every other signal. Preserve
-    // insertion order but collapse exact duplicates, then cap. Mutates
-    // the array in place so the return value below picks up the change.
+    // Dedup + cap warnings: a server with, say, 60 tools all missing
+    // descriptions produces 60 near-identical lines that crowd out every
+    // other signal.
+    harness.finalizeWarnings();
 
-    const MAX_WARNINGS = 50;
-    const capped = dedupAndCapWarnings(warnings, MAX_WARNINGS);
-    warnings.length = 0;
-    warnings.push(...capped);
-
-    // ── Compute score ────────────────────────────────────────────────
-
-    const { score, grade, overall, summary, categories } = computeScore(tests);
-    // Badge URLs are retired (the mcp.hosting renderer is gone); the field is
-    // kept empty for report-schema back-compat. Use `--output <file>.svg` for
-    // a local badge image instead.
-    const badge = { imageUrl: "", reportUrl: "", markdown: "", html: "" };
-
-    return {
-      schemaVersion: REPORT_SCHEMA_VERSION,
-      specVersion: SPEC_VERSION,
+    return assembleReport({
+      specVersion: LEGACY_SPEC_VERSION,
       toolVersion: TOOL_VERSION,
       url: displayUrl,
-      timestamp: new Date().toISOString(),
-      score,
-      grade,
-      overall,
-      summary,
-      categories,
       tests,
       warnings,
       serverInfo,
@@ -3436,8 +3421,7 @@ export async function runComplianceSuite(
       resourceNames,
       promptCount,
       promptNames,
-      badge,
-    };
+    });
   } finally {
     // Always close the transport — swallow any close error so we don't
     // mask the real failure that brought us here.
