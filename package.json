@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/mcp-compliance",
-  "version": "0.17.4",
+  "version": "0.18.0",
   "mcpName": "io.github.YawLabs/mcp-compliance",
   "description": "MCP compliance testing: 88-test spec suite for any MCP server over HTTP or stdio, with A-F grading, a CLI, an MCP server, and CI output.",
   "license": "MIT",
