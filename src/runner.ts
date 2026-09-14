@@ -387,6 +387,23 @@ export async function runComplianceSuite(
       resolvedSpec = requested === "auto" ? LEGACY_SPEC_VERSION : requested;
     }
 
+    // `--only` / `--skip` values that match nothing in the resolved
+    // catalog would silently produce an empty (grade F) or partial run.
+    // Ids are only meaningful within one catalog — a legacy id such as
+    // lifecycle-init does not exist in 2026-07-28 — so name the miss.
+    {
+      const catalog = getTestDefinitionMap(resolvedSpec);
+      const categories = new Set([...catalog.values()].map((d) => d.category as string));
+      const unknown = [...(options.only ?? []), ...(options.skip ?? [])].filter(
+        (f) => !catalog.has(f) && !categories.has(f),
+      );
+      if (unknown.length > 0) {
+        preWarnings.push(
+          `Filter value(s) ${unknown.map((u) => `"${u}"`).join(", ")} match no test id or category in the ${resolvedSpec} catalog; run --list --spec-version ${resolvedSpec} to see valid ids.`,
+        );
+      }
+    }
+
     if (resolvedSpec === MODERN_SPEC_VERSION) {
       return await runModernSuite({
         transport,
