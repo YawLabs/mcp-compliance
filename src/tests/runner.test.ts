@@ -1,5 +1,6 @@
+import { createServer, type Server } from "node:http";
 import { describe, expect, it } from "vitest";
-import { dedupAndCapWarnings, runComplianceSuite } from "../runner.js";
+import { dedupAndCapWarnings, isHeaderToken, runComplianceSuite } from "../runner.js";
 
 // Use localhost on a port that's definitely not listening for instant ECONNREFUSED
 const DEAD_URL = "http://127.0.0.1:1/mcp";
@@ -156,6 +157,143 @@ describe("runComplianceSuite — report structure", () => {
       expect(t.durationMs).toBeGreaterThanOrEqual(0);
     }
   }, 15000);
+});
+
+/**
+ * A 2025-11-25 HTTP server that answers initialize with `protocolVersion`
+ * and a session id, `ping` with {} whatever headers it carries, and 202s
+ * notifications; records the method and the session / protocol-version
+ * headers of every POST.
+ */
+async function startVersionStub(protocolVersion: string): Promise<{
+  url: string;
+  seen: Array<{ method: string; sessionId?: string; protocolVersion?: string }>;
+  stop(): Promise<void>;
+}> {
+  const seen: Array<{ method: string; sessionId?: string; protocolVersion?: string }> = [];
+  const server: Server = createServer((req, res) => {
+    let text = "";
+    req.setEncoding("utf8");
+    req.on("data", (c: string) => {
+      text += c;
+    });
+    req.on("end", () => {
+      if (req.method !== "POST") {
+        res.writeHead(405);
+        res.end();
+        return;
+      }
+      let msg: { id?: unknown; method?: string } = {};
+      try {
+        msg = JSON.parse(text);
+      } catch {}
+      seen.push({
+        method: msg.method ?? "?",
+        sessionId: req.headers["mcp-session-id"] as string | undefined,
+        protocolVersion: req.headers["mcp-protocol-version"] as string | undefined,
+      });
+      if (msg.id === undefined) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      const body =
+        msg.method === "initialize"
+          ? {
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: { protocolVersion, capabilities: {}, serverInfo: { name: "version-stub", version: "1" } },
+            }
+          : msg.method === "ping"
+            ? { jsonrpc: "2.0", id: msg.id, result: {} }
+            : { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } };
+      res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "3f6c1a9e0b7d4e2f8a5c6b1d" });
+      res.end(JSON.stringify(body));
+    });
+  });
+  const url = await new Promise<string>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      resolve(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+    });
+  });
+  return {
+    url,
+    seen,
+    stop: () =>
+      new Promise<void>((resolve, reject) => {
+        server.closeAllConnections();
+        server.close((err) => (err ? reject(err) : resolve()));
+      }),
+  };
+}
+
+describe("runComplianceSuite — the negotiated protocol version on later requests", () => {
+  const ONLY = ["lifecycle-init", "lifecycle-proto-version", "lifecycle-ping"];
+
+  it("a version that cannot be a header value is left off the later requests; lifecycle-proto-version still reports it", async () => {
+    // Before: the CR/LF value went into MCP-Protocol-Version and undici
+    // refused every later request client-side, so lifecycle-ping (and every
+    // other post-init test) failed with "Error: invalid mcp-protocol-version
+    // header" against a server that answers ping, and the notification
+    // never went out.
+    const bad = "2025-11-25\r\nX-Injected: 1";
+    const stub = await startVersionStub(bad);
+    try {
+      const report = await runComplianceSuite(stub.url, { timeout: 3000, specVersion: "2025-11-25", only: ONLY });
+      const byId = Object.fromEntries(report.tests.map((t) => [t.id, { passed: t.passed, details: t.details }]));
+      expect(byId["lifecycle-ping"]).toEqual({ passed: true, details: expect.any(String) });
+      // Not hidden: the server's value is still what the version test judges.
+      expect(byId["lifecycle-proto-version"]).toEqual({ passed: false, details: `Version: ${bad}` });
+      expect(report.serverInfo.protocolVersion).toBe(bad);
+      const afterInit = stub.seen.slice(stub.seen.findIndex((p) => p.method === "initialize") + 1);
+      expect(afterInit.map((p) => p.method)).toEqual(["notifications/initialized", "ping"]);
+      for (const p of afterInit) {
+        expect(p).toEqual({ method: p.method, sessionId: "3f6c1a9e0b7d4e2f8a5c6b1d", protocolVersion: undefined });
+      }
+    } finally {
+      await stub.stop();
+    }
+  }, 15000);
+
+  it("a valid negotiated version is still carried on every later request", async () => {
+    const stub = await startVersionStub("2025-06-18");
+    try {
+      const report = await runComplianceSuite(stub.url, { timeout: 3000, specVersion: "2025-11-25", only: ONLY });
+      expect(report.tests.find((t) => t.id === "lifecycle-ping")?.passed).toBe(true);
+      const afterInit = stub.seen.slice(stub.seen.findIndex((p) => p.method === "initialize") + 1);
+      expect(afterInit.map((p) => p.method)).toEqual(["notifications/initialized", "ping"]);
+      for (const p of afterInit) {
+        expect(p).toEqual({ method: p.method, sessionId: "3f6c1a9e0b7d4e2f8a5c6b1d", protocolVersion: "2025-06-18" });
+      }
+    } finally {
+      await stub.stop();
+    }
+  }, 15000);
+});
+
+describe("isHeaderToken", () => {
+  it("accepts a visible-ASCII token such as a date version", () => {
+    expect(isHeaderToken("2025-11-25")).toBe(true);
+    expect(isHeaderToken("draft/2026-07-28+x")).toBe(true);
+  });
+
+  it("rejects what cannot go out verbatim as a header value, and non-strings", () => {
+    for (const value of [
+      "",
+      "2025-11-25\r\nX-Injected: 1",
+      "2025-11-25\n",
+      "2025 11 25",
+      "2025-11-25\t",
+      "2025-11-25\u00e9",
+      "\u0000",
+    ]) {
+      expect(isHeaderToken(value), JSON.stringify(value)).toBe(false);
+    }
+    for (const value of [20251125, null, undefined, {}, ["2025-11-25"]]) {
+      expect(isHeaderToken(value), JSON.stringify(value)).toBe(false);
+    }
+  });
 });
 
 describe("runComplianceSuite — exports", () => {

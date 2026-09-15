@@ -8,7 +8,7 @@ import {
 } from "../../checks/patterns.js";
 import type { TestOutcome } from "../../harness.js";
 import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
-import { ensureTools, hasTools, type ModernSuiteContext } from "./context.js";
+import { ensureTools, hasTools, listUnavailable, type ModernSuiteContext } from "./context.js";
 
 /**
  * Security tests of the 2026-07-28 suite (21 in the catalog). Ported from
@@ -25,8 +25,11 @@ import { ensureTools, hasTools, type ModernSuiteContext } from "./context.js";
  *
  * Tool-dependent tests read the tools list through `ensureTools`, which
  * fetches it once on demand, so a `--only security` run measures the
- * server instead of skip-passing. They skip-pass only when the server
- * declares no tools capability or the list call itself failed.
+ * server instead of skip-passing. They skip-pass when the server declares
+ * no tools capability or lists none. When the list call itself failed they
+ * go through `listUnavailable`: a skip-pass pointing at tools-list when
+ * that test is in the run, a failure naming the recorded reason when the
+ * run filtered it out (`--only security`).
  */
 
 const DISCOVER = "server/discover";
@@ -531,16 +534,24 @@ function mentionsName(text: string, name: string): boolean {
 }
 
 /**
+ * Verdict for a tool-dependent test that got no tools list: a skip-pass
+ * when the server declares no tools; otherwise the list call failed, and
+ * `listUnavailable` skip-passes pointing at tools-list when that test is
+ * in the run, or fails with the recorded reason when it was filtered out.
+ */
+function toolsUnavailable(ctx: ModernSuiteContext): TestOutcome {
+  if (!hasTools(ctx)) return { passed: true, details: "Skipped: server declares no tools" };
+  return listUnavailable(ctx, "tools", "no tools to test");
+}
+
+/**
  * The tools list for a tool-dependent test, fetched once on demand, or
- * the skip-pass verdict when the server declares no tools / the list
- * call failed (the required tools-list test reports why).
+ * the verdict when there is none to test (`toolsUnavailable`, or a
+ * skip-pass when the server lists no tools).
  */
 async function toolsOrSkip(ctx: ModernSuiteContext): Promise<{ tools: any[]; skip: TestOutcome | null }> {
   const tools = await ensureTools(ctx);
-  if (tools === null) {
-    const details = hasTools(ctx) ? "Skipped: tools/list failed (see tools-list)" : "Skipped: server declares no tools";
-    return { tools: [], skip: { passed: true, details } };
-  }
+  if (tools === null) return { tools: [], skip: toolsUnavailable(ctx) };
   if (tools.length === 0) return { tools, skip: { passed: true, details: "No tools available to test (skipped)" } };
   return { tools, skip: null };
 }
@@ -1422,14 +1433,10 @@ async function checkExtraParams(ctx: ModernSuiteContext, tool: any): Promise<Tes
 
 async function runToolIntegrity(ctx: ModernSuiteContext) {
   const { check } = ctx.harness;
-  const unavailable = (): TestOutcome => ({
-    passed: true,
-    details: hasTools(ctx) ? "Skipped: tools/list failed (see tools-list)" : "Skipped: server declares no tools",
-  });
 
   await check("security-tool-schema-defined", async () => {
     const tools = await ensureTools(ctx);
-    if (tools === null) return unavailable();
+    if (tools === null) return toolsUnavailable(ctx);
     if (tools.length === 0) return { passed: true, details: "No tools to validate" };
     const missing = tools.filter((t: any) => t?.inputSchema?.type !== "object");
     if (missing.length > 0) {
@@ -1441,7 +1448,7 @@ async function runToolIntegrity(ctx: ModernSuiteContext) {
 
   await check("security-tool-rug-pull", async () => {
     const tools = await ensureTools(ctx);
-    if (tools === null) return unavailable();
+    if (tools === null) return toolsUnavailable(ctx);
     try {
       const res = await ctx.client.rpc(TOOLS_LIST, {});
       const again = resultOf(res.body)?.tools;
@@ -1458,7 +1465,7 @@ async function runToolIntegrity(ctx: ModernSuiteContext) {
 
   await check("security-tool-description-poisoning", async () => {
     const tools = await ensureTools(ctx);
-    if (tools === null) return unavailable();
+    if (tools === null) return toolsUnavailable(ctx);
     if (tools.length === 0) return { passed: true, details: "No tools to validate" };
     const issues: string[] = [];
     for (const tool of tools) {
@@ -1481,7 +1488,7 @@ async function runToolIntegrity(ctx: ModernSuiteContext) {
 
   await check("security-tool-cross-reference", async () => {
     const tools = await ensureTools(ctx);
-    if (tools === null) return unavailable();
+    if (tools === null) return toolsUnavailable(ctx);
     if (tools.length < 2) {
       return { passed: true, details: "Fewer than 2 tools -- cross-reference check not applicable" };
     }

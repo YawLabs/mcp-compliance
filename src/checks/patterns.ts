@@ -131,6 +131,12 @@ export const POISONING_PATTERNS = [
   { pattern: /you\s+must\s+(always|never)/i, label: "behavioral override" },
   { pattern: /do\s+not\s+(tell|inform|mention)/i, label: "concealment instruction" },
   { pattern: /\b[A-Za-z0-9+/]{40,}={0,2}\b/, label: "possible Base64-encoded payload" },
-  // Zero-width characters (U+200B, U+200C, U+200D, U+FEFF)
-  { pattern: /\u200B|\u200C|\u200D|\uFEFF/, label: "hidden Unicode characters" },
+  // Hidden Unicode: the zero-width characters (U+200B, U+200C, U+200D,
+  // U+FEFF), and the bidi embedding / override controls (U+202A-U+202E:
+  // LRE, RLE, PDF, LRO, RLO) and isolate controls (U+2066-U+2069: LRI,
+  // RLI, FSI, PDI), which reorder how text displays -- so what a reviewer
+  // reads differs from what the model is given ("Trojan Source"). Plain
+  // right-to-left text needs none of them. Escapes only: never put the
+  // characters themselves in this file.
+  { pattern: /\u200B|\u200C|\u200D|\uFEFF|[\u202A-\u202E]|[\u2066-\u2069]/, label: "hidden Unicode characters" },
 ];

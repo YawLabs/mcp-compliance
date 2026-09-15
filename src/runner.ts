@@ -135,6 +135,20 @@ export function spawnStdioTarget(target: Extract<TransportTarget, { type: "stdio
 }
 
 /**
+ * Whether a server-chosen value can go out verbatim as an HTTP header
+ * value: one or more visible ASCII characters, so no whitespace, no CR/LF
+ * and nothing non-ASCII. The negotiated protocolVersion is carried into
+ * MCP-Protocol-Version on every later request, and undici throws "invalid
+ * mcp-protocol-version header" for anything else -- one bad initialize
+ * result would fail every request after it on the client's side. Shared
+ * with the benchmark's handshake.
+ * @internal
+ */
+export function isHeaderToken(value: unknown): value is string {
+  return typeof value === "string" && /^[\x21-\x7e]+$/.test(value);
+}
+
+/**
  * Warnings for `only` / `skip` values that select nothing in a catalog:
  * values that name no test id or category in it (ids are only meaningful
  * within one catalog -- a legacy id such as lifecycle-init does not exist
@@ -952,7 +966,11 @@ export async function runComplianceSuite(
           sessionId = sid;
           transport.setSessionId(sid);
         }
-        if (result.protocolVersion) {
+        // Only a value that can be sent as a header is carried. Anything
+        // else (CR/LF, spaces, non-ASCII) is left off the later requests
+        // instead of failing each of them client-side; lifecycle-proto-version
+        // still reports the value the server sent.
+        if (isHeaderToken(result.protocolVersion)) {
           negotiatedProtocolVersion = result.protocolVersion;
           transport.setProtocolVersion(result.protocolVersion);
         }

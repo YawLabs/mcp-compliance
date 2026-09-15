@@ -1,7 +1,10 @@
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type BenchmarkResult, describeProbeFailure, formatBenchmark, runBenchmark } from "../benchmark.js";
 import type { TransportTarget } from "../types.js";
@@ -93,6 +96,154 @@ async function startCountingServer(): Promise<{ url: string; counts: Record<stri
   return {
     url,
     counts,
+    stop: () => new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve()))),
+  };
+}
+
+interface SeenPost {
+  method: string;
+  sessionId: string | undefined;
+  protocolVersion: string | undefined;
+}
+
+/**
+ * The SDK v1 sessionful Streamable HTTP server (the shape integration.test.ts
+ * and detect.test.ts build): a plain 2025-11-25 server that issues an
+ * Mcp-Session-Id on initialize and answers any later request that does not
+ * carry it with 400 -32000 "Server not initialized". Records the method and
+ * the session / protocol-version headers of every POST, and the session ids
+ * it issued.
+ */
+async function startSdkV1Sessionful(): Promise<{
+  url: string;
+  seen: SeenPost[];
+  issued: string[];
+  stop(): Promise<void>;
+}> {
+  const seen: SeenPost[] = [];
+  const issued: string[] = [];
+  const transports = new Map<string, StreamableHTTPServerTransport>();
+  const server: Server = createServer((req, res) => {
+    let text = "";
+    req.setEncoding("utf8");
+    req.on("data", (c: string) => {
+      text += c;
+    });
+    req.on("end", async () => {
+      let parsed: { method?: string } | undefined;
+      try {
+        parsed = JSON.parse(text);
+      } catch {}
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+      if (req.method === "POST") {
+        seen.push({
+          method: parsed?.method ?? "?",
+          sessionId,
+          protocolVersion: req.headers["mcp-protocol-version"] as string | undefined,
+        });
+      }
+      const known = sessionId ? transports.get(sessionId) : undefined;
+      if (known) {
+        await known.handleRequest(req, res, parsed);
+        return;
+      }
+      if (req.method === "POST") {
+        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
+        const mcp = new McpServer({ name: "bench-sdk-v1", version: "1.0.0" });
+        await mcp.connect(transport);
+        await transport.handleRequest(req, res, parsed);
+        if (transport.sessionId) {
+          issued.push(transport.sessionId);
+          transports.set(transport.sessionId, transport);
+        } else {
+          // Rejected before initialize (no session issued): nothing to keep.
+          await transport.close();
+        }
+        return;
+      }
+      res.writeHead(405);
+      res.end();
+    });
+  });
+  const url = await new Promise<string>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      resolve(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+    });
+  });
+  return {
+    url,
+    seen,
+    issued,
+    stop: async () => {
+      for (const t of transports.values()) await t.close().catch(() => {});
+      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    },
+  };
+}
+
+interface InitializeAnswer {
+  status: number;
+  headers: Record<string, string>;
+  body: unknown;
+}
+
+/**
+ * A hand-rolled 2025-11-25 HTTP server whose initialize answer the test
+ * writes (status, headers, JSON body for the request id), that answers
+ * `ping` with {} whatever headers it carries and 202s every notification.
+ * Records every POST the way startSdkV1Sessionful does.
+ */
+async function startLegacyStub(
+  initialize: (id: unknown) => InitializeAnswer,
+): Promise<{ url: string; seen: SeenPost[]; stop(): Promise<void> }> {
+  const seen: SeenPost[] = [];
+  const server: Server = createServer((req, res) => {
+    let text = "";
+    req.setEncoding("utf8");
+    req.on("data", (c: string) => {
+      text += c;
+    });
+    req.on("end", () => {
+      let msg: { id?: unknown; method?: string } = {};
+      try {
+        msg = JSON.parse(text);
+      } catch {}
+      seen.push({
+        method: msg.method ?? "?",
+        sessionId: req.headers["mcp-session-id"] as string | undefined,
+        protocolVersion: req.headers["mcp-protocol-version"] as string | undefined,
+      });
+      if (msg.id === undefined) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      if (msg.method === "initialize") {
+        const answer = initialize(msg.id);
+        res.writeHead(answer.status, { "content-type": "application/json", ...answer.headers });
+        res.end(JSON.stringify(answer.body));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify(
+          msg.method === "ping"
+            ? { jsonrpc: "2.0", id: msg.id, result: {} }
+            : { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } },
+        ),
+      );
+    });
+  });
+  const url = await new Promise<string>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      resolve(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+    });
+  });
+  return {
+    url,
+    seen,
     stop: () => new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve()))),
   };
 }
@@ -218,6 +369,106 @@ describe("runBenchmark against the legacy echo fixture over stdio", () => {
     expect(result.specVersion).toBe("2026-07-28");
     expect(result.method).toBe("server/discover");
     expectAllFailed(result, /^JSON-RPC error -32601 /);
+  });
+});
+
+describe("runBenchmark against an SDK v1 sessionful HTTP server", () => {
+  // The legacy warm-up used to drop the initialize reply: no Mcp-Session-Id
+  // and no negotiated MCP-Protocol-Version on the timed pings, so the
+  // reference SDK server answered every ping 400 -32000 "Server not
+  // initialized" and `benchmark` exited 1 with 0 succeeded. The benchmark
+  // now carries both, exactly as the runner's handshake does.
+  it.each([
+    ["auto", undefined],
+    ["pinned 2025-11-25", "2025-11-25" as const],
+  ])(
+    "%s: every ping carries the issued session id and the negotiated version, and succeeds",
+    async (_label, specVersion) => {
+      const stub = await startSdkV1Sessionful();
+      try {
+        const result = await runBenchmark({ type: "http", url: stub.url }, { ...OPTS, specVersion });
+        expect(result.specVersion).toBe("2025-11-25");
+        expect(result.method).toBe("ping");
+        expectAllSucceeded(result);
+        // One session, issued to the one initialize.
+        expect(stub.issued).toHaveLength(1);
+        const [sid] = stub.issued;
+        const methods = stub.seen.map((p) => p.method);
+        expect(methods).toEqual([
+          ...(specVersion === undefined ? ["server/discover"] : []),
+          "initialize",
+          "notifications/initialized",
+          ...Array(REQUESTS).fill("ping"),
+        ]);
+        // initialize (and the auto probe) go out before there is a session.
+        for (const p of stub.seen.filter((s) => s.method === "initialize" || s.method === "server/discover")) {
+          expect(p.sessionId).toBeUndefined();
+        }
+        for (const p of stub.seen.filter((s) => s.method === "notifications/initialized" || s.method === "ping")) {
+          expect(p).toEqual({ method: p.method, sessionId: sid, protocolVersion: "2025-11-25" });
+        }
+      } finally {
+        await stub.stop();
+      }
+    },
+    20_000,
+  );
+});
+
+describe("runBenchmark legacy handshake: what an initialize answer does and does not carry", () => {
+  const PINNED = { ...OPTS, specVersion: "2025-11-25" as const };
+  const handshakeThenPings = ["initialize", "notifications/initialized", ...Array(REQUESTS).fill("ping")];
+
+  it("an initialize answered with a JSON-RPC error opens no session, is still acknowledged, and the pings are measured", async () => {
+    // Mirrors the runner: an error reply is a reply (notifications/initialized
+    // still goes out), but only a result carries a session or a version --
+    // not even a session id the error response happens to set.
+    const stub = await startLegacyStub((id) => ({
+      status: 400,
+      headers: { "mcp-session-id": "session-from-an-error-reply" },
+      body: { jsonrpc: "2.0", id, error: { code: -32602, message: "Unsupported protocol version" } },
+    }));
+    try {
+      const result = await runBenchmark({ type: "http", url: stub.url }, PINNED);
+      expect(result.method).toBe("ping");
+      expectAllSucceeded(result);
+      expect(stub.seen.map((p) => p.method)).toEqual(handshakeThenPings);
+      for (const p of stub.seen) {
+        expect(p).toEqual({ method: p.method, sessionId: undefined, protocolVersion: undefined });
+      }
+    } finally {
+      await stub.stop();
+    }
+  });
+
+  it("a negotiated protocolVersion that is not a valid header value is left off; the session id is still carried", async () => {
+    // Before: the CR/LF value went into MCP-Protocol-Version, undici refused
+    // every request ("invalid mcp-protocol-version header") and a server
+    // that answers ping measured 0 succeeded.
+    const stub = await startLegacyStub((id) => ({
+      status: 200,
+      headers: { "mcp-session-id": "session-1" },
+      body: {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: "2025-11-25\r\nX-Injected: 1",
+          capabilities: {},
+          serverInfo: { name: "bad-version", version: "1" },
+        },
+      },
+    }));
+    try {
+      const result = await runBenchmark({ type: "http", url: stub.url }, PINNED);
+      expectAllSucceeded(result);
+      expect(stub.seen.map((p) => p.method)).toEqual(handshakeThenPings);
+      expect(stub.seen[0]).toEqual({ method: "initialize", sessionId: undefined, protocolVersion: undefined });
+      for (const p of stub.seen.slice(1)) {
+        expect(p).toEqual({ method: p.method, sessionId: "session-1", protocolVersion: undefined });
+      }
+    } finally {
+      await stub.stop();
+    }
   });
 });
 

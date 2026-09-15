@@ -20,6 +20,7 @@ import {
   hasTools,
   LIST_METHOD,
   type ListKey,
+  listUnavailable,
   type ModernSuiteContext,
   publishList,
   recordListFailure,
@@ -33,7 +34,12 @@ import {
  * the lifecycle / transport / schema modules -- reads them back through
  * the context's `ensureList`, which fetches once on demand when a `-list`
  * test did not run (a `--only` run). One cache, one attempt per list, so
- * the modules agree on what the server listed.
+ * the modules agree on what the server listed. A check that needs a list
+ * whose call failed goes through `listUnavailable`: it skip-passes
+ * pointing at the `-list` test when that test is in the run, and fails
+ * with the recorded reason when the run filtered it out, so
+ * `--only tools-call` cannot grade A over a broken tools/list. A declared
+ * but empty list still skip-passes ("server lists no tools").
  *
  * What stays private is the RESPONSE cache below: the `-list-caching`
  * tests validate the caching hints on the same response the `-list` test
@@ -213,7 +219,7 @@ async function runTools(ctx: ModernSuiteContext, cache: ResponseCache): Promise<
 
   await harness.check("tools-list-deterministic-order", async () => {
     const first = await ensureList(ctx, "tools");
-    if (!first) return pass("skipped: no tools list available");
+    if (!first) return listUnavailable(ctx, "tools", "no tool order to compare");
     const baseline = namesOf(first);
     const snapshots: string[][] = [];
     for (let call = 2; call <= 3; call++) {
@@ -243,7 +249,7 @@ async function runTools(ctx: ModernSuiteContext, cache: ResponseCache): Promise<
 
   const callPicked = async (): Promise<{ tool: PickedTool; res: RpcResponse } | Outcome> => {
     const tools = await ensureList(ctx, "tools");
-    if (!tools) return pass("skipped: no tools list available");
+    if (!tools) return listUnavailable(ctx, "tools", "no tool to call");
     const tool = pickTool(tools);
     if (!tool) return pass("skipped: server lists no tools");
     const res = await client.rpc(
@@ -305,15 +311,19 @@ async function runTools(ctx: ModernSuiteContext, cache: ResponseCache): Promise<
 
 // ── Resources ─────────────────────────────────────────────────────
 
-type ReadAttempt = { uri: string; res: RpcResponse } | { skipped: string };
+type ReadAttempt = { uri: string; res: RpcResponse } | { outcome: Outcome };
 
-/** resources/read of the first listed resource, sent once per run. */
+/**
+ * resources/read of the first listed resource, sent once per run; the
+ * verdict instead when there is nothing to read (a failed resources/list
+ * goes through `listUnavailable`).
+ */
 async function readFirstResource(ctx: ModernSuiteContext, cache: ResponseCache): Promise<ReadAttempt> {
   if (cache.read) return cache.read;
   const resources = await ensureList(ctx, "resources");
-  if (!resources) return { skipped: "skipped: no resources list available" };
+  if (!resources) return { outcome: listUnavailable(ctx, "resources", "no resource to read") };
   const first = resources.find((r) => isPlainObject(r) && typeof r.uri === "string" && r.uri.length > 0);
-  if (!isPlainObject(first)) return { skipped: "skipped: server lists no resources with a uri" };
+  if (!isPlainObject(first)) return { outcome: pass("skipped: server lists no resources with a uri") };
   const uri = first.uri as string;
   const res = await ctx.client.rpc("resources/read", { uri });
   cache.read = { uri, res };
@@ -344,7 +354,7 @@ async function runResources(ctx: ModernSuiteContext, cache: ResponseCache): Prom
     "resources-read",
     async () => {
       const attempt = await readFirstResource(ctx, cache);
-      if ("skipped" in attempt) return pass(attempt.skipped);
+      if ("outcome" in attempt) return attempt.outcome;
       const { uri, res } = attempt;
       const err = errorOf(res.body);
       if (err) return fail(`resources/read ${uri}: ${errDetail(err)}`);
@@ -370,7 +380,7 @@ async function runResources(ctx: ModernSuiteContext, cache: ResponseCache): Prom
     "resources-read-caching",
     async () => {
       const attempt = await readFirstResource(ctx, cache);
-      if ("skipped" in attempt) return pass(attempt.skipped);
+      if ("outcome" in attempt) return attempt.outcome;
       return cachingOutcome(attempt.res, `resources/read ${attempt.uri}`, "fail");
     },
     { required: true },
@@ -480,7 +490,7 @@ async function runPrompts(ctx: ModernSuiteContext, cache: ResponseCache): Promis
     "prompts-get",
     async () => {
       const prompts = await ensureList(ctx, "prompts");
-      if (!prompts) return pass("skipped: no prompts list available");
+      if (!prompts) return listUnavailable(ctx, "prompts", "no prompt to get");
       const prompt = pickPrompt(prompts);
       if (!prompt) return pass("skipped: server lists no prompts");
       const params: Record<string, unknown> = { name: prompt.name };

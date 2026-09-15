@@ -321,3 +321,234 @@ describe("HttpTransport raw probes honour an abort signal", () => {
     }
   });
 });
+
+/**
+ * Answer the next request with 200 text/event-stream, write `frames` (one
+ * SSE event each), then hold the response open without another byte --
+ * the way a server holds a subscriptions/listen it has nothing more to
+ * say on. `closed` resolves once the connection is gone (the client tore
+ * it down); a safety timer ends a response nothing else reached.
+ */
+function holdNextStream(frames: unknown[] = []): { restore: () => void; closed: Promise<void> } {
+  const origListeners = server.listeners("request");
+  server.removeAllListeners("request");
+  let resolveClosed: () => void = () => {};
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+  server.once("request", (req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.flushHeaders();
+      for (const frame of frames) res.write(`event: message\ndata: ${JSON.stringify(frame)}\n\n`);
+    });
+    const timer = setTimeout(() => res.destroy(), 8000);
+    res.on("close", () => {
+      clearTimeout(timer);
+      resolveClosed();
+    });
+  });
+  return {
+    restore: () => {
+      server.removeAllListeners("request");
+      for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+    },
+    closed,
+  };
+}
+
+/** How iterating a stream's messages ended within the guard budget. */
+interface Drained {
+  outcome: "ended" | "threw" | "still open";
+  seen: unknown[];
+  error?: unknown;
+}
+
+/**
+ * Iterate `messages` to the end, but give up after `budgetMs`: a stream
+ * whose end regressed must fail the assertion on `outcome`, not hang the
+ * file until the server's safety timer.
+ */
+async function drain(messages: AsyncIterable<unknown>, budgetMs = 4000): Promise<Drained> {
+  const seen: unknown[] = [];
+  const run = (async (): Promise<Drained> => {
+    try {
+      for await (const m of messages) seen.push(m);
+      return { outcome: "ended", seen };
+    } catch (error) {
+      return { outcome: "threw", seen, error };
+    }
+  })();
+  let guard: ReturnType<typeof setTimeout> | undefined;
+  const giveUp = new Promise<Drained>((resolve) => {
+    guard = setTimeout(() => resolve({ outcome: "still open", seen }), budgetMs);
+  });
+  try {
+    return await Promise.race([run, giveUp]);
+  } finally {
+    clearTimeout(guard);
+  }
+}
+
+/**
+ * "settled" when `promise` settles within `budgetMs`, else "still open".
+ * Bounds the wait on holdNextStream's `closed` (and on close() itself): a
+ * client that stopped tearing the connection down must fail the assertion,
+ * not pass late when the stub's own 8s safety timer destroys the response.
+ */
+async function settlesWithin(promise: Promise<unknown>, budgetMs: number): Promise<"settled" | "still open"> {
+  let guard: ReturnType<typeof setTimeout> | undefined;
+  const giveUp = new Promise<"still open">((resolve) => {
+    guard = setTimeout(() => resolve("still open"), budgetMs);
+  });
+  try {
+    return await Promise.race([
+      promise.then(
+        () => "settled" as const,
+        () => "settled" as const,
+      ),
+      giveUp,
+    ]);
+  } finally {
+    clearTimeout(guard);
+  }
+}
+
+describe("HttpTransport stream(): the timer, close() and an upstream abort end a held-open stream", () => {
+  // Nothing else bounds an HTTP stream: undici's own headers/body timeouts
+  // are minutes, so a subscriptions/listen the server never writes to
+  // would stall the run without the whole-stream timer.
+  const ack = { jsonrpc: "2.0", method: "notifications/subscriptions/acknowledged", params: {} };
+
+  it("a stream the server holds open without a frame ends quietly at the timeout, with no messages", async () => {
+    const { restore, closed } = holdNextStream();
+    try {
+      const t = createHttpTransport({ url: serverUrl });
+      const started = Date.now();
+      const stream = await t.stream("subscriptions/listen", { notifications: {} }, () => 500, { timeout: 300 });
+      expect(stream.statusCode).toBe(200);
+      expect(stream.requestId).toBe(500);
+      const drained = await drain(stream.messages);
+      const elapsed = Date.now() - started;
+      // Our own abort is the normal end of a held-open stream: not an error.
+      expect(drained.error).toBeUndefined();
+      expect(drained.outcome).toBe("ended");
+      expect(drained.seen).toEqual([]);
+      // It was the 300ms timer that ended it: not an early end of the body,
+      // and not a timer firing late (a loaded machine stretches 300ms, it
+      // does not make it 10x).
+      expect(elapsed).toBeGreaterThanOrEqual(250);
+      expect(elapsed).toBeLessThan(2000);
+      // And the client tore the connection down: the server sees it close
+      // at once, not when its own safety timer gives up on the response.
+      expect(await settlesWithin(closed, 1000)).toBe("settled");
+      await stream.close();
+    } finally {
+      restore();
+    }
+  });
+
+  it("frames already on the wire are delivered (and emitted to listeners) before the timeout ends the stream", async () => {
+    const { restore, closed } = holdNextStream([ack]);
+    try {
+      const t = createHttpTransport({ url: serverUrl });
+      const heard: { message: unknown; statusCode?: number }[] = [];
+      t.onMessage((message, meta) => heard.push({ message, statusCode: meta.statusCode }));
+      const started = Date.now();
+      const stream = await t.stream("subscriptions/listen", { notifications: {} }, () => 501, { timeout: 300 });
+      const drained = await drain(stream.messages);
+      const elapsed = Date.now() - started;
+      expect(drained.error).toBeUndefined();
+      expect(drained.outcome).toBe("ended");
+      expect(drained.seen).toEqual([ack]);
+      expect(heard).toEqual([{ message: ack, statusCode: 200 }]);
+      // A delivered frame does not stop the timer: it still ends the stream
+      // at 300ms and tears the connection down.
+      expect(elapsed).toBeGreaterThanOrEqual(250);
+      expect(elapsed).toBeLessThan(2000);
+      expect(await settlesWithin(closed, 1000)).toBe("settled");
+    } finally {
+      restore();
+    }
+  });
+
+  it("response headers that never arrive reject stream() with 'stream timed out after Nms'", async () => {
+    const restore = hangNextRequest();
+    try {
+      const t = createHttpTransport({ url: serverUrl });
+      const outcome = await Promise.race([
+        t
+          .stream("subscriptions/listen", { notifications: {} }, () => 502, { timeout: 300 })
+          .then(
+            () => "resolved",
+            (err: unknown) => (err instanceof Error ? err.message : String(err)),
+          ),
+        new Promise<string>((resolve) => setTimeout(() => resolve("still pending"), 4000)),
+      ]);
+      expect(outcome).toMatch(/stream timed out after 300ms/);
+    } finally {
+      restore();
+    }
+  });
+
+  it("close() ends a held-open stream long before its timeout, after the frames already delivered", async () => {
+    const { restore, closed } = holdNextStream([ack]);
+    try {
+      const t = createHttpTransport({ url: serverUrl });
+      const stream = await t.stream("subscriptions/listen", { notifications: {} }, () => 503, { timeout: 10000 });
+      const iterator = stream.messages[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      expect(first).toEqual({ done: false, value: ack });
+      // close() itself returns promptly (it does not wait on a body the
+      // server never ends) ...
+      expect(await settlesWithin(stream.close(), 1000)).toBe("settled");
+      const drained = await drain({ [Symbol.asyncIterator]: () => iterator }, 1000);
+      expect(drained.error).toBeUndefined();
+      expect(drained.outcome).toBe("ended");
+      expect(drained.seen).toEqual([]);
+      // ... and tore the connection down, rather than leaving it to the
+      // stub's safety timer.
+      expect(await settlesWithin(closed, 1000)).toBe("settled");
+    } finally {
+      restore();
+    }
+  });
+
+  it("an upstream abort mid-stream ends the iteration quietly, long before the timeout", async () => {
+    const { restore, closed } = holdNextStream();
+    try {
+      const t = createHttpTransport({ url: serverUrl });
+      const controller = new AbortController();
+      const stream = await t.stream("subscriptions/listen", { notifications: {} }, () => 504, {
+        timeout: 10000,
+        signal: controller.signal,
+      });
+      setTimeout(() => controller.abort(new Error("run aborted by the user")), 50);
+      const drained = await drain(stream.messages);
+      expect(drained.error).toBeUndefined();
+      expect(drained.outcome).toBe("ended");
+      expect(drained.seen).toEqual([]);
+      expect(await settlesWithin(closed, 1000)).toBe("settled");
+    } finally {
+      restore();
+    }
+  });
+
+  it("an already-aborted upstream signal rejects stream() with its reason instead of sending the request", async () => {
+    responder = () => ({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ jsonrpc: "2.0", id: 505, result: {} }),
+    });
+    const t = createHttpTransport({ url: serverUrl });
+    lastRequest = null;
+    await expect(
+      t.stream("subscriptions/listen", { notifications: {} }, () => 505, {
+        timeout: 1000,
+        signal: AbortSignal.abort(new Error("aborted before send")),
+      }),
+    ).rejects.toThrow(/aborted before send/);
+    expect(lastRequest).toBeNull();
+  });
+});

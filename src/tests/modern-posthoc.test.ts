@@ -227,13 +227,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
 async function scanStub(
   handler: (req: IncomingMessage, res: ServerResponse, body: string) => void,
   trigger: (client: ModernClient) => Promise<void>,
-): Promise<{ results: Record<string, TestResult>; warnings: string[] }> {
+): Promise<{ results: Record<string, TestResult>; warnings: string[]; recorder: Recorder }> {
   const stub = await stubHttp(handler);
   try {
     const ctx = makeContext(createHttpTransport({ url: stub.url }));
     await trigger(ctx.client);
     await runPostHoc(ctx);
-    return { results: collect(ctx), warnings: ctx.harness.warnings };
+    return { results: collect(ctx), warnings: ctx.harness.warnings, recorder: ctx.recorder };
   } finally {
     await stub.stop();
   }
@@ -246,6 +246,38 @@ const DISCOVER_RESULT = {
   ttlMs: 1000,
   cacheScope: "public",
 };
+
+let childScripts: string[] = [];
+afterEach(() => {
+  for (const f of childScripts) rmSync(f, { force: true });
+  childScripts = [];
+});
+
+/**
+ * A scripted stdio child, written to a temp file (a multi-line `-e`
+ * script through cmd.exe is unreliable on Windows). It reads JSON lines;
+ * `onLine` is the body of the per-line handler and sees `msg` (the parsed
+ * line), `send(obj)` (writes one JSON line) and `discover` (the discover
+ * result). Anything declared in `setup` lives across lines.
+ */
+function scriptedChild(onLine: string[], setup: string[] = []): string {
+  const script = [
+    'const rl = require("node:readline").createInterface({ input: process.stdin });',
+    'const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");',
+    `const discover = ${JSON.stringify(DISCOVER_RESULT)};`,
+    ...setup,
+    'rl.on("line", (line) => {',
+    "  let msg;",
+    "  try { msg = JSON.parse(line); } catch { return; }",
+    ...onLine.map((l) => `  ${l}`),
+    "});",
+    "setTimeout(() => {}, 30000);",
+  ].join("\n");
+  const path = join(tmpdir(), `mcp-compliance-posthoc-child-${process.pid}-${Date.now()}-${Math.random()}.cjs`);
+  writeFileSync(path, script, "utf8");
+  childScripts.push(path);
+  return path;
+}
 
 describe("2026-07-28 post-hoc tests: the real suite over the clean fixture", () => {
   it("all eight pass over stdio (full suite, no --only)", async () => {
@@ -696,6 +728,67 @@ describe("2026-07-28 post-hoc tests: timeline attribution of a reply to a client
       "1 of 1 error response did not echo the request id; first: server/discover sent id 1040, reply carried null",
     );
   });
+
+  // A real run keeps sending after the stray. Re-attribution looks only
+  // BACKWARDS from it: a request sent later cannot have drawn the reply,
+  // even one that never got an answer of its own (it timed out).
+  it("a LATER id-bearing request that never got a reply does not capture the stray (scripted)", async () => {
+    const { results } = await scanRecording("stdio", (recorder) => {
+      notificationAnswered(recorder);
+      recorder.recordSent({ id: 1041, method: "tools/list", params: {}, meta: undefined }); // times out
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed, echo.details).toBe(true);
+    expect(echo.details).toBe(
+      "no error responses to id-bearing requests recorded (exempt: 1 answering raw probes or client notifications)",
+    );
+  });
+
+  it("over real stdio: the stray answering a notification stays exempt when a later request times out", async () => {
+    // The child holds its (wrong) reply to notifications/cancelled until
+    // the next request arrives, so the stray deterministically lands
+    // after server/discover was sent -- the stdio flush race, made
+    // repeatable. It never answers tools/list, which then times out.
+    const transport = createStdioTransport({
+      command: process.execPath,
+      args: [
+        scriptedChild(
+          [
+            'if (msg.method === "notifications/cancelled") heldFor = msg.params.requestId;',
+            'if (msg.method === "server/discover") {',
+            '  if (heldFor !== null) send({ jsonrpc: "2.0", id: null, error: { code: -32602, message: "unknown request " + heldFor } });',
+            "  heldFor = null;",
+            '  send({ jsonrpc: "2.0", id: msg.id, result: discover });',
+            "}",
+          ],
+          ["let heldFor = null;"],
+        ),
+      ],
+    });
+    try {
+      const ctx = makeContext(transport);
+      await ctx.client.notify("notifications/cancelled", { requestId: 987654321 });
+      await fire(ctx.client, "server/discover");
+      await expect(ctx.client.rpc("tools/list", {}, { timeout: 300 })).rejects.toThrow(/timed out/);
+      expect(ctx.recorder.sent.map((s) => [s.method, s.id])).toEqual([
+        ["notifications/cancelled", undefined],
+        ["server/discover", 1000],
+        ["tools/list", 1001],
+      ]);
+      // The stray arrived after discover went out (so the pop lands it on
+      // discover and re-attribution runs), ahead of discover's own reply.
+      expect(ctx.recorder.received.map((r) => (r.message as { id?: unknown }).id)).toEqual([null, 1000]);
+      expect(ctx.recorder.received[0]?.seq).toBeGreaterThan(ctx.recorder.sent[1]?.seq as number);
+      await runPostHoc(ctx);
+      const echo = collect(ctx)["error-id-echo"] as TestResult;
+      expect(echo.passed, echo.details).toBe(true);
+      expect(echo.details).toBe(
+        "no error responses to id-bearing requests recorded (exempt: 1 answering raw probes or client notifications)",
+      );
+    } finally {
+      await transport.close();
+    }
+  });
 });
 
 describe("2026-07-28 post-hoc tests: timeline attribution when id-bearing requests overlap", () => {
@@ -789,15 +882,87 @@ describe("2026-07-28 post-hoc tests: timeline attribution when id-bearing reques
       "1 of 1 error response did not echo the request id; first: server/discover sent id 1002, reply carried null",
     );
   });
+
+  // A real run keeps sending after the overlap: raw probes and
+  // notifications follow transport-concurrent. An id-less entry sent
+  // AFTER the stray is not a candidate owner, so it cannot exempt it.
+  it.each([
+    ["raw probe", { id: undefined, method: "server/discover", params: undefined, meta: undefined, raw: "{not json" }],
+    ["client notification", { id: undefined, method: "notifications/cancelled", params: {}, meta: undefined }],
+  ])("a LATER %s does not exempt the stray blamed on 1002 (scripted)", async (_label, later) => {
+    const { results } = await scanRecording("stdio", (recorder) => {
+      recorder.recordSent({ id: 1001, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordSent({ id: 1002, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordSent({ id: 1003, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived(nullIdError);
+      recorder.recordReceived(discover(1001));
+      recorder.recordReceived(discover(1003));
+      recorder.recordSent(later);
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      "1 of 1 error response did not echo the request id; first: server/discover sent id 1002, reply carried null",
+    );
+  });
+
+  it("over real HTTP, traffic sent after the overlap (a raw probe, a notification, another discover) neither captures nor exempts the stray", async () => {
+    // The same overlap as above, then what a full run sends next: a
+    // malformed-body raw probe (answered 400 with a null-id parse error,
+    // legitimately exempt), a notification, and one more discover.
+    const pending: { id: number; res: ServerResponse }[] = [];
+    const overlap = (_req: IncomingMessage, res: ServerResponse, body: string) => {
+      let m: { id?: number };
+      try {
+        m = JSON.parse(body) as { id?: number };
+      } catch {
+        sendJson(res, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
+        return;
+      }
+      if (m.id === undefined) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      if (m.id < 1001 || m.id > 1003) {
+        sendJson(res, 200, discover(m.id));
+        return;
+      }
+      pending.push({ id: m.id, res });
+      if (pending.length < 3) return;
+      for (const p of pending) {
+        if (p.id === 1002) sendJson(p.res, 200, nullIdError);
+        else setTimeout(() => sendJson(p.res, 200, discover(p.id)), p.id === 1001 ? 80 : 160);
+      }
+    };
+    const { results, recorder } = await scanStub(overlap, async (client) => {
+      await fire(client, "server/discover");
+      await client.notify("notifications/cancelled", { requestId: 999999 });
+      await Promise.all([0, 1, 2].map(() => fire(client, "server/discover")));
+      await client.raw("{not json", { method: "server/discover" });
+      await client.notify("notifications/cancelled", { requestId: 888888 });
+      await fire(client, "server/discover");
+    });
+    // The later traffic really went out after the three overlapping discovers.
+    expect(recorder.sent.map((s) => (s.raw !== undefined ? "raw" : (s.id ?? s.method)))).toEqual([
+      1000,
+      "notifications/cancelled",
+      1001,
+      1002,
+      1003,
+      "raw",
+      "notifications/cancelled",
+      1004,
+    ]);
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      "1 of 1 error response did not echo the request id; first: server/discover sent id 1002, reply carried null (exempt: 1 answering raw probes or client notifications)",
+    );
+  });
 });
 
 describe("2026-07-28 post-hoc tests: the cancel a stdio stream's close() writes is recorded", () => {
-  let tempFiles: string[] = [];
-  afterEach(() => {
-    for (const f of tempFiles) rmSync(f, { force: true });
-    tempFiles = [];
-  });
-
   /**
    * A stdio child that answers server/discover, never acknowledges
    * subscriptions/listen, and (wrongly) answers notifications/cancelled
@@ -805,22 +970,10 @@ describe("2026-07-28 post-hoc tests: the cancel a stdio stream's close() writes 
    * cancel, not to the listen request it names.
    */
   function cancelAnsweringChild(): string {
-    const script = [
-      'const rl = require("node:readline").createInterface({ input: process.stdin });',
-      'const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");',
-      `const discover = ${JSON.stringify(DISCOVER_RESULT)};`,
-      'rl.on("line", (line) => {',
-      "  let msg;",
-      "  try { msg = JSON.parse(line); } catch { return; }",
-      '  if (msg.method === "server/discover") send({ jsonrpc: "2.0", id: msg.id, result: discover });',
-      '  if (msg.method === "notifications/cancelled") send({ jsonrpc: "2.0", id: null, error: { code: -32602, message: "unknown request " + msg.params.requestId } });',
-      "});",
-      "setTimeout(() => {}, 30000);",
-    ].join("\n");
-    const path = join(tmpdir(), `mcp-compliance-posthoc-cancel-${process.pid}-${Date.now()}-${Math.random()}.cjs`);
-    writeFileSync(path, script, "utf8");
-    tempFiles.push(path);
-    return path;
+    return scriptedChild([
+      'if (msg.method === "server/discover") send({ jsonrpc: "2.0", id: msg.id, result: discover });',
+      'if (msg.method === "notifications/cancelled") send({ jsonrpc: "2.0", id: null, error: { code: -32602, message: "unknown request " + msg.params.requestId } });',
+    ]);
   }
 
   it("attributes the reply to notifications/cancelled to that notification, not to the stream's request", async () => {

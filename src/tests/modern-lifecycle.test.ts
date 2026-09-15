@@ -242,6 +242,111 @@ for (const kind of KINDS) {
       expectPassed(report, "lifecycle-meta-client-info-optional");
     });
 
+    it("meta-error-wrong-code: a -32600 rejection of the malformed _meta passes each rejection test with a warning", async () => {
+      const report = await runBroken(kind, ["meta-error-wrong-code"], META_REJECTION_IDS);
+      const status = kind === "http" ? " (HTTP 400)" : "";
+      expect(expectPassed(report, "lifecycle-meta-required").details).toBe(
+        `server/discover without _meta: rejected with -32600${status}, expected -32602 (see warning)`,
+      );
+      expect(expectPassed(report, "lifecycle-meta-protocol-version-required").details).toBe(
+        `server/discover without _meta protocolVersion: rejected with -32600${status}, expected -32602 (see warning)`,
+      );
+      expect(expectPassed(report, "lifecycle-meta-client-capabilities-required").details).toBe(
+        `server/discover without _meta clientCapabilities: rejected with -32600${status}, expected -32602 (see warning)`,
+      );
+      // Report order: the clientCapabilities probe runs early, the two claim-less probes late.
+      expect(lifecycleWarnings(report)).toEqual([
+        'lifecycle-meta-client-capabilities-required: server/discover without _meta clientCapabilities was rejected with -32600 (Invalid Request: params._meta["io.modelcontextprotocol/cl...) (expected -32602)',
+        "lifecycle-meta-required: server/discover without _meta was rejected with -32600 (Invalid Request: params._meta is required) (expected -32602)",
+        'lifecycle-meta-protocol-version-required: server/discover without _meta protocolVersion was rejected with -32600 (Invalid Request: params._meta["io.modelcontextprotocol/pr...) (expected -32602)',
+      ]);
+    });
+
+    it("accept-any-version: version-unsupported fails when the unsupported version is served", async () => {
+      const report = await runBroken(
+        kind,
+        ["accept-any-version"],
+        ["lifecycle-discover", "lifecycle-version-unsupported"],
+      );
+      expectPassed(report, "lifecycle-discover");
+      expect(expectFailed(report, "lifecycle-version-unsupported").details).toBe(
+        `server/discover declaring protocol version 1999-01-01 was served (result)${kind === "http" ? " (HTTP 200)" : ""}; expected -32022`,
+      );
+    });
+
+    it("boolean-capability: capabilities fails, and the boolean reads as undeclared instead of crashing a gate", async () => {
+      const report = await runBroken(
+        kind,
+        ["boolean-capability"],
+        [
+          "lifecycle-discover",
+          "lifecycle-capabilities",
+          "lifecycle-capability-handlers-match",
+          "lifecycle-progress-token",
+          "tools-list",
+        ],
+      );
+      // The envelope is still an object, so discover itself passes.
+      expectPassed(report, "lifecycle-discover");
+      expect(expectFailed(report, "lifecycle-capabilities").details).toBe(
+        "Declared capabilities must be objects: tools is boolean",
+      );
+      // `tools: true` declares nothing: the tool-gated tests skip or drop out...
+      expect(expectPassed(report, "lifecycle-progress-token").details).toBe("skipped: server declares no tools");
+      expect(report.tests.some((t) => t.id === "tools-list")).toBe(false);
+      // ...and the fixture still serves tools/list, which the handlers check sees as undeclared-but-served.
+      expectFailed(
+        report,
+        "lifecycle-capability-handlers-match",
+        /^tools: not declared but tools\/list returned a result/,
+      );
+    });
+
+    it("completion-rejects-argument / completion-no-values: completions fails on a listed prompt argument", async () => {
+      const source = 'prompt "greet" argument "name"';
+      const rejected = await runBroken(kind, ["completion-rejects-argument"], ["lifecycle-completions"]);
+      // InvalidParams is acceptable only for the placeholder probe, never for a real listed argument.
+      const r = expectFailed(rejected, "lifecycle-completions");
+      expect(r.details).toBe(
+        `completion/complete for ${source}: JSON-RPC error -32602 (Invalid params: cannot complete argument "name")${kind === "http" ? " (HTTP 400)" : ""}`,
+      );
+      expect(r.required).toBe(true);
+      const noValues = await runBroken(kind, ["completion-no-values"], ["lifecycle-completions"]);
+      expect(expectFailed(noValues, "lifecycle-completions").details).toBe(
+        `completion/complete for ${source}: result has no completion.values array`,
+      );
+    });
+
+    it("prompts-list-error: completions still completes the listed template variable", async () => {
+      // --only: prompts-list is filtered out, yet a real template argument is measured, so no list verdict is needed.
+      const report = await runBroken(kind, ["prompts-list-error"], ["lifecycle-completions"]);
+      expect(expectPassed(report, "lifecycle-completions").details).toBe(
+        'Returned 0 completion(s) for resource template "test://template/{id}/data" variable "id"',
+      );
+    });
+
+    it("prompts-list-error + templates-list-error: completions reports the failed lists instead of probing a placeholder", async () => {
+      const breaks = ["prompts-list-error", "templates-list-error"];
+      const prompts = "prompts/list failed (JSON-RPC error -32603 (Internal error: prompt store unavailable))";
+      const templates =
+        "resources/templates/list failed (JSON-RPC error -32603 (Internal error: resource template store unavailable))";
+      const what = "no prompt or template argument to complete";
+      // Neither owning list test in the run: nothing else names the broken lists.
+      const alone = await runBroken(kind, breaks, ["lifecycle-completions"]);
+      expect(expectFailed(alone, "lifecycle-completions").details).toBe(`${prompts} and ${templates}; ${what}`);
+      // prompts-list reports its own failure; the filtered-out templates list is still named here.
+      const withPrompts = await runBroken(kind, breaks, ["prompts-list", "lifecycle-completions"]);
+      expectFailed(withPrompts, "prompts-list");
+      expect(expectFailed(withPrompts, "lifecycle-completions").details).toBe(`${templates}; ${what}`);
+      // Both owning tests in the run: each failure is reported once, there.
+      const both = await runBroken(kind, breaks, ["prompts-list", "resources-templates", "lifecycle-completions"]);
+      expectFailed(both, "prompts-list");
+      expectFailed(both, "resources-templates");
+      expect(expectPassed(both, "lifecycle-completions").details).toBe(
+        `skipped: prompts/list and resources/templates/list failed, ${what} (see prompts-list, resources-templates)`,
+      );
+    });
+
     it("wrong-version-error / version-error-no-data: version-unsupported fails", async () => {
       const wrongCode = await runBroken(kind, ["wrong-version-error"], ["lifecycle-version-unsupported"]);
       expectFailed(wrongCode, "lifecycle-version-unsupported", /rejected with -32602.*expected -32022/);
@@ -454,7 +559,8 @@ async function startModernStub(route: StubRoute): Promise<{ url: string; close()
 
 const SUB = "io.modelcontextprotocol/subscriptionId";
 
-function discoverReply(id: unknown, capabilities: Record<string, unknown>): StubReply {
+/** `capabilities` is untyped so a stub can serve a malformed one. */
+function discoverReply(id: unknown, capabilities: unknown): StubReply {
   return {
     status: 200,
     body: {
@@ -901,6 +1007,294 @@ describe("a server that rejects everything (SDK v1 'Server not initialized') ove
         `subscriptions/listen rejected with -32000 (HTTP 400); ${reason}`,
       );
       expect(lifecycleWarnings(report)).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("the HTTP status rule on the rejection tests (a JSON-RPC error must come with HTTP 400)", () => {
+  it("-32602 on HTTP 200 fails both claim-less _meta probes instead of passing as a rejection", async () => {
+    const stub = await startModernStub(
+      conformantRoute((method, msg) =>
+        method === "server/discover" && !hasProtocolVersionClaim(msg)
+          ? {
+              status: 200,
+              body: { jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Invalid params: _meta required" } },
+            }
+          : undefined,
+      ),
+    );
+    try {
+      const report = await runModern(stub.url, {
+        only: ["lifecycle-discover", "lifecycle-meta-required", "lifecycle-meta-protocol-version-required"],
+      });
+      expectPassed(report, "lifecycle-discover");
+      expect(expectFailed(report, "lifecycle-meta-required").details).toBe(
+        "server/discover without _meta: JSON-RPC error -32602 with HTTP 200 (expected 400)",
+      );
+      expect(expectFailed(report, "lifecycle-meta-protocol-version-required").details).toBe(
+        "server/discover without _meta protocolVersion: JSON-RPC error -32602 with HTTP 200 (expected 400)",
+      );
+      expect(lifecycleWarnings(report)).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("a correct -32022 on HTTP 200 fails version-unsupported", async () => {
+    const stub = await startModernStub(
+      conformantRoute((method, msg) =>
+        method === "server/discover" && msg.params?._meta?.["io.modelcontextprotocol/protocolVersion"] === "1999-01-01"
+          ? {
+              status: 200,
+              body: {
+                jsonrpc: "2.0",
+                id: msg.id,
+                error: {
+                  code: -32022,
+                  message: "Unsupported protocol version: 1999-01-01",
+                  data: { supported: ["2026-07-28"], requested: "1999-01-01" },
+                },
+              },
+            }
+          : undefined,
+      ),
+    );
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-discover", "lifecycle-version-unsupported"] });
+      expectPassed(report, "lifecycle-discover");
+      // The data is right (a subset of the discover list, requested echoed): only the status is wrong.
+      expect(expectFailed(report, "lifecycle-version-unsupported").details).toBe(
+        "-32022 returned but HTTP 200 (expected 400)",
+      );
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("lifecycle-capabilities: a capabilities value that is not an object", () => {
+  // An array is the value a bare `typeof === "object"` guard lets through, and
+  // one holding a declaration is what a client that walks it would misread.
+  for (const [label, capabilities, type] of [
+    ["a string", "x", "string"],
+    ["an array holding a declaration", [{ tools: {}, completions: {} }], "an array"],
+  ] as const) {
+    it(`${label}: fails discover and capabilities, stores no declaration, and gates every capability as undeclared`, async () => {
+      const stub = await startModernStub((method, msg) => {
+        if (method === "server/discover") return discoverReply(msg.id, capabilities);
+        return notFound(msg.id, method);
+      });
+      try {
+        const report = await runModern(stub.url, {
+          only: [
+            "lifecycle-discover",
+            "lifecycle-capabilities",
+            "lifecycle-capability-handlers-match",
+            "lifecycle-progress-token",
+            "lifecycle-completions",
+          ],
+        });
+        expect(expectFailed(report, "lifecycle-discover").details).toBe(
+          `DiscoverResult invalid: capabilities is ${type}, expected an object`,
+        );
+        expect(expectFailed(report, "lifecycle-capabilities").details).toBe(
+          `capabilities is ${type}, expected an object`,
+        );
+        // The malformed value is not kept as the declaration: the report (and the
+        // terminal's "Capabilities:" line, which walks its keys) carries none.
+        expect(report.serverInfo.capabilities).toEqual({});
+        expect(expectPassed(report, "lifecycle-capability-handlers-match").details).toBe(
+          "tools: undeclared, tools/list -> -32601; resources: undeclared, resources/list -> -32601; prompts: undeclared, prompts/list -> -32601",
+        );
+        expect(expectPassed(report, "lifecycle-progress-token").details).toBe("skipped: server declares no tools");
+        expect(report.tests.some((t) => t.id === "lifecycle-completions")).toBe(false);
+      } finally {
+        await stub.close();
+      }
+    });
+  }
+});
+
+describe("lifecycle-completions: the placeholder probe when no prompt or template argument is listed", () => {
+  const PLACEHOLDER = 'probe prompt "__test__" (no prompt or template argument listed)';
+
+  /** Declares only completions, so there is no prompts or templates list to take an argument from. */
+  const completionsOnly = (complete: (msg: Record<string, any>) => StubReply) => {
+    const sent: Array<{ method: string; params: unknown }> = [];
+    const started = startModernStub((method, msg) => {
+      sent.push({ method, params: msg.params });
+      if (method === "server/discover") return discoverReply(msg.id, { completions: {} });
+      if (method === "completion/complete") return complete(msg);
+      return notFound(msg.id, method);
+    });
+    return { sent, started };
+  };
+
+  it("passes on InvalidParams for the placeholder ref", async () => {
+    const { sent, started } = completionsOnly((msg) => invalidParams(msg.id, "unknown prompt __test__"));
+    const stub = await started;
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-completions"] });
+      const r = expectPassed(report, "lifecycle-completions");
+      expect(r.details).toBe(`InvalidParams for ${PLACEHOLDER} (acceptable)`);
+      expect(r.required).toBe(true);
+      // Nothing was listed first (prompts and resources are undeclared), and the probe used the placeholder ref.
+      expect(sent.map((s) => s.method).filter((m) => m !== "server/discover")).toEqual(["completion/complete"]);
+      expect(sent.find((s) => s.method === "completion/complete")?.params).toMatchObject({
+        ref: { type: "ref/prompt", name: "__test__" },
+        argument: { name: "test", value: "" },
+      });
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("fails on any other error for the placeholder ref", async () => {
+    const { started } = completionsOnly((msg) => notFound(msg.id, "completion/complete"));
+    const stub = await started;
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-completions"] });
+      expect(expectFailed(report, "lifecycle-completions").details).toBe(
+        `completion/complete for ${PLACEHOLDER}: JSON-RPC error -32601 (Method not found: completion/complete) (HTTP 404)`,
+      );
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("lifecycle-completions: a declared list the probe draws from failed", () => {
+  const PLACEHOLDER = 'probe prompt "__test__" (no prompt or template argument listed)';
+  const WHAT = "no prompt or template argument to complete";
+
+  const boom = (id: unknown): StubReply => ({
+    status: 200,
+    body: { jsonrpc: "2.0", id, error: { code: -32603, message: "boom" } },
+  });
+  const listReply = (id: unknown, key: string, items: unknown[]): StubReply => ({
+    status: 200,
+    body: { jsonrpc: "2.0", id, result: { resultType: "complete", [key]: items, ttlMs: 0, cacheScope: "public" } },
+  });
+
+  /**
+   * Declares `capabilities` plus completions; `lists` answers methods by
+   * name (the list calls, optionally completion/complete); an unanswered
+   * completion/complete draws the -32602 on 400 a server gives a ref it
+   * does not know (what the placeholder probe accepts); anything else -32601.
+   */
+  const completionsStub = (
+    capabilities: Record<string, unknown>,
+    lists: Record<string, (msg: Record<string, any>) => StubReply>,
+  ) => {
+    const sent: Array<{ method: string; params: unknown }> = [];
+    const started = startModernStub((method, msg) => {
+      sent.push({ method, params: msg.params });
+      if (method === "server/discover") return discoverReply(msg.id, { ...capabilities, completions: {} });
+      const list = lists[method];
+      if (list) return list(msg);
+      if (method === "completion/complete") return invalidParams(msg.id, "unknown ref");
+      return notFound(msg.id, method);
+    });
+    return { sent, started };
+  };
+  const methodsSent = (sent: Array<{ method: string }>) =>
+    sent.map((s) => s.method).filter((m) => m !== "server/discover");
+
+  it("prompts/list fails: FAIL with the reason when prompts-list is filtered out, skip-pass pointing at it when it runs", async () => {
+    // The reviewer's repro: pre-fix this graded A on the placeholder's -32602.
+    const { sent, started } = completionsStub({ prompts: {} }, { "prompts/list": (msg) => boom(msg.id) });
+    const stub = await started;
+    try {
+      const alone = await runModern(stub.url, { only: ["lifecycle-completions"] });
+      expect(expectFailed(alone, "lifecycle-completions").details).toBe(
+        `prompts/list failed (JSON-RPC error -32603 (boom)); ${WHAT}`,
+      );
+      expect(alone.grade).toBe("F");
+      // The placeholder is never sent: its -32602 would say nothing about the arguments the server really lists.
+      expect(methodsSent(sent)).toEqual(["prompts/list"]);
+
+      sent.length = 0;
+      const withList = await runModern(stub.url, { only: ["prompts-list", "lifecycle-completions"] });
+      expect(expectFailed(withList, "prompts-list").details).toMatch(/^prompts\/list returned .*-32603/);
+      expect(expectPassed(withList, "lifecycle-completions").details).toBe(
+        `skipped: prompts/list failed, ${WHAT} (see prompts-list)`,
+      );
+      expect(methodsSent(sent).filter((m) => m === "completion/complete")).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("prompts/list fails but a template is listed: the template variable is completed", async () => {
+    const { sent, started } = completionsStub(
+      { prompts: {}, resources: {} },
+      {
+        "prompts/list": (msg) => boom(msg.id),
+        "resources/templates/list": (msg) =>
+          listReply(msg.id, "resourceTemplates", [{ uriTemplate: "file:///{path}", name: "files" }]),
+        "completion/complete": (msg) => ({
+          status: 200,
+          body: { jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", completion: { values: ["a.txt"] } } },
+        }),
+      },
+    );
+    const stub = await started;
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-completions"] });
+      expect(expectPassed(report, "lifecycle-completions").details).toBe(
+        'Returned 1 completion(s) for resource template "file:///{path}" variable "path"',
+      );
+      expect(sent.find((s) => s.method === "completion/complete")?.params).toMatchObject({
+        ref: { type: "ref/resource", uri: "file:///{path}" },
+        argument: { name: "path", value: "" },
+      });
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("resources/templates/list fails: FAIL with the reason; answered -32601 (not supported) it keeps the placeholder", async () => {
+    const failing = completionsStub({ resources: {} }, { "resources/templates/list": (msg) => boom(msg.id) });
+    const stub = await failing.started;
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-completions"] });
+      expect(expectFailed(report, "lifecycle-completions").details).toBe(
+        `resources/templates/list failed (JSON-RPC error -32603 (boom)); ${WHAT}`,
+      );
+      expect(methodsSent(failing.sent)).toEqual(["resources/templates/list"]);
+    } finally {
+      await stub.close();
+    }
+
+    // -32601 is what resources-templates accepts as "not supported": no templates, nothing broken.
+    const unsupported = completionsStub({ resources: {} }, {});
+    const stub2 = await unsupported.started;
+    try {
+      const report = await runModern(stub2.url, { only: ["resources-templates", "lifecycle-completions"] });
+      expect(expectPassed(report, "resources-templates").details).toBe("Method not supported (acceptable): -32601");
+      expect(expectPassed(report, "lifecycle-completions").details).toBe(
+        `InvalidParams for ${PLACEHOLDER} (acceptable)`,
+      );
+      expect(methodsSent(unsupported.sent)).toEqual(["resources/templates/list", "completion/complete"]);
+    } finally {
+      await stub2.close();
+    }
+  });
+
+  it("a declared prompts list that is genuinely empty keeps the placeholder probe", async () => {
+    const { sent, started } = completionsStub(
+      { prompts: {} },
+      { "prompts/list": (msg) => listReply(msg.id, "prompts", []) },
+    );
+    const stub = await started;
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-completions"] });
+      expect(expectPassed(report, "lifecycle-completions").details).toBe(
+        `InvalidParams for ${PLACEHOLDER} (acceptable)`,
+      );
+      expect(methodsSent(sent)).toEqual(["prompts/list", "completion/complete"]);
     } finally {
       await stub.close();
     }

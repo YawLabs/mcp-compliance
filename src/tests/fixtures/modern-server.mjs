@@ -48,6 +48,8 @@ const KNOBS = new Set([
   "no-discover",
   "discover-missing-versions",
   "accept-missing-meta",
+  "meta-error-wrong-code",
+  "accept-any-version",
   "wrong-version-error",
   "version-error-no-data",
   "accept-header-mismatch",
@@ -86,6 +88,11 @@ const KNOBS = new Set([
   "internal-ip-errors",
   "injection-echo",
   "capabilities-mismatch",
+  "boolean-capability",
+  "completion-rejects-argument",
+  "completion-no-values",
+  "prompts-list-error",
+  "templates-list-error",
   "tool-no-input-schema",
   "unicode-broken",
   "slow-discover",
@@ -165,6 +172,8 @@ function serverCapabilities() {
     completions: {},
   };
   if (broken("capabilities-mismatch")) delete caps.prompts;
+  // A boolean where the spec requires an object: clients read it as undeclared.
+  if (broken("boolean-capability")) caps.tools = true;
   return caps;
 }
 
@@ -338,6 +347,11 @@ function errorResponse(id, code, message, data) {
 /** Outcome: a single JSON-RPC error. `status` is the HTTP status; stdio ignores it. */
 function errorOutcome(id, code, message, { status = 200, data } = {}) {
   return { kind: "json", status, message: errorResponse(id, code, message, data) };
+}
+
+/** A handler that failed server-side: -32603 on HTTP 500. */
+function internalError(id, what) {
+  return errorOutcome(id, -32603, `Internal error: ${what}`, { status: 500 });
 }
 
 /**
@@ -575,10 +589,14 @@ async function handleRequest(msg, ctx) {
   }
   if (!broken("accept-missing-meta")) {
     const problem = metaProblem(params, meta);
-    if (problem) return errorOutcome(id, CODES.INVALID_PARAMS, `Invalid params: ${problem}`, { status: 400 });
+    if (problem) {
+      return broken("meta-error-wrong-code")
+        ? errorOutcome(id, CODES.INVALID_REQUEST, `Invalid Request: ${problem}`, { status: 400 })
+        : errorOutcome(id, CODES.INVALID_PARAMS, `Invalid params: ${problem}`, { status: 400 });
+    }
   }
   const requested = meta?.[META.protocolVersion];
-  if (typeof requested === "string" && !supportedVersions().includes(requested)) {
+  if (typeof requested === "string" && !broken("accept-any-version") && !supportedVersions().includes(requested)) {
     return unsupportedVersion(id, requested);
   }
   return dispatch(id, method, params, meta);
@@ -615,10 +633,13 @@ async function dispatch(id, method, params, meta) {
     case "resources/list":
       return paginated(id, method, params, "resources", RESOURCES);
     case "resources/templates/list":
+      // A declared list whose store is down: the call fails, it is not "unsupported".
+      if (broken("templates-list-error")) return internalError(id, "resource template store unavailable");
       return paginated(id, method, params, "resourceTemplates", RESOURCE_TEMPLATES);
     case "resources/read":
       return readResource(id, params);
     case "prompts/list":
+      if (broken("prompts-list-error")) return internalError(id, "prompt store unavailable");
       return paginated(id, method, params, "prompts", PROMPTS);
     case "prompts/get":
       return getPrompt(id, params);
@@ -877,6 +898,12 @@ function getPrompt(id, params) {
 function complete(id, params) {
   const ref = isObject(params.ref) ? params.ref : {};
   const argument = isObject(params.argument) ? params.argument : {};
+  if (broken("completion-rejects-argument")) {
+    return errorOutcome(id, CODES.INVALID_PARAMS, `Invalid params: cannot complete argument "${argument.name}"`, {
+      status: 400,
+    });
+  }
+  if (broken("completion-no-values")) return resultOutcome(id, "completion/complete", { completion: {} });
   const values = ref.type === "ref/prompt" && ref.name === "greet" && argument.name === "name" ? ["Alice", "Bob"] : [];
   return resultOutcome(id, "completion/complete", { completion: { values, hasMore: false } });
 }

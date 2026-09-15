@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   INTERNAL_HOSTNAME_PATTERN,
   INTERNAL_IP_PATTERNS,
+  POISONING_PATTERNS,
   STACK_TRACE_PATTERNS,
   WINDOWS_PATH_PATTERN,
 } from "../checks/patterns.js";
@@ -109,5 +110,48 @@ describe("INTERNAL_HOSTNAME_PATTERN", () => {
 
   it("is the hostname entry of INTERNAL_IP_PATTERNS", () => {
     expect(INTERNAL_IP_PATTERNS).toContain(INTERNAL_HOSTNAME_PATTERN);
+  });
+});
+
+describe("POISONING_PATTERNS: hidden Unicode", () => {
+  // Every character here is built from its code point, so this file stays
+  // free of invisible characters itself.
+  const hex = (cp: number) => `U+${cp.toString(16).toUpperCase().padStart(4, "0")}`;
+  const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => from + i);
+
+  /** Every label the whole pattern list reports for `text`. */
+  const labels = (text: string) => POISONING_PATTERNS.filter((p) => p.pattern.test(text)).map((p) => p.label);
+
+  it("flags each zero-width character: U+200B, U+200C, U+200D, U+FEFF", () => {
+    for (const cp of [0x200b, 0x200c, 0x200d, 0xfeff]) {
+      expect(labels(`read the${String.fromCodePoint(cp)}file`), hex(cp)).toEqual(["hidden Unicode characters"]);
+    }
+  });
+
+  it("flags each bidi embedding and override control, U+202A-U+202E (LRE, RLE, PDF, LRO, RLO)", () => {
+    for (const cp of range(0x202a, 0x202e)) {
+      expect(labels(`report${String.fromCodePoint(cp)}fdp.exe`), hex(cp)).toEqual(["hidden Unicode characters"]);
+    }
+  });
+
+  it("flags each bidi isolate control, U+2066-U+2069 (LRI, RLI, FSI, PDI)", () => {
+    for (const cp of range(0x2066, 0x2069)) {
+      expect(labels(`access${String.fromCodePoint(cp)}level`), hex(cp)).toEqual(["hidden Unicode characters"]);
+    }
+  });
+
+  it("passes plain right-to-left text and ordinary spacing characters", () => {
+    // Hebrew "shalom olam" and Arabic "marhaba bil-alam", escaped so the
+    // source does not reorder itself in an editor.
+    const hebrew = "\u05e9\u05dc\u05d5\u05dd \u05e2\u05d5\u05dc\u05dd";
+    const arabic = "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645";
+    for (const text of [
+      `Translates ${hebrew} and ${arabic} into English`,
+      `${arabic}: ${hebrew} (123)`,
+      // U+00A0 no-break space, and U+202F narrow no-break space (the code point just past RLO).
+      `10${String.fromCodePoint(0x00a0)}km and 5${String.fromCodePoint(0x202f)}%`,
+    ]) {
+      expect(labels(text), JSON.stringify(text)).toEqual([]);
+    }
   });
 });

@@ -521,7 +521,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/utilities/completion#requesting-completions",
     description:
-      "If the server declares the completions capability, sends completion/complete for the first listed prompt argument, else the first resource-template variable (prompts/list and resources/templates/list are fetched on demand), else a placeholder ref where -32602 is acceptable, and expects a result with a completion.values array (empty is fine). Servers that declare the capability must serve the method; skipped when the capability is absent.",
+      "If the server declares the completions capability, sends completion/complete for the first listed prompt argument, else the first resource-template variable (prompts/list and resources/templates/list are fetched on demand; a listed template is still used when prompts/list failed), else a placeholder ref where -32602 is acceptable, and expects a result with a completion.values array (empty is fine). When nothing is listed because a declared prompts/list or resources/templates/list failed (-32601 from resources/templates/list counts as no templates), the placeholder is not sent: the test skip-passes pointing at prompts-list / resources-templates when that test is in the run, and fails with the recorded reason when the run filtered it out. Servers that declare the capability must serve the method; skipped when the capability is absent.",
     recommendation:
       "When you declare completions, implement completion/complete and return at least { completion: { values: [], hasMore: false } }. Reference prompts by name and resource templates by uriTemplate exactly as listed.",
   },
@@ -567,7 +567,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#capabilities",
     description:
-      "Calls tools/list three times and compares the order of tool names. Servers SHOULD return tools in a deterministic order when the underlying set has not changed; a shuffled order defeats client caching and LLM prompt caching.",
+      "Calls tools/list three times and compares the order of tool names. Servers SHOULD return tools in a deterministic order when the underlying set has not changed; a shuffled order defeats client caching and LLM prompt caching. tools/list is fetched on demand when tools-list did not run; when that call failed, skipped pointing at tools-list if that test is in the run, and failed with the recorded reason (--only tools-list-deterministic-order, or --skip tools-list) when it is not. A server that lists no tools passes trivially (an empty order is deterministic).",
     recommendation:
       "Sort tools by name (or keep a fixed registration order) before returning them. Do not iterate an unordered map whose iteration order changes between calls.",
   },
@@ -578,7 +578,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "Calls the first tool whose inputSchema declares no required properties (else the first tool) with empty arguments and validates the result shape: a content array whose items each carry a type (isError: true with content also passes), or resultType 'input_required' (an MRTR InputRequiredResult) with inputRequests entries of the { method, params } shape and/or a string requestState. A JSON-RPC error passes -- -32602 (or -32600) as the expected answer for a tool that needs arguments, any other code noted as a protocol error in the details. resultType 'complete' is not checked here; schema-result-type scans every result post-hoc. Required at runtime when the tools capability is declared.",
+      "Calls the first tool whose inputSchema declares no required properties (else the first tool) with empty arguments and validates the result shape: a content array whose items each carry a type (isError: true with content also passes), or resultType 'input_required' (an MRTR InputRequiredResult) with inputRequests entries of the { method, params } shape and/or a string requestState. A JSON-RPC error passes -- -32602 (or -32600) as the expected answer for a tool that needs arguments, any other code noted as a protocol error in the details. resultType 'complete' is not checked here; schema-result-type scans every result post-hoc. tools/list is fetched on demand when tools-list did not run; when that call failed, skipped pointing at tools-list if that test is in the run, and failed with the recorded reason (--only tools-call, or --skip tools-list) when it is not. A server that lists no tools skips. Required at runtime when the tools capability is declared.",
     recommendation:
       "Return { resultType: 'complete', content: [{ type: 'text', text }], isError?: boolean } for a completed call, or { resultType: 'input_required', inputRequests, requestState } when you need elicitation or sampling. Report missing arguments with -32602 rather than an empty content array.",
   },
@@ -589,7 +589,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#tool-result",
     description:
-      "Validates that every item in a tools/call content array has a type of text, image, audio, resource or resource_link. These are the only content types defined for tool results; a typo or missing type breaks client rendering. Required at runtime when the tools capability is declared.",
+      "Validates that every item in a tools/call content array has a type of text, image, audio, resource or resource_link. These are the only content types defined for tool results; a typo or missing type breaks client rendering. tools/list is fetched on demand when tools-list did not run; when that call failed, skipped pointing at tools-list if that test is in the run, and failed with the recorded reason (--only tools-content-types, or --skip tools-list) when it is not. A server that lists no tools skips. Required at runtime when the tools capability is declared.",
     recommendation:
       "Set type on every content block to one of 'text', 'image', 'audio', 'resource', 'resource_link' and include the fields that type requires (text; data + mimeType; resource.uri; uri + name).",
   },
@@ -635,7 +635,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/resources#reading-resources",
     description:
-      "Reads the first listed resource that has a uri and validates the result: a contents array whose items carry uri and either text or blob, or resultType 'input_required' with a valid InputRequiredResult (inputRequests entries of the { method, params } shape and/or a string requestState). A JSON-RPC error for a resource the server itself listed fails, and an empty contents array passes with a warning. resultType 'complete' is not checked here; schema-result-type scans every result post-hoc. Required at runtime when the resources capability is declared.",
+      "Reads the first listed resource that has a uri and validates the result: a contents array whose items carry uri and either text or blob, or resultType 'input_required' with a valid InputRequiredResult (inputRequests entries of the { method, params } shape and/or a string requestState). A JSON-RPC error for a resource the server itself listed fails, and an empty contents array passes with a warning. resultType 'complete' is not checked here; schema-result-type scans every result post-hoc. resources/list is fetched on demand when resources-list did not run; when that call failed, skipped pointing at resources-list if that test is in the run, and failed with the recorded reason (--only resources-read, or --skip resources-list) when it is not. A server that lists no resource with a uri skips. Required at runtime when the resources capability is declared.",
     recommendation:
       "Return { resultType: 'complete', contents: [{ uri, mimeType, text | blob }], ttlMs, cacheScope } and make each item's uri the one that was requested (or a child of it for directory reads).",
   },
@@ -646,7 +646,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/utilities/caching#cacheable-results",
     description:
-      "Checks ttlMs (an integer >= 0) and cacheScope on the resources/read result. resources/read is a cacheable operation and MUST carry both hints on complete results; input_required interim results carry none and are exempt. Required at runtime when the resources capability is declared.",
+      "Checks ttlMs (an integer >= 0) and cacheScope on the resources/read result. resources/read is a cacheable operation and MUST carry both hints on complete results; input_required interim results carry none and are exempt. resources/list is fetched on demand when resources-list did not run; when that call failed, skipped pointing at resources-list if that test is in the run, and failed with the recorded reason (--only resources-read-caching, or --skip resources-list) when it is not. A server that lists no resource with a uri skips. Required at runtime when the resources capability is declared.",
     recommendation:
       "Add ttlMs and cacheScope to resources/read results. Content that depends on the authenticated user needs cacheScope: 'private'; use ttlMs: 0 for volatile data rather than omitting the field.",
   },
@@ -724,7 +724,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/prompts#getting-a-prompt",
     description:
-      "Gets the first listed prompt with no required arguments (else the first prompt, with each required argument filled by the placeholder 'test') and validates the result: a messages array whose items have a role of user or assistant and a content object, or resultType 'input_required' with a valid InputRequiredResult (inputRequests entries of the { method, params } shape and/or a string requestState). A -32602 (or -32600) error for a prompt that rejects the arguments also passes; any other JSON-RPC error fails. resultType 'complete' is not checked here; schema-result-type scans every result post-hoc. Required at runtime when the prompts capability is declared.",
+      "Gets the first listed prompt with no required arguments (else the first prompt, with each required argument filled by the placeholder 'test') and validates the result: a messages array whose items have a role of user or assistant and a content object, or resultType 'input_required' with a valid InputRequiredResult (inputRequests entries of the { method, params } shape and/or a string requestState). A -32602 (or -32600) error for a prompt that rejects the arguments also passes; any other JSON-RPC error fails. resultType 'complete' is not checked here; schema-result-type scans every result post-hoc. prompts/list is fetched on demand when prompts-list did not run; when that call failed, skipped pointing at prompts-list if that test is in the run, and failed with the recorded reason (--only prompts-get, or --skip prompts-list) when it is not. A server that lists no prompts skips. Required at runtime when the prompts capability is declared.",
     recommendation:
       "Return { resultType: 'complete', messages: [{ role, content: { type: 'text', text } }] }. Report missing required arguments with -32602 Invalid params, not an empty messages array.",
   },
@@ -1095,7 +1095,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Calls one tool with OS command-injection payloads ('; cat /etc/passwd', '$(whoami)', backticks) in one string argument. Tools with a string argument are tiered by annotation -- readOnlyHint true, then destructiveHint false, then unannotated, then destructiveHint true -- and only the safest non-empty tier is searched, because the spec defaults destructiveHint to true: a tool that says nothing may write, so it is a last resort. Passed-over tools are named in a warning (destructive and unannotated separately), and when the probed tool is unannotated or destructive a warning says it was hit with live payloads. Within the tier a free-form string argument is chosen over an enum/const/pattern one, which no payload can satisfy. The tool's other required arguments are filled with placeholders that honour the schema (const/enum/default/examples, the first non-null type, minimum, minItems, minLength/format, nested required) so the payload reaches the handler (also warned), and x-mcp-header parameters are mirrored into Mcp-Param-* headers so the request stays valid. Results are inspected for evidence of execution (passwd lines, id output, directory listings) and the details count what came back: rejected (isError or rejection wording -- the only outcome counted as a defence), returned without evidence of execution, and never reached the tool (a JSON-RPC or transport error). When no payload reached the tool at all the test passes as inconclusive with a warning. Servers MUST validate all tool inputs; a tool that echoes the payload back unexecuted passes.",
+      "Calls one tool with OS command-injection payloads ('; cat /etc/passwd', '$(whoami)', backticks) in one string argument. Tools with a string argument are tiered by annotation -- readOnlyHint true, then destructiveHint false, then unannotated, then destructiveHint true -- and only the safest non-empty tier is searched, because the spec defaults destructiveHint to true: a tool that says nothing may write, so it is a last resort. Passed-over tools are named in a warning (destructive and unannotated separately), and when the probed tool is unannotated or destructive a warning says it was hit with live payloads. Within the tier a free-form string argument is chosen over an enum/const/pattern one, which no payload can satisfy. The tool's other required arguments are filled with placeholders that honour the schema (const/enum/default/examples, the first non-null type, minimum, minItems, minLength/format, nested required) so the payload reaches the handler (also warned), and x-mcp-header parameters are mirrored into Mcp-Param-* headers so the request stays valid. Results are inspected for evidence of execution (passwd lines, id output, directory listings) and the details count what came back: rejected (isError or rejection wording -- the only outcome counted as a defence), returned without evidence of execution, and never reached the tool (a JSON-RPC or transport error). When no payload reached the tool at all the test passes as inconclusive with a warning. Servers MUST validate all tool inputs; a tool that echoes the payload back unexecuted passes. Skipped when the server declares or lists no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.",
     recommendation:
       "Never build shell strings from tool arguments. Use execFile/spawn with an argument array, parameterised APIs, or a strict allowlist, and return a tool error for anything outside the expected shape.",
   },
@@ -1106,7 +1106,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Calls the same single target as security-command-injection with SQL-injection payloads (' OR 1=1 --, UNION SELECT, stacked statements), other required arguments filled with schema-honouring placeholders and x-mcp-header parameters mirrored into headers, and inspects results for database error text or unexpected row dumps. The details count rejected, benign and never-reached outcomes; only rejections count as a defence, and a run in which no payload reached the tool passes as inconclusive with a warning. Servers MUST validate all tool inputs and sanitise tool outputs.",
+      "Calls the same single target as security-command-injection with SQL-injection payloads (' OR 1=1 --, UNION SELECT, stacked statements), other required arguments filled with schema-honouring placeholders and x-mcp-header parameters mirrored into headers, and inspects results for database error text or unexpected row dumps. The details count rejected, benign and never-reached outcomes; only rejections count as a defence, and a run in which no payload reached the tool passes as inconclusive with a warning. Servers MUST validate all tool inputs and sanitise tool outputs. Skipped when the server declares or lists no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.",
     recommendation:
       "Use parameterised queries or prepared statements everywhere and never concatenate arguments into SQL. Return a generic tool error for database failures rather than the driver's message.",
   },
@@ -1117,7 +1117,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Calls one tool with path-traversal payloads (../../etc/passwd, ..\\\\..\\\\windows\\\\system.ini, URL-encoded variants) in one string argument, preferring an argument whose name suggests a path (path, file, dir, folder; then url, uri, href, endpoint, host) searched across the tools of the safest annotation tier only (readOnlyHint true first; see security-command-injection) -- a non-read-only tool's path argument is never chosen while a read-only tool has any string argument, since the spec defaults destructiveHint to true -- otherwise the shared injection target. Other required arguments are filled with schema-honouring placeholders and x-mcp-header parameters mirrored. Inspects results for file contents outside the tool's scope and counts rejected, benign and never-reached outcomes (all never-reached passes as inconclusive with a warning). Servers MUST validate inputs and, for file:// resources, MUST sanitise paths to prevent directory traversal.",
+      "Calls one tool with path-traversal payloads (../../etc/passwd, ..\\\\..\\\\windows\\\\system.ini, URL-encoded variants) in one string argument, preferring an argument whose name suggests a path (path, file, dir, folder; then url, uri, href, endpoint, host) searched across the tools of the safest annotation tier only (readOnlyHint true first; see security-command-injection) -- a non-read-only tool's path argument is never chosen while a read-only tool has any string argument, since the spec defaults destructiveHint to true -- otherwise the shared injection target. Other required arguments are filled with schema-honouring placeholders and x-mcp-header parameters mirrored. Inspects results for file contents outside the tool's scope and counts rejected, benign and never-reached outcomes (all never-reached passes as inconclusive with a warning). Servers MUST validate inputs and, for file:// resources, MUST sanitise paths to prevent directory traversal. Skipped when the server declares or lists no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.",
     recommendation:
       "Resolve every path against a fixed base directory and reject results that escape it (path.resolve, then check the normalised result starts with the base). Reject '..' segments and null bytes outright.",
   },
@@ -1128,7 +1128,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Submits internal targets (the 169.254.169.254 metadata service, 127.0.0.1, [::1], 10.0.0.1) to one string argument, preferring one whose name suggests a URL (url, uri, href, endpoint, host, link; then path, file, dir) searched across the tools of the safest annotation tier only (readOnlyHint true first; see security-command-injection); when no such argument exists the shared injection target is used, so the details always name the tool.argument probed. Other required arguments are filled with schema-honouring placeholders and x-mcp-header parameters mirrored. Inspects results for cloud-metadata or internal-service responses and counts rejected, benign and never-reached outcomes (all never-reached passes as inconclusive with a warning). Servers MUST validate all tool inputs; fetching internal addresses on a caller's behalf is server-side request forgery.",
+      "Submits internal targets (the 169.254.169.254 metadata service, 127.0.0.1, [::1], 10.0.0.1) to one string argument, preferring one whose name suggests a URL (url, uri, href, endpoint, host, link; then path, file, dir) searched across the tools of the safest annotation tier only (readOnlyHint true first; see security-command-injection); when no such argument exists the shared injection target is used, so the details always name the tool.argument probed. Other required arguments are filled with schema-honouring placeholders and x-mcp-header parameters mirrored. Inspects results for cloud-metadata or internal-service responses and counts rejected, benign and never-reached outcomes (all never-reached passes as inconclusive with a warning). Servers MUST validate all tool inputs; fetching internal addresses on a caller's behalf is server-side request forgery. Skipped when the server declares or lists no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.",
     recommendation:
       "Resolve the hostname and reject private, loopback, link-local and metadata addresses before connecting (and re-check after redirects). Prefer an allowlist of permitted hosts for outbound fetches.",
   },
@@ -1139,7 +1139,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Calls a tool with a string argument of roughly 1 MB in the first string argument that is not header-mirrored (an x-mcp-header value would also travel in an Mcp-Param-* header and measure the header limit instead of the body; such an argument is used only when no other exists, and the details say so; a tool with no string argument at all gets the value as 'data'), far beyond what any reasonable tool needs, and expects a prompt rejection: HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport. A completed result passes with a warning (the server survived), while a 5xx, a timeout or a broken stdio frame fails. Skipped when the server declares no tools.",
+      "Calls a tool with a string argument of roughly 1 MB in the first string argument that is not header-mirrored (an x-mcp-header value would also travel in an Mcp-Param-* header and measure the header limit instead of the body; such an argument is used only when no other exists, and the details say so; a tool with no string argument at all gets the value as 'data'), far beyond what any reasonable tool needs, and expects a prompt rejection: HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport. A completed result passes with a warning (the server survived), while a 5xx, a timeout or a broken stdio frame fails. Skipped when the server declares or lists no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.",
     recommendation:
       "Enforce a request body limit (e.g. 1 MB) at the HTTP layer and return 413, and add maxLength to string properties in inputSchema so oversized arguments fail validation with -32602 before reaching the tool.",
   },
@@ -1150,7 +1150,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Calls the first tool with arguments that include properties its inputSchema does not define and verifies the server either rejects them (-32602) or ignores them, without a 5xx or a crash (a dropped connection, or a stdio child that exits). A call that merely times out is inconclusive and passes with a warning. Servers MUST validate tool inputs; unknown properties reaching internal functions are a classic parameter-injection vector. Skipped when the server declares no tools.",
+      "Calls the first tool with arguments that include properties its inputSchema does not define and verifies the server either rejects them (-32602) or ignores them, without a 5xx or a crash (a dropped connection, or a stdio child that exits). A call that merely times out is inconclusive and passes with a warning. Servers MUST validate tool inputs; unknown properties reaching internal functions are a classic parameter-injection vector. Skipped when the server declares or lists no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.",
     recommendation:
       "Validate arguments against inputSchema with additionalProperties: false, or strip unknown properties before use. Never spread raw arguments into internal calls.",
   },
@@ -1163,7 +1163,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#tool",
     description:
-      "Verifies every listed tool has an inputSchema with type 'object'. inputSchema MUST be a valid JSON Schema object; a tool without one cannot have its arguments validated, so anything the model sends reaches the handler unchecked.",
+      "Verifies every listed tool has an inputSchema with type 'object'. inputSchema MUST be a valid JSON Schema object; a tool without one cannot have its arguments validated, so anything the model sends reaches the handler unchecked. Skipped when the server declares or lists no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.",
     recommendation:
       "Define inputSchema for every tool, listing each property with a type and marking required ones. Use { type: 'object', additionalProperties: false } for tools that take no arguments.",
   },
@@ -1174,7 +1174,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#capabilities",
     description:
-      "Calls tools/list twice and compares the definitions (name, description, inputSchema, annotations). The set MUST NOT vary per-connection or as a side effect of other requests, and silently changing a definition between calls is the rug-pull pattern behind tool poisoning; a legitimate change is announced with notifications/tools/list_changed on a subscriptions/listen stream.",
+      "Calls tools/list twice and compares the definitions (name, description, inputSchema, annotations). The set MUST NOT vary per-connection or as a side effect of other requests, and silently changing a definition between calls is the rug-pull pattern behind tool poisoning; a legitimate change is announced with notifications/tools/list_changed on a subscriptions/listen stream. Skipped when the server declares no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.",
     recommendation:
       "Serve tool definitions from a stable registry and announce changes with notifications/tools/list_changed to subscribed clients. Never alter descriptions or schemas based on who is asking or how many times.",
   },
@@ -1185,9 +1185,9 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Scans tool names, descriptions and parameter descriptions for prompt-injection patterns ('ignore previous instructions', 'system prompt', hidden Unicode such as zero-width and bidi controls, long Base64 runs). Tool text is rendered into the model context, so an injection here reaches every user of the server.",
+      "Scans tool names, descriptions and parameter descriptions for prompt-injection patterns ('ignore previous instructions', 'system prompt', hidden Unicode such as zero-width and bidi controls, long Base64 runs). Tool text is rendered into the model context, so an injection here reaches every user of the server. Skipped when the server declares or lists no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.",
     recommendation:
-      "Keep descriptions plain, factual and free of instructions to the model. Strip zero-width characters and encoded blobs; if a tool needs usage rules, put them in the server's instructions field.",
+      "Keep descriptions plain, factual and free of instructions to the model. Strip zero-width and bidi control characters and encoded blobs; if a tool needs usage rules, put them in the server's instructions field.",
   },
   {
     id: "security-tool-cross-reference",
@@ -1196,7 +1196,7 @@ export const MODERN_TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#security-considerations",
     description:
-      "Checks that no tool description mentions another tool's name. Cross-references let a description steer the model's tool selection and chain calls the user never asked for; a description should describe only the tool it belongs to.",
+      "Checks that no tool description mentions another tool's name. Cross-references let a description steer the model's tool selection and chain calls the user never asked for; a description should describe only the tool it belongs to. Skipped when the server declares no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.",
     recommendation:
       "Describe each tool on its own. Document multi-step workflows in the server's instructions field rather than inside individual tool descriptions.",
   },

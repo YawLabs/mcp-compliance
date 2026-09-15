@@ -341,6 +341,46 @@ function listRoute(tools: (msg: Record<string, any>) => StubReply) {
   };
 }
 
+/**
+ * discover with tools + resources + prompts declared; each of the three
+ * list calls answered per `list` (called with the list's result key).
+ */
+function allListsRoute(list: (key: "tools" | "resources" | "prompts", msg: Record<string, any>) => StubReply) {
+  return (method: string, msg: Record<string, any>): StubReply => {
+    if (method === "server/discover") {
+      return ok(msg.id, {
+        supportedVersions: ["2026-07-28"],
+        capabilities: { tools: {}, resources: {}, prompts: {} },
+        _meta: { "io.modelcontextprotocol/serverInfo": { name: "list-stub", version: "0" } },
+      });
+    }
+    if (method === "tools/list") return list("tools", msg);
+    if (method === "resources/list") return list("resources", msg);
+    if (method === "prompts/list") return list("prompts", msg);
+    return rpcError(msg.id, -32601, `Method not found: ${method}`);
+  };
+}
+
+/** The feature checks that consume a list rather than own it. */
+const LIST_CONSUMER_IDS = [
+  "tools-list-deterministic-order",
+  "tools-call",
+  "tools-content-types",
+  "resources-read",
+  "resources-read-caching",
+  "prompts-get",
+];
+
+/** What each consumer had nothing to do, and the list it needed. */
+const CONSUMER_NEEDS: Record<string, { method: string; listTest: string; what: string }> = {
+  "tools-list-deterministic-order": { method: "tools/list", listTest: "tools-list", what: "no tool order to compare" },
+  "tools-call": { method: "tools/list", listTest: "tools-list", what: "no tool to call" },
+  "tools-content-types": { method: "tools/list", listTest: "tools-list", what: "no tool to call" },
+  "resources-read": { method: "resources/list", listTest: "resources-list", what: "no resource to read" },
+  "resources-read-caching": { method: "resources/list", listTest: "resources-list", what: "no resource to read" },
+  "prompts-get": { method: "prompts/list", listTest: "prompts-list", what: "no prompt to get" },
+};
+
 describe("a list call that fails", () => {
   it("tools-list-caching re-throws the cached tools/list timeout instead of paying a second one", async () => {
     const stub = await startListStub(listRoute(() => "hang"));
@@ -408,6 +448,83 @@ describe("a list call that fails", () => {
         details: "skipped: tools/list failed, no tools list to validate (see tools-list)",
       });
       expect(stub.sent.filter((m) => m === "tools/list")).toHaveLength(1);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("--only on the list consumers fails each one with the recorded reason when its -list test is not in the run", async () => {
+    const stub = await startListStub(allListsRoute((_key, msg) => rpcError(msg.id, -32603, "boom")));
+    try {
+      const report = await runModern(stub.url, { only: LIST_CONSUMER_IDS });
+      expect(report.tests.map((t) => t.id)).toEqual(LIST_CONSUMER_IDS);
+      for (const id of LIST_CONSUMER_IDS) {
+        const { method, what } = CONSUMER_NEEDS[id];
+        expect(resultOf(report, id), id).toMatchObject({
+          passed: false,
+          details: `${method} failed (JSON-RPC error -32603 (boom)); ${what}`,
+        });
+      }
+      // One attempt per list, however many consumers needed it.
+      for (const method of ["tools/list", "resources/list", "prompts/list"]) {
+        expect(
+          stub.sent.filter((m) => m === method),
+          method,
+        ).toHaveLength(1);
+      }
+      // Before the fix this run graded A / 100 with "skipped: no tools list available".
+      expect(report.score).toBeLessThan(100);
+      expect(report.grade).not.toBe("A");
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("with the -list tests in the run they carry the failure and the consumers skip-pass pointing at them", async () => {
+    const stub = await startListStub(allListsRoute((_key, msg) => rpcError(msg.id, -32603, "boom")));
+    try {
+      const report = await runModern(stub.url, {
+        only: ["tools-list", "resources-list", "prompts-list", ...LIST_CONSUMER_IDS],
+      });
+      for (const [listTest, method] of [
+        ["tools-list", "tools/list"],
+        ["resources-list", "resources/list"],
+        ["prompts-list", "prompts/list"],
+      ]) {
+        expect(resultOf(report, listTest), listTest).toMatchObject({
+          passed: false,
+          details: `${method} returned JSON-RPC error -32603 (boom)`,
+        });
+        expect(
+          stub.sent.filter((m) => m === method),
+          method,
+        ).toHaveLength(1);
+      }
+      for (const id of LIST_CONSUMER_IDS) {
+        const { method, listTest, what } = CONSUMER_NEEDS[id];
+        expect(resultOf(report, id), id).toMatchObject({
+          passed: true,
+          details: `skipped: ${method} failed, ${what} (see ${listTest})`,
+        });
+      }
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("a declared but empty list is not a failure: the consumers still skip-pass under --only", async () => {
+    const stub = await startListStub(allListsRoute((key, msg) => ok(msg.id, { [key]: [] })));
+    try {
+      const report = await runModern(stub.url, { only: LIST_CONSUMER_IDS });
+      expect(passedIds(report, LIST_CONSUMER_IDS)).toEqual(allPass(LIST_CONSUMER_IDS));
+      expect(resultOf(report, "tools-list-deterministic-order").details).toBe(
+        "0 tool(s); order is trivially deterministic",
+      );
+      expect(resultOf(report, "tools-call").details).toBe("skipped: server lists no tools");
+      expect(resultOf(report, "tools-content-types").details).toBe("skipped: server lists no tools");
+      expect(resultOf(report, "resources-read").details).toBe("skipped: server lists no resources with a uri");
+      expect(resultOf(report, "resources-read-caching").details).toBe("skipped: server lists no resources with a uri");
+      expect(resultOf(report, "prompts-get").details).toBe("skipped: server lists no prompts");
     } finally {
       await stub.close();
     }

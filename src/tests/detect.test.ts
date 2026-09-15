@@ -96,6 +96,84 @@ async function startFixedServer(
   };
 }
 
+type SseAnswer = { result: unknown } | { error: { code: number; message: string } };
+
+/**
+ * A node:http stub that answers every JSON-RPC request with 200 and
+ * Content-Type text/event-stream -- a normal Streamable HTTP response mode
+ * -- so the HTTP preflight (the era probe) has to read its reply through
+ * the SSE arm. `answer` decides each reply by method; notifications get a
+ * bare 202. `framing: "json"` keeps the text/event-stream header but
+ * writes a plain JSON body (no `data:` lines), the shape the SSE parser
+ * returns null on. Records every method it was sent.
+ */
+async function startSseServer(
+  answer: (method: string) => SseAnswer,
+  framing: "sse" | "json" = "sse",
+): Promise<{ url: string; methods: string[]; stop(): Promise<void> }> {
+  const methods: string[] = [];
+  const server = createServer((req, res) => {
+    let text = "";
+    req.setEncoding("utf8");
+    req.on("data", (c: string) => {
+      text += c;
+    });
+    req.on("end", () => {
+      let msg: { id?: unknown; method?: string } = {};
+      try {
+        msg = JSON.parse(text);
+      } catch {}
+      const method = msg.method ?? "?";
+      methods.push(method);
+      if (msg.id === undefined) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      const json = JSON.stringify({ jsonrpc: "2.0", id: msg.id, ...answer(method) });
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(framing === "sse" ? `event: message\ndata: ${json}\n\n` : json);
+    });
+  });
+  const url = await new Promise<string>((done) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      done(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+    });
+  });
+  return {
+    url,
+    methods,
+    stop: () => new Promise<void>((done, fail) => server.close((err) => (err ? fail(err) : done()))),
+  };
+}
+
+const SSE_DISCOVER_RESULT = {
+  resultType: "complete",
+  supportedVersions: ["2026-07-28"],
+  capabilities: {},
+  ttlMs: 0,
+  cacheScope: "public",
+  _meta: { "io.modelcontextprotocol/serverInfo": { name: "sse-modern", version: "1" } },
+};
+
+/** A modern-only server that streams its replies: DiscoverResult, -32601 for anything else. */
+const modernSseAnswer = (method: string): SseAnswer =>
+  method === "server/discover"
+    ? { result: SSE_DISCOVER_RESULT }
+    : { error: { code: -32601, message: `Method not found: ${method}` } };
+
+/** A 2025-11-25 server that streams its replies: -32601 for server/discover, a served handshake and ping. */
+const legacySseAnswer = (method: string): SseAnswer => {
+  if (method === "initialize") {
+    return {
+      result: { protocolVersion: "2025-11-25", capabilities: {}, serverInfo: { name: "sse-legacy", version: "1" } },
+    };
+  }
+  if (method === "ping") return { result: {} };
+  return { error: { code: -32601, message: `Method not found: ${method}` } };
+};
+
 /**
  * A legacy stdio server whose unguarded dispatcher THROWS on an unknown
  * pre-initialize method -- so the modern era probe kills the process
@@ -742,6 +820,79 @@ describe("pinned-run mismatch warning fires only on a real era signal", () => {
       expect(pinMismatch(report), JSON.stringify(report.warnings)).toBe(
         "Server answered the 2026-07-28 server/discover probe with a result without supportedVersions; this run is pinned to 2026-07-28. Re-run with --spec-version 2025-11-25 (or auto) to grade it.",
       );
+    } finally {
+      await stub.stop();
+    }
+  }, 15_000);
+});
+
+describe("HTTP preflight answered as an SSE stream", () => {
+  // The preflight is a raw request, not the transport, so it parses a
+  // text/event-stream reply itself before classifying it. If that arm
+  // breaks, the `event:`/`data:` text falls to JSON.parse, lands as
+  // { _raw } and classifies as "non-modern response, legacy": a modern
+  // server that streams its replies would be graded on the wrong catalog.
+
+  it("auto: an SSE DiscoverResult resolves 2026-07-28", async () => {
+    const stub = await startSseServer(modernSseAnswer);
+    try {
+      const report = await runComplianceSuite(stub.url, { timeout: 5000, only: ["lifecycle-discover"] });
+      expect(stub.methods[0]).toBe("server/discover");
+      expect(report.specVersion).toBe(MODERN_SPEC_VERSION);
+      expect(autoNote(report)).toMatch(
+        /^Spec version auto-detected as 2026-07-28 \(server\/discover -> supportedVersions \[2026-07-28\]\)/,
+      );
+      expect(report.warnings.some((w) => w.includes("unreachable"))).toBe(false);
+      const discover = resultOf(report, "lifecycle-discover");
+      expect(discover.passed, discover.details).toBe(true);
+    } finally {
+      await stub.stop();
+    }
+  }, 15_000);
+
+  it("auto: an SSE -32601 resolves 2025-11-25 and the reason names the code", async () => {
+    const stub = await startSseServer(legacySseAnswer);
+    try {
+      const report = await runComplianceSuite(stub.url, { timeout: 5000, only: ["lifecycle-init"] });
+      expect(report.specVersion).toBe(LEGACY_SPEC_VERSION);
+      expect(autoNote(report)).toMatch(
+        /^Spec version auto-detected as 2025-11-25 \(server\/discover -> JSON-RPC error -32601, legacy\)/,
+      );
+      const init = resultOf(report, "lifecycle-init");
+      expect(init.passed, init.details).toBe(true);
+      expect(report.serverInfo.name).toBe("sse-legacy");
+    } finally {
+      await stub.stop();
+    }
+  }, 15_000);
+
+  it("pinned 2025-11-25 against a modern server that streams: the mismatch warning reads the SSE DiscoverResult", async () => {
+    const stub = await startSseServer(modernSseAnswer);
+    try {
+      const report = await runComplianceSuite(stub.url, {
+        timeout: 5000,
+        specVersion: LEGACY_SPEC_VERSION,
+        only: ["lifecycle-init"],
+      });
+      expect(report.specVersion).toBe(LEGACY_SPEC_VERSION);
+      expectNoAutoNote(report);
+      expect(resultOf(report, "lifecycle-init").passed).toBe(false);
+      expect(pinMismatch(report), JSON.stringify(report.warnings)).toBe(
+        "Server answered the 2026-07-28 server/discover probe with a DiscoverResult (supportedVersions [2026-07-28]); this run is pinned to 2025-11-25. Re-run with --spec-version 2026-07-28 (or auto) to grade it.",
+      );
+    } finally {
+      await stub.stop();
+    }
+  }, 15_000);
+
+  it("auto: a text/event-stream header over a plain JSON body still resolves 2026-07-28", async () => {
+    // The SSE parser finds no `data:` event and returns null; the body
+    // must then fall through to JSON.parse rather than classify as empty.
+    const stub = await startSseServer(modernSseAnswer, "json");
+    try {
+      const report = await runComplianceSuite(stub.url, { timeout: 5000, only: ["lifecycle-discover"] });
+      expect(report.specVersion).toBe(MODERN_SPEC_VERSION);
+      expect(autoNote(report)).toContain("server/discover -> supportedVersions [2026-07-28]");
     } finally {
       await stub.stop();
     }

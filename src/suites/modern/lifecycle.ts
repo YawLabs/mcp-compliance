@@ -21,6 +21,8 @@ import {
   hasPrompts,
   hasResources,
   hasTools,
+  LIST_METHOD,
+  LIST_TEST_ID,
   type ListKey,
   listUnavailable,
   type ModernSuiteContext,
@@ -1043,6 +1045,38 @@ async function ensureEraPinned(ctx: ModernSuiteContext): Promise<void> {
   }
 }
 
+/**
+ * Whether resources/templates/list failed only because the method is not
+ * served: resources-templates accepts -32601 ("Method not supported"), so
+ * for lifecycle-completions that means "no templates", not a broken list.
+ * Reads the reason `listFailureReason` recorded ("JSON-RPC error -32601 (...)").
+ */
+function templatesUnsupported(ctx: ModernSuiteContext): boolean {
+  const reason = ctx.state.listFailures.resourceTemplates ?? "";
+  return new RegExp(`^JSON-RPC error ${JSONRPC_ERROR_CODES.METHOD_NOT_FOUND}(?: |$)`).test(reason);
+}
+
+/**
+ * `listUnavailable` over every list a check could have drawn its probe
+ * from. One list reads exactly as `listUnavailable`. Several: FAIL naming
+ * each list whose owning `-list` test this run filtered out (nothing else
+ * in the report names it), else a skip-pass pointing at the owning tests.
+ */
+function listsUnavailable(ctx: ModernSuiteContext, failed: ListKey[], what: string): TestOutcome {
+  const [first] = failed;
+  if (failed.length === 1 && first) return listUnavailable(ctx, first, what);
+  const unreported = failed.filter((key) => !listUnavailable(ctx, key, what).passed);
+  if (unreported.length > 0) {
+    const reasons = unreported.map(
+      (key) => `${LIST_METHOD[key]} failed (${ctx.state.listFailures[key] ?? "no list obtained"})`,
+    );
+    return fail(`${reasons.join(" and ")}; ${what}`);
+  }
+  return pass(
+    `skipped: ${failed.map((key) => LIST_METHOD[key]).join(" and ")} failed, ${what} (see ${failed.map((key) => LIST_TEST_ID[key]).join(", ")})`,
+  );
+}
+
 export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
   const { harness, client } = ctx;
 
@@ -1054,7 +1088,9 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
         let argument: Record<string, unknown> | undefined;
         let source = "";
         let fallback = false;
-        const prompt = ((await ensurePrompts(ctx)) ?? []).find(
+        const prompts = await ensurePrompts(ctx);
+        let templates: unknown[] | null = null;
+        const prompt = (prompts ?? []).find(
           (p) =>
             isObject(p) &&
             typeof p.name === "string" &&
@@ -1070,7 +1106,14 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
           argument = { name: arg.name, value: "" };
           source = `prompt "${String(prompt.name)}" argument "${String(arg.name)}"`;
         } else {
-          for (const t of (await ensureResourceTemplates(ctx)) ?? []) {
+          // Templates are consulted even when prompts/list FAILED: a listed
+          // template variable is a real argument, so completion/complete is
+          // still measured on the server's own data and this rule's claim
+          // (the method is served) is fully tested. The broken prompts/list
+          // is prompts-list's to report, not this rule's. A failed list only
+          // decides the verdict when no argument was found (below).
+          templates = await ensureResourceTemplates(ctx);
+          for (const t of templates ?? []) {
             if (!isObject(t) || typeof t.uriTemplate !== "string") continue;
             const variable = firstTemplateVariable(t.uriTemplate);
             if (!variable) continue;
@@ -1081,8 +1124,19 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
           }
         }
         if (!ref || !argument) {
-          // No listed prompt or template argument to complete: probe with a
-          // placeholder ref, where InvalidParams is an acceptable answer.
+          // No listed argument. When a declared list the probe draws from
+          // FAILED, the placeholder would pass on -32602 without knowing
+          // whether the server lists an argument it cannot complete: report
+          // the broken list instead (see listUnavailable). An undeclared
+          // capability, a genuinely empty list, or a resources/templates/list
+          // answered -32601 (not supported, which resources-templates
+          // accepts) leaves nothing to complete and keeps the placeholder.
+          const failed: ListKey[] = [];
+          if (hasPrompts(ctx) && !prompts) failed.push("prompts");
+          if (hasResources(ctx) && !templates && !templatesUnsupported(ctx)) failed.push("resourceTemplates");
+          if (failed.length > 0) return listsUnavailable(ctx, failed, "no prompt or template argument to complete");
+          // Nothing listed to complete: probe with a placeholder ref, where
+          // InvalidParams is an acceptable answer.
           ref = { type: "ref/prompt", name: "__test__" };
           argument = { name: "test", value: "" };
           source = 'probe prompt "__test__" (no prompt or template argument listed)';

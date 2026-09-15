@@ -320,6 +320,35 @@ out explicitly here.
 - **`benchmark` counted JSON-RPC error replies as successful requests**, so a
   server answering `-32601` to every probe reported error-path latency with
   `failed: 0`. Error bodies are now failures.
+- **A failed list call made its consumers pass in a filtered run.** When
+  `tools/list`, `resources/list` or `prompts/list` failed, `tools-call`,
+  `tools-content-types`, `tools-list-deterministic-order`, `resources-read`,
+  `resources-read-caching`, `prompts-get` and the ten tool-based security tests
+  skip-passed, so `--only tools-call` against a server whose `tools/list` returns
+  `-32603` graded A / 100. `lifecycle-completions` did the same with a failed
+  `prompts/list` or `resources/templates/list`: it fell back to the placeholder
+  probe and passed on `-32602`. They now follow the rule the schema checks
+  already used: skipped with a pointer when the owning `-list` test is in the run
+  (it fails on its own), failed with the recorded reason ("tools/list failed
+  (JSON-RPC error -32603 ...); no tool to call") when it is not. A declared but
+  empty list, an undeclared capability, or `-32601` from
+  `resources/templates/list` still behaves as before, and a listed template is
+  still completed when only `prompts/list` failed.
+- **`benchmark` against a sessionful 2025-11-25 HTTP server failed every
+  ping** (the SDK v1 `StreamableHTTPServerTransport` with a `sessionIdGenerator`
+  answered `400 Server not initialized`, and the command exited 1): the warm-up
+  `initialize` discarded the `Mcp-Session-Id` and negotiated
+  `MCP-Protocol-Version`. It now carries both into the timed pings, as `test`
+  does.
+- **A negotiated `protocolVersion` that is not a valid header value broke every
+  later request** (`test` and `benchmark` on 2025-11-25 HTTP servers): undici
+  refused the `MCP-Protocol-Version` header client-side ("invalid
+  mcp-protocol-version header"). Such a value is no longer carried as a header;
+  `lifecycle-proto-version` still reports it.
+- **`security-tool-description-poisoning` missed bidi control characters**
+  (U+202A-U+202E, U+2066-U+2069, the "Trojan Source" overrides) although its
+  description promised them; only the zero-width characters were matched. Both
+  catalogs now flag them.
 
 ## [0.18.0] — 2026-09-13
 

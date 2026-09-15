@@ -37,6 +37,17 @@ const EMPTY_RECORDING =
 const LIST_ON_DEMAND = (what: string) =>
   `The list is fetched on demand under --only. When ${what}/list failed the rule skips (as passed) pointing at ${what}-list if that rule is in the run, and fails with the recorded reason when it was filtered out (--only schema).`;
 
+/**
+ * List consumers outside the schema category (the feature checks that call
+ * or read a listed item, and the tool-dependent security checks): a list
+ * call that failed skips them pointing at the -list rule when it is in the
+ * run, and fails them with the recorded reason when it was filtered out.
+ */
+const LIST_FAILED_SKIP = (what: string) =>
+  `When ${what}/list failed the rule skips (as passed) pointing at ${what}-list if that rule is in the run.`;
+const LIST_FAILED_FAIL = (what: string) =>
+  `Also fails when ${what}/list failed while ${what}-list was filtered out of the run (the recorded reason is named).`;
+
 const C: Record<string, Criteria> = {
   // ── transport ──
   "transport-post": {
@@ -241,8 +252,8 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "lifecycle-completions": {
-    pass: "When the completions capability is declared, completion/complete for the first listed prompt argument (else the first resource-template variable; prompts/list and resources/templates/list are fetched on demand) returns a result with a completion.values array (empty allowed); with nothing listed a placeholder ref is probed, where -32602 also passes. Skipped when the capability is absent.",
-    fail: "A JSON-RPC error (other than -32602 for the placeholder probe), or a result without completion.values as an array.",
+    pass: "When the completions capability is declared, completion/complete for the first listed prompt argument (else the first resource-template variable, still used when prompts/list failed; prompts/list and resources/templates/list are fetched on demand) returns a result with a completion.values array (empty allowed); with nothing listed a placeholder ref is probed, where -32602 also passes. Skipped when the capability is absent, and skipped pointing at prompts-list / resources-templates when a declared list the probe draws from failed and that rule is in the run.",
+    fail: "A JSON-RPC error (other than -32602 for the placeholder probe), a result without completion.values as an array, or a declared prompts/list or resources/templates/list failed (not a -32601 from resources/templates/list) with no argument listed while its owning rule was filtered out of the run (the recorded reason is named).",
     gate: "completions",
   },
   "lifecycle-progress-token": {
@@ -262,18 +273,18 @@ const C: Record<string, Criteria> = {
     gate: "tools",
   },
   "tools-list-deterministic-order": {
-    pass: "Three consecutive tools/list calls return the tool names in the same order.",
-    fail: "The order differs between any two of the three calls.",
+    pass: `Three consecutive tools/list calls return the tool names in the same order. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `The order differs between any two of the three calls. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "tools-call": {
-    pass: "Calling the first tool without required properties (else the first tool) with empty arguments returns a content array whose items each carry a type (isError: true included), an input_required result with well-formed inputRequests and/or a string requestState, or a JSON-RPC error (-32602/-32600 as the expected answer for a tool that needs arguments; any other code is noted as a protocol error). resultType 'complete' is left to schema-result-type.",
-    fail: "No result object, a non-input_required result without a content array, a content item without a type, or an input_required result with neither field or a malformed inputRequests entry.",
+    pass: `Calling the first tool without required properties (else the first tool) with empty arguments returns a content array whose items each carry a type (isError: true included), an input_required result with well-formed inputRequests and/or a string requestState, or a JSON-RPC error (-32602/-32600 as the expected answer for a tool that needs arguments; any other code is noted as a protocol error). resultType 'complete' is left to schema-result-type. Skipped when the server lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `No result object, a non-input_required result without a content array, a content item without a type, or an input_required result with neither field or a malformed inputRequests entry. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "tools-content-types": {
-    pass: "Every item in the tools/call content array has a type of text, image, audio, resource, or resource_link.",
-    fail: "Any content item with a missing or unrecognised type.",
+    pass: `Every item in the tools/call content array has a type of text, image, audio, resource, or resource_link. Skipped when the server lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `Any content item with a missing or unrecognised type. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "tools-pagination": {
@@ -293,13 +304,13 @@ const C: Record<string, Criteria> = {
     gate: "resources",
   },
   "resources-read": {
-    pass: "Reading the first listed resource that has a uri returns a contents array whose items carry uri and text or blob, or an input_required result with a valid InputRequiredResult shape; an empty contents array passes with a warning. resultType 'complete' is left to schema-result-type.",
-    fail: "A JSON-RPC error, no result object, no contents array, a contents item missing uri or both text and blob, or a malformed input_required result.",
+    pass: `Reading the first listed resource that has a uri returns a contents array whose items carry uri and text or blob, or an input_required result with a valid InputRequiredResult shape; an empty contents array passes with a warning. resultType 'complete' is left to schema-result-type. Skipped when the server lists no resource with a uri. ${LIST_FAILED_SKIP("resources")}`,
+    fail: `A JSON-RPC error, no result object, no contents array, a contents item missing uri or both text and blob, or a malformed input_required result. ${LIST_FAILED_FAIL("resources")}`,
     gate: "resources",
   },
   "resources-read-caching": {
-    pass: "The complete resources/read result carries ttlMs as an integer >= 0 and cacheScope equal to public or private; input_required interim results are exempt.",
-    fail: "Either hint missing or invalid on a complete result.",
+    pass: `The complete resources/read result carries ttlMs as an integer >= 0 and cacheScope equal to public or private; input_required interim results are exempt. Skipped when the server lists no resource with a uri. ${LIST_FAILED_SKIP("resources")}`,
+    fail: `Either hint missing or invalid on a complete result. ${LIST_FAILED_FAIL("resources")}`,
     gate: "resources",
   },
   "resources-not-found": {
@@ -334,8 +345,8 @@ const C: Record<string, Criteria> = {
     gate: "prompts",
   },
   "prompts-get": {
-    pass: "Getting the first prompt without required arguments (else the first prompt, its required arguments filled with the placeholder 'test') returns a messages array whose items have role user or assistant and a content object, an input_required result with a valid InputRequiredResult shape, or a -32602/-32600 error. resultType 'complete' is left to schema-result-type.",
-    fail: "A JSON-RPC error other than -32602/-32600, no result object, a missing or malformed messages array, or a malformed input_required result.",
+    pass: `Getting the first prompt without required arguments (else the first prompt, its required arguments filled with the placeholder 'test') returns a messages array whose items have role user or assistant and a content object, an input_required result with a valid InputRequiredResult shape, or a -32602/-32600 error. resultType 'complete' is left to schema-result-type. Skipped when the server lists no prompts. ${LIST_FAILED_SKIP("prompts")}`,
+    fail: `A JSON-RPC error other than -32602/-32600, no result object, a missing or malformed messages array, or a malformed input_required result. ${LIST_FAILED_FAIL("prompts")}`,
     gate: "prompts",
   },
   "prompts-pagination": {
@@ -497,53 +508,53 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "security-command-injection": {
-    pass: `No result from the single target -- a tool with a string argument from the safest annotation tier (readOnlyHint true, then destructiveHint false, then unannotated, then destructiveHint true; the spec defaults destructiveHint to true), a free-form argument before an enum/const/pattern one, other required arguments filled with schema-honouring placeholders -- shows evidence of executing an injected shell payload (passwd lines, id output, directory listings) without rejection wording or isError; the details count rejected, benign and never-reached payloads, and a run where no payload reached the tool passes as inconclusive with a warning.`,
-    fail: "Any result containing evidence of execution that is not also a rejection.",
+    pass: `No result from the single target -- a tool with a string argument from the safest annotation tier (readOnlyHint true, then destructiveHint false, then unannotated, then destructiveHint true; the spec defaults destructiveHint to true), a free-form argument before an enum/const/pattern one, other required arguments filled with schema-honouring placeholders -- shows evidence of executing an injected shell payload (passwd lines, id output, directory listings) without rejection wording or isError; the details count rejected, benign and never-reached payloads, and a run where no payload reached the tool passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `Any result containing evidence of execution that is not also a rejection. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-sql-injection": {
-    pass: `No result from the same single target contains database error text or unexpected row dumps for the SQL payloads without rejection wording or isError; all never-reached passes as inconclusive with a warning.`,
-    fail: "Any result containing database error text or dumped rows that is not also a rejection.",
+    pass: `No result from the same single target contains database error text or unexpected row dumps for the SQL payloads without rejection wording or isError; all never-reached passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `Any result containing database error text or dumped rows that is not also a rejection. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-path-traversal": {
-    pass: `No result from the target (a path-named string argument when one exists in the safest annotation tier, else a URL-named one, else the shared injection target) contains file contents from outside the tool's scope for the traversal payloads without rejection wording or isError; all never-reached passes as inconclusive with a warning.`,
-    fail: "Any result containing out-of-scope file contents that is not also a rejection.",
+    pass: `No result from the target (a path-named string argument when one exists in the safest annotation tier, else a URL-named one, else the shared injection target) contains file contents from outside the tool's scope for the traversal payloads without rejection wording or isError; all never-reached passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `Any result containing out-of-scope file contents that is not also a rejection. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-ssrf-internal": {
-    pass: `No result from the target (a URL-named string argument when one exists in the safest annotation tier, else a path-named one, else the shared injection target) contains cloud-metadata or internal-service content for the internal targets without rejection wording or isError; all never-reached passes as inconclusive with a warning.`,
-    fail: "Any result containing metadata or internal-service content that is not also a rejection.",
+    pass: `No result from the target (a URL-named string argument when one exists in the safest annotation tier, else a path-named one, else the shared injection target) contains cloud-metadata or internal-service content for the internal targets without rejection wording or isError; all never-reached passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `Any result containing metadata or internal-service content that is not also a rejection. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-oversized-input": {
-    pass: "A roughly 1 MB string in the first string argument that is not header-mirrored (a mirrored one only when no other exists, noted in the details) draws HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport; a completed result passes with a warning, and so does a reply that overflowed the runner's stdio line buffer. Skipped when the server declares no tools.",
-    fail: "A 5xx status, a timeout, a broken stdio frame, or a stdio child that dies.",
+    pass: `A roughly 1 MB string in the first string argument that is not header-mirrored (a mirrored one only when no other exists, noted in the details) draws HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport; a completed result passes with a warning, and so does a reply that overflowed the runner's stdio line buffer. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `A 5xx status, a timeout, a broken stdio frame, or a stdio child that dies. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-extra-params": {
-    pass: "Arguments with properties the first tool's inputSchema does not define are rejected with a JSON-RPC error or ignored with a normal result; a call that times out passes with a warning (inconclusive). Skipped when the server declares no tools.",
-    fail: "A 5xx status, a malformed response, a stdio child that exits, or a dropped connection.",
+    pass: `Arguments with properties the first tool's inputSchema does not define are rejected with a JSON-RPC error or ignored with a normal result; a call that times out passes with a warning (inconclusive). Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `A 5xx status, a malformed response, a stdio child that exits, or a dropped connection. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-tool-schema-defined": {
-    pass: "Every listed tool has an inputSchema with type 'object'.",
-    fail: "Any tool without such an inputSchema.",
+    pass: `Every listed tool has an inputSchema with type 'object'. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `Any tool without such an inputSchema. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-tool-rug-pull": {
-    pass: "Two tools/list calls return identical definitions (name, description, inputSchema, annotations).",
-    fail: "Any definition differs between the two calls.",
+    pass: `Two tools/list calls return identical definitions (name, description, inputSchema, annotations). Skipped when the server declares no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `Any definition differs between the two calls. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-tool-description-poisoning": {
-    pass: "No tool name, title, description, or parameter description matches a prompt-injection pattern (instruction overrides, hidden Unicode, long Base64 runs in prose).",
-    fail: "Any match (the tool and pattern are named in the details).",
+    pass: `No tool name, title, description, or parameter description matches a prompt-injection pattern (instruction overrides, hidden Unicode, long Base64 runs in prose). Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `Any match (the tool and pattern are named in the details). ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-tool-cross-reference": {
-    pass: "No tool description mentions another listed tool's name.",
-    fail: "Any cross-reference found (named in the details).",
+    pass: `No tool description mentions another listed tool's name. Skipped when the server declares no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `Any cross-reference found (named in the details). ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-error-no-stacktrace": {

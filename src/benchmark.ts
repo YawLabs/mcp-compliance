@@ -8,7 +8,7 @@ import {
   probeExitWarning,
 } from "./detect.js";
 import { readPackageVersion } from "./pkg-version.js";
-import { spawnStdioTarget } from "./runner.js";
+import { isHeaderToken, spawnStdioTarget } from "./runner.js";
 import { LEGACY_SPEC_VERSION, MODERN_SPEC_VERSION, type SpecVersion, type SpecVersionOption } from "./spec.js";
 import { createHttpTransport } from "./transport/http.js";
 import type { JsonRpcId, Transport, TransportResponse } from "./transport/index.js";
@@ -204,7 +204,7 @@ export async function runBenchmark(target: TransportTarget, opts: BenchmarkOptio
       // Warm up: do an initialize so the server is responsive. For stdio
       // this also makes sure the child has booted (startup budget).
       try {
-        await transport.request(
+        const init = await transport.request(
           "initialize",
           {
             protocolVersion: LEGACY_SPEC_VERSION,
@@ -215,6 +215,24 @@ export async function runBenchmark(target: TransportTarget, opts: BenchmarkOptio
           { timeout: startupTimeout },
         );
         warmedUp = true;
+        // Carry the session the handshake opened, exactly as the runner
+        // does: a sessionful HTTP server (the SDK's
+        // StreamableHTTPServerTransport with a sessionIdGenerator) rejects
+        // every request without its Mcp-Session-Id with 400 "Server not
+        // initialized", so without this every timed ping failed. The
+        // notification and the pings then go out with the session id and
+        // the negotiated MCP-Protocol-Version -- when that version can be
+        // sent as a header at all: a value with CR/LF or spaces would make
+        // every ping fail client-side ("invalid mcp-protocol-version
+        // header"), so it is left off, as the runner does.
+        const result = (init.body as { result?: { protocolVersion?: unknown } } | null | undefined)?.result;
+        if (result && typeof result === "object") {
+          const sid = init.headers?.["mcp-session-id"];
+          if (sid) transport.setSessionId(sid);
+          if (isHeaderToken(result.protocolVersion)) {
+            transport.setProtocolVersion(result.protocolVersion);
+          }
+        }
         await transport.notify("notifications/initialized", undefined, { timeout: startupTimeout });
       } catch {
         // Some servers don't require init for ping; carry on.
