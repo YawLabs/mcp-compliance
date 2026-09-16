@@ -3,6 +3,7 @@ import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
 import { JSONRPC_ERROR_CODES } from "../../modern/meta.js";
 import type { JsonRpcId } from "../../transport/index.js";
 import { hasPrompts, hasResources, hasTools, type ModernSuiteContext } from "./context.js";
+import { notEvaluable } from "./lifecycle.js";
 
 /**
  * Error-handling tests of the 2026-07-28 suite (catalog category
@@ -15,6 +16,18 @@ import { hasPrompts, hasResources, hasTools, type ModernSuiteContext } from "./c
  * are HTTP-only (catalog `transports`) and use `client.raw` with the
  * headers a `server/discover` would carry, so the only defect in the
  * request is the body itself.
+ *
+ * A rejection is credited to the probe's defect only when the conformant
+ * setup `server/discover` was served (`notEvaluable`, as for the `_meta`
+ * tests in lifecycle.ts and the header tests in transport.ts): a server
+ * that rejects everything -- a 2025-era SDK answering 400 / -32000
+ * "Server not initialized" to every POST -- proves nothing by rejecting an
+ * unknown method or a malformed body too, so those ids fail as not
+ * evaluable (see `blanketRejection`). A served probe is judged on its
+ * own whatever the discover state. The tools-gated ids cannot run
+ * without a served discover, so they never see that case;
+ * error-capability-gated sees it as "nothing declared" and fails as not
+ * evaluable rather than call a served list method undeclared.
  */
 
 const UNKNOWN_TOOL = "__nonexistent_tool_compliance_test__";
@@ -44,6 +57,8 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
     const probe = await rpcOrFailure(ctx, method);
     if ("failure" in probe) return { passed: false, details: probe.failure };
     const res = probe.res;
+    const blanket = blanketRejection(ctx, res, "an unknown method");
+    if (blanket) return blanket;
     const err = errorOf(res.body);
     if (!err) {
       if (resultOf(res.body)) {
@@ -76,6 +91,8 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
   await harness.check("error-method-code", async () => {
     const probe = await rpcOrFailure(ctx, unknownMethodName());
     if ("failure" in probe) return { passed: false, details: probe.failure };
+    const blanket = blanketRejection(ctx, probe.res, "an unknown method");
+    if (blanket) return blanket;
     const err = errorOf(probe.res.body);
     if (!err) {
       return { passed: false, details: `No JSON-RPC error returned for unknown method${status(ctx, probe.res)}` };
@@ -90,6 +107,8 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
     if (!http) return { passed: true, details: "Skipped: raw-body probe is HTTP-only" };
     const probe = await rawOrFailure(ctx, JSON.stringify({ not: "a valid jsonrpc message" }));
     if ("failure" in probe) return { passed: false, details: probe.failure };
+    const blanket = blanketRawRejection(ctx, probe, "a malformed envelope");
+    if (blanket) return blanket;
     const { statusCode, error, result } = probe;
     if (statusCode >= 500)
       return {
@@ -109,6 +128,8 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
     if (!http) return { passed: true, details: "Skipped: raw-body probe is HTTP-only" };
     const probe = await rawOrFailure(ctx, "{not json");
     if ("failure" in probe) return { passed: false, details: probe.failure };
+    const blanket = blanketRawRejection(ctx, probe, "invalid JSON");
+    if (blanket) return blanket;
     const { statusCode, error, result } = probe;
     if (statusCode >= 500)
       return { passed: false, details: `HTTP ${statusCode} for invalid JSON; expected -32700 or a 4xx` };
@@ -179,6 +200,12 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
         details: "Server declares all capabilities (tools, resources, prompts); no undeclared methods to test",
       };
     }
+    // Without a served discover nothing counts as declared, so every list
+    // method is probed -- but no answer can be judged against a
+    // declaration the suite never saw: a server that rejects everything
+    // rejects these too, and one that serves them may well declare them.
+    // The answers are still recorded; only the verdict is withheld.
+    const unattributable = notEvaluable(ctx, "whether undeclared methods are rejected");
     const issues: string[] = [];
     const seen: string[] = [];
     for (const { method, capability } of undeclared) {
@@ -188,7 +215,13 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
         continue;
       }
       const err = errorOf(probe.res.body);
-      if (!err && resultOf(probe.res.body)) {
+      const result = resultOf(probe.res.body);
+      if (unattributable) {
+        const answer = err ? String(err.code) : result ? "result" : `no JSON-RPC body${status(ctx, probe.res)}`;
+        seen.push(`${method} -> ${answer}`);
+        continue;
+      }
+      if (!err && result) {
         issues.push(`${method} returned a result despite the undeclared ${capability} capability`);
         continue;
       }
@@ -200,8 +233,8 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
       }
     }
     if (issues.length > 0) return { passed: false, details: clip(issues.join("; ")) };
-    const origin = ctx.state.discover ? "" : " (server/discover unavailable, so no capability counts as declared)";
-    return { passed: true, details: clip(`Undeclared method(s) rejected: ${seen.join(", ")}${origin}`) };
+    if (unattributable) return { passed: false, details: `${seen.join(", ")}; ${unattributable}` };
+    return { passed: true, details: clip(`Undeclared method(s) rejected: ${seen.join(", ")}`) };
   });
 
   await harness.check("error-invalid-cursor", async () => {
@@ -257,10 +290,50 @@ async function rpcOrFailure(ctx: ModernSuiteContext, method: string, params?: un
   }
 }
 
+/**
+ * The not-evaluable failure for a rejection of `what` -- a JSON-RPC
+ * error, or on HTTP any 4xx/5xx without one -- while the conformant setup
+ * `server/discover` was itself rejected or unanswered (see
+ * `notEvaluable`): the rejection is the server's answer to everything,
+ * not a verdict on `what`. Null when the discover was served, so every
+ * verdict after it is unchanged, and for a served probe (a result, or a
+ * 2xx/3xx with no JSON-RPC error at all: an HTML page), which the check
+ * judges on its own whatever the discover state, as
+ * `evaluateHeaderRejection` in transport.ts does.
+ */
+function blanketRejection(
+  ctx: ModernSuiteContext,
+  res: RpcResponse,
+  what: string,
+): { passed: boolean; details: string } | null {
+  const err = errorOf(res.body);
+  if (resultOf(res.body)) return null;
+  // stdio's status is a synthetic 200, so only HTTP reaches a bare rejection.
+  if (!err && res.statusCode < 400) return null;
+  const reason = notEvaluable(ctx);
+  if (!reason) return null;
+  const answer = err ? `JSON-RPC error ${err.code}` : "no JSON-RPC error body";
+  return { passed: false, details: `${answer}${status(ctx, res)} for ${what}; ${reason}` };
+}
+
 interface RawProbe {
   statusCode: number;
   error?: { code: number; message: string };
   result?: Record<string, unknown>;
+}
+
+/** `blanketRejection` for a raw-body probe (always HTTP). */
+function blanketRawRejection(
+  ctx: ModernSuiteContext,
+  probe: RawProbe,
+  what: string,
+): { passed: boolean; details: string } | null {
+  if (probe.result) return null;
+  if (!probe.error && probe.statusCode < 400) return null;
+  const reason = notEvaluable(ctx);
+  if (!reason) return null;
+  const answer = probe.error ? `JSON-RPC error ${probe.error.code}` : "no JSON-RPC error body";
+  return { passed: false, details: `${answer} on HTTP ${probe.statusCode} for ${what}; ${reason}` };
 }
 
 /**
@@ -291,6 +364,8 @@ function exactCode(
   name: string,
   what: string,
 ): { passed: boolean; details: string } {
+  const blanket = blanketRawRejection(ctx, probe, what);
+  if (blanket) return blanket;
   const { statusCode, error, result } = probe;
   if (error) {
     if (error.code === code) return { passed: true, details: `${code} (${name}) on HTTP ${statusCode}` };

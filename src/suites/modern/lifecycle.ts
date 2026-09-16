@@ -173,16 +173,19 @@ function seedState(ctx: ModernSuiteContext, res: RpcResponse, result: Record<str
  * and the negative probe measured nothing. Null when the discover result
  * is in hand. Shared by the `_meta` tests here and the header tests in
  * transport.ts; every negative probe reads it after seeing a rejection.
+ * `about` names what the probe varied, for a probe whose variation is
+ * not a defect (lifecycle-meta-client-info-optional omits an optional
+ * field).
  */
-export function notEvaluable(ctx: ModernSuiteContext): string | null {
+export function notEvaluable(ctx: ModernSuiteContext, about = "the injected defect"): string | null {
   if (ctx.state.discover) return null;
   const rejection = ctx.state.discoverRejection;
   if (!rejection) {
-    return "not evaluable: the conformant server/discover got no response, so this rejection proves nothing about the injected defect";
+    return `not evaluable: the conformant server/discover got no response, so this rejection proves nothing about ${about}`;
   }
   const code = rejection.code === null ? "no JSON-RPC error code" : String(rejection.code);
   const status = ctx.kind === "http" ? ` (HTTP ${rejection.statusCode})` : "";
-  return `not evaluable: the conformant server/discover was itself rejected with ${code}${status}, so this rejection proves nothing about the injected defect`;
+  return `not evaluable: the conformant server/discover was itself rejected with ${code}${status}, so this rejection proves nothing about ${about}`;
 }
 
 /**
@@ -194,12 +197,17 @@ export function notEvaluable(ctx: ModernSuiteContext): string | null {
  * whether the server validates `_meta` or the standard headers. Null on
  * stdio and for every other status. Read AFTER `notEvaluable`, which
  * names the root cause when the conformant discover drew the same gate.
+ * `about` as for `notEvaluable`.
  */
-export function transportLevelRejection(ctx: ModernSuiteContext, res: RpcResponse): string | null {
+export function transportLevelRejection(
+  ctx: ModernSuiteContext,
+  res: RpcResponse,
+  about = "the injected defect",
+): string | null {
   if (ctx.kind !== "http") return null;
   const source = TRANSPORT_LEVEL_STATUS[res.statusCode];
   if (!source) return null;
-  return `not evaluable: HTTP ${res.statusCode} is a transport-level rejection (${source} answered before the JSON-RPC layer read the request), so it proves nothing about the injected defect`;
+  return `not evaluable: HTTP ${res.statusCode} is a transport-level rejection (${source} answered before the JSON-RPC layer read the request), so it proves nothing about ${about}`;
 }
 
 /**
@@ -216,13 +224,18 @@ function isTimeout(err: unknown): boolean {
 /**
  * Shared verdict for the "request must be rejected" tests: a result
  * fails, a JSON-RPC error with `expectedCode` passes, any other code
- * passes with a warning, and on HTTP the status must be 400. A bare HTTP
- * 4xx with no JSON-RPC body (an intermediary rejecting the request) is
- * accepted with a warning: it is a rejection, just not a diagnosable one
- * -- unless the status is a transport-level gate (401/403/413/415/429),
- * which is not evaluable (see `transportLevelRejection`). Any rejection
- * is credited only when the conformant discover was served (see
- * `notEvaluable`).
+ * passes with a warning, and on HTTP the status must be 400 (basic/index
+ * #meta: "the server MUST reject it with JSON-RPC error code -32602 ...
+ * On HTTP, the response status MUST be 400 Bad Request"). A bare HTTP 400
+ * with no JSON-RPC body (an intermediary rejecting the request, which
+ * streamable-http lets answer with a status alone) is accepted with a
+ * warning: it is a rejection, just not a diagnosable one. Any other bare
+ * status fails for the status, as `evaluateHeaderRejection` in
+ * transport.ts does: a 404 or a plain-text 500 crash is not the 400 the
+ * spec requires -- unless it is a transport-level gate
+ * (401/403/413/415/429), which is not evaluable (see
+ * `transportLevelRejection`). Any rejection is credited only when the
+ * conformant discover was served (see `notEvaluable`).
  */
 async function expectRejection(
   ctx: ModernSuiteContext,
@@ -246,6 +259,11 @@ async function expectRejection(
   const err = errorOf(res.body);
   if (!err) {
     if (ctx.kind === "http" && res.statusCode >= 400) {
+      if (res.statusCode !== 400) {
+        return fail(
+          `${what}: rejected with HTTP ${res.statusCode} and no JSON-RPC error body (expected HTTP 400 with JSON-RPC error ${expectedCode})`,
+        );
+      }
       ctx.harness.warnings.push(
         `${id}: ${what} was rejected with HTTP ${res.statusCode} but no JSON-RPC error body (expected ${expectedCode})`,
       );
@@ -508,9 +526,21 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
     }
     const status = statusOf(ctx, res);
     const err = errorOf(res.body);
-    if (err)
-      return fail(`server/discover without clientInfo rejected with ${err.code}${status}; clientInfo is optional`);
-    if (!resultOf(res.body)) return fail(`server/discover without clientInfo: no result${status}`);
+    const served = resultOf(res.body);
+    if (err || !served) {
+      const refusal = err
+        ? `server/discover without clientInfo rejected with ${err.code}${status}`
+        : `server/discover without clientInfo: no result${status}`;
+      // Blame clientInfo only when the conformant discover (clientInfo
+      // included) was served and no gate answered before the JSON-RPC
+      // layer (see notEvaluable, transportLevelRejection): a server that
+      // rejects everything, or a rate limiter, says nothing about whether
+      // it treats clientInfo as optional.
+      const about = "omitting clientInfo";
+      const unattributable = served ? null : (notEvaluable(ctx, about) ?? transportLevelRejection(ctx, res, about));
+      if (unattributable) return fail(`${refusal}; ${unattributable}`);
+      return fail(err ? `${refusal}; clientInfo is optional` : refusal);
+    }
     if (ctx.kind === "http" && (res.statusCode < 200 || res.statusCode >= 300)) {
       return fail(`server/discover without clientInfo returned a result with HTTP ${res.statusCode} (expected 2xx)`);
     }
@@ -709,6 +739,8 @@ async function checkSubscriptionsListen(ctx: ModernSuiteContext): Promise<TestOu
   try {
     stream = await ctx.client.stream("subscriptions/listen", { notifications: filter }, { timeout: listenTimeout });
   } catch (err) {
+    // An aborted run is not a verdict: let the harness see the abort.
+    if (ctx.signal?.aborted) throw err;
     return fail(`subscriptions/listen: no response (${short(messageOf(err))})`);
   }
 
@@ -730,6 +762,10 @@ async function checkSubscriptionsListen(ctx: ModernSuiteContext): Promise<TestOu
   } finally {
     await stream.close();
   }
+  // Both transports end the iterator quietly on an abort, exactly as on
+  // the listen timeout: with no frame in hand, the wait was cut short by
+  // the run, not by a server that never acknowledged. Not a verdict.
+  if (!first && !response && ctx.signal?.aborted) throw ctx.signal.reason ?? new Error("Aborted");
 
   const httpStatus = ctx.kind === "http" && stream.statusCode !== undefined ? ` (HTTP ${stream.statusCode})` : "";
   const err = response ? errorOf(response) : undefined;
@@ -896,8 +932,14 @@ function pickProgressTool(tools: unknown[]): Record<string, unknown> | undefined
   return noArgs.find(mentionsProgress) ?? noArgs[0] ?? named[0];
 }
 
-/** First variable name of an RFC 6570 template ("{id}", "{?q,lang}", "{+path*}" -> id, q, path). */
-function firstTemplateVariable(uriTemplate: string): string | undefined {
+/**
+ * First variable name of an RFC 6570 template ("{id}", "{?q,lang}",
+ * "{+path*}" -> id, q, path): the operator prefix, any further variables
+ * in the list, and a modifier (":3", "*") are not part of the name.
+ * Undefined for a template with no expression. Exported for unit tests:
+ * the fixture lists one simple "{id}" template.
+ */
+export function firstTemplateVariable(uriTemplate: string): string | undefined {
   const m = /\{([^}]+)\}/.exec(uriTemplate);
   if (!m) return undefined;
   const name = m[1]

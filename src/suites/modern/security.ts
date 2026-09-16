@@ -8,6 +8,7 @@ import {
 } from "../../checks/patterns.js";
 import type { TestOutcome } from "../../harness.js";
 import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
+import { parseSSEMessages } from "../../sse.js";
 import { ensureTools, hasTools, listUnavailable, type ModernSuiteContext } from "./context.js";
 
 /**
@@ -97,6 +98,95 @@ function isTimeout(err: unknown): boolean {
   return /timed out|timeout|abort/i.test(errorMessage(err));
 }
 
+/** First line of an error message: the stdio transport appends the child's stderr on later lines. */
+function firstLine(text: string): string {
+  return text.split("\n")[0] ?? "";
+}
+
+/**
+ * Error codes of a connection that was never established (refused, no
+ * such host, unroutable, connect timeout): nothing reached the server's
+ * HTTP layer, so the server never read the request.
+ */
+const CONNECT_FAILURE_CODES = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EADDRNOTAVAIL",
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+/**
+ * Error codes of an established connection the peer closed or reset
+ * without a complete HTTP response: undici's SocketError "other side
+ * closed" (UND_ERR_SOCKET) for a FIN, ECONNRESET for an RST, EPIPE when
+ * the write side was already gone. undici reports the same codes whether
+ * the server closed right after accepting the connection or after reading
+ * the request, so the client cannot tell those two apart.
+ */
+const DROPPED_CODES = new Set(["UND_ERR_SOCKET", "ECONNRESET", "EPIPE", "ECONNABORTED"]);
+
+/**
+ * The stdio transport's diagnostics for a child that is gone: its exit
+ * rejection ("crashed with exit code N", "exited cleanly", "terminated by
+ * signal") and the write guard's "stdin is closed" (transport/stdio.ts).
+ */
+const STDIO_GONE = /crashed with exit code|exited cleanly|terminated by signal|stdin is closed/i;
+
+/**
+ * What a request that produced no response ran into, read from the error
+ * itself rather than guessed from its wording:
+ *
+ * - "connect": the connection was never established (a CONNECT_FAILURE_CODES code);
+ * - "dropped": the server closed or reset a connection it had accepted, or
+ *   the stdio child exited (DROPPED_CODES, STDIO_GONE) -- it went away
+ *   instead of answering;
+ * - "timeout": the deadline elapsed with the connection still open (undici's
+ *   TimeoutError / HeadersTimeoutError / BodyTimeoutError names, the stdio
+ *   transport's "timed out after");
+ * - "other": anything else (an unparseable HTTP response, a spawn failure,
+ *   a caller's abort).
+ *
+ * Codes are checked first, so a connect timeout is "connect", not "timeout".
+ * Only the first line of the message is read: the stdio transport appends
+ * the child's stderr below it, and a server that logs "timed out" or
+ * "terminated by signal" must not change what happened to the request.
+ *
+ * @internal Exported for testing.
+ */
+export type TransportFailure = "connect" | "dropped" | "timeout" | "other";
+
+export function classifyTransportError(err: unknown): TransportFailure {
+  const e = err as { code?: unknown; name?: unknown } | null;
+  // undici's request() (the HTTP transport and the raw probes) puts the
+  // socket error's code on the rejection itself.
+  if (typeof e?.code === "string") {
+    if (CONNECT_FAILURE_CODES.has(e.code)) return "connect";
+    if (DROPPED_CODES.has(e.code)) return "dropped";
+  }
+  const message = firstLine(errorMessage(err));
+  if (STDIO_GONE.test(message)) return "dropped";
+  if ((typeof e?.name === "string" && /timeout/i.test(e.name)) || /\btimed out\b/i.test(message)) return "timeout";
+  return "other";
+}
+
+/**
+ * "no response within Nms" for a timeout, "no response (connection
+ * closed: ...)" for a drop, "no response (connection failed: ...)" for
+ * everything else -- the same reading of the error classifyTransportError
+ * gives, so a connect timeout (never established) is a failed connection,
+ * not a silent server.
+ */
+function noResponse(err: unknown, timeout: number): string {
+  const failure = classifyTransportError(err);
+  if (failure === "timeout") return `no response within ${timeout}ms`;
+  const how = failure === "dropped" ? "connection closed" : "connection failed";
+  return `no response (${how}: ${clip(firstLine(errorMessage(err)), 90)})`;
+}
+
 /** Case-insensitive lookup in a response header map. */
 function headerOf(headers: Record<string, string>, name: string): string | undefined {
   const lower = name.toLowerCase();
@@ -119,10 +209,62 @@ function notApplicable(what: string): TestOutcome {
  */
 function unreachable(ctx: ModernSuiteContext, what: string, err?: unknown): TestOutcome {
   if (err === undefined) return { passed: false, details: `server unreachable: ${what}` };
-  const reason = isTimeout(err)
-    ? `no response within ${ctx.timeout}ms`
-    : `no response (connection failed: ${clip(errorMessage(err), 60)})`;
-  return { passed: false, details: `server unreachable: ${what} got ${reason}` };
+  return { passed: false, details: clip(`server unreachable: ${what} got ${noResponse(err, ctx.timeout)}`, 220) };
+}
+
+/**
+ * The verdict for a negative HTTP probe (no credential, a token in the
+ * query string, a foreign Origin) that got no HTTP response, or null when
+ * the missing answer counts as the server refusing the probe.
+ *
+ * Which transport errors still count as a refusal is read from the error
+ * (classifyTransportError), not from its wording:
+ *
+ * - a timeout is never a refusal: the connection stayed open and nothing
+ *   came back, so the probe measured nothing (a hung server or gateway);
+ * - a connection that was never established (ECONNREFUSED, ENOTFOUND, a
+ *   connect timeout) is never a refusal: the server did not see the request
+ *   at all, so nothing about the probe's defect was decided;
+ * - an accepted connection the server closed or reset without an HTTP
+ *   answer (UND_ERR_SOCKET "other side closed", ECONNRESET -- including a
+ *   reset right after connect) is the one shape a connection-level refusal
+ *   takes: some gateways drop a request that lacks a credential instead of
+ *   answering 401. But a drop carries no reason, and the client cannot see
+ *   whether it came before or after the request was read, so it counts
+ *   only when `attributable` -- the conformant request that differs from
+ *   the probe in nothing but the defect was served, so the defect is what
+ *   drew the drop. Without that comparison a server that drops everything
+ *   would pass (the same rule notEvaluable in lifecycle.ts applies to a
+ *   rejection of any negative probe);
+ * - anything else (an unparseable response) is not a refusal either.
+ *
+ * Every probe that is not a refusal gets unreachable() -- the verdict
+ * security-oauth-metadata gives for the same missing answer. A run the
+ * caller aborted is rethrown, not graded.
+ */
+function unansweredProbe(
+  ctx: ModernSuiteContext,
+  what: string,
+  err: unknown,
+  attributable: boolean,
+): TestOutcome | null {
+  if (ctx.signal?.aborted) throw err;
+  if (attributable && classifyTransportError(err) === "dropped") return null;
+  return unreachable(ctx, what, err);
+}
+
+/**
+ * Whether a drop on a credential-less probe can be pinned on the missing
+ * credential: --auth was given and the conformant setup server/discover,
+ * which carried it, was served.
+ */
+function credentialedDiscoverServed(ctx: ModernSuiteContext): boolean {
+  return ctx.hasAuth && ctx.state.discover !== null;
+}
+
+/** "Connection closed without a response (<first line of the error>)" for a drop that counted as a refusal. */
+function closedWithoutResponse(err: unknown): string {
+  return `Connection closed without a response (${clip(firstLine(errorMessage(err)), 60)})`;
 }
 
 /** Push a warning unless the identical text is already queued (tests sharing a target share the note). */
@@ -169,6 +311,26 @@ function parseJson(text: string): unknown {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The JSON-RPC response in a raw HTTP response body. The server MUST
+ * answer a POSTed request with either application/json or
+ * text/event-stream, and the client MUST support both
+ * (basic/transports/streamable-http#sending-messages), so an SSE body is
+ * read as its events: the first one carrying `result` or `error` is the
+ * response (notifications before it are skipped; an error without an id,
+ * which a rejection may carry, still counts). Anything else is plain JSON.
+ */
+function rpcBodyOf(text: string, contentType: string | string[] | undefined): unknown {
+  const type = (Array.isArray(contentType) ? contentType.join(", ") : (contentType ?? "")).toLowerCase();
+  if (type.includes("text/event-stream")) {
+    const response = parseSSEMessages(text).find(
+      (m) => !!m && typeof m === "object" && ("result" in m || "error" in m),
+    );
+    return response ?? parseJson(text);
+  }
+  return parseJson(text);
 }
 
 /**
@@ -527,10 +689,60 @@ function stableStringify(value: unknown): string {
   });
 }
 
-/** Word-bounded, case-insensitive "does this text mention that tool name". */
-function mentionsName(text: string, name: string): boolean {
+/**
+ * A tool name that cannot be an ordinary word in prose: it carries an
+ * underscore, dot, hyphen, slash, colon or digit, or an internal capital
+ * (camelCase). "read_file", "fs.read", "get-user", "v2" and "getUser" are
+ * distinctive; "a", "get", "search" and "Search" are not.
+ */
+function isDistinctiveName(name: string): boolean {
+  return /[_.\-/:0-9]/.test(name) || /[a-z][A-Z]/.test(name);
+}
+
+/**
+ * The punctuation that can continue a tool name: the spec's tool-name
+ * alphabet is letters, digits, underscore, hyphen and dot
+ * (server/tools#tool-names), so a dot or hyphen followed by another name
+ * character extends the identifier ("fs.read.all"), while a slash or colon
+ * ends it ("fs.read/fs.write" names both).
+ */
+const IDENTIFIER_JOINER = "[.\\-]";
+
+/**
+ * Whether `text` mentions the tool `name`, case-insensitively.
+ *
+ * A distinctive name (see isDistinctiveName) counts wherever it stands as
+ * a whole identifier: no letter, digit or underscore directly before or
+ * after, and no further segment joined on with a dot or hyphen, so "call
+ * fs.read first" and "fs.read." (sentence end) mention fs.read but
+ * "fsXread", "fs.readAll", "fs.read.all" and "my.fs.read" do not (the name
+ * is regex-escaped). A plain-word name is only a mention in code-like
+ * context -- in backticks or quotes (`search`, "search", 'search'), called
+ * (search()), or named as a tool ("the search tool") -- because the bare
+ * word is ordinary prose: a tool named "a" or "search" next to "Search the
+ * web for a page" is not a cross-reference.
+ *
+ * @internal Exported for testing.
+ */
+export function mentionsName(text: string, name: string): boolean {
+  if (!name) return false;
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(^|[^A-Za-z0-9_])${escaped}([^A-Za-z0-9_]|$)`, "i").test(text);
+  if (isDistinctiveName(name)) {
+    const before = `(?<![A-Za-z0-9_]|[A-Za-z0-9_]${IDENTIFIER_JOINER})`;
+    const after = `(?![A-Za-z0-9_]|${IDENTIFIER_JOINER}[A-Za-z0-9_])`;
+    return new RegExp(`${before}${escaped}${after}`, "i").test(text);
+  }
+  const codeLike = [
+    `\`${escaped}\``,
+    `"${escaped}"`,
+    `'${escaped}'`,
+    // Curly double and single quotes, as escapes to keep this file ASCII.
+    `\u201C${escaped}\u201D`,
+    `\u2018${escaped}\u2019`,
+    `(^|[^A-Za-z0-9_])${escaped}\\(`,
+    `\\bthe\\s+${escaped}\\s+tool\\b`,
+  ];
+  return new RegExp(codeLike.join("|"), "i").test(text);
 }
 
 /**
@@ -646,8 +858,15 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
         passed: false,
         details: `HTTP ${res.statusCode}, ${summarize(res)} -- server accepted unauthenticated request${hint}`,
       };
-    } catch {
-      return { passed: true, details: "Connection rejected (acceptable)" };
+    } catch (err) {
+      // No HTTP answer: a refusal only when the server dropped a request
+      // it served with the credential (see unansweredProbe).
+      const verdict = unansweredProbe(ctx, "unauthenticated server/discover", err, credentialedDiscoverServed(ctx));
+      if (verdict) return verdict;
+      return {
+        passed: true,
+        details: `${closedWithoutResponse(err)}; the same request with the credential was served (unauthenticated request rejected)`,
+      };
     }
   });
 
@@ -680,8 +899,17 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
         return { passed: true, details: "HTTP 403 (WWW-Authenticate not applicable for 403)" };
       }
       return { passed: true, details: `HTTP ${res.statusCode} -- not a 401 response (skipped)` };
-    } catch {
-      return { passed: true, details: "Connection rejected (acceptable)" };
+    } catch (err) {
+      const verdict = unansweredProbe(ctx, "unauthenticated server/discover", err, credentialedDiscoverServed(ctx));
+      if (verdict) return verdict;
+      warnOnce(
+        ctx,
+        "security-www-authenticate: the server closed the connection on the unauthenticated server/discover instead of answering HTTP 401; MCP clients start authorization from the 401 and its WWW-Authenticate challenge, so a dropped connection leaves them nothing to act on. Answer 401 with WWW-Authenticate: Bearer resource_metadata=...",
+      );
+      return {
+        passed: true,
+        details: `${closedWithoutResponse(err)} -- not a 401 response, no challenge to check (see warning)`,
+      };
     }
   });
 
@@ -705,24 +933,24 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
     // clear, and a real bearer token must never be sent over http.
     const httpUrl = ctx.backendUrl.replace(/^https:/, "http:");
     const probe = discoverProbe(ctx, RAW_ID_TLS);
+    const probeTimeout = Math.min(ctx.timeout, 5000);
     try {
       const res = await request(httpUrl, {
         method: "POST",
         headers: probe.headers,
         body: probe.body,
-        signal: AbortSignal.timeout(Math.min(ctx.timeout, 5000)),
+        signal: AbortSignal.timeout(probeTimeout),
       });
       await res.body.text();
       const status = res.statusCode;
-      if ([301, 302, 307, 308].includes(status)) {
-        const location = res.headers.location;
-        const target = typeof location === "string" ? clip(location, 80) : "no Location header";
-        return { passed: true, details: `HTTP ${status} redirect to HTTPS (${target})` };
-      }
+      if ([301, 302, 307, 308].includes(status)) return tlsRedirectVerdict(status, res.headers.location, httpUrl);
       if (status >= 400) return { passed: true, details: `HTTP ${status} (plaintext rejected)` };
       return { passed: false, details: `HTTP ${status} -- server accepts plaintext HTTP connections` };
-    } catch {
-      return { passed: true, details: "HTTP connection refused (HTTPS enforced)" };
+    } catch (err) {
+      // Unlike the auth probes, no answer IS the answer here: the question
+      // is whether the endpoint is served in the clear, and a refused,
+      // dropped or silent plaintext connection serves nothing.
+      return { passed: true, details: `Plaintext http:// probe got ${noResponse(err, probeTimeout)} (HTTPS enforced)` };
     }
   });
 
@@ -731,8 +959,11 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
     // The challenge on the unauthenticated discover names the metadata
     // URL clients try first; without --auth the same 401 is also what
     // says the server is auth-protected at all. An rpc that throws got
-    // no HTTP answer of any status: that is an unreachable (or hung)
-    // server, never an auth refusal.
+    // no HTTP answer of any status: an unreachable (or hung) server,
+    // never an auth refusal -- except a drop the credentialed discover
+    // pins on the missing credential (see unansweredProbe), which leaves
+    // an auth-protected server with no challenge, so the well-known
+    // locations are what a client has.
     let challenge: string | undefined;
     try {
       const res = await unauthenticatedDiscover();
@@ -744,7 +975,8 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
         };
       }
     } catch (err) {
-      return unreachable(ctx, "unauthenticated server/discover", err);
+      const verdict = unansweredProbe(ctx, "unauthenticated server/discover", err, credentialedDiscoverServed(ctx));
+      if (verdict) return verdict;
     }
     return checkProtectedResourceMetadata(ctx, challenge);
   });
@@ -775,7 +1007,7 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
         return { passed: true, details: `HTTP ${status} (token in query string rejected)` };
       }
       if (is2xx(status)) {
-        const body = parseJson(text);
+        const body = rpcBodyOf(text, res.headers["content-type"]);
         const err = errorOf(body);
         if (err) {
           return {
@@ -790,8 +1022,17 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
         };
       }
       return { passed: true, details: `HTTP ${status} (token in query string not accepted)` };
-    } catch {
-      return { passed: true, details: "Connection rejected (acceptable)" };
+    } catch (err) {
+      // The probe differs from the served credentialed discover only in
+      // where the token travels, so a drop is pinned on that.
+      const verdict = unansweredProbe(
+        ctx,
+        "server/discover with the token in the query string",
+        err,
+        credentialedDiscoverServed(ctx),
+      );
+      if (verdict) return verdict;
+      return { passed: true, details: `${closedWithoutResponse(err)} (token in query string not accepted)` };
     }
   });
 
@@ -817,10 +1058,65 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
       }
       if (status >= 400) return { passed: true, details: `HTTP ${status} (suspicious Origin rejected)` };
       return { passed: false, details: `HTTP ${status}` };
-    } catch {
-      return { passed: true, details: "Connection rejected (acceptable)" };
+    } catch (err) {
+      // The probe is the conformant discover plus a foreign Origin, so a
+      // drop is pinned on the Origin when that discover was served.
+      const verdict = unansweredProbe(ctx, "server/discover with a foreign Origin", err, ctx.state.discover !== null);
+      if (verdict) return verdict;
+      return { passed: true, details: `${closedWithoutResponse(err)} (suspicious Origin rejected)` };
     }
   });
+}
+
+/**
+ * A redirect answer to the plaintext probe. It enforces TLS only when its
+ * Location, resolved against the http:// URL the probe used (a relative
+ * "/mcp" stays on http), is an https URL: a redirect to http, or with no
+ * usable Location, leaves the client on plaintext, which the catalog's
+ * "redirect http to https or refuse" and the spec's communication security
+ * ("Implementations MUST follow OAuth 2.1 Section 1.5",
+ * basic/authorization/security-considerations#communication-security) do
+ * not allow. Location is a single URI-reference (RFC 9110 section 10.2.2),
+ * so a response carrying several (undici hands them over as an array) names
+ * no one target and does not enforce anything either.
+ */
+function tlsRedirectVerdict(status: number, location: string | string[] | undefined, httpUrl: string): TestOutcome {
+  const values = (Array.isArray(location) ? location : [location])
+    .map((v) => (typeof v === "string" ? v.trim() : ""))
+    .filter((v) => v !== "");
+  if (values.length > 1) {
+    return {
+      passed: false,
+      details: clip(
+        `HTTP ${status} redirect with ${values.length} Location headers (${values.join(", ")}) -- no single target, the plaintext request is not sent to HTTPS`,
+        220,
+      ),
+    };
+  }
+  const raw = values[0];
+  if (!raw) {
+    return {
+      passed: false,
+      details: `HTTP ${status} redirect with no Location header -- the plaintext request is not sent to HTTPS`,
+    };
+  }
+  let target: URL | null = null;
+  try {
+    target = new URL(raw, httpUrl);
+  } catch {}
+  if (!target) {
+    return {
+      passed: false,
+      details: `HTTP ${status} redirect to an unparseable Location "${clip(raw, 80)}" -- the plaintext request is not sent to HTTPS`,
+    };
+  }
+  if (target.protocol !== "https:") {
+    return {
+      passed: false,
+      details: `HTTP ${status} redirect to ${clip(target.href, 80)} -- not HTTPS, the client stays on plaintext`,
+    };
+  }
+  return { passed: true, details: `HTTP ${status} redirect to HTTPS (${clip(raw, 80)})` };
 }
 
 /**
@@ -1064,14 +1360,18 @@ interface CorsObservation {
 /**
  * CORS on both shapes a browser would send: the OPTIONS preflight (legacy
  * probe) and a conformant POST discover carrying an Origin. A wildcard or
- * a reflected foreign origin on either fails.
+ * a reflected foreign origin on either fails; when neither probe got a
+ * response there is nothing to inspect, and the verdict is unreachable().
  */
 async function checkCorsHeaders(ctx: ModernSuiteContext): Promise<TestOutcome> {
   const seen: string[] = [];
   const observations: CorsObservation[] = [];
+  /** Why each probe got no response, for the verdict when neither did. */
+  const failures: Array<{ probe: string; err: unknown; reason: string }> = [];
 
   const rawRequest = (ctx.transport as { rawRequest?: HttpRawRequest }).rawRequest;
   if (rawRequest) {
+    const optionsTimeout = Math.min(ctx.timeout, 5000);
     try {
       const res = await rawRequest(
         "OPTIONS",
@@ -1081,7 +1381,7 @@ async function checkCorsHeaders(ctx: ModernSuiteContext): Promise<TestOutcome> {
           "Access-Control-Request-Method": "POST",
           "Access-Control-Request-Headers": "content-type, authorization, mcp-protocol-version, mcp-method",
         },
-        Math.min(ctx.timeout, 5000),
+        optionsTimeout,
         undefined,
         ctx.signal,
       );
@@ -1094,6 +1394,7 @@ async function checkCorsHeaders(ctx: ModernSuiteContext): Promise<TestOutcome> {
     } catch (err: unknown) {
       if (ctx.signal?.aborted) throw err;
       seen.push("OPTIONS failed");
+      failures.push({ probe: "OPTIONS preflight", err, reason: noResponse(err, optionsTimeout) });
     }
   }
   try {
@@ -1104,8 +1405,37 @@ async function checkCorsHeaders(ctx: ModernSuiteContext): Promise<TestOutcome> {
       acao: headerOf(res.headers, "access-control-allow-origin"),
       credentials: headerOf(res.headers, "access-control-allow-credentials"),
     });
-  } catch {
+  } catch (err: unknown) {
+    if (ctx.signal?.aborted) throw err;
     seen.push("POST with Origin failed");
+    failures.push({ probe: "POST server/discover with Origin", err, reason: noResponse(err, ctx.timeout) });
+  }
+  if (observations.length === 0) {
+    // No response carried headers to inspect, so "no CORS headers" would
+    // be a claim about responses that never arrived. Both probes carry
+    // the foreign Origin and nothing else the served setup discover
+    // lacked, so -- by the rule unansweredProbe applies to the Origin
+    // probe of security-origin-validation -- a connection the server
+    // accepted and closed on each of them is a refusal of cross-origin
+    // access (a browser gets no CORS grant from a dropped connection
+    // either). A timeout or a refused connection measured nothing.
+    const probes = failures.map((f) => f.probe).join(" and ");
+    const allDropped = failures.every((f) => classifyTransportError(f.err) === "dropped");
+    if (allDropped && ctx.state.discover !== null) {
+      return {
+        passed: true,
+        details: clip(
+          `Connection closed without a response on ${probes}; the same server/discover without an Origin was served (cross-origin requests refused, no CORS headers to check)`,
+          220,
+        ),
+      };
+    }
+    const reasons = [...new Set(failures.map((f) => f.reason))];
+    const what =
+      reasons.length === 1
+        ? `${probes} got ${reasons[0]}`
+        : failures.map((f) => `${f.probe} got ${f.reason}`).join("; ");
+    return unreachable(ctx, clip(`${what}, so there are no CORS headers to check`, 200));
   }
 
   for (const o of observations) {
@@ -1124,9 +1454,6 @@ async function checkCorsHeaders(ctx: ModernSuiteContext): Promise<TestOutcome> {
         details: `Server reflects arbitrary Origin in CORS${credentials} on ${o.via} -- effectively wildcard`,
       };
     }
-  }
-  if (observations.length === 0) {
-    return { passed: true, details: `${seen.join(", ")} (no CORS, acceptable)` };
   }
   const restricted = observations.find((o) => o.acao)?.acao;
   if (restricted) {
@@ -1230,8 +1557,12 @@ function noteInjectionScope(ctx: ModernSuiteContext, target: InjectionTarget): v
 /**
  * Send every payload to the one target and count what came back. Only a
  * rejection (isError or rejection wording) is evidence the server
- * defended; a benign result proves nothing either way, and a JSON-RPC or
- * transport error means the payload never reached the tool at all.
+ * defended; a benign result proves nothing either way, and a JSON-RPC
+ * error or a timeout means the payload never reached a verdict. A server
+ * that goes away on a payload (the stdio child exits, an accepted HTTP
+ * connection is closed or reset) fails naming that payload; one that was
+ * already gone when a payload was sent (a dead child, a refused
+ * connection) stops the probe with an unreachable() verdict.
  * `toolInputSchema` keeps `x-mcp-header` arguments callable: their values
  * are mirrored into `Mcp-Param-*` headers so the server does not reject
  * the request as a header mismatch before the tool ever runs.
@@ -1249,7 +1580,11 @@ async function runInjectionTest(
   let rejected = 0;
   let benign = 0;
   let unreached = 0;
+  const stdioExited = () => ctx.kind === "stdio" && (ctx.transport as { exited?: boolean }).exited === true;
   for (const payload of payloads) {
+    // A child that is already gone was not killed by this payload: an
+    // earlier test (or payload) did it, and nothing more can be sent.
+    const alreadyGone = stdioExited();
     try {
       const res = await ctx.client.rpc(
         TOOLS_CALL,
@@ -1270,7 +1605,34 @@ async function runInjectionTest(
       } else {
         benign++;
       }
-    } catch {
+    } catch (err) {
+      if (ctx.signal?.aborted) throw err;
+      const failure = classifyTransportError(err);
+      const reason = clip(firstLine(errorMessage(err)), 100);
+      // The server went away on this payload: the stdio child exited, or
+      // an accepted HTTP connection was closed or reset instead of
+      // answered. That is the crash the test exists to catch -- the same
+      // behaviour security-extra-params fails as "died" -- not a payload
+      // that merely never reached the tool.
+      if (failure === "dropped" && !alreadyGone) {
+        const died =
+          ctx.kind === "stdio"
+            ? `server died on payload "${clip(payload, 30)}" sent to ${where}: ${reason}`
+            : `connection dropped on payload "${clip(payload, 30)}" sent to ${where}: ${reason} (server may have crashed)`;
+        return { passed: false, details: clip([...issues, died].join("; "), 220) };
+      }
+      // Gone before this payload (a dead child, a refused connection): no
+      // payload after it can be sent either, so the probe stops here. When
+      // nothing was answered at all, nothing was measured.
+      if (failure === "dropped" || failure === "connect") {
+        if (issues.length > 0) return { passed: false, details: clip(issues.join("; "), 200) };
+        const gone = unreachable(ctx, `tools/call ${where} with payload "${clip(payload, 30)}"`, err);
+        const earlier = rejected + benign + unreached;
+        if (earlier === 0) return gone;
+        return { passed: false, details: clip(`${gone.details}, after ${earlier} earlier payload(s)`, 220) };
+      }
+      // A timeout (the tool may just be slow; the server is still up) or
+      // an unclassifiable error: the payload never reached a verdict.
       unreached++;
     }
   }

@@ -52,7 +52,7 @@ const C: Record<string, Criteria> = {
   // ── transport ──
   "transport-post": {
     pass: "HTTP 2xx for a POST carrying a conformant server/discover request (standard headers plus _meta).",
-    fail: "Any non-2xx status; 401/403 is annotated as authentication required.",
+    fail: "Any non-2xx status; 401/403 is annotated as authentication required, or as the configured credential rejected when --auth was given.",
     gate: null,
   },
   "transport-content-type": {
@@ -67,7 +67,7 @@ const C: Record<string, Criteria> = {
   },
   "transport-batch-reject": {
     pass: "A JSON array of two valid server/discover requests draws HTTP 4xx or a JSON-RPC error body.",
-    fail: "A 2xx status without a JSON-RPC error, or an array response.",
+    fail: "A 2xx status without a JSON-RPC error, an array response, or a text/event-stream carrying no JSON-RPC response (notifications before an error frame are ignored).",
     gate: null,
   },
   "transport-notification-202": {
@@ -198,22 +198,22 @@ const C: Record<string, Criteria> = {
   },
   "lifecycle-meta-required": {
     pass: `A server/discover with no params._meta draws a JSON-RPC error (HTTP 400 on HTTP), ${NOT_EVALUABLE}; code -32602 is expected and any other code is reported as a warning. Runs after the feature tests and before the security tests, so a dual-era stdio server is already pinned modern (a --only run on stdio sends the first declared list, else ping, first) and the rate-limit burst cannot have tripped an intermediary.`,
-    fail: `A result is returned, on HTTP the error arrives with a status other than 400, the conformant server/discover was itself rejected or unanswered, or the answer is a transport-level status (401, 403, 413, 415, 429) -- the last two not evaluable.`,
+    fail: `A result is returned, on HTTP the error arrives with a status other than 400 or no JSON-RPC error body arrives on a status other than 400 (a bare 400 passes with a warning), the conformant server/discover was itself rejected or unanswered, or the answer is a transport-level status (401, 403, 413, 415, 429) -- the last two not evaluable.`,
     gate: null,
   },
   "lifecycle-meta-protocol-version-required": {
     pass: `A _meta without protocolVersion draws a JSON-RPC error (HTTP 400 on HTTP), ${NOT_EVALUABLE}; -32602 is expected and another code (typically -32020) is reported as a warning. Runs after the feature tests and before the security tests.`,
-    fail: `A result is returned, on HTTP the error arrives with a status other than 400, the conformant server/discover was itself rejected or unanswered, or the answer is a transport-level status (401, 403, 413, 415, 429) -- the last two not evaluable.`,
+    fail: `A result is returned, on HTTP the error arrives with a status other than 400 or no JSON-RPC error body arrives on a status other than 400 (a bare 400 passes with a warning), the conformant server/discover was itself rejected or unanswered, or the answer is a transport-level status (401, 403, 413, 415, 429) -- the last two not evaluable.`,
     gate: null,
   },
   "lifecycle-meta-client-capabilities-required": {
     pass: `A _meta without clientCapabilities draws a JSON-RPC error (HTTP 400 on HTTP), ${NOT_EVALUABLE}; -32602 is expected and another code is reported as a warning.`,
-    fail: `The request is served as if {} had been sent, on HTTP the error arrives with a status other than 400, the conformant server/discover was itself rejected or unanswered, or the answer is a transport-level status (401, 403, 413, 415, 429) -- the last two not evaluable.`,
+    fail: `The request is served as if {} had been sent, on HTTP the error arrives with a status other than 400 or no JSON-RPC error body arrives on a status other than 400 (a bare 400 passes with a warning), the conformant server/discover was itself rejected or unanswered, or the answer is a transport-level status (401, 403, 413, 415, 429) -- the last two not evaluable.`,
     gate: null,
   },
   "lifecycle-meta-client-info-optional": {
     pass: "A server/discover whose _meta omits clientInfo returns a normal result.",
-    fail: "A JSON-RPC error or non-2xx status caused by the missing clientInfo.",
+    fail: "A JSON-RPC error or non-2xx status caused by the missing clientInfo; when the conformant server/discover was itself rejected, or the answer is a transport-level status (401, 403, 413, 415, 429), the failure is reported as not evaluable.",
     gate: null,
   },
   "lifecycle-version-unsupported": {
@@ -314,8 +314,8 @@ const C: Record<string, Criteria> = {
     gate: "resources",
   },
   "resources-not-found": {
-    pass: "Reading a nonexistent URI draws a JSON-RPC error: -32602 passes cleanly, and any other code except -32002 (for example -32603 from a resolver that throws on the unknown scheme) passes with a warning naming the expected -32602; a missing data.uri is reported as a warning.",
-    fail: "A result of any shape (including an empty contents array or input_required), or the retired code -32002.",
+    pass: "Reading a nonexistent URI draws JSON-RPC error -32602; a missing data.uri is reported as a warning.",
+    fail: "A result of any shape (including an empty contents array or input_required), or any error code other than -32602 (the retired -32002, -32603, -32601, ...).",
     gate: "resources",
   },
   "resources-templates": {
@@ -357,32 +357,32 @@ const C: Record<string, Criteria> = {
   // ── errors ──
   "error-unknown-method": {
     pass: "A JSON-RPC error echoing the request id; on HTTP a 404 status passes cleanly and an error carried on 200 passes with a warning.",
-    fail: "A result, no response, or an error that does not echo the request id.",
+    fail: "A result, no response, or an error that does not echo the request id. A server that rejects server/discover too fails as not evaluable.",
     gate: null,
   },
   "error-method-code": {
     pass: "The unknown-method error carries exactly code -32601.",
-    fail: "Any other code (-32600, -32000, or an application code).",
+    fail: "Any other code (-32600, -32000, or an application code). A server that rejects server/discover too fails as not evaluable.",
     gate: null,
   },
   "error-invalid-jsonrpc": {
     pass: "A JSON object with no method and no id draws a JSON-RPC error or an HTTP 4xx status.",
-    fail: "A result, a 5xx status, or no response.",
+    fail: "A result, a 5xx status, or no response. A server that rejects server/discover too fails as not evaluable.",
     gate: null,
   },
   "error-invalid-json": {
     pass: "The body '{not json' draws a -32700 error or an HTTP 4xx status.",
-    fail: "A 5xx status, a hang, or an HTML error page.",
+    fail: "A 5xx status, a hang, or an HTML error page. A server that rejects server/discover too fails as not evaluable.",
     gate: null,
   },
   "error-parse-code": {
     pass: "The invalid-JSON response carries exactly code -32700; a bare 400 with no JSON-RPC body passes with a warning.",
-    fail: "A JSON-RPC error with a code other than -32700.",
+    fail: "A JSON-RPC error with a code other than -32700. A server that rejects server/discover too fails as not evaluable.",
     gate: null,
   },
   "error-invalid-request-code": {
     pass: "The malformed-envelope response carries exactly code -32600; a bare 400 with no JSON-RPC body passes with a warning.",
-    fail: "A JSON-RPC error with a code other than -32600 (for example -32601 or -32602).",
+    fail: "A JSON-RPC error with a code other than -32600 (for example -32601 or -32602). A server that rejects server/discover too fails as not evaluable.",
     gate: null,
   },
   "error-missing-params": {
@@ -397,7 +397,7 @@ const C: Record<string, Criteria> = {
   },
   "error-capability-gated": {
     pass: "Every list method for a capability the discover result did not declare draws a JSON-RPC error (-32601 expected). Skipped when every capability is declared.",
-    fail: "A list method for an undeclared capability returns a result.",
+    fail: "A list method for an undeclared capability returns a result. Without a served server/discover the test fails as not evaluable (the answers are still recorded).",
     gate: null,
   },
   "error-invalid-cursor": {
@@ -406,7 +406,7 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "error-id-echo": {
-    pass: `Every recorded JSON-RPC error response (jsonrpc 2.0 with an error object carrying a numeric code) that answers an id-bearing request carries that same id; an id-less reply is attributed by timeline to the nearest earlier request that never got its own reply, or to a more recent client notification or raw probe. Exempt: replies to the suite's raw probes and client notifications, and replies without an id on HTTP 401/403/413/415/429 transport-level rejections; non-JSON-RPC error bodies (a gateway's {"error":...}) are not counted.`,
+    pass: `Every recorded JSON-RPC error response (jsonrpc 2.0 with an error object carrying a numeric code) that answers an id-bearing request carries that same id; an id-less reply is attributed by timeline to the nearest earlier request that never got its own reply, or to a more recent client notification or raw probe (which counts only while no request sent after it was answered before the stray arrived). Exempt: replies to the suite's raw probes and client notifications, and replies without an id on HTTP 401/403/413/415/429 transport-level rejections; non-JSON-RPC error bodies (a gateway's {"error":...}) are not counted.`,
     fail: `A JSON-RPC error with a null or missing id in reply to a well-formed request, whatever the error code (-32600 and -32700 included), or a present but wrong id whatever the HTTP status. ${EMPTY_RECORDING}`,
     gate: null,
   },
@@ -468,13 +468,13 @@ const C: Record<string, Criteria> = {
   },
   // ── security ──
   "security-auth-required": {
-    pass: "A conformant server/discover with the Authorization header removed draws HTTP 401 or 403 (probed with or without --auth), or the connection is refused.",
-    fail: "Any other status: the server accepted an unauthenticated request (the details say when no --auth was provided).",
+    pass: "A conformant server/discover with the Authorization header removed draws HTTP 401 or 403 (probed with or without --auth), or -- with --auth and a served credentialed server/discover -- the connection is closed without an answer.",
+    fail: "Any other status: the server accepted an unauthenticated request (the details say when no --auth was provided); a timeout or refused connection fails as server unreachable.",
     gate: null,
   },
   "security-www-authenticate": {
     pass: `The 401 observed on the unauthenticated server/discover carries a WWW-Authenticate header (a challenge without resource_metadata, or whose resource_metadata is not an absolute http(s) URL, passes with a warning). Skipped when no 401 was observed (a 403 or a served request).`,
-    fail: "A 401 with no WWW-Authenticate header.",
+    fail: "A 401 with no WWW-Authenticate header, or no HTTP answer at all (server unreachable).",
     gate: null,
   },
   "security-auth-malformed": {
@@ -483,8 +483,8 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "security-tls-required": {
-    pass: "For an https target, the same server/discover over plain http to the same host is refused or redirected to https.",
-    fail: "A result over plaintext, or an http target (fails outright).",
+    pass: "For an https target, the same server/discover over plain http to the same host is refused (a 4xx/5xx, or no plaintext answer) or redirected with a single Location that resolves to an https URL.",
+    fail: "A result over plaintext, a redirect to http, without a Location, with an unparseable one or with several, or an http target (fails outright).",
     gate: null,
   },
   "security-oauth-metadata": {
@@ -493,38 +493,38 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "security-token-in-uri": {
-    pass: "A server/discover with the token moved from the Authorization header to the ?access_token= query parameter draws HTTP 401 or 403, a non-2xx status, or a JSON-RPC error. Requires --auth.",
-    fail: "A 2xx result or non-error body (the query-string token was honoured).",
+    pass: "A server/discover with the token moved from the Authorization header to the ?access_token= query parameter draws HTTP 401 or 403, a non-2xx status, or a JSON-RPC error (plain JSON or an SSE event). Requires --auth.",
+    fail: "A 2xx result or non-error body (the query-string token was honoured), or no HTTP answer at all (server unreachable).",
     gate: null,
   },
   "security-cors-headers": {
     pass: "Access-Control-Allow-Origin on the OPTIONS preflight and on the server/discover response is absent or names a specific origin.",
-    fail: "Access-Control-Allow-Origin: * is returned, or the foreign Origin is reflected back.",
+    fail: "Access-Control-Allow-Origin: * is returned, the foreign Origin is reflected back, or neither probe gets an HTTP answer (server unreachable).",
     gate: null,
   },
   "security-origin-validation": {
     pass: "A fully valid server/discover with Origin: https://evil-rebinding-attack.example.com draws HTTP 403 (401 or another 4xx/5xx also counts as rejected).",
-    fail: "A 2xx status (the origin was not validated), or a 1xx/3xx status.",
+    fail: "A 2xx status (the origin was not validated), a 1xx/3xx status, or no HTTP answer at all (server unreachable).",
     gate: null,
   },
   "security-command-injection": {
     pass: `No result from the single target -- a tool with a string argument from the safest annotation tier (readOnlyHint true, then destructiveHint false, then unannotated, then destructiveHint true; the spec defaults destructiveHint to true), a free-form argument before an enum/const/pattern one, other required arguments filled with schema-honouring placeholders -- shows evidence of executing an injected shell payload (passwd lines, id output, directory listings) without rejection wording or isError; the details count rejected, benign and never-reached payloads, and a run where no payload reached the tool passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
-    fail: `Any result containing evidence of execution that is not also a rejection. ${LIST_FAILED_FAIL("tools")}`,
+    fail: `Any result containing evidence of execution that is not also a rejection, or a server that dies or drops the connection on a payload. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-sql-injection": {
     pass: `No result from the same single target contains database error text or unexpected row dumps for the SQL payloads without rejection wording or isError; all never-reached passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
-    fail: `Any result containing database error text or dumped rows that is not also a rejection. ${LIST_FAILED_FAIL("tools")}`,
+    fail: `Any result containing database error text or dumped rows that is not also a rejection, or a server that dies or drops the connection on a payload. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-path-traversal": {
     pass: `No result from the target (a path-named string argument when one exists in the safest annotation tier, else a URL-named one, else the shared injection target) contains file contents from outside the tool's scope for the traversal payloads without rejection wording or isError; all never-reached passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
-    fail: `Any result containing out-of-scope file contents that is not also a rejection. ${LIST_FAILED_FAIL("tools")}`,
+    fail: `Any result containing out-of-scope file contents that is not also a rejection, or a server that dies or drops the connection on a payload. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-ssrf-internal": {
     pass: `No result from the target (a URL-named string argument when one exists in the safest annotation tier, else a path-named one, else the shared injection target) contains cloud-metadata or internal-service content for the internal targets without rejection wording or isError; all never-reached passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
-    fail: `Any result containing metadata or internal-service content that is not also a rejection. ${LIST_FAILED_FAIL("tools")}`,
+    fail: `Any result containing metadata or internal-service content that is not also a rejection, or a server that dies or drops the connection on a payload. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-oversized-input": {
@@ -553,7 +553,7 @@ const C: Record<string, Criteria> = {
     gate: "tools",
   },
   "security-tool-cross-reference": {
-    pass: `No tool description mentions another listed tool's name. Skipped when the server declares no tools. ${LIST_FAILED_SKIP("tools")}`,
+    pass: `No tool description mentions another listed tool's name (a plain-word name counts only in code-like context: backticks, quotes, a call, or 'the X tool'). Skipped when the server declares no tools. ${LIST_FAILED_SKIP("tools")}`,
     fail: `Any cross-reference found (named in the details). ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
@@ -727,7 +727,7 @@ const CAT_INTRO: Record<string, string> = {
   tools:
     "Only present in the report when the discover result declares the `tools` capability; every rule is then required at runtime except `tools-list-deterministic-order` and `tools-pagination`. `tools/call` may now answer with an MRTR `input_required` result instead of content. The feature tests do not check `resultType: 'complete'` themselves; the post-hoc `schema-result-type` scan does, over every result.",
   resources:
-    "Only present when the `resources` capability is declared. New in this revision: caching hints on every cacheable result, and `resources-not-found`, which fails the retired `-32002` code (any code other than `-32602` passes with a warning).",
+    "Only present when the `resources` capability is declared. New in this revision: caching hints on every cacheable result, and `resources-not-found`, which fails the retired `-32002` code (any code other than `-32602` fails).",
   prompts: "Only present when the `prompts` capability is declared.",
   errors:
     'Error tests send conformant envelopes so the error under test comes from the server\'s own dispatch, not from `_meta` validation. `error-unknown-method` now expects HTTP 404 on the JSON-RPC error. Two rules are post-hoc scans of every JSON-RPC error recorded during the run; a body that is not a jsonrpc 2.0 error (an auth gate\'s `{"error":"invalid_token"}` on 401, a gateway\'s `{"error":{"code":400,...}}`) is not counted.',

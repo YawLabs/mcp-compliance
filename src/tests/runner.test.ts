@@ -393,3 +393,244 @@ describe("dedupAndCapWarnings", () => {
     expect(dedupAndCapWarnings([], 50)).toEqual([]);
   });
 });
+
+/** One POST a {@link startLegacyStub} server received. */
+interface StubHit {
+  method: string;
+  url: string;
+  authorization?: string;
+  apiKey?: string;
+  sessionId?: string;
+}
+
+const STUB_SESSION = "9b2e4c7a1f3d4e8b";
+
+/**
+ * A 2025-11-25 HTTP server with one string-param tool, `shell(cmd)`, for the
+ * legacy security checks that need a server to misbehave:
+ *
+ * - `gateway`: a gateway in front of it that 403s any request without
+ *   `X-Api-Key: <apiKey>` and 401s one without the bearer `token`, taken
+ *   from the Authorization header or, when `queryToken`, the `access_token`
+ *   query parameter as well; ping and tools/* also need the session id.
+ * - `toolCall`: `"executes"` answers like a tool that hands `cmd` to a
+ *   shell (the command's output, not the payload); `"invalid-params"`
+ *   answers every tools/call with a JSON-RPC -32602 error.
+ *
+ * Records every POST.
+ */
+async function startLegacyStub(opts: {
+  gateway?: { apiKey: string; token: string; queryToken: boolean };
+  toolCall?: "executes" | "invalid-params";
+}): Promise<{ url: string; hits: StubHit[]; stop(): Promise<void> }> {
+  const SHELL_OUTPUT: Record<string, string> = {
+    "; cat /etc/passwd": "root:x:0:0:root:/root:/bin/bash",
+    "$(whoami)": "root",
+    "| ls -la": "total 8 drwxr-xr-x 2 root root 4096 Sep 14 09:00 .",
+    "`id`": "uid=0(root) gid=0(root) groups=0(root)",
+    "&& echo pwned": "pwned",
+  };
+  const hits: StubHit[] = [];
+  const server: Server = createServer((req, res) => {
+    let text = "";
+    req.setEncoding("utf8");
+    req.on("data", (c: string) => {
+      text += c;
+    });
+    req.on("end", () => {
+      if (req.method !== "POST") {
+        res.writeHead(405);
+        res.end();
+        return;
+      }
+      let msg: { id?: unknown; method?: string; params?: { arguments?: { cmd?: string } } } = {};
+      try {
+        msg = JSON.parse(text);
+      } catch {}
+      const hit: StubHit = {
+        method: msg.method ?? "?",
+        url: req.url ?? "",
+        authorization: req.headers.authorization,
+        apiKey: req.headers["x-api-key"] as string | undefined,
+        sessionId: req.headers["mcp-session-id"] as string | undefined,
+      };
+      hits.push(hit);
+      const json = (status: number, body: unknown, headers: Record<string, string> = {}) => {
+        res.writeHead(status, { "content-type": "application/json", ...headers });
+        res.end(JSON.stringify(body));
+      };
+      const gw = opts.gateway;
+      if (gw) {
+        if (hit.apiKey !== gw.apiKey) {
+          json(403, { error: "missing or unknown API key" });
+          return;
+        }
+        const queryToken = new URL(hit.url, "http://stub").searchParams.get("access_token");
+        const authorized = hit.authorization === `Bearer ${gw.token}` || (gw.queryToken && queryToken === gw.token);
+        if (!authorized) {
+          json(
+            401,
+            { jsonrpc: "2.0", id: null, error: { code: -32001, message: "Unauthorized" } },
+            { "www-authenticate": 'Bearer error="invalid_token"' },
+          );
+          return;
+        }
+      }
+      if (msg.id === undefined) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      const reply = (body: Record<string, unknown>) =>
+        json(200, { jsonrpc: "2.0", id: msg.id, ...body }, { "mcp-session-id": STUB_SESSION });
+      if (msg.method === "initialize") {
+        reply({
+          result: {
+            protocolVersion: "2025-11-25",
+            capabilities: { tools: {} },
+            serverInfo: { name: "legacy-stub", version: "1" },
+          },
+        });
+        return;
+      }
+      const needsSession = msg.method === "ping" || msg.method?.startsWith("tools/");
+      if (gw && needsSession && hit.sessionId !== STUB_SESSION) {
+        json(400, { jsonrpc: "2.0", id: msg.id, error: { code: -32600, message: "Bad Request: no valid session" } });
+        return;
+      }
+      if (msg.method === "ping") {
+        reply({ result: {} });
+      } else if (msg.method === "tools/list") {
+        reply({
+          result: {
+            tools: [
+              {
+                name: "shell",
+                description: "Runs a command",
+                inputSchema: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] },
+              },
+            ],
+          },
+        });
+      } else if (msg.method === "tools/call" && opts.toolCall === "executes") {
+        const cmd = msg.params?.arguments?.cmd ?? "";
+        reply({ result: { content: [{ type: "text", text: SHELL_OUTPUT[cmd] ?? "" }] } });
+      } else if (msg.method === "tools/call" && opts.toolCall === "invalid-params") {
+        reply({ error: { code: -32602, message: "Invalid params: cmd must match ^[a-z]+$" } });
+      } else {
+        reply({ error: { code: -32601, message: "Method not found" } });
+      }
+    });
+  });
+  const url = await new Promise<string>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      resolve(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+    });
+  });
+  return {
+    url,
+    hits,
+    stop: () =>
+      new Promise<void>((resolve, reject) => {
+        server.closeAllConnections();
+        server.close((err) => (err ? reject(err) : resolve()));
+      }),
+  };
+}
+
+describe("runComplianceSuite — legacy injection checks judge the tool's output", () => {
+  // tools-list discovers the tool the injection tests target.
+  const ONLY = ["tools-list", "security-command-injection"];
+
+  it("a tool whose output is the executed command's (not the payload echoed) FAILS, naming each payload and its output", async () => {
+    const stub = await startLegacyStub({ toolCall: "executes" });
+    try {
+      const report = await runComplianceSuite(stub.url, { timeout: 3000, specVersion: "2025-11-25", only: ONLY });
+      const t = report.tests.find((x) => x.id === "security-command-injection");
+      expect(t?.passed).toBe(false);
+      // "$(whoami)" -> "root" is no execution evidence the detector knows.
+      expect(t?.details).toBe(
+        [
+          'Payload "; cat /etc/passwd" appears to have executed (output: root:x:0:0:root:/root:/bin/bash)',
+          'Payload "| ls -la" appears to have executed (output: total 8 drwxr-xr-x 2 root root 4096 Sep 14 09:00 .)',
+          'Payload "`id`" appears to have executed (output: uid=0(root) gid=0(root) groups=0(root))',
+          'Payload "&& echo pwned" appears to have executed (output: pwned)',
+        ].join("; "),
+      );
+      expect(stub.hits.filter((h) => h.method === "tools/call")).toHaveLength(5);
+    } finally {
+      await stub.stop();
+    }
+  }, 15000);
+
+  it("a tool that answers every payload with a JSON-RPC invalid-params error defended itself: PASS", async () => {
+    const stub = await startLegacyStub({ toolCall: "invalid-params" });
+    try {
+      const report = await runComplianceSuite(stub.url, { timeout: 3000, specVersion: "2025-11-25", only: ONLY });
+      const t = report.tests.find((x) => x.id === "security-command-injection");
+      expect({ passed: t?.passed, details: t?.details }).toEqual({
+        passed: true,
+        details: "Tested 5 payloads against shell.cmd — server defended (rejected or sanitized)",
+      });
+      expect(stub.hits.filter((h) => h.method === "tools/call")).toHaveLength(5);
+    } finally {
+      await stub.stop();
+    }
+  }, 15000);
+});
+
+describe("runComplianceSuite — legacy security-token-in-uri", () => {
+  const gateway = { apiKey: "gw-7c1e", token: "tok-9f2a", queryToken: true };
+  const headers = { Authorization: `Bearer ${gateway.token}`, "X-Api-Key": gateway.apiKey };
+
+  it("FAILS a server that accepts the token from ?access_token=; the probe carries the -H headers and the session, not Authorization", async () => {
+    const stub = await startLegacyStub({ gateway });
+    try {
+      const report = await runComplianceSuite(stub.url, {
+        headers,
+        timeout: 3000,
+        specVersion: "2025-11-25",
+        only: ["security-token-in-uri"],
+      });
+      const t = report.tests.find((x) => x.id === "security-token-in-uri");
+      expect({ passed: t?.passed, details: t?.details }).toEqual({
+        passed: false,
+        details: "Server accepted auth token in query string (spec: MUST NOT transmit credentials in URIs)",
+      });
+      // The gateway key and the session are what get the probe to the token
+      // check; without either, the 403/400 would read as "not accepted" and
+      // this server would wrongly PASS.
+      expect(stub.hits.filter((h) => h.url.includes("access_token="))).toEqual([
+        {
+          method: "ping",
+          url: `/mcp?access_token=${gateway.token}`,
+          authorization: undefined,
+          apiKey: gateway.apiKey,
+          sessionId: STUB_SESSION,
+        },
+      ]);
+    } finally {
+      await stub.stop();
+    }
+  }, 15000);
+
+  it("the same gateway ignoring the query parameter answers 401, which PASSES", async () => {
+    const stub = await startLegacyStub({ gateway: { ...gateway, queryToken: false } });
+    try {
+      const report = await runComplianceSuite(stub.url, {
+        headers,
+        timeout: 3000,
+        specVersion: "2025-11-25",
+        only: ["security-token-in-uri"],
+      });
+      const t = report.tests.find((x) => x.id === "security-token-in-uri");
+      expect({ passed: t?.passed, details: t?.details }).toEqual({
+        passed: true,
+        details: "HTTP 401 (token in query string rejected)",
+      });
+    } finally {
+      await stub.stop();
+    }
+  }, 15000);
+});

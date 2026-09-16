@@ -266,6 +266,19 @@ describe("modern transport suite: knob runs", () => {
     expect(failed(report, "transport-concurrent")).toContain("(mismatch)");
   });
 
+  it("MODERN_FIXTURE_AUTH with a wrong credential: transport-post says the credential was rejected", async () => {
+    const fixture = await startHttpFixture({ auth: "secret-token" });
+    try {
+      const report = await runModern(
+        { type: "http", url: fixture.url, headers: { Authorization: "Bearer WRONG" } },
+        { only: ["transport-post"] },
+      );
+      expect(failed(report, "transport-post")).toBe("HTTP 401 (credential rejected -- check --auth)");
+    } finally {
+      await fixture.stop();
+    }
+  });
+
   it("MODERN_FIXTURE_AUTH without --auth: transport-post fails with the --auth hint", async () => {
     const report = await runWithBreaks([], ["transport-post", "transport-header-case-insensitive"], "secret-token");
     expect(failed(report, "transport-post")).toBe("HTTP 401 (auth required -- pass --auth)");
@@ -622,6 +635,88 @@ describe("modern transport suite: stub servers for knob-less branches", () => {
     }
   });
 
+  /**
+   * The four standard-header probes against one stub, each defect drawing
+   * the `status` it maps to; every other POST is served. `body` carries the
+   * version mismatch in `_meta`, the only defect that is not a header.
+   */
+  async function headerRejectionStub(status: (defect: "version" | "method") => number) {
+    return startStub((req, res, body) => {
+      const reject = (code: number) => {
+        // No JSON-RPC body at all: what an intermediary answers.
+        res.writeHead(code, { "Content-Type": "text/plain" });
+        res.end("rejected");
+      };
+      if (req.headers["mcp-protocol-version"] === undefined) return reject(status("version"));
+      if (req.headers["mcp-method"] !== "server/discover") return reject(status("method"));
+      if (body.includes("1999-01-01")) return reject(status("version"));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(discoverResult(body));
+    });
+  }
+
+  it("a bare HTTP 400 passes the SHOULD header tests with a warning and still fails version-mismatch", async () => {
+    // streamable-http lets an intermediary reject a request with a status
+    // alone, so a 400 with no -32020 is a rejection the tool cannot
+    // diagnose: a warning on the three SHOULD tests, but version-mismatch
+    // requires the code (basic/index #protocol-version-header) and fails.
+    const stub = await headerRejectionStub(() => 400);
+    try {
+      const run = directContext(stub.url, {}, { only: HEADER_REJECT_IDS });
+      const all = await run.all();
+      const tolerated = {
+        passed: true,
+        details: "HTTP 400 with no JSON-RPC error body (expected -32020; reported as a warning)",
+      };
+      expect(all).toEqual({
+        "transport-header-version-required": tolerated,
+        "transport-header-method-required": tolerated,
+        "transport-header-method-mismatch": tolerated,
+        "transport-header-version-mismatch": {
+          passed: false,
+          details: "HTTP 400 but no JSON-RPC error body (expected -32020 HeaderMismatch)",
+        },
+      });
+      expect(run.warnings()).toEqual(
+        [
+          "transport-header-version-required",
+          "transport-header-method-required",
+          "transport-header-method-mismatch",
+        ].map(
+          (id) =>
+            `${id}: server rejected the request with HTTP 400 but no JSON-RPC error body instead of -32020 HeaderMismatch (SHOULD).`,
+        ),
+      );
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("a rejection that is not HTTP 400 fails every standard-header test naming the status", async () => {
+    // 400 is the hard requirement, so a 500 from a handler that crashed on
+    // the missing header, or a gateway's 404 / 422, is not a rejection the
+    // suite credits -- and not a transport-level status either (those are
+    // not evaluable, see the 429 case above).
+    const stub = await headerRejectionStub((defect) => (defect === "version" ? 500 : 404));
+    try {
+      const run = directContext(stub.url, {}, { only: HEADER_REJECT_IDS });
+      const all = await run.all();
+      const failsWith = (status: number) => ({
+        passed: false,
+        details: `HTTP ${status}, non-JSON-RPC body (expected HTTP 400)`,
+      });
+      expect(all).toEqual({
+        "transport-header-version-required": failsWith(500),
+        "transport-header-version-mismatch": failsWith(500),
+        "transport-header-method-required": failsWith(404),
+        "transport-header-method-mismatch": failsWith(404),
+      });
+      expect(run.warnings()).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+
   it("transport-session-ignored fails when the server serves the result but mints Mcp-Session-Id", async () => {
     const stub = await startStub((_req, res, body) => {
       res.writeHead(200, { "Content-Type": "application/json", "Mcp-Session-Id": "minted-1" });
@@ -721,6 +816,83 @@ describe("modern transport suite: stub servers for knob-less branches", () => {
       expect(without).toMatchObject({
         passed: false,
         details: "HTTP 200 without a JSON-RPC error (expected 4xx or error)",
+      });
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("transport-batch-reject reads a text/event-stream answer by its JSON-RPC responses", async () => {
+    const frame = (msg: unknown) => `event: message\ndata: ${JSON.stringify(msg)}\n\n`;
+    const rejection = frame({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "no batches" } });
+    const progress = frame({
+      jsonrpc: "2.0",
+      method: "notifications/message",
+      params: { level: "info", data: "reading the body" },
+    });
+    const responses = [99903, 99904].map((id) => ({
+      jsonrpc: "2.0",
+      id,
+      result: { resultType: "complete", supportedVersions: [MODERN_SPEC_VERSION], capabilities: {} },
+    }));
+    const bodies: Record<string, string> = {
+      "one error frame": rejection,
+      // The stream MAY carry notifications before the response; before the
+      // fix this counted as "processed the batch (2 replies)".
+      "a notification, then the error": progress + rejection,
+      // Before the fix these three read "server processed the batch (0 replies)".
+      "only a priming comment": ": primed\n\n",
+      "an empty stream": "",
+      "a data frame that is not JSON": "data: not json\n\n",
+      // Before the fix: "HTTP 200 without a JSON-RPC error (expected 4xx or error)".
+      "only a notification": progress,
+      // Parsed JSON that is not an object is not a response either (and must not crash the check).
+      "JSON frames that are not objects": "data: null\n\ndata: 42\n\n",
+      "a response per element": responses.map(frame).join(""),
+      // A JSON-RPC batch answered as one array frame: processed, not "1 non-response message".
+      "the batch array in one frame": frame(responses),
+    };
+    let mode = "";
+    const stub = await startStub((_req, res, body) => {
+      if (body.trimStart().startsWith("[")) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.end(bodies[mode]);
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(discoverResult(body));
+    });
+    try {
+      const outcomes: Record<string, { passed: boolean; details: string }> = {};
+      for (const name of Object.keys(bodies)) {
+        mode = name;
+        const { passed, details } = await directContext(stub.url, {}, { only: ["transport-batch-reject"] }).run();
+        outcomes[name] = { passed, details };
+      }
+      const rejected = { passed: true, details: "HTTP 200, JSON-RPC error -32600 (batch rejected)" };
+      const nothing = {
+        passed: false,
+        details: "HTTP 200 text/event-stream with no JSON-RPC message; expected 4xx or a JSON-RPC error",
+      };
+      const processed = { passed: false, details: "HTTP 200: server processed the batch (2 replies)" };
+      expect(outcomes).toEqual({
+        "one error frame": rejected,
+        "a notification, then the error": rejected,
+        "only a priming comment": nothing,
+        "an empty stream": nothing,
+        "a data frame that is not JSON": nothing,
+        "only a notification": {
+          passed: false,
+          details:
+            "HTTP 200 text/event-stream with 1 message(s) but no JSON-RPC response; expected 4xx or a JSON-RPC error",
+        },
+        "JSON frames that are not objects": {
+          passed: false,
+          details:
+            "HTTP 200 text/event-stream with 2 message(s) but no JSON-RPC response; expected 4xx or a JSON-RPC error",
+        },
+        "a response per element": processed,
+        "the batch array in one frame": processed,
       });
     } finally {
       await stub.close();

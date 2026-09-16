@@ -173,6 +173,10 @@ function plural(n: number, noun: string): string {
  * most plausibly answers -- unless an id-less sent entry (a client
  * notification or raw probe) lies between that request and the stray,
  * in which case the id-less entry, being the more recent send, wins.
+ * An id-less entry is a candidate only while no request sent after it
+ * was fully answered by id before the stray arrived: its reply would
+ * have come before that answer, so an old notification or raw probe
+ * several answered requests back cannot capture (and exempt) a stray.
  * With no such candidate at all the popped owner stands: the stray is
  * then a second answer to the only request that could have drawn it.
  */
@@ -192,8 +196,8 @@ function buildTimeline(recorder: Recorder): Timeline {
   const unanswered: SentRequest[] = [];
   const unmatched = new Map<ReceivedMessage, SentRequest | null>();
   const inFlight = new Map<ReceivedMessage, SentRequest | null>();
-  /** Requests that received a response carrying their own id. */
-  const answeredById = new Set<SentRequest>();
+  /** Requests that received a response carrying their own id -> the seq of the first such response. */
+  const answeredById = new Map<SentRequest, number>();
   for (const ev of events) {
     if (ev.sent) {
       unanswered.push(ev.sent);
@@ -203,7 +207,7 @@ function buildTimeline(recorder: Recorder): Timeline {
     inFlight.set(entry, unanswered[unanswered.length - 1] ?? null);
     if (!isResponse(entry.message)) continue; // notifications and server requests answer nothing
     if (entry.request) {
-      answeredById.add(entry.request);
+      if (!answeredById.has(entry.request)) answeredById.set(entry.request, entry.seq);
       const idx = unanswered.lastIndexOf(entry.request);
       if (idx !== -1) unanswered.splice(idx, 1);
       continue;
@@ -223,14 +227,27 @@ function buildTimeline(recorder: Recorder): Timeline {
  * popped owner is ruled out: walking back from the stray, the first
  * id-less entry wins if it comes before the first id-bearing request
  * that never received an id-matched reply; otherwise that request does.
- * Undefined when neither exists before `seq`.
+ * Once the walk passes a request whose id-matched reply arrived before
+ * `seq`, id-less entries older than it are no longer candidates (see
+ * Timeline); an unanswered id-bearing request still is.
+ * Undefined when no candidate exists before `seq`.
  */
-function reattribute(sent: SentRequest[], seq: number, answeredById: Set<SentRequest>): SentRequest | undefined {
+function reattribute(
+  sent: SentRequest[],
+  seq: number,
+  answeredById: Map<SentRequest, number>,
+): SentRequest | undefined {
+  let answeredInBetween = false;
   for (let i = sent.length - 1; i >= 0; i--) {
     const s = sent[i] as SentRequest;
     if (s.seq >= seq) continue;
-    if (s.id === undefined) return s;
-    if (!answeredById.has(s)) return s;
+    if (s.id === undefined) {
+      if (!answeredInBetween) return s;
+      continue;
+    }
+    const answeredAt = answeredById.get(s);
+    if (answeredAt === undefined) return s;
+    if (answeredAt < seq) answeredInBetween = true;
   }
   return undefined;
 }

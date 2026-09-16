@@ -349,6 +349,55 @@ out explicitly here.
   (U+202A-U+202E, U+2066-U+2069, the "Trojan Source" overrides) although its
   description promised them; only the zero-width characters were matched. Both
   catalogs now flag them.
+- **False verdicts found by a coverage pass over the 2026-07-28 suite:**
+  - The errors checks credited any rejection, so a server that rejects every
+    request (`400 -32000 Server not initialized`, or `-32601` for everything)
+    passed the required `error-unknown-method` and `error-method-code`, plus
+    `error-invalid-jsonrpc`, `error-invalid-json` and `error-capability-gated`.
+    They now fail as not evaluable when the conformant `server/discover` was
+    itself rejected, as the lifecycle and header checks already did.
+  - `lifecycle-meta-required`, `-protocol-version-required` and
+    `-client-capabilities-required` passed (with a warning) when the malformed
+    probe drew a plain-text 404, 422 or 500. Only a bare HTTP 400 still passes
+    with a warning; any other status without a JSON-RPC error body fails.
+  - `resources-not-found` passed with a warning on `-32603`, `-32601` or any
+    other code for a missing resource. The spec requires `-32602`; other codes
+    now fail.
+  - `security-auth-required`, `security-www-authenticate`,
+    `security-token-in-uri`, `security-cors-headers` and
+    `security-origin-validation` passed as "connection rejected" against a
+    server that timed out or refused the connection. That is now
+    `server unreachable`; a connection closed without an answer still counts as
+    a refusal only when the same request with the credential (or without the
+    Origin) was served.
+  - The injection checks passed as inconclusive when the server died on every
+    payload. A stdio child that exits, or an HTTP connection dropped on a
+    payload, now fails naming the payload.
+  - `security-tls-required` passed any 3xx redirect without reading `Location`;
+    a redirect must now resolve to a single https URL.
+  - `security-token-in-uri` failed a server that answered the query-string
+    token with a JSON-RPC error framed as SSE, as if it had accepted the token.
+  - `security-tool-cross-reference` failed on one-letter or common-word tool
+    names (`a`, `get`, `search`) appearing in ordinary prose. Plain-word names
+    now count only in code-like context (backticks, quotes, a call, "the X
+    tool").
+  - `transport-batch-reject` reported "server processed the batch (0 replies)"
+    for an SSE answer with no data frames and failed an SSE answer whose error
+    frame followed a notification. Only JSON-RPC responses on the stream count
+    now.
+  - `error-id-echo` exempted a double-answered request's stray id-less error
+    whenever any client notification had been sent earlier in the run; a
+    notification now owns a stray only while no later request was answered
+    before it.
+  - `lifecycle-meta-client-info-optional` blamed clientInfo for a blanket
+    rejection or a rate limiter's 429; that is now reported as not evaluable.
+  - Cancelling a run during `lifecycle-subscriptions-listen` recorded "No
+    acknowledgment within Nms" instead of stopping.
+- **A rejected `--auth` credential got advice to pass `--auth`.** A 401/403 on
+  the era probe or preflight with an Authorization header configured now gets a
+  first-position warning (auto and pinned runs) that the credential was rejected
+  and the grade is not meaningful, and the auto-detection note and
+  `transport-post` say "credential rejected -- check --auth".
 
 ## [0.18.0] — 2026-09-13
 

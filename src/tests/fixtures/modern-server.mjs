@@ -49,6 +49,7 @@ const KNOBS = new Set([
   "discover-missing-versions",
   "accept-missing-meta",
   "meta-error-wrong-code",
+  "require-client-info",
   "accept-any-version",
   "wrong-version-error",
   "version-error-no-data",
@@ -61,6 +62,7 @@ const KNOBS = new Set([
   "initialize-vague",
   "log-without-level",
   "no-listen-ack",
+  "listen-silent",
   "listen-untagged",
   "listen-ignores-filter",
   "unstable-tool-order",
@@ -492,11 +494,18 @@ function headerProblem(headers, msg, params, meta) {
   return undefined;
 }
 
-/** The `_meta` fields every request MUST carry; returns what is missing, or undefined. */
+/**
+ * The `_meta` fields every request MUST carry; returns what is missing, or
+ * undefined. The `require-client-info` knob also demands the OPTIONAL
+ * clientInfo, the violation lifecycle-meta-client-info-optional must see.
+ */
 function metaProblem(params, meta) {
   if (!isObject(params._meta)) return "params._meta is required";
   if (typeof meta[META.protocolVersion] !== "string") return `params._meta["${META.protocolVersion}"] must be a string`;
   if (!isObject(meta[META.clientCapabilities])) return `params._meta["${META.clientCapabilities}"] must be an object`;
+  if (broken("require-client-info") && !isObject(meta[META.clientInfo])) {
+    return `params._meta["${META.clientInfo}"] must be an object`;
+  }
   return undefined;
 }
 
@@ -545,6 +554,9 @@ function listenOutcome(id, params) {
     return errorOutcome(id, CODES.INVALID_PARAMS, "Invalid params: notifications filter is required");
   }
   const filter = honouredFilter(params.notifications);
+  // `listen-silent`: the stream opens (HTTP 200 with headers flushed) and
+  // then nothing is ever written to it, not even the acknowledgment.
+  if (broken("listen-silent")) return { kind: "listen", status: 200, id, filter, first: [] };
   const first = broken("no-listen-ack")
     ? notification("notifications/tools/list_changed", {}, id)
     : notification("notifications/subscriptions/acknowledged", { notifications: filter }, id);
@@ -1287,6 +1299,9 @@ async function handleHttp(req, res) {
       return;
     case "listen": {
       res.writeHead(outcome.status, sseHeaders(common));
+      // Send the status line now: a stream with no first frame
+      // (`listen-silent`) is still an open stream, not a missing response.
+      res.flushHeaders();
       const sub = {
         id: outcome.id,
         filter: outcome.filter,

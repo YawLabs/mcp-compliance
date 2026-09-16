@@ -51,6 +51,11 @@ function contentTypeOf(headers: Record<string, string>): string {
   return (headers["content-type"] || "").toLowerCase();
 }
 
+/** A JSON-RPC response (result or error), as opposed to a notification, a request or junk. */
+function isJsonRpcResponse(message: unknown): boolean {
+  return !!message && typeof message === "object" && ("result" in message || "error" in message);
+}
+
 /** Case-insensitive header lookup on a normalized (lowercase-keyed) response header map. */
 function headerOf(headers: Record<string, string>, name: string): string | undefined {
   const lower = name.toLowerCase();
@@ -130,7 +135,10 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
     const res = await client.rpc(DISCOVER, {});
     if (is2xx(res.statusCode)) return { passed: true, details: `HTTP ${res.statusCode}` };
     if (res.statusCode === 401 || res.statusCode === 403) {
-      return { passed: false, details: `HTTP ${res.statusCode} (auth required -- pass --auth)` };
+      return {
+        passed: false,
+        details: `HTTP ${res.statusCode} (${ctx.hasAuth ? "credential rejected -- check --auth" : "auth required -- pass --auth"})`,
+      };
     }
     return { passed: false, details: `HTTP ${res.statusCode}, ${summarize(res, true)}` };
   });
@@ -167,8 +175,23 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
     if (is4xx(res.statusCode)) return { passed: true, details: `HTTP ${res.statusCode} (batch rejected)` };
     let parsed: unknown;
     if (contentTypeOf(res.headers).includes("text/event-stream")) {
-      const messages = parseSSEMessages(res.body);
-      parsed = messages.length === 1 ? messages[0] : messages;
+      // The stream MAY carry notifications before the response
+      // (streamable-http "Receiving Messages") and a comment-only or empty
+      // stream carries nothing, so only JSON-RPC responses count as
+      // replies -- a batch answered as one array frame by its elements. A
+      // 2xx stream with no response is neither the 4xx nor the JSON-RPC
+      // error the rule expects, not "0 replies".
+      const messages = parseSSEMessages(res.body).flatMap((m) => (Array.isArray(m) ? m : [m]));
+      const replies = messages.filter(isJsonRpcResponse);
+      if (replies.length === 0) {
+        const carried =
+          messages.length === 0 ? "no JSON-RPC message" : `${messages.length} message(s) but no JSON-RPC response`;
+        return {
+          passed: false,
+          details: `HTTP ${res.statusCode} text/event-stream with ${carried}; expected 4xx or a JSON-RPC error`,
+        };
+      }
+      parsed = replies.length === 1 ? replies[0] : replies;
     } else {
       try {
         parsed = JSON.parse(res.body);

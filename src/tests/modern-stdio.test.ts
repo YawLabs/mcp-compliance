@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { getTestDefinitionMap } from "../definitions/index.js";
 import { createHarness } from "../harness.js";
 import { createModernClient } from "../modern/client.js";
@@ -20,7 +23,7 @@ import { MODERN_FIXTURE, passedIds, runModern, startHttpFixture, stdioFixture } 
 /**
  * The four stdio-only tests of the 2026-07-28 suite.
  *
- * Three layers, because the fixture has a break knob for exactly one of
+ * Four layers, because the fixture has a break knob for exactly one of
  * them (`unicode-broken`):
  *   1. the real suite over the real fixture (stdio passes; HTTP never
  *      runs them),
@@ -31,7 +34,9 @@ import { MODERN_FIXTURE, passedIds, runModern, startHttpFixture, stdioFixture } 
  *      misbehave in the ways the other three tests exist to catch
  *      (silent frames, a crash after an unknown method, a crash or a
  *      reply on notifications/cancelled) -- the red runs those checks
- *      would otherwise never have.
+ *      would otherwise never have,
+ *   4. `runStdio` over a real scripted stdio child for the JSON-RPC
+ *      errors a tools/call probe can draw (-32700, -32602, -32601).
  */
 
 const STDIO_IDS = ["stdio-framing", "stdio-unicode", "stdio-unknown-method-recovers", "stdio-cancellation"];
@@ -41,7 +46,7 @@ const TIMEOUT = 2000;
 const EMPTY_STATE: ModernState = createModernState();
 
 /** A suite context around any transport, the way runModernSuite builds one. */
-function makeContext(transport: Transport, state: Partial<ModernState> = {}): ModernSuiteContext {
+function makeContext(transport: Transport, state: Partial<ModernState> = {}, timeout = TIMEOUT): ModernSuiteContext {
   const harness = createHarness({
     definitions: getTestDefinitionMap(MODERN_SPEC_VERSION),
     specBase: specBaseFor(MODERN_SPEC_VERSION),
@@ -54,7 +59,7 @@ function makeContext(transport: Transport, state: Partial<ModernState> = {}): Mo
     transport,
     recorder,
     nextId: () => id++,
-    timeout: TIMEOUT,
+    timeout,
     protocolVersion: MODERN_SPEC_VERSION,
     clientCapabilities: { elicitation: {} },
     clientInfo: { name: "mcp-compliance-test", version: "0.0.0" },
@@ -65,7 +70,7 @@ function makeContext(transport: Transport, state: Partial<ModernState> = {}): Mo
     recorder,
     transport,
     kind: transport.kind,
-    timeout: TIMEOUT,
+    timeout,
     startupTimeout: 5000,
     backendUrl: "",
     userHeaders: {},
@@ -461,5 +466,111 @@ describe("2026-07-28 stdio tests: scripted misbehaviour (no fixture knob exists 
     for (const id of STDIO_IDS.filter((i) => i !== "stdio-cancellation")) {
       expect(outcome(ctx, id).passed, `${id}: ${outcome(ctx, id).details}`).toBe(true);
     }
+  });
+});
+
+describe("2026-07-28 stdio-unicode: a JSON-RPC error on the tools/call probe, over a real stdio child", () => {
+  /** Generous: the framing burst lands on a cold process, and a spawn under a parallel vitest run can be slow. */
+  const CHILD_TIMEOUT = 8000;
+  const PROBE = "héllo 世界 🚀";
+  /** One no-arg tool, so the probe rides under all four candidate names (a strict schema's -32602 is the common outcome). */
+  const GET_TIME_STATE: Partial<ModernState> = {
+    capabilities: { tools: {} },
+    tools: [{ name: "get_time", inputSchema: { type: "object", properties: {}, additionalProperties: false } }],
+    toolNames: ["get_time"],
+  };
+
+  let childScripts: string[] = [];
+  afterEach(() => {
+    for (const f of childScripts) rmSync(f, { force: true });
+    childScripts = [];
+  });
+
+  /**
+   * A stdio child (written to a temp file: a multi-line `-e` script through
+   * cmd.exe is unreliable on Windows) that answers server/discover with a
+   * DiscoverResult, answers tools/call with an id-echoed JSON-RPC error of
+   * `toolsCallCode`, answers any other request -32601, and never answers a
+   * notification. Its error messages carry no part of the probe.
+   */
+  function toolErrorChild(toolsCallCode: number, toolsCallMessage: string): string {
+    const script = [
+      'const rl = require("node:readline").createInterface({ input: process.stdin });',
+      'const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");',
+      `const discover = ${JSON.stringify({ resultType: "complete", supportedVersions: [MODERN_SPEC_VERSION], capabilities: { tools: {} }, ttlMs: 1000, cacheScope: "public" })};`,
+      'rl.on("line", (line) => {',
+      "  let msg;",
+      "  try { msg = JSON.parse(line); } catch { return; }",
+      "  if (msg.id === undefined) return;",
+      '  if (msg.method === "server/discover") return send({ jsonrpc: "2.0", id: msg.id, result: discover });',
+      `  if (msg.method === "tools/call") return send({ jsonrpc: "2.0", id: msg.id, error: { code: ${toolsCallCode}, message: ${JSON.stringify(toolsCallMessage)} } });`,
+      '  send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });',
+      "});",
+      "setTimeout(() => {}, 30000);",
+    ].join("\n");
+    const path = join(tmpdir(), `mcp-compliance-stdio-child-${process.pid}-${Date.now()}-${Math.random()}.cjs`);
+    writeFileSync(path, script, "utf8");
+    childScripts.push(path);
+    return path;
+  }
+
+  async function runAgainst(toolsCallCode: number, toolsCallMessage: string) {
+    const transport = createStdioTransport({
+      command: process.execPath,
+      args: [toolErrorChild(toolsCallCode, toolsCallMessage)],
+    });
+    try {
+      const ctx = makeContext(transport, GET_TIME_STATE, CHILD_TIMEOUT);
+      await runStdio(ctx);
+      return ctx;
+    } finally {
+      await transport.close();
+    }
+  }
+
+  /** The recorded tools/call probe and the discovers whose clientInfo name carried the probe. */
+  function probesSent(ctx: ModernSuiteContext) {
+    const call = ctx.recorder.sent.find((s) => s.method === "tools/call");
+    const envelope = ctx.recorder.sent.filter(
+      (s) => s.method === "server/discover" && JSON.stringify(s.meta ?? {}).includes(PROBE),
+    );
+    return { call, envelope };
+  }
+
+  it("FAILS with '-> -32700 parse error' when the CJK/emoji tools/call draws an id-echoed -32700 (the envelope probe is not consulted)", async () => {
+    const ctx = await runAgainst(-32700, "Parse error: invalid UTF-8 in arguments");
+    const unicode = outcome(ctx, "stdio-unicode");
+    expect(unicode.passed).toBe(false);
+    expect(unicode.details).toBe("tools/call get_time with a CJK/emoji argument -> -32700 parse error");
+    const { call, envelope } = probesSent(ctx);
+    expect((call?.params as { arguments: unknown }).arguments).toEqual({
+      message: PROBE,
+      text: PROBE,
+      input: PROBE,
+      query: PROBE,
+    });
+    expect(envelope).toEqual([]);
+    // The child is otherwise conformant: the other three stay green.
+    for (const id of STDIO_IDS.filter((i) => i !== "stdio-unicode")) {
+      expect(outcome(ctx, id).passed, `${id}: ${outcome(ctx, id).details}`).toBe(true);
+    }
+  });
+
+  it.each([
+    [-32602, "Invalid params: additional properties not allowed"],
+    [-32601, "Tool not found"],
+  ])("a non-parse JSON-RPC error (%d) on the probe is noted and the envelope discover decides: PASS on a conformant server", async (code, message) => {
+    const ctx = await runAgainst(code, message);
+    const unicode = outcome(ctx, "stdio-unicode");
+    expect(unicode.passed, unicode.details).toBe(true);
+    expect(unicode.details).toBe(
+      `tools/call get_time rejected the probe (JSON-RPC error ${code}); envelope round-trip verified: server/discover accepted a request whose clientInfo name carries CJK/emoji (no echo path to compare byte-for-byte)`,
+    );
+    // The verdict came from the envelope: a discover carrying the probe went out after the rejected call.
+    const { call, envelope } = probesSent(ctx);
+    expect(call).toBeDefined();
+    expect(envelope).toHaveLength(1);
+    expect(envelope[0]?.seq).toBeGreaterThan(call?.seq as number);
+    for (const id of STDIO_IDS) expect(outcome(ctx, id).passed, `${id}: ${outcome(ctx, id).details}`).toBe(true);
   });
 });

@@ -962,6 +962,121 @@ describe("2026-07-28 post-hoc tests: timeline attribution when id-bearing reques
   });
 });
 
+describe("2026-07-28 post-hoc tests: a stray id-less error PLUS the request's own reply (a double answer)", () => {
+  /**
+   * A stdio child that answers every server/discover, but for the
+   * `double`-th one first writes a JSON-RPC error with the id member
+   * OMITTED (not null) and then the proper id-matched result. It never
+   * answers a notification. Both lines leave in one tick, so the stray is
+   * recorded after the discover was sent and before its own reply.
+   */
+  function doubleAnsweringChild(double: number): string {
+    return scriptedChild(
+      [
+        'if (msg.method !== "server/discover") return;',
+        "discovers++;",
+        `if (discovers === ${double}) send({ jsonrpc: "2.0", error: { code: -32600, message: "Invalid Request" } });`,
+        'send({ jsonrpc: "2.0", id: msg.id, result: discover });',
+      ],
+      ["let discovers = 0;"],
+    );
+  }
+
+  async function runDoubleAnswer(double: number, trigger: (client: ModernClient) => Promise<void>) {
+    const transport = createStdioTransport({ command: process.execPath, args: [doubleAnsweringChild(double)] });
+    try {
+      const ctx = makeContext(transport);
+      await trigger(ctx.client);
+      // Every discover resolved on its own id-matched line, so the stray is already recorded.
+      await runPostHoc(ctx);
+      return { results: collect(ctx), recorder: ctx.recorder };
+    } finally {
+      await transport.close();
+    }
+  }
+
+  it("with no earlier candidate the popped request stands: the stray FAILS error-id-echo, rendered 'reply carried no id'", async () => {
+    const { results, recorder } = await runDoubleAnswer(1, (client) => fire(client, "server/discover"));
+    // The recording this scan sees: the stray (no id member at all) lands between the send and the reply.
+    expect(
+      recorder.received.map((r) => ("id" in (r.message as object) ? (r.message as { id: unknown }).id : "absent")),
+    ).toEqual(["absent", 1000]);
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      "1 of 1 error response did not echo the request id; first: server/discover sent id 1000, reply carried no id",
+    );
+    // An omitted id is what the schema models for an unreadable-id error, so only error-id-echo reports it.
+    expectPassed(
+      results,
+      POSTHOC_IDS.filter((id) => id !== "error-id-echo"),
+    );
+  });
+
+  it("an OLD notification several answered requests back does not exempt the stray (a request fully answered in between rules it out)", async () => {
+    // A full run's shape: a client notification early (a stream close's
+    // cancel, stdio-cancellation), then ordinary traffic answered by id,
+    // then the double answer. The notification's own reply would have come
+    // before the discover sent after it was answered, so the stray cannot
+    // be that reply. Before the fix the walk-back skipped every answered
+    // request, reached the notification and exempted the stray (PASS).
+    const { results, recorder } = await runDoubleAnswer(3, async (client) => {
+      await client.notify("notifications/cancelled", { requestId: 987654321 });
+      await fire(client, "server/discover");
+      await fire(client, "server/discover");
+      await fire(client, "server/discover");
+    });
+    expect(recorder.sent.map((s) => s.id ?? s.method)).toEqual(["notifications/cancelled", 1000, 1001, 1002]);
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      "1 of 1 error response did not echo the request id; first: server/discover sent id 1002, reply carried no id",
+    );
+  });
+
+  it("a request answered only AFTER the stray is no barrier: the notification still owns it (the flush race across two sends)", async () => {
+    // Two requests went out behind the notification before its stray
+    // reply arrived; both are answered after it. Nothing was fully
+    // answered between the notification and the stray, so it stays the
+    // most plausible owner and the stray is exempt.
+    const { results } = await scanRecording("stdio", (recorder) => {
+      recorder.recordSent({ id: undefined, method: "notifications/cancelled", params: {}, meta: undefined });
+      recorder.recordSent({ id: 1000, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordSent({ id: 1001, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived({ jsonrpc: "2.0", error: { code: -32601, message: "unknown request" } });
+      recorder.recordReceived({ jsonrpc: "2.0", id: 1000, result: DISCOVER_RESULT });
+      recorder.recordReceived({ jsonrpc: "2.0", id: 1001, result: DISCOVER_RESULT });
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed, echo.details).toBe(true);
+    expect(echo.details).toBe(
+      "no error responses to id-bearing requests recorded (exempt: 1 answering raw probes or client notifications)",
+    );
+  });
+
+  it("the barrier rules out only id-less owners: an older request that never got a reply is still blamed past it", async () => {
+    // 1000 timed out; a notification followed; 1001 was answered; the stray
+    // then arrives while 1002 is in flight and 1002 is answered too. The
+    // answered 1001 rules the notification out, but the unanswered 1000
+    // behind it remains the request the stray most plausibly answers (a
+    // late reply), not the popped 1002.
+    const { results } = await scanRecording("stdio", (recorder) => {
+      recorder.recordSent({ id: 1000, method: "tools/list", params: {}, meta: undefined });
+      recorder.recordSent({ id: undefined, method: "notifications/cancelled", params: {}, meta: undefined });
+      recorder.recordSent({ id: 1001, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived({ jsonrpc: "2.0", id: 1001, result: DISCOVER_RESULT });
+      recorder.recordSent({ id: 1002, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived({ jsonrpc: "2.0", error: { code: -32603, message: "late" } });
+      recorder.recordReceived({ jsonrpc: "2.0", id: 1002, result: DISCOVER_RESULT });
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(
+      "1 of 1 error response did not echo the request id; first: tools/list sent id 1000, reply carried no id",
+    );
+  });
+});
+
 describe("2026-07-28 post-hoc tests: the cancel a stdio stream's close() writes is recorded", () => {
   /**
    * A stdio child that answers server/discover, never acknowledges
@@ -1094,6 +1209,51 @@ describe("2026-07-28 post-hoc tests: schema-input-required-shape rules", () => {
     expect(r.passed).toBe(false);
     expect(r.details).toBe(
       "1 of 1 input_required result violates the MRTR server requirements; first (tools/call): server requested roots/list although the client declared only elicitation",
+    );
+  });
+
+  /** An input_required result answering tools/call, with the whole result body scripted (malformed shapes included). */
+  const inputRequiredResult = (result: Record<string, unknown>) => (recorder: Recorder) => {
+    recorder.recordSent({ id: 1000, method: "tools/call", params: { name: "t", arguments: {} }, meta: undefined });
+    recorder.recordReceived({ jsonrpc: "2.0", id: 1000, result: { resultType: "input_required", ...result } });
+  };
+  const METHODS = "elicitation/create, sampling/createMessage, roots/list";
+
+  it.each<[string, Record<string, unknown>, string]>([
+    ["inputRequests null", { inputRequests: null, requestState: "s1" }, "inputRequests is not an object (got null)"],
+    [
+      "inputRequests an array of requests",
+      { inputRequests: [], requestState: "s1" },
+      "inputRequests is not an object (got [])",
+    ],
+    [
+      "inputRequests a string",
+      { inputRequests: "elicit", requestState: "s1" },
+      'inputRequests is not an object (got "elicit")',
+    ],
+    [
+      "an entry that is not an object",
+      { inputRequests: { a: "x" }, requestState: "s1" },
+      "inputRequests.a is not an object",
+    ],
+    [
+      "an entry without a method",
+      { inputRequests: { a: {} } },
+      `inputRequests.a.method undefined is not one of ${METHODS}`,
+    ],
+    [
+      "an entry whose method is not a string",
+      { inputRequests: { a: { method: 7, params: {} } } },
+      `inputRequests.a.method 7 is not one of ${METHODS}`,
+    ],
+    ["requestState an object", { requestState: { step: 1 } }, 'requestState is not a string (got {"step":1})'],
+  ])("names the violation for %s (never a harness Error:)", async (_label, result, problem) => {
+    const { results } = await scanRecording("http", inputRequiredResult(result));
+    const r = results["schema-input-required-shape"] as TestResult;
+    expect(r.passed).toBe(false);
+    expect(r.details).not.toMatch(/^Error:/);
+    expect(r.details).toBe(
+      `1 of 1 input_required result violates the MRTR server requirements; first (tools/call): ${problem}`,
     );
   });
 

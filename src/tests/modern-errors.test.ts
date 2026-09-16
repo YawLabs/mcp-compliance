@@ -141,7 +141,9 @@ async function startBadHttp(): Promise<{ url: string; set(decide: Decide): void;
  * would be mangled). BAD_MODE=results answers every request with a
  * result (unknown methods included, list pages without their array);
  * BAD_MODE=isError declares only tools, answers tools/call with
- * isError: true, and unknown methods with -32000.
+ * isError: true, and unknown methods with -32000. BAD_MODE=reject
+ * answers every request, server/discover included, with -32601 (a
+ * 2025-era server that knows no modern method).
  */
 const BAD_STDIO_SCRIPT = `
 const rl = require("node:readline").createInterface({ input: process.stdin });
@@ -154,6 +156,9 @@ rl.on("line", (line) => {
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
   if (msg.id === undefined || msg.id === null) return;
+  if (mode === "reject") {
+    return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found: " + msg.method } });
+  }
   switch (msg.method) {
     case "server/discover":
       return reply(msg.id, { supportedVersions: ["2026-07-28"], capabilities: caps, ttlMs: 0, cacheScope: "public" });
@@ -174,7 +179,7 @@ rl.on("line", (line) => {
 
 let badStdioDir: string | undefined;
 
-function badStdio(mode: "results" | "isError"): TransportTarget {
+function badStdio(mode: "results" | "isError" | "reject"): TransportTarget {
   if (!badStdioDir) {
     badStdioDir = mkdtempSync(join(tmpdir(), "mcp-compliance-bad-stdio-"));
     writeFileSync(join(badStdioDir, "bad-stdio.cjs"), BAD_STDIO_SCRIPT, "utf8");
@@ -497,9 +502,186 @@ describe("errors suite: canned bad HTTP server", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// A server that rejects everything: no rejection is credited
+// ---------------------------------------------------------------------------
+
+/** notEvaluable's reason (lifecycle.ts) for a setup discover rejected as `rejection`. */
+function notEvaluableReason(rejection: string, about = "the injected defect"): string {
+  return `not evaluable: the conformant server/discover was itself rejected with ${rejection}, so this rejection proves nothing about ${about}`;
+}
+
+const GATED_ABOUT = "whether undeclared methods are rejected";
+
+const REJECT_EVERYTHING: Array<{
+  name: string;
+  canned: (id: unknown) => Canned;
+  /** How each probe's answer is named in the details. */
+  answer: string;
+  status: number;
+  /** How the setup discover's rejection is named in the reason. */
+  rejection: string;
+  /** How each undeclared list method's answer is named by error-capability-gated. */
+  listAnswer: string;
+}> = [
+  {
+    name: "400 / -32000 'Server not initialized' with the id echoed (a 2025-era SDK v1 server)",
+    canned: (id) => ({ status: 400, body: rpcError(id ?? null, -32000, "Bad Request: Server not initialized") }),
+    answer: "JSON-RPC error -32000",
+    status: 400,
+    rejection: "-32000 (HTTP 400)",
+    listAnswer: "-32000",
+  },
+  {
+    name: "404 / -32601 for every method, server/discover included",
+    canned: (id) => ({ status: 404, body: rpcError(id ?? null, -32601, "Method not found") }),
+    answer: "JSON-RPC error -32601",
+    status: 404,
+    rejection: "-32601 (HTTP 404)",
+    listAnswer: "-32601",
+  },
+  {
+    name: "a bare 400 with no JSON-RPC body (a gateway in front of it)",
+    canned: () => ({ status: 400, raw: "Bad Request", contentType: "text/plain" }),
+    answer: "no JSON-RPC error body",
+    status: 400,
+    rejection: "no JSON-RPC error code (HTTP 400)",
+    listAnswer: "no JSON-RPC body (HTTP 400)",
+  },
+  {
+    name: "a bare 503 with no JSON-RPC body (the server is down behind its proxy)",
+    canned: () => ({ status: 503, raw: "Service Unavailable", contentType: "text/plain" }),
+    answer: "no JSON-RPC error body",
+    status: 503,
+    rejection: "no JSON-RPC error code (HTTP 503)",
+    listAnswer: "no JSON-RPC body (HTTP 503)",
+  },
+];
+
+describe("errors suite: a server that rejects everything, server/discover included", () => {
+  let bad: Awaited<ReturnType<typeof startBadHttp>>;
+  beforeAll(async () => {
+    bad = await startBadHttp();
+  });
+  afterAll(async () => {
+    await bad.stop();
+  });
+
+  it.each(REJECT_EVERYTHING)("fails every rejection as not evaluable over HTTP: $name", async (shape) => {
+    // Before the attribution guard the first shape PASSED error-unknown-method
+    // (required), error-invalid-jsonrpc, error-invalid-json and
+    // error-capability-gated; the second also PASSED error-method-code
+    // (required); the third passed the four raw-body probes and
+    // error-capability-gated -- each on the server's answer to everything.
+    // The 503 shape passed error-capability-gated ("rejected (HTTP 503)") and
+    // failed the rest, blaming each probe ("HTTP 503 for invalid JSON") for
+    // what the server does to every request.
+    bad.set(({ id }) => shape.canned(id));
+    const report = await runModern(bad.url, { only: ["lifecycle-discover", ...ALL] });
+    expect(resultOf(report, "lifecycle-discover").passed).toBe(false);
+    const reason = notEvaluableReason(shape.rejection);
+    const rpc = (what: string) => `${shape.answer} (HTTP ${shape.status}) for ${what}; ${reason}`;
+    const raw = (what: string) => `${shape.answer} on HTTP ${shape.status} for ${what}; ${reason}`;
+    const lists = ["tools/list", "resources/list", "prompts/list"].map((m) => `${m} -> ${shape.listAnswer}`);
+    expect(Object.fromEntries(report.tests.map((t) => [t.id, { passed: t.passed, details: t.details }]))).toEqual({
+      "lifecycle-discover": expect.objectContaining({ passed: false }),
+      "error-unknown-method": { passed: false, details: rpc("an unknown method") },
+      "error-method-code": { passed: false, details: rpc("an unknown method") },
+      "error-invalid-jsonrpc": { passed: false, details: raw("a malformed envelope") },
+      "error-invalid-json": { passed: false, details: raw("invalid JSON") },
+      "error-parse-code": { passed: false, details: raw("invalid JSON") },
+      "error-invalid-request-code": { passed: false, details: raw("a message with no method") },
+      // Nothing is declared without a served discover, so all three list
+      // methods are probed; their answers are recorded, not judged.
+      "error-capability-gated": {
+        passed: false,
+        details: `${lists.join(", ")}; ${notEvaluableReason(shape.rejection, GATED_ABOUT)}`,
+      },
+      // No capability is declared without a served discover: nothing to probe, nothing credited.
+      "error-invalid-cursor": { passed: true, details: "No list methods available to test (skipped)" },
+    });
+    expect(resultOf(report, "error-unknown-method").required).toBe(true);
+    expect(resultOf(report, "error-method-code").required).toBe(true);
+    // Nothing was credited, so none of the "passes with a warning" notes either.
+    expect(warned(report, NOT_FOUND_WARNING)).toBe(false);
+    expect(warned(report, BARE_4XX_WARNING)).toBe(false);
+  });
+
+  it("still judges a result on its own: a served probe fails for the result, not as not evaluable", async () => {
+    // server/discover is rejected, but the malformed probes are SERVED (on
+    // an error status, even): that is a defect whatever the discover state,
+    // as in expectRejection and evaluateHeaderRejection.
+    bad.set(({ method, id }) => {
+      if (method === "server/discover") return { status: 400, body: rpcError(id, -32000, "Server not initialized") };
+      if (method === undefined) return { status: 400, body: rpcResult(null, {}) };
+      return { status: 400, body: rpcResult(id, {}) };
+    });
+    const report = await runModern(bad.url, { only: ALL });
+    expectFail(report, "error-unknown-method", "Unknown method returned a result (HTTP 400)");
+    expectFail(report, "error-method-code", "No JSON-RPC error returned for unknown method (HTTP 400)");
+    expectFail(report, "error-invalid-jsonrpc", "Malformed envelope produced a result on HTTP 400");
+    expectFail(report, "error-invalid-json", "Invalid JSON produced a result on HTTP 400");
+    expectFail(report, "error-parse-code", "Result instead of -32700 (Parse error) for invalid JSON on HTTP 400");
+    expectFail(report, "error-invalid-request-code", "Result instead of -32600 (Invalid Request)");
+    // The list methods were served too, but "undeclared" is unknowable
+    // without a discover result: recorded, not blamed.
+    expect(resultOf(report, "error-capability-gated")).toMatchObject({
+      passed: false,
+      details: `tools/list -> result, resources/list -> result, prompts/list -> result; ${notEvaluableReason("-32000 (HTTP 400)", GATED_ABOUT)}`,
+    });
+    for (const t of report.tests) {
+      if (t.id !== "error-capability-gated") expect(t.details, t.id).not.toContain("not evaluable");
+    }
+  });
+
+  it("still judges a 200 with no JSON-RPC body on its own: an HTML page is not a rejection to attribute", async () => {
+    // The URL serves a web page to every POST, server/discover included:
+    // nothing was rejected, so the probes fail for what they got (as
+    // before the guard), not as "not evaluable" -- except capability
+    // gating, which has no declaration to judge against.
+    bad.set(() => ({ status: 200, raw: "<html><body>Hello</body></html>", contentType: "text/html" }));
+    const report = await runModern(bad.url, { only: ["lifecycle-discover", ...ALL] });
+    expect(resultOf(report, "lifecycle-discover").passed).toBe(false);
+    expectFail(report, "error-unknown-method", "No JSON-RPC error body for unknown method (HTTP 200)");
+    expectFail(report, "error-method-code", "No JSON-RPC error returned for unknown method (HTTP 200)");
+    expectFail(report, "error-invalid-jsonrpc", "HTTP 200 with no JSON-RPC error; expected a JSON-RPC error or 4xx");
+    expectFail(report, "error-invalid-json", "HTTP 200 with no JSON-RPC error; expected -32700 or a 4xx");
+    expectFail(report, "error-parse-code", "HTTP 200 with no JSON-RPC error; expected -32700 (Parse error)");
+    expectFail(
+      report,
+      "error-invalid-request-code",
+      "HTTP 200 with no JSON-RPC error; expected -32600 (Invalid Request)",
+    );
+    expect(resultOf(report, "error-capability-gated")).toMatchObject({
+      passed: false,
+      details: `tools/list -> no JSON-RPC body (HTTP 200), resources/list -> no JSON-RPC body (HTTP 200), prompts/list -> no JSON-RPC body (HTTP 200); ${notEvaluableReason("no JSON-RPC error code (HTTP 200)", GATED_ABOUT)}`,
+    });
+    for (const t of report.tests) {
+      if (t.id !== "error-capability-gated") expect(t.details, t.id).not.toContain("not evaluable");
+    }
+  });
+});
+
 describe("errors suite: canned bad stdio server", () => {
   afterAll(() => {
     removeBadStdio();
+  });
+
+  it("fails every rejection as not evaluable when server/discover is rejected too", async () => {
+    // Before the attribution guard error-unknown-method and error-method-code
+    // (both required) and error-capability-gated PASSED on the blanket -32601.
+    const report = await runModern(badStdio("reject"), { only: ["lifecycle-discover", ...BOTH] });
+    const reason = notEvaluableReason("-32601");
+    expect(Object.fromEntries(report.tests.map((t) => [t.id, { passed: t.passed, details: t.details }]))).toEqual({
+      "lifecycle-discover": expect.objectContaining({ passed: false }),
+      "error-unknown-method": { passed: false, details: `JSON-RPC error -32601 for an unknown method; ${reason}` },
+      "error-method-code": { passed: false, details: `JSON-RPC error -32601 for an unknown method; ${reason}` },
+      "error-capability-gated": {
+        passed: false,
+        details: `tools/list -> -32601, resources/list -> -32601, prompts/list -> -32601; ${notEvaluableReason("-32601", GATED_ABOUT)}`,
+      },
+      "error-invalid-cursor": { passed: true, details: "No list methods available to test (skipped)" },
+    });
   });
 
   it("fails every transport-neutral id when the server answers everything with a result", async () => {

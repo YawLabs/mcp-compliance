@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -956,6 +956,112 @@ describe("auth-gated server without --auth", () => {
   }, 20_000);
 });
 
+describe("auth-gated server with a rejected --auth credential", () => {
+  // A wrong or expired token: the Authorization header WAS sent, so the
+  // report must say the credential was refused, never "pass --auth".
+  let http: HttpFixture;
+  const WRONG = { Authorization: "Bearer WRONG" };
+
+  beforeAll(async () => {
+    http = await startHttpFixture({ auth: "secret" });
+  });
+
+  afterAll(async () => {
+    await http.stop();
+  });
+
+  it("auto: the first warning says the configured credential was rejected; the note and transport-post say check --auth", async () => {
+    const report = await runComplianceSuite(http.target, {
+      timeout: 5000,
+      headers: WRONG,
+      only: ["transport-post"],
+    });
+    expect(report.specVersion).toBe(LEGACY_SPEC_VERSION);
+    expect(report.warnings[0]).toBe(
+      `Server at ${http.target} rejected the configured credential (the server/discover probe carried an Authorization header and got HTTP 401), so the era could not be determined and the 2025-11-25 grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): a 401 means the token is invalid or expired.`,
+    );
+    expect(autoNote(report)).toBe(
+      "Spec version auto-detected as 2025-11-25 (server/discover -> HTTP 401 (credential rejected -- check --auth); era not determinable, using 2025-11-25). Pin with --spec-version to override.",
+    );
+    expect(resultOf(report, "transport-post").details).toBe("HTTP 401 (credential rejected — check --auth)");
+    expect(report.warnings.filter((w) => w.includes("pass --auth") || w.includes("no Authorization header"))).toEqual(
+      [],
+    );
+  }, 20_000);
+
+  it.each([
+    LEGACY_SPEC_VERSION,
+    MODERN_SPEC_VERSION,
+  ] as const)("pinned %s: the same first-position warning, worded for a pinned run", async (specVersion) => {
+    const report = await runComplianceSuite(http.target, {
+      timeout: 5000,
+      headers: WRONG,
+      specVersion,
+      only: [specVersion === MODERN_SPEC_VERSION ? "lifecycle-discover" : "lifecycle-init"],
+    });
+    expect(report.warnings[0]).toBe(
+      `Server at ${http.target} rejected the configured credential (the preflight carried an Authorization header and got HTTP 401), so the ${specVersion} grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): a 401 means the token is invalid or expired.`,
+    );
+    expectNoAutoNote(report);
+    expect(pinMismatch(report)).toBeUndefined();
+  }, 20_000);
+
+  it("a 403 (insufficient scope) names a missing scope or permission instead of an invalid token", async () => {
+    const stub = await startFixedServer(403, JSON.stringify({ error: "insufficient_scope" }), "application/json");
+    try {
+      const auto = await runComplianceSuite(stub.url, { timeout: 5000, headers: WRONG, only: ["transport-post"] });
+      expect(auto.warnings[0]).toBe(
+        `Server at ${stub.url} rejected the configured credential (the server/discover probe carried an Authorization header and got HTTP 403), so the era could not be determined and the 2025-11-25 grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): a 403 means the token lacks a required scope or permission.`,
+      );
+      expect(resultOf(auto, "transport-post").details).toBe("HTTP 403 (credential rejected — check --auth)");
+    } finally {
+      await stub.stop();
+    }
+  }, 20_000);
+
+  it("auto re-probe after a preflight timeout: the credential rejection still reads as rejected, not missing", async () => {
+    // The first request (the preflight) outlives preflightTimeout; the
+    // re-sent era probe is refused at once with the configured header.
+    let first = true;
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        const delay = first ? 1500 : 0;
+        first = false;
+        setTimeout(() => {
+          if (res.destroyed) return;
+          res.writeHead(401, { "content-type": "application/json", "www-authenticate": "Bearer" });
+          res.end(JSON.stringify({ error: "invalid_token" }));
+        }, delay);
+      });
+    });
+    const url = await new Promise<string>((done) => {
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address();
+        done(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+      });
+    });
+    try {
+      const report = await runComplianceSuite(url, {
+        timeout: 5000,
+        preflightTimeout: 300,
+        startupTimeout: 5000,
+        headers: WRONG,
+        only: ["transport-post"],
+      });
+      expect(report.specVersion).toBe(LEGACY_SPEC_VERSION);
+      expect(autoNote(report)).toContain("server/discover -> HTTP 401 (credential rejected -- check --auth)");
+      expect(report.warnings[0]).toContain(
+        `Server at ${url} rejected the configured credential (the server/discover probe carried an Authorization header and got HTTP 401)`,
+      );
+      expect(report.warnings.some((w) => w.includes("pass --auth"))).toBe(false);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((done) => server.close(() => done()));
+    }
+  }, 20_000);
+});
+
 describe("--only values gated off the target transport", () => {
   it("stdio: an HTTP-only id selects nothing, and the report says so instead of pointing at absent warnings", async () => {
     const report = await runComplianceSuite(legacyStdio(LEGACY_ECHO_FIXTURE), {
@@ -1016,6 +1122,125 @@ describe("abort during the HTTP preflight", () => {
       await new Promise<void>((done) => hanging.close(() => done()));
     }
   }, 10_000);
+});
+
+describe("abort after the preflight: the era probe, the re-probe and the pinned handshake", () => {
+  // Each of these waits is bounded by startupTimeout (60s by default), and
+  // the first harness abort gate is on the far side of it. The caller's
+  // signal has to reach the request itself, so a UI disconnect or an MCP
+  // tool cancel ends the run now, with the abort reason, rather than a
+  // minute later. The cancelled request must not surface as a legacy
+  // "no response" either: the run rejects, it does not report.
+  const startupTimeout = 20_000;
+  // Well under startupTimeout, well over the abort latency on a loaded box.
+  const promptly = 8000;
+
+  it("auto over stdio: an abort while the era probe waits on a silent legacy server rejects with the reason at once", async () => {
+    const controller = new AbortController();
+    const reason = new Error("client disconnected during the probe");
+    const status: string[] = [];
+    const started = Date.now();
+    await expect(
+      runComplianceSuite(legacyStdio(LEGACY_SILENT_FIXTURE), {
+        timeout: 5000,
+        startupTimeout,
+        signal: controller.signal,
+        // The status line fires STDIO_PROBE_STATUS_DELAY_MS into the probe,
+        // so aborting from it lands inside the wait, not before the request
+        // is written.
+        onStatus: (m) => {
+          status.push(m);
+          setTimeout(() => controller.abort(reason), 50);
+        },
+      }),
+    ).rejects.toBe(reason);
+    expect(status).toHaveLength(1);
+    expect(status[0]).toContain("Probing spec era (server/discover, up to 20s)");
+    expect(Date.now() - started).toBeLessThan(STDIO_PROBE_STATUS_DELAY_MS + promptly);
+  }, 30_000);
+
+  it("auto over HTTP: an abort during the era re-probe after a preflight timeout rejects with the reason at once", async () => {
+    const hanging = createServer(() => {
+      // never answers: the preflight times out, then the re-probe hangs
+    });
+    const url = await new Promise<string>((done) => {
+      hanging.listen(0, "127.0.0.1", () => {
+        const addr = hanging.address();
+        done(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+      });
+    });
+    try {
+      const controller = new AbortController();
+      const reason = new Error("client disconnected during the re-probe");
+      const status: string[] = [];
+      const started = Date.now();
+      await expect(
+        runComplianceSuite(url, {
+          timeout: 5000,
+          preflightTimeout: 200,
+          startupTimeout,
+          signal: controller.signal,
+          // Announced the moment the preflight gives up, right before the
+          // re-probe is sent: the abort lands inside its wait.
+          onStatus: (m) => {
+            status.push(m);
+            setTimeout(() => controller.abort(reason), 200);
+          },
+        }),
+      ).rejects.toBe(reason);
+      expect(status).toEqual([
+        "Preflight got no reply within 200ms; re-sending the era probe (server/discover, up to 20s) before defaulting to 2025-11-25.",
+      ]);
+      expect(Date.now() - started).toBeLessThan(promptly);
+    } finally {
+      hanging.closeAllConnections();
+      await new Promise<void>((done) => hanging.close(() => done()));
+    }
+  }, 30_000);
+
+  describe("pinned 2025-11-25 over stdio", () => {
+    let dir: string;
+    let neverAnswers: string;
+    let marker: string;
+
+    beforeAll(() => {
+      dir = mkdtempSync(join(tmpdir(), "mcp-compliance-abort-"));
+      marker = join(dir, "received-initialize");
+      // Reads stdin and never writes a byte; touches the marker on its
+      // first line so the test knows `initialize` is pending server-side.
+      neverAnswers = join(dir, "never-answers.mjs");
+      writeFileSync(
+        neverAnswers,
+        [
+          'import { writeFileSync } from "node:fs";',
+          'process.stdin.once("data", () => writeFileSync(process.argv[2], ""));',
+          "process.stdin.resume();",
+          "",
+        ].join("\n"),
+      );
+    });
+
+    afterAll(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("an abort while initialize is pending rejects with the reason, not the startup-timeout 'no response'", async () => {
+      const controller = new AbortController();
+      const reason = new Error("client disconnected during initialize");
+      const started = Date.now();
+      const run = runComplianceSuite(
+        { type: "stdio", command: process.execPath, args: [neverAnswers, marker] },
+        { timeout: 5000, startupTimeout, specVersion: LEGACY_SPEC_VERSION, signal: controller.signal },
+      );
+      // No probe on a pinned run: the first line the child reads is initialize.
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(marker) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+      expect(existsSync(marker)).toBe(true);
+      controller.abort(reason);
+      await expect(run).rejects.toBe(reason);
+      expect(Date.now() - started).toBeLessThan(promptly);
+    }, 30_000);
+  });
 });
 
 describe("probeAnswerShowsEra", () => {
@@ -1116,6 +1341,30 @@ describe("classifyDiscoverResponse", () => {
     expect(d.reason).toBe(
       `server/discover -> HTTP ${status} (authentication required -- pass --auth); era not determinable, using 2025-11-25`,
     );
+  });
+
+  it.each([
+    401, 403,
+  ])("HTTP %i with an Authorization header on the probe: the credential was rejected, and the reason does not say to pass --auth", (status) => {
+    const d = classifyDiscoverResponse(res({ error: "invalid_token", error_description: "x" }, status), {
+      authorizationSent: true,
+    });
+    expect(d.version).toBe(LEGACY_SPEC_VERSION);
+    expect(d.eraUndetermined).toBe(true);
+    expect(d.reason).toBe(
+      `server/discover -> HTTP ${status} (credential rejected -- check --auth); era not determinable, using 2025-11-25`,
+    );
+  });
+
+  it("authorizationSent changes only the auth reason: other shapes classify exactly as without it", () => {
+    for (const shape of [
+      res({ _raw: "Not Found" }, 404),
+      res({ jsonrpc: "2.0", id: 0, error: { code: -32601, message: "x" } }, 200),
+      res({ result: { supportedVersions: ["2026-07-28"] } }, 200),
+      null,
+    ]) {
+      expect(classifyDiscoverResponse(shape, { authorizationSent: true })).toEqual(classifyDiscoverResponse(shape));
+    }
   });
 
   it("HTTP 401 carrying a non-modern JSON-RPC error body is still the auth case", () => {

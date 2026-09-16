@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type Server, type ServerResponse } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createModernClient } from "../modern/client.js";
 import { createRecorder } from "../recorder.js";
@@ -550,5 +550,89 @@ describe("HttpTransport stream(): the timer, close() and an upstream abort end a
       }),
     ).rejects.toThrow(/aborted before send/);
     expect(lastRequest).toBeNull();
+  });
+});
+
+/**
+ * Answer the next request with 200 text/event-stream and hand the response
+ * to `script`, which writes the body in whatever pieces it likes (pausing
+ * between writes so they reach the client as separate chunks) and decides
+ * how the body ends. Returns the function that restores the default handler.
+ */
+function scriptNextStream(script: (res: ServerResponse) => Promise<void>): () => void {
+  const origListeners = server.listeners("request");
+  server.removeAllListeners("request");
+  server.once("request", (req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.flushHeaders();
+      script(res).catch(() => res.destroy());
+    });
+  });
+  return () => {
+    server.removeAllListeners("request");
+    for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+  };
+}
+
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe("HttpTransport stream(): frames that arrive in pieces, and a body that ends mid-event", () => {
+  it("a frame split across writes inside a two-byte UTF-8 character decodes to the original text", async () => {
+    const frame = { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "héllo wörld" } };
+    const bytes = Buffer.from(`event: message\ndata: ${JSON.stringify(frame)}\n\n`, "utf8");
+    // Cut between the two bytes of "é" (0xC3 0xA9).
+    const cut = bytes.indexOf(Buffer.from("é", "utf8")) + 1;
+    expect(bytes[cut - 1]).toBe(0xc3);
+    const restore = scriptNextStream(async (res) => {
+      res.write(bytes.subarray(0, cut));
+      await pause(150);
+      res.write(bytes.subarray(cut));
+      await pause(50);
+      res.end();
+    });
+    try {
+      const t = createHttpTransport({ url: serverUrl });
+      const heard: unknown[] = [];
+      t.onMessage((message) => heard.push(message));
+      const stream = await t.stream("subscriptions/listen", { notifications: {} }, () => 600, { timeout: 5000 });
+      const drained = await drain(stream.messages);
+      expect(drained.error).toBeUndefined();
+      expect(drained.outcome).toBe("ended");
+      expect(drained.seen).toEqual([frame]);
+      expect(heard).toEqual([frame]);
+    } finally {
+      restore();
+    }
+  });
+
+  it("a body that ends right after its last data: line (no blank line) still delivers that event, to the iterator and the listeners", async () => {
+    const ack = { jsonrpc: "2.0", method: "notifications/subscriptions/acknowledged", params: {} };
+    const result = { jsonrpc: "2.0", id: 601, result: {} };
+    const restore = scriptNextStream(async (res) => {
+      res.write(`event: message\ndata: ${JSON.stringify(ack)}\n\n`);
+      await pause(50);
+      res.end(`event: message\ndata: ${JSON.stringify(result)}`);
+    });
+    try {
+      const t = createHttpTransport({ url: serverUrl });
+      const heard: Array<{ message: unknown; statusCode?: number }> = [];
+      t.onMessage((message, meta) => heard.push({ message, statusCode: meta.statusCode }));
+      const started = Date.now();
+      const stream = await t.stream("subscriptions/listen", { notifications: {} }, () => 601, { timeout: 10_000 });
+      const drained = await drain(stream.messages);
+      expect(drained.error).toBeUndefined();
+      expect(drained.outcome).toBe("ended");
+      expect(drained.seen).toEqual([ack, result]);
+      expect(heard).toEqual([
+        { message: ack, statusCode: 200 },
+        { message: result, statusCode: 200 },
+      ]);
+      // It was the end of the body that ended the stream, not the 10s timer.
+      expect(Date.now() - started).toBeLessThan(5000);
+    } finally {
+      restore();
+    }
   });
 });

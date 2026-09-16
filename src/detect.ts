@@ -37,6 +37,17 @@ export interface DetectOptions {
    * skip it. Never fires on HTTP (the caller narrates its own re-probe).
    */
   onStatus?: (message: string) => void;
+  /** Whether the probe carried a user-configured Authorization header (see ClassifyOptions). */
+  authorizationSent?: boolean;
+}
+
+export interface ClassifyOptions {
+  /**
+   * Whether the probe carried a user-configured Authorization header. A
+   * 401/403 then means the credential was rejected, not that one is
+   * missing, and the reason must not tell the user to pass --auth.
+   */
+  authorizationSent?: boolean;
 }
 
 /** How long the stdio era probe may sit unanswered before `onStatus` fires. */
@@ -89,7 +100,7 @@ export function isModernErrorCode(code: unknown): boolean {
  * Classify one response to a modern `server/discover` probe. Exported so
  * the classification rule is unit-testable without a live server.
  */
-export function classifyDiscoverResponse(res: TransportResponse | null): DetectionResult {
+export function classifyDiscoverResponse(res: TransportResponse | null, opts: ClassifyOptions = {}): DetectionResult {
   if (!res) {
     return {
       version: LEGACY_SPEC_VERSION,
@@ -130,13 +141,18 @@ export function classifyDiscoverResponse(res: TransportResponse | null): Detecti
     // Refused before the era could show (whatever the body says):
     // neither modern nor legacy is observable without credentials. The
     // legacy default still applies (spec: a 4xx without a modern error
-    // body falls back to initialize).
+    // body falls back to initialize). With an Authorization header on the
+    // probe the server refused that credential; "pass --auth" would send
+    // the user to do what they already did.
+    const why = opts.authorizationSent
+      ? "credential rejected -- check --auth"
+      : "authentication required -- pass --auth";
     return {
       version: LEGACY_SPEC_VERSION,
       era: "legacy",
       responded: true,
       eraUndetermined: true,
-      reason: `${REASON_PREFIX}HTTP ${res.statusCode} (authentication required -- pass --auth); era not determinable, using ${LEGACY_SPEC_VERSION}`,
+      reason: `${REASON_PREFIX}HTTP ${res.statusCode} (${why}); era not determinable, using ${LEGACY_SPEC_VERSION}`,
     };
   }
   const detail =
@@ -210,7 +226,7 @@ export async function detectSpecVersion(transport: Transport, opts: DetectOption
   } finally {
     if (timer) clearTimeout(timer);
   }
-  return classifyDiscoverResponse(res);
+  return classifyDiscoverResponse(res, { authorizationSent: opts.authorizationSent });
 }
 
 // ── A stdio child that died on the probe ─────────────────────────────

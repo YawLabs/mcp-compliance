@@ -408,6 +408,13 @@ async function runResources(ctx: ModernSuiteContext, cache: ResponseCache): Prom
       if (err.code === -32002) {
         return fail("error code -32002 is retired in 2026-07-28; a missing resource MUST be -32602 Invalid params");
       }
+      // server/resources#error-handling: "If the requested resource does
+      // not exist, servers MUST return a JSON-RPC error with code -32602
+      // (Invalid Params)". The -32603 the same section mentions is for
+      // internal errors, not for a URI the server cannot resolve.
+      if (err.code !== -32602) {
+        return fail(`nonexistent URI -> ${errDetail(err)}; a missing resource MUST be -32602 Invalid params`);
+      }
       const dataUri = isPlainObject(err.data) ? err.data.uri : undefined;
       const echoed = dataUri === uri;
       if (!echoed) {
@@ -415,11 +422,7 @@ async function runResources(ctx: ModernSuiteContext, cache: ResponseCache): Prom
           `resources-not-found: error.data.uri ${dataUri === undefined ? "is missing" : `is ${brief(dataUri)}, not the requested URI`}; servers SHOULD name the missing resource in data.uri`,
         );
       }
-      if (err.code === -32602) return pass(`nonexistent URI -> JSON-RPC error -32602${echoed ? " with data.uri" : ""}`);
-      harness.warnings.push(
-        `resources-not-found: server answered a nonexistent URI with code ${err.code}; -32602 Invalid params is expected`,
-      );
-      return pass(`nonexistent URI -> JSON-RPC error ${err.code} (expected -32602; see warnings)`);
+      return pass(`nonexistent URI -> JSON-RPC error -32602${echoed ? " with data.uri" : ""}`);
     },
     { required: true },
   );

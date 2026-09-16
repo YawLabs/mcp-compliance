@@ -114,6 +114,34 @@ function describeProbeAnswer(d: DetectionResult): string {
   return /^(JSON-RPC|HTTP|modern|no )/.test(shape) ? shape : `a ${shape}`;
 }
 
+/**
+ * The first-position warning for a preflight / era probe that drew
+ * 401/403. Without an Authorization header the server wants one; with
+ * one, it refused the credential the user configured, so re-running with
+ * --auth is the wrong advice. The hint follows the spec's status split
+ * (basic/authorization: "Invalid or expired tokens MUST receive a HTTP
+ * 401"; 403 is "Invalid scopes or insufficient permissions").
+ */
+function authRejectionWarning(opts: {
+  displayUrl: string;
+  status: number;
+  authSent: boolean;
+  spec: SpecVersion;
+  auto: boolean;
+}): string {
+  const { displayUrl, status, spec } = opts;
+  const probe = opts.auto ? "the server/discover probe" : "the preflight";
+  const era = opts.auto ? "the era could not be determined and " : "";
+  if (!opts.authSent) {
+    return `Server at ${displayUrl} requires authentication (${probe} got HTTP ${status}) and no Authorization header was sent, so ${era}the ${spec} grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`;
+  }
+  const why =
+    status === 403
+      ? "a 403 means the token lacks a required scope or permission"
+      : "a 401 means the token is invalid or expired";
+  return `Server at ${displayUrl} rejected the configured credential (${probe} carried an Authorization header and got HTTP ${status}), so ${era}the ${spec} grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): ${why}.`;
+}
+
 /** Propagate a caller's abort between phases that no test() gate covers (preflight, detection, handshake). */
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
@@ -532,6 +560,7 @@ export async function runComplianceSuite(
         timeout: startupTimeout,
         clientInfo,
         signal: options.signal,
+        authorizationSent: hasAuthHeader,
       });
       throwIfAborted(options.signal);
       if (retry.responded) {
@@ -565,7 +594,7 @@ export async function runComplianceSuite(
       if (!detection) {
         detection =
           resolvedTarget.type === "http"
-            ? classifyDiscoverResponse(preflightResponse)
+            ? classifyDiscoverResponse(preflightResponse, { authorizationSent: hasAuthHeader })
             : await detectSpecVersion(transport, {
                 nextId,
                 timeout: startupTimeout,
@@ -597,9 +626,15 @@ export async function runComplianceSuite(
           probeExit = null;
         }
       }
-      if (detection.eraUndetermined && !hasAuthHeader) {
+      if (detection.eraUndetermined) {
         preWarnings.unshift(
-          `Server at ${displayUrl} requires authentication (the server/discover probe got HTTP ${preflightResponse?.statusCode ?? 401}) and no Authorization header was sent, so the era could not be determined and the ${resolvedSpec} grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`,
+          authRejectionWarning({
+            displayUrl,
+            status: preflightResponse?.statusCode ?? 401,
+            authSent: hasAuthHeader,
+            spec: resolvedSpec,
+            auto: true,
+          }),
         );
       }
     } else {
@@ -612,9 +647,15 @@ export async function runComplianceSuite(
       // mismatch, and a 5xx or an intermediary's page is not an era.
       if (requested !== "auto" && preflightResponse) {
         const seen = classifyDiscoverResponse(preflightResponse);
-        if (seen.eraUndetermined && !hasAuthHeader) {
+        if (seen.eraUndetermined) {
           preWarnings.unshift(
-            `Server at ${displayUrl} requires authentication (the preflight got HTTP ${preflightResponse.statusCode ?? 401}) and no Authorization header was sent, so the ${resolvedSpec} grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`,
+            authRejectionWarning({
+              displayUrl,
+              status: preflightResponse.statusCode ?? 401,
+              authSent: hasAuthHeader,
+              spec: resolvedSpec,
+              auto: false,
+            }),
           );
         } else if (seen.version !== requested && !seen.eraUndetermined) {
           if (seen.supportedVersions?.includes(requested)) {
@@ -767,7 +808,10 @@ export async function runComplianceSuite(
           return { passed: true, details: `HTTP ${res.statusCode}` };
         }
         if (res.statusCode === 401 || res.statusCode === 403) {
-          return { passed: false, details: `HTTP ${res.statusCode} (auth required — pass --auth)` };
+          // With an Authorization header configured, the server refused
+          // that credential; "pass --auth" would be the wrong advice.
+          const hint = hasAuthHeader ? "credential rejected — check --auth" : "auth required — pass --auth";
+          return { passed: false, details: `HTTP ${res.statusCode} (${hint})` };
         }
         // 400 with a JSON-RPC error body is acceptable — server processed the POST
         // but rejected the pre-init request (e.g., session required)

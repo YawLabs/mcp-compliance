@@ -531,6 +531,535 @@ describe("a list call that fails", () => {
   });
 });
 
+// ── The answers the fixture cannot produce: stubbed feature calls ──
+
+/** discover declaring `capabilities`; `route` answers the rest (-32601 when it returns undefined). */
+function featureRoute(
+  capabilities: Record<string, unknown>,
+  route: (method: string, msg: Record<string, any>) => StubReply | undefined,
+) {
+  return (method: string, msg: Record<string, any>): StubReply => {
+    if (method === "server/discover") {
+      return ok(msg.id, {
+        supportedVersions: ["2026-07-28"],
+        capabilities,
+        _meta: { "io.modelcontextprotocol/serverInfo": { name: "feature-stub", version: "0" } },
+      });
+    }
+    return route(method, msg) ?? rpcError(msg.id, -32601, `Method not found: ${method}`);
+  };
+}
+
+/** A JSON-RPC envelope with neither result nor error (a server that answered nothing). */
+const noResult = (msg: Record<string, any>, status = 200): StubReply => ({
+  status,
+  body: { jsonrpc: "2.0", id: msg.id },
+});
+
+const INPUT_REQUIRED = { method: "elicitation/create", params: { message: "who?" } };
+
+describe("a list answered with the wrong shape", () => {
+  interface ListCase {
+    name: string;
+    reply: (msg: Record<string, any>) => StubReply;
+    /** tools-list (always a failure here) and tools-list-caching on the same response. */
+    list: string;
+    caching: string;
+    cachingPassed?: boolean;
+  }
+
+  const cases: ListCase[] = [
+    {
+      name: "an envelope with no result object",
+      reply: (msg) => noResult(msg),
+      list: "tools/list: no result object (HTTP 200)",
+      caching: "tools/list: no result object (HTTP 200)",
+    },
+    {
+      name: "a result with no tools array",
+      reply: (msg) => ok(msg.id, {}),
+      list: "No tools array in result",
+      // The hints are on the response either way, so the caching check is
+      // not dragged down by the missing array.
+      caching: 'tools/list: ttlMs=0 cacheScope="public"',
+      cachingPassed: true,
+    },
+    {
+      name: "tool entries that are not objects",
+      reply: (msg) => ok(msg.id, { tools: ["echo", 2, { name: "real" }] }),
+      list: "2 of 3 tools entries are not objects",
+      caching: 'tools/list: ttlMs=0 cacheScope="public"',
+      cachingPassed: true,
+    },
+    {
+      // One defect, two required failures: tools/list MUST be served, so
+      // its caching test has nothing to check and fails too.
+      name: "a JSON-RPC error",
+      reply: (msg) => rpcError(msg.id, -32603, "boom"),
+      list: "tools/list returned JSON-RPC error -32603 (boom)",
+      caching: "tools/list returned JSON-RPC error -32603 (boom); no complete result to check caching hints on",
+    },
+    {
+      // An interim MRTR result is not a list (and schema-no-input-required-on-lists
+      // fails it), but it carries no caching hints to judge either.
+      name: "an input_required interim result",
+      reply: (msg) => ok(msg.id, { resultType: "input_required", requestState: "s1" }),
+      list: "No tools array in result",
+      caching: "tools/list: not applicable (input_required interim results carry no caching hints)",
+      cachingPassed: true,
+    },
+  ];
+
+  it.each(cases)("tools-list fails on $name", async ({ reply, list, caching, cachingPassed = false }) => {
+    const stub = await startListStub(
+      featureRoute({ tools: {} }, (method, msg) => (method === "tools/list" ? reply(msg) : undefined)),
+    );
+    try {
+      const report = await runModern(stub.url, { only: ["tools-list", "tools-list-caching"] });
+      expect(resultOf(report, "tools-list")).toMatchObject({ passed: false, required: true, details: list });
+      expect(resultOf(report, "tools-list-caching")).toMatchObject({
+        passed: cachingPassed,
+        required: true,
+        details: caching,
+      });
+      // Both checks read one response.
+      expect(stub.sent.filter((m) => m === "tools/list")).toHaveLength(1);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("tools/call answered against a stub", () => {
+  const TOOL = { name: "t", description: "the only tool", inputSchema: { type: "object" } };
+
+  interface CallCase {
+    name: string;
+    call: (msg: Record<string, any>) => StubReply;
+    callPassed: boolean;
+    callDetails: string;
+    typesPassed: boolean;
+    typesDetails: string;
+  }
+
+  const cases: CallCase[] = [
+    {
+      name: "an HTTP 500 carrying no result object",
+      call: (msg) => noResult(msg, 500),
+      callPassed: false,
+      callDetails: "t: no result object (HTTP 500)",
+      typesPassed: false,
+      typesDetails: "t: no result object (HTTP 500)",
+    },
+    {
+      name: "a result with no content array",
+      call: (msg) => ok(msg.id, { text: "x" }),
+      callPassed: false,
+      callDetails: "t: response missing content array",
+      typesPassed: true,
+      typesDetails: "t: no content items to validate",
+    },
+    {
+      name: "a content item with no type",
+      call: (msg) => ok(msg.id, { content: [{ text: "x" }, { type: "text", text: "ok" }] }),
+      callPassed: false,
+      callDetails: "t: 1 content item(s) missing 'type' field",
+      typesPassed: false,
+      typesDetails: "t: Content item missing type field",
+    },
+    {
+      // isError is a valid tool result, not a protocol failure.
+      name: "an execution error with content",
+      call: (msg) => ok(msg.id, { content: [{ type: "text", text: "boom" }], isError: true }),
+      callPassed: true,
+      callDetails: "t: tool returned execution error with content (valid)",
+      typesPassed: true,
+      typesDetails: "t: content types: text",
+    },
+    {
+      // The isError arm is read before the content-type arm, so tools-call
+      // passes an execution error whose content is untyped and
+      // tools-content-types is the check that catches it.
+      name: "an execution error whose content is untyped",
+      call: (msg) => ok(msg.id, { content: [{ text: "boom" }], isError: true }),
+      callPassed: true,
+      callDetails: "t: tool returned execution error with content (valid)",
+      typesPassed: false,
+      typesDetails: "t: Content item missing type field",
+    },
+    {
+      name: "a valid MRTR input_required result",
+      call: (msg) =>
+        ok(msg.id, { resultType: "input_required", inputRequests: { user_name: INPUT_REQUIRED }, requestState: "s1" }),
+      callPassed: true,
+      callDetails: "t: MRTR input_required (inputRequests: user_name, requestState)",
+      typesPassed: true,
+      typesDetails: "t: input_required result (content types not applicable)",
+    },
+    {
+      name: "a malformed MRTR input_required result",
+      call: (msg) => ok(msg.id, { resultType: "input_required" }),
+      callPassed: false,
+      callDetails: "t: MRTR input_required malformed: input_required result has neither inputRequests nor requestState",
+      typesPassed: true,
+      typesDetails: "t: input_required result (content types not applicable)",
+    },
+  ];
+
+  it.each(cases)("$name", async ({ call, callPassed, callDetails, typesPassed, typesDetails }) => {
+    const stub = await startListStub(
+      featureRoute({ tools: {} }, (method, msg) => {
+        if (method === "tools/list") return ok(msg.id, { tools: [TOOL] });
+        if (method === "tools/call") return call(msg);
+        return undefined;
+      }),
+    );
+    try {
+      const report = await runModern(stub.url, { only: ["tools-call", "tools-content-types"] });
+      expect(resultOf(report, "tools-call")).toMatchObject({
+        passed: callPassed,
+        required: true,
+        details: callDetails,
+      });
+      expect(resultOf(report, "tools-content-types")).toMatchObject({
+        passed: typesPassed,
+        required: true,
+        details: typesDetails,
+      });
+      // One list for both checks; each sends its own call.
+      expect(stub.sent.filter((m) => m === "tools/list")).toHaveLength(1);
+      expect(stub.sent.filter((m) => m === "tools/call")).toHaveLength(2);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("resources/read of a listed resource against a stub", () => {
+  const URI = "test://listed";
+  const EMPTY_WARNING = `resources/read of the listed resource ${URI} returned an empty contents array; a listed resource is expected to have content`;
+
+  interface ReadCase {
+    name: string;
+    read: (msg: Record<string, any>) => StubReply;
+    readPassed?: boolean;
+    readDetails: string;
+    cachingPassed?: boolean;
+    cachingDetails: string;
+    warnings?: string[];
+  }
+
+  const HINTS = `resources/read ${URI}: ttlMs=0 cacheScope="public"`;
+
+  const cases: ReadCase[] = [
+    {
+      // One defect, two required failures: the read that failed is the
+      // only response resources-read-caching has to check.
+      name: "a JSON-RPC error for a listed resource",
+      read: (msg) => rpcError(msg.id, -32603, "permission denied"),
+      readDetails: `resources/read ${URI}: JSON-RPC error -32603 (permission denied)`,
+      cachingDetails: `resources/read ${URI} returned JSON-RPC error -32603 (permission denied); no complete result to check caching hints on`,
+    },
+    {
+      name: "an envelope with no result object",
+      read: (msg) => noResult(msg),
+      readDetails: `resources/read ${URI}: no result object (HTTP 200)`,
+      cachingDetails: `resources/read ${URI}: no result object (HTTP 200)`,
+    },
+    {
+      name: "a result with no contents array",
+      read: (msg) => ok(msg.id, {}),
+      readDetails: `resources/read ${URI}: no contents array`,
+      cachingPassed: true,
+      cachingDetails: HINTS,
+    },
+    {
+      name: "a content item with no uri",
+      read: (msg) => ok(msg.id, { contents: [{ text: "x" }] }),
+      readDetails: `resources/read ${URI}: Content item missing uri`,
+      cachingPassed: true,
+      cachingDetails: HINTS,
+    },
+    {
+      // A listed resource with nothing in it is odd but not a violation.
+      name: "an empty contents array",
+      read: (msg) => ok(msg.id, { contents: [] }),
+      readPassed: true,
+      readDetails: `read 0 content items from ${URI} (empty contents for a listed resource; see warnings)`,
+      cachingPassed: true,
+      cachingDetails: HINTS,
+      warnings: [EMPTY_WARNING],
+    },
+    {
+      name: "a valid MRTR input_required result",
+      read: (msg) => ok(msg.id, { resultType: "input_required", inputRequests: { confirm: INPUT_REQUIRED } }),
+      readPassed: true,
+      readDetails: `resources/read ${URI}: MRTR input_required (inputRequests: confirm)`,
+      cachingPassed: true,
+      cachingDetails: `resources/read ${URI}: not applicable (input_required interim results carry no caching hints)`,
+    },
+  ];
+
+  it.each(cases)("$name", async ({
+    read,
+    readPassed = false,
+    readDetails,
+    cachingPassed = false,
+    cachingDetails,
+    warnings = [],
+  }) => {
+    const stub = await startListStub(
+      featureRoute({ resources: {} }, (method, msg) => {
+        if (method === "resources/list") {
+          return ok(msg.id, { resources: [{ uri: URI, name: "listed", mimeType: "text/plain" }] });
+        }
+        if (method === "resources/read" && msg.params?.uri === URI) return read(msg);
+        return undefined;
+      }),
+    );
+    try {
+      const report = await runModern(stub.url, { only: ["resources-read", "resources-read-caching"] });
+      expect(resultOf(report, "resources-read")).toMatchObject({
+        passed: readPassed,
+        required: true,
+        details: readDetails,
+      });
+      expect(resultOf(report, "resources-read-caching")).toMatchObject({
+        passed: cachingPassed,
+        required: true,
+        details: cachingDetails,
+      });
+      expect(report.warnings.filter((w) => w.startsWith("resources/read of the listed resource"))).toEqual(warnings);
+      // Both checks read the one response the read sent.
+      expect(stub.sent.filter((m) => m === "resources/read")).toHaveLength(1);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("prompts/get when every prompt has required arguments", () => {
+  const PROMPT = {
+    name: "g",
+    description: "needs an argument",
+    arguments: [
+      { name: "x", required: true },
+      { name: "y", description: "optional" },
+    ],
+  };
+
+  /**
+   * Run prompts-get against a stub, returning the verdict and the params
+   * it received -- without the `_meta` every request carries, which the
+   * lifecycle tests pin.
+   */
+  async function runGet(get: (msg: Record<string, any>) => StubReply, prompts: unknown[] = [PROMPT]) {
+    const params: Array<Record<string, any>> = [];
+    const stub = await startListStub(
+      featureRoute({ prompts: {} }, (method, msg) => {
+        if (method === "prompts/list") return ok(msg.id, { prompts });
+        if (method === "prompts/get") {
+          const { _meta, ...rest } = msg.params ?? {};
+          params.push(rest);
+          return get(msg);
+        }
+        return undefined;
+      }),
+    );
+    try {
+      const report = await runModern(stub.url, { only: ["prompts-get"] });
+      return { result: resultOf(report, "prompts-get"), params };
+    } finally {
+      await stub.close();
+    }
+  }
+
+  const messages = (msg: Record<string, any>) =>
+    ok(msg.id, { messages: [{ role: "user", content: { type: "text", text: "hi" } }] });
+
+  const cases: Array<{ name: string; get: (msg: Record<string, any>) => StubReply; passed: boolean; details: string }> =
+    [
+      {
+        name: "messages: the placeholder arguments are noted in the details",
+        get: messages,
+        passed: true,
+        details: "1 message(s) from g (placeholder arguments sent)",
+      },
+      {
+        // The placeholder "test" may genuinely be the wrong value, so the
+        // server rejecting it is an acceptable answer.
+        name: "-32602 Invalid params: acceptable for a placeholder value",
+        get: (msg) => rpcError(msg.id, -32602, "x must be a uri"),
+        passed: true,
+        details: "g: invalid params error (acceptable): code -32602",
+      },
+      {
+        name: "-32600 Invalid request: acceptable too",
+        get: (msg) => rpcError(msg.id, -32600, "bad request"),
+        passed: true,
+        details: "g: invalid params error (acceptable): code -32600",
+      },
+      {
+        // Unlike tools-call, which passes any protocol error, prompts-get
+        // accepts only the two invalid-params codes.
+        name: "-32603 Internal error: not an acceptable answer",
+        get: (msg) => rpcError(msg.id, -32603, "boom"),
+        passed: false,
+        details: "g: JSON-RPC error -32603 (boom) (expected messages, input_required or -32602)",
+      },
+      {
+        name: "an envelope with no result object",
+        get: (msg) => noResult(msg),
+        passed: false,
+        details: "g: no result object (HTTP 200)",
+      },
+      {
+        name: "a result whose messages is not an array",
+        get: (msg) => ok(msg.id, { messages: {} }),
+        passed: false,
+        details: "g: no messages array in result",
+      },
+      {
+        name: "a message with an invalid role",
+        get: (msg) => ok(msg.id, { messages: [{ role: "system", content: { type: "text", text: "x" } }] }),
+        passed: false,
+        details: 'g: Invalid role: "system"',
+      },
+      {
+        name: "a valid MRTR input_required result",
+        get: (msg) =>
+          ok(msg.id, { resultType: "input_required", inputRequests: { x: INPUT_REQUIRED }, requestState: "s1" }),
+        passed: true,
+        details: "g: MRTR input_required (inputRequests: x, requestState)",
+      },
+    ];
+
+  it.each(cases)("$name", async ({ get, passed, details }) => {
+    const { result } = await runGet(get);
+    expect(result).toMatchObject({ passed, required: true, details });
+  });
+
+  it("sends 'test' for every required argument, and no arguments at all for a prompt that needs none", async () => {
+    const withArgs = await runGet(messages);
+    expect(withArgs.params).toEqual([{ name: "g", arguments: { x: "test" } }]);
+    // The control: no required arguments, so no arguments key and no note.
+    const free = await runGet(messages, [{ name: "free", description: "no arguments" }]);
+    expect(free.params).toEqual([{ name: "free" }]);
+    expect(free.result.details).toBe("1 message(s) from free");
+  });
+});
+
+// ── resources-not-found: the answers the fixture has no knob for ──
+
+describe("resources-not-found against a stub", () => {
+  const NOT_FOUND_PREFIX = "test://mcp-compliance/does-not-exist-";
+
+  /** discover with resources declared; resources/read of the probe URI answered by `missing`. */
+  function notFoundRoute(missing: (msg: Record<string, any>) => StubReply) {
+    return (method: string, msg: Record<string, any>): StubReply => {
+      if (method === "server/discover") {
+        return ok(msg.id, {
+          supportedVersions: ["2026-07-28"],
+          capabilities: { resources: {} },
+          _meta: { "io.modelcontextprotocol/serverInfo": { name: "not-found-stub", version: "0" } },
+        });
+      }
+      if (method === "resources/read" && String(msg.params?.uri).startsWith(NOT_FOUND_PREFIX)) return missing(msg);
+      return rpcError(msg.id, -32601, `Method not found: ${method}`);
+    };
+  }
+
+  const cases: Array<{ name: string; missing: (msg: Record<string, any>) => StubReply; details: string }> = [
+    {
+      // server/resources#error-handling: "servers MUST return a JSON-RPC
+      // error with code -32602"; -32603 is for internal errors. Before the
+      // fix this and the next two PASSED (required) with a warning.
+      name: "-32603 Internal error",
+      missing: (msg) => ({
+        status: 200,
+        body: {
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32603, message: "Internal error", data: { uri: msg.params.uri } },
+        },
+      }),
+      details:
+        "nonexistent URI -> JSON-RPC error -32603 (Internal error); a missing resource MUST be -32602 Invalid params",
+    },
+    {
+      name: "-32601 Method not found",
+      missing: (msg) => rpcError(msg.id, -32601, "Method not found"),
+      details:
+        "nonexistent URI -> JSON-RPC error -32601 (Method not found); a missing resource MUST be -32602 Invalid params",
+    },
+    {
+      name: "a legacy-range -32000",
+      missing: (msg) => rpcError(msg.id, -32000, "Resource not found"),
+      details:
+        "nonexistent URI -> JSON-RPC error -32000 (Resource not found); a missing resource MUST be -32602 Invalid params",
+    },
+    {
+      name: "real contents (a wildcard resource server)",
+      missing: (msg) => ok(msg.id, { contents: [{ uri: msg.params.uri, text: "anything" }] }),
+      details: "nonexistent URI returned 1 content item(s) instead of a JSON-RPC error",
+    },
+    {
+      name: "input_required",
+      missing: (msg) =>
+        ok(msg.id, {
+          resultType: "input_required",
+          inputRequests: { confirm: { method: "elicitation/create", params: {} } },
+        }),
+      details: "nonexistent URI returned input_required instead of a JSON-RPC error",
+    },
+    {
+      name: "neither a result nor an error",
+      missing: (msg) => ({ status: 200, body: { jsonrpc: "2.0", id: msg.id } }),
+      details: "nonexistent URI: no JSON-RPC error and no result object (HTTP 200)",
+    },
+  ];
+
+  it.each(cases)("fails on $name", async ({ missing, details }) => {
+    const stub = await startListStub(notFoundRoute(missing));
+    try {
+      const report = await runModern(stub.url, { only: ["resources-not-found"] });
+      expect(resultOf(report, "resources-not-found")).toMatchObject({ passed: false, required: true, details });
+      // A failing answer is not also graded on its data.uri (a SHOULD of the -32602 error).
+      expect(report.warnings.filter((w) => w.startsWith("resources-not-found:"))).toEqual([]);
+      expect(stub.sent.filter((m) => m === "resources/read")).toHaveLength(1);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("passes on -32602, with a warning when data.uri names a different resource", async () => {
+    // The control for the cases above: the MUST is satisfied by the code
+    // alone; data.uri is a SHOULD, so a wrong one is a warning, not a verdict.
+    const stub = await startListStub(
+      notFoundRoute((msg) => ({
+        status: 200,
+        body: {
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32602, message: "Resource not found", data: { uri: "test://mcp-compliance/other" } },
+        },
+      })),
+    );
+    try {
+      const report = await runModern(stub.url, { only: ["resources-not-found"] });
+      expect(resultOf(report, "resources-not-found")).toMatchObject({
+        passed: true,
+        details: "nonexistent URI -> JSON-RPC error -32602",
+      });
+      expect(report.warnings.filter((w) => w.startsWith("resources-not-found:"))).toEqual([
+        'resources-not-found: error.data.uri is "test://mcp-compliance/other", not the requested URI; servers SHOULD name the missing resource in data.uri',
+      ]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
 // ── Checks the fixture cannot break: pinned at the validator seam ──
 
 describe("validators", () => {
