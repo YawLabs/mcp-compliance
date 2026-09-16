@@ -399,6 +399,17 @@ out explicitly here.
   and the grade is not meaningful, and the auto-detection note and
   `transport-post` say "credential rejected -- check --auth".
 
+## [0.18.2] — 2026-09-15
+
+### Security
+- **`undici` is now `^8.9.0` (was `^8.7.0`) and `@modelcontextprotocol/sdk` is now `^1.30.0` (was `^1.29.0`); `npm audit` goes from 10 findings (5 high) to 0.** Both are runtime dependencies that tsup leaves external, and nothing in the advisory set is bundled: the published `dist/` imports the SDK and `undici` as bare specifiers and carries no `fast-uri`, `hono`, `@hono/node-server`, `qs` or `ip-address` code, so a consumer's copies come from their own install, and a fresh install of 0.18.1 already resolves every advised runtime package to a patched version. What the new `undici` floor changes is that an existing install or consumer lockfile can no longer sit on 8.7.x–8.8.x, the range the five undici advisories cover (one high, in cache-directive parsing); this package only calls undici's `request` and never touches the cache interceptor, so exposure there was low. The SDK floor is sibling consistency, since 1.30.0 keeps the same transitive ranges apart from widening `@hono/node-server` to allow 2.x. The lockfile moves `undici` 8.7.0 → 8.10.2, `fast-uri` 3.1.2 → 3.1.7, `hono` 4.12.25 → 4.13.7, `@hono/node-server` 1.19.14 → 2.1.1, `ip-address` 10.2.0 → 10.7.0 (with `express-rate-limit` 8.5.2 → 8.7.0 above it), `qs` 6.15.2 → 6.16.0, `postcss` 8.5.16 → 8.5.28 (with `nanoid` 3.3.12 → 3.3.19 under it) and `vitest` 4.1.10 → 4.1.11. Of the SDK's transitives only `fast-uri` (via `ajv`) is loaded at run time; `hono`, `@hono/node-server`, `qs` and `ip-address` back the SDK's HTTP server transport, which only the integration tests import. `postcss` and `vitest` are dev toolchain only.
+
+## [0.18.1] — 2026-09-14
+
+### Changed
+- npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
+- `release.sh` writes a `## [x.y.z]` changelog entry for every release — promoting `[Unreleased]` when it has content, otherwise generating one from the commit subjects since the previous tag — keeps the Keep-a-Changelog link references current when the file has them, and takes the GitHub release notes from that entry instead of from `git log` subjects. Before this, the script never touched CHANGELOG.md at all: a release got an entry only if someone wrote one by hand (0.18.0 below is backfilled), and every GitHub release page showed raw commit subjects.
+
 ## [0.18.0] — 2026-09-13
 
 No runtime changes; the published package behaves exactly as 0.17.4.
