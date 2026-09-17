@@ -16,6 +16,7 @@ import {
 } from "./checks/patterns.js";
 import { getTestDefinitionMap } from "./definitions/index.js";
 import {
+  authRefusalHint,
   buildDiscoverProbe,
   classifyDiscoverResponse,
   type DetectionResult,
@@ -25,6 +26,7 @@ import {
   probeExitOf,
   probeExitWarning,
   REASON_PREFIX,
+  refusedCredential,
   settledStderr,
   summarizeStderr,
 } from "./detect.js";
@@ -117,15 +119,21 @@ function describeProbeAnswer(d: DetectionResult): string {
 /**
  * The first-position warning for a preflight / era probe that drew
  * 401/403. Without an Authorization header the server wants one; with
- * one, it refused the credential the user configured, so re-running with
- * --auth is the wrong advice. The hint follows the spec's status split
- * (basic/authorization: "Invalid or expired tokens MUST receive a HTTP
- * 401"; 403 is "Invalid scopes or insufficient permissions").
+ * one, re-running with --auth is the wrong advice. The hint follows the
+ * spec's status split (basic/authorization: "Invalid or expired tokens
+ * MUST receive a HTTP 401"; 403 is "Invalid scopes or insufficient
+ * permissions", signalled by a Bearer error="insufficient_scope"
+ * challenge). A 403 without that challenge (`credentialRefused` false,
+ * see refusedCredential) is not called a rejected credential: it is as
+ * likely Host/Origin validation (streamable-http requires 403 for an
+ * invalid Origin; the SDK's Host guard answers a tunnel hostname with it)
+ * or a gateway.
  */
 function authRejectionWarning(opts: {
   displayUrl: string;
   status: number;
   authSent: boolean;
+  credentialRefused: boolean;
   spec: SpecVersion;
   auto: boolean;
 }): string {
@@ -134,6 +142,9 @@ function authRejectionWarning(opts: {
   const era = opts.auto ? "the era could not be determined and " : "";
   if (!opts.authSent) {
     return `Server at ${displayUrl} requires authentication (${probe} got HTTP ${status}) and no Authorization header was sent, so ${era}the ${spec} grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`;
+  }
+  if (!opts.credentialRefused) {
+    return `Server at ${displayUrl} refused ${probe} with HTTP ${status}, so ${era}the ${spec} grade below is not meaningful. The request carried an Authorization header, but the ${status} has no WWW-Authenticate: Bearer error="insufficient_scope" challenge, so it need not be about the credential: check the server's Host and Origin validation (a tunnel or proxy hostname it does not allow), any gateway in front of it, and the permissions of the --auth token.`;
   }
   const why =
     status === 403
@@ -525,7 +536,13 @@ export async function runComplianceSuite(
             body = { _raw: text };
           }
         }
-        preflightResponse = { body, requestId: 0, statusCode: preflight.statusCode, headers: {} };
+        // The headers are kept: a 403's WWW-Authenticate challenge decides
+        // whether it refused the credential (refusedCredential).
+        const headers: Record<string, string> = {};
+        for (const [name, value] of Object.entries(preflight.headers)) {
+          if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(", ") : value;
+        }
+        preflightResponse = { body, requestId: 0, statusCode: preflight.statusCode, headers };
       } catch (err: unknown) {
         throwIfAborted(options.signal);
         serverReachable = false;
@@ -583,8 +600,14 @@ export async function runComplianceSuite(
       if (!unreachableWarning || !preflightTimedOut || !answered) return;
       const i = warnings.indexOf(unreachableWarning);
       if (i === -1) return;
-      warnings[i] =
-        `Server at ${displayUrl} did not answer the preflight within ${preflightTimeout}ms${reprobedAfterTimeout ? ` or the era probe within ${startupTimeout}ms` : ""} but did answer later requests; a slow cold start needs a higher --preflight-timeout${reprobedAfterTimeout ? " / --startup-timeout" : ""}.`;
+      // Re-probed means auto with no era seen, so the legacy suite ran by
+      // default (a modern verdict needs an answered probe). A slow cold
+      // start is one reading; a server that never answers server/discover
+      // (a bridge in front of a 2025-11-25 server that ignores unknown
+      // methods) is the other, and for it a higher timeout only adds wait.
+      warnings[i] = reprobedAfterTimeout
+        ? `Server at ${displayUrl} did not answer the preflight within ${preflightTimeout}ms or the era probe within ${startupTimeout}ms but did answer initialize, so its era was not detected and this run defaulted to ${LEGACY_SPEC_VERSION}. A slow cold start needs a higher --preflight-timeout / --startup-timeout; a server that never answers server/discover costs that wait on every auto run, and --spec-version ${LEGACY_SPEC_VERSION} skips the re-probe.`
+        : `Server at ${displayUrl} did not answer the preflight within ${preflightTimeout}ms but did answer later requests; a slow cold start needs a higher --preflight-timeout.`;
     };
     // A stdio child that died on the era probe; the warning is composed
     // once the fresh instance's first exchange has settled (a server that
@@ -627,11 +650,15 @@ export async function runComplianceSuite(
         }
       }
       if (detection.eraUndetermined) {
+        // Read from the classified answer: after a preflight timeout the
+        // re-probe answered, and the preflight holds nothing.
+        const refusal = detection.refusal ?? { statusCode: 401, credentialRefused: true };
         preWarnings.unshift(
           authRejectionWarning({
             displayUrl,
-            status: preflightResponse?.statusCode ?? 401,
+            status: refusal.statusCode,
             authSent: hasAuthHeader,
+            credentialRefused: refusal.credentialRefused,
             spec: resolvedSpec,
             auto: true,
           }),
@@ -648,11 +675,13 @@ export async function runComplianceSuite(
       if (requested !== "auto" && preflightResponse) {
         const seen = classifyDiscoverResponse(preflightResponse);
         if (seen.eraUndetermined) {
+          const refusal = seen.refusal ?? { statusCode: 401, credentialRefused: true };
           preWarnings.unshift(
             authRejectionWarning({
               displayUrl,
-              status: preflightResponse.statusCode ?? 401,
+              status: refusal.statusCode,
               authSent: hasAuthHeader,
+              credentialRefused: refusal.credentialRefused,
               spec: resolvedSpec,
               auto: false,
             }),
@@ -808,9 +837,15 @@ export async function runComplianceSuite(
           return { passed: true, details: `HTTP ${res.statusCode}` };
         }
         if (res.statusCode === 401 || res.statusCode === 403) {
-          // With an Authorization header configured, the server refused
-          // that credential; "pass --auth" would be the wrong advice.
-          const hint = hasAuthHeader ? "credential rejected — check --auth" : "auth required — pass --auth";
+          // With an Authorization header configured, "pass --auth" would be
+          // the wrong advice; "credential rejected" only when the status
+          // says so (a bare 403 may be Host/Origin validation).
+          const hint = authRefusalHint(
+            hasAuthHeader,
+            refusedCredential(res.statusCode, res.headers),
+            "auth required — pass --auth",
+            "—",
+          );
           return { passed: false, details: `HTTP ${res.statusCode} (${hint})` };
         }
         // 400 with a JSON-RPC error body is acceptable — server processed the POST
@@ -2093,11 +2128,15 @@ export async function runComplianceSuite(
           },
         });
         try {
+          // Both media types: a Streamable HTTP server MUST see both in
+          // Accept on a POST (basic/transports#sending-messages-to-the-server),
+          // and the SDK answers "text/event-stream" alone with 406 without
+          // ever calling the tool.
           const res = await request(backendUrl, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              Accept: "text/event-stream",
+              Accept: "application/json, text/event-stream",
               ...buildHeaders(),
             },
             body: reqBody,
@@ -2117,7 +2156,10 @@ export async function runComplianceSuite(
               details: "Server accepted request with progressToken (no progress events observed — optional)",
             };
           }
-          return { passed: true, details: `HTTP ${res.statusCode} — request with progressToken accepted` };
+          return {
+            passed: true,
+            details: `HTTP ${res.statusCode} — tools/call with progressToken was not served (no progress events observed — optional)`,
+          };
         } catch {
           return {
             passed: true,

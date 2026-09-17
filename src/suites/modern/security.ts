@@ -9,7 +9,9 @@ import {
 import type { TestOutcome } from "../../harness.js";
 import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
 import { parseSSEMessages } from "../../sse.js";
+import type { StdioTransport } from "../../transport/stdio.js";
 import { ensureTools, hasTools, listUnavailable, type ModernSuiteContext } from "./context.js";
+import { TRANSPORT_LEVEL_STATUS } from "./lifecycle.js";
 
 /**
  * Security tests of the 2026-07-28 suite (21 in the catalog). Ported from
@@ -68,9 +70,6 @@ export const INJECTION_DETECTORS = {
 const URL_PARAM_NAME = /url|uri|href|endpoint|host|link/i;
 const PATH_PARAM_NAME = /path|file|dir|folder/i;
 const PATH_OR_URL_PARAM_NAME = /path|file|dir|url|uri|href|endpoint|host/i;
-
-/** The stdio transport's marker for a response line it dropped (see transport/stdio.ts). */
-const STDIO_BUFFER_DROPPED = "stdout buffer exceeded";
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -1124,9 +1123,15 @@ function tlsRedirectVerdict(status: number, location: string | string[] | undefi
  * authorization server issued (MUST draw 401; 403 tolerated) and a value
  * outside the b64token grammar (a malformed request, which may draw 400
  * per RFC 6750 invalid_request and the spec's error table, or 401/403).
+ * A probe that got no HTTP answer is read the way unansweredProbe reads
+ * every other negative probe: a dropped connection the served credentialed
+ * discover pins on the credential is "connection rejected", a timeout or a
+ * refused connection measured nothing, and a caller's abort is rethrown.
  */
 async function checkMalformedAuth(ctx: ModernSuiteContext): Promise<TestOutcome> {
-  const probe = async (value: string): Promise<RpcResponse | null> => {
+  /** The unreachable() verdict of each probe that got no answer and no refusal either. */
+  const unanswered: TestOutcome[] = [];
+  const probe = async (value: string, what: string): Promise<RpcResponse | null> => {
     try {
       // Drop the configured (valid) Authorization first, then supply the
       // replacement; without the omit the valid user header would
@@ -1136,12 +1141,14 @@ async function checkMalformedAuth(ctx: ModernSuiteContext): Promise<TestOutcome>
         {},
         { omitUserHeaders: ["authorization"], headers: { Authorization: value } },
       );
-    } catch {
+    } catch (err) {
+      const verdict = unansweredProbe(ctx, `server/discover with ${what}`, err, credentialedDiscoverServed(ctx));
+      if (verdict) unanswered.push(verdict);
       return null;
     }
   };
-  const invalid = await probe(INVALID_TOKEN_AUTH);
-  const garbage = await probe(MALFORMED_AUTH);
+  const invalid = await probe(INVALID_TOKEN_AUTH, "a well-formed invalid token");
+  const garbage = await probe(MALFORMED_AUTH, "a malformed Authorization header");
 
   const issues: string[] = [];
   const seen: string[] = [];
@@ -1172,6 +1179,9 @@ async function checkMalformedAuth(ctx: ModernSuiteContext): Promise<TestOutcome>
     issues.push(`malformed credential: HTTP ${garbage.statusCode}, ${summarize(garbage)} -- expected 400 or 401`);
   }
   if (issues.length > 0) return { passed: false, details: clip(issues.join("; "), 220) };
+  // A wrong answer to one probe outranks the other probe measuring nothing;
+  // without one, a probe that was never answered leaves the check unmeasured.
+  if (unanswered.length > 0) return unanswered[0];
   return { passed: true, details: seen.join("; ") };
 }
 
@@ -1559,9 +1569,12 @@ function noteInjectionScope(ctx: ModernSuiteContext, target: InjectionTarget): v
  * rejection (isError or rejection wording) is evidence the server
  * defended; a benign result proves nothing either way, and a JSON-RPC
  * error or a timeout means the payload never reached a verdict. A server
- * that goes away on a payload (the stdio child exits, an accepted HTTP
- * connection is closed or reset) fails naming that payload; one that was
- * already gone when a payload was sent (a dead child, a refused
+ * that goes away on a payload fails naming that payload: the stdio child
+ * exits, or an accepted HTTP connection is closed or reset and a follow-up
+ * server/discover is neither served nor refused by a transport-level gate
+ * (discoverAfterDrop). A drop the server outlives (a WAF or IPS, a
+ * keep-alive close) never reached the tool, with a warning. One
+ * that was already gone when a payload was sent (a dead child, a refused
  * connection) stops the probe with an unreachable() verdict.
  * `toolInputSchema` keeps `x-mcp-header` arguments callable: their values
  * are mirrored into `Mcp-Param-*` headers so the server does not reject
@@ -1609,17 +1622,33 @@ async function runInjectionTest(
       if (ctx.signal?.aborted) throw err;
       const failure = classifyTransportError(err);
       const reason = clip(firstLine(errorMessage(err)), 100);
-      // The server went away on this payload: the stdio child exited, or
-      // an accepted HTTP connection was closed or reset instead of
-      // answered. That is the crash the test exists to catch -- the same
-      // behaviour security-extra-params fails as "died" -- not a payload
-      // that merely never reached the tool.
-      if (failure === "dropped" && !alreadyGone) {
-        const died =
-          ctx.kind === "stdio"
-            ? `server died on payload "${clip(payload, 30)}" sent to ${where}: ${reason}`
-            : `connection dropped on payload "${clip(payload, 30)}" sent to ${where}: ${reason} (server may have crashed)`;
+      // The stdio child exited on this payload: the crash the test exists
+      // to catch -- the same behaviour security-extra-params fails as
+      // "died" -- not a payload that merely never reached the tool. The
+      // exit event makes that conclusive.
+      if (failure === "dropped" && !alreadyGone && ctx.kind === "stdio") {
+        const died = `server died on payload "${clip(payload, 30)}" sent to ${where}: ${reason}`;
         return { passed: false, details: clip([...issues, died].join("; "), 220) };
+      }
+      // An HTTP connection closed or reset instead of answered says nothing
+      // on its own about whether the server is still up: a WAF or IPS drops
+      // attack payloads at the connection level, and a keep-alive
+      // connection the server closes as the request is sent drops it too.
+      // A follow-up server/discover decides (discoverAfterDrop): served, or
+      // refused by a gate still standing in front of the server, the payload
+      // never reached the tool; otherwise the server went away on it.
+      if (failure === "dropped" && ctx.kind === "http") {
+        const after = await discoverAfterDrop(ctx);
+        if ("gone" in after) {
+          const died = `connection dropped on payload "${clip(payload, 30)}" sent to ${where}: ${clip(reason, 40)}; server/discover then ${after.gone} (server may have crashed)`;
+          return { passed: false, details: clip([...issues, died].join("; "), 220) };
+        }
+        warnOnce(
+          ctx,
+          `security injection tests: a tools/call to ${where} carrying a payload had its connection closed without a response, but ${after.alive}, so the payload is counted as never reaching the tool, not as a crash (a WAF or IPS dropping the request, or a keep-alive connection closed as it was sent). Refuse a payload with HTTP 4xx or a JSON-RPC error so a client can tell a refusal from a crash.`,
+        );
+        unreached++;
+        continue;
       }
       // Gone before this payload (a dead child, a refused connection): no
       // payload after it can be sent either, so the probe stops here. When
@@ -1654,6 +1683,35 @@ async function runInjectionTest(
 }
 
 /**
+ * After an HTTP connection was dropped on an injection payload, one
+ * conformant server/discover tells a connection-level refusal from a crash:
+ *
+ * - served (a DiscoverResult, as the setup discover that unlocked the tool
+ *   tests was): the server is up;
+ * - refused with a transport-level status (401, 403, 413, 415, 429;
+ *   TRANSPORT_LEVEL_STATUS): a gate in front of the server -- a WAF or IPS
+ *   now blocking this client, an auth gate, a rate limiter -- answered, so
+ *   this is no crash either;
+ * - anything else (no response, a proxy's 502 for a backend that went away,
+ *   a JSON-RPC error): the server may have crashed.
+ *
+ * `alive` / `gone` is the clause the warning / failure quotes. A run the
+ * caller aborted is rethrown.
+ */
+async function discoverAfterDrop(ctx: ModernSuiteContext): Promise<{ alive: string } | { gone: string }> {
+  try {
+    const res = await ctx.client.rpc(DISCOVER, {});
+    if (resultOf(res.body)) return { alive: "the server still served a follow-up server/discover" };
+    const gate = res.statusCode === undefined ? undefined : TRANSPORT_LEVEL_STATUS[res.statusCode];
+    if (gate) return { alive: `a follow-up server/discover was still answered (HTTP ${res.statusCode}, ${gate})` };
+    return { gone: `answered HTTP ${res.statusCode}, ${summarize(res)}` };
+  } catch (err) {
+    if (ctx.signal?.aborted) throw err;
+    return { gone: `got ${noResponse(err, ctx.timeout)}` };
+  }
+}
+
+/**
  * A ~1 MB string in the first string argument that is NOT header-mirrored
  * (an `x-mcp-header` value would travel in an Mcp-Param-* header too, and
  * the header limit would be measured instead of the body). A mirrored
@@ -1671,6 +1729,11 @@ async function checkOversizedInput(ctx: ModernSuiteContext, tools: any[]): Promi
     !plain && strings.length > 0 ? ` [${target.param} is x-mcp-header: measured the header limit, not the body]` : "";
   const withNote = (o: TestOutcome): TestOutcome => (note ? { ...o, details: `${o.details}${note}` } : o);
   const largeValue = "A".repeat(OVERSIZED_BYTES);
+  // Scopes the "reply dropped by the runner" verdict to output produced
+  // during THIS call: the stdio transport counts every overflow of its
+  // line buffer for its whole life (see transport/stdio.ts).
+  const overflows = () => (ctx.transport as Partial<StdioTransport>).stdoutOverflows ?? 0;
+  const overflowsBefore = overflows();
   try {
     const res = await ctx.client.rpc(
       TOOLS_CALL,
@@ -1706,10 +1769,12 @@ async function checkOversizedInput(ctx: ModernSuiteContext, tools: any[]): Promi
   } catch (err) {
     const message = errorMessage(err);
     if (ctx.kind === "stdio") {
-      const tail = (ctx.transport as { stderrTail?: () => string }).stderrTail?.() ?? "";
-      if (tail.includes(STDIO_BUFFER_DROPPED)) {
+      if (overflows() > overflowsBefore) {
         // The server answered, but with a single line longer than the
         // runner's 1 MiB stdio buffer: a runner limit, not a server fault.
+        // An overflow from before this call (an earlier over-long reply,
+        // a startup banner) says nothing about this one, and neither does
+        // the same text on the child's own stderr.
         ctx.harness.warnings.push(
           `security-oversized-input: the server's reply to a 1 MB ${where} exceeded the runner's 1 MiB stdio line buffer and was dropped; treated as survived. Prefer rejecting oversized arguments with a JSON-RPC error.`,
         );

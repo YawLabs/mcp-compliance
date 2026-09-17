@@ -19,9 +19,10 @@ import { TEST_DEFINITIONS, type TestDefinition } from "../types.js";
 //                                 block per rule (section 3 = 2025-11-25,
 //                                 section 3b = 2026-07-28)
 //
-// Neither file is generated or shipped in the npm package, so nothing else
-// notices when a test is added, renamed, re-categorised or flipped between
-// required and optional without the docs following. Before this guard the
+// Neither file is shipped in the npm package, and the 2026-07-28 half is
+// only regenerated when someone runs scripts/gen-catalog-docs.ts by hand,
+// so nothing else notices when a test is added, renamed, re-categorised or
+// flipped between required and optional without the docs following. Before this guard the
 // catalog sat at 81 rules while the code had 88, and `error-method-code`
 // carried a different name in rules.json for two releases. The checks are
 // per spec version because ids are only comparable within one catalog.
@@ -91,6 +92,19 @@ function rubricSection(start: string, end: string): string {
 function bullet(block: string, label: string): string | null {
   const m = block.match(new RegExp(`^- \\*\\*${label}:\\*\\* (.+)$`, "m"));
   return m ? m[1].trim() : null;
+}
+
+/**
+ * Each `#### `id`` block of a rubric section, keyed by id. A block runs
+ * until the next `#### ` heading or the end of the section.
+ */
+function ruleBlocks(section: string): Map<string, string> {
+  const blocks = new Map<string, string>();
+  for (const part of section.split(/^(?=#### `)/m)) {
+    const m = part.match(/^#### `([^`]+)`/);
+    if (m) blocks.set(m[1], part);
+  }
+  return blocks;
 }
 
 describe("mcp-compliance-rules.json top level", () => {
@@ -181,18 +195,10 @@ for (const { version, defs, rubricStart, rubricEnd } of CATALOGS) {
       expect(found).toEqual(counts);
     });
 
-    // Each `#### `id`` block runs until the next `#### ` heading or the end
-    // of the section. Its bullets must agree with the catalog: the required
+    // Each rule block's bullets must agree with the catalog: the required
     // flag (a "Yes"/"No" prefix, so "No (required at runtime when ...)" is
     // fine) and the absolute spec URL for this revision.
-    const blocks = new Map<string, string>();
-    {
-      const parts = section.split(/^(?=#### `)/m);
-      for (const part of parts) {
-        const m = part.match(/^#### `([^`]+)`/);
-        if (m) blocks.set(m[1], part);
-      }
-    }
+    const blocks = ruleBlocks(section);
 
     for (const def of defs) {
       it(`${def.id}: rubric block agrees on required flag and spec URL`, () => {
@@ -211,3 +217,86 @@ for (const { version, defs, rubricStart, rubricEnd } of CATALOGS) {
     }
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Section 3b and the 2026-07-28 rules in rules.json are written by
+// scripts/gen-catalog-docs.ts, which cannot be imported (it writes both
+// files at load). Besides per-rule fields it writes prose the checks above
+// never read: the rule count, a "Counts:" line and the transport intro's
+// HTTP-only / stdio-only figures are literal strings in the script, and
+// each rule's description and capability gate are copied in. After a
+// catalog change a regenerated rubric could state stale totals and stay
+// green, so recompute every figure from the catalog here. (The
+// 2025-11-25 rules are hand-maintained and their descriptions differ from
+// TEST_DEFINITIONS by design, so this is 2026-07-28 only.)
+// ─────────────────────────────────────────────────────────────────────
+describe("COMPLIANCE_RUBRIC.md section 3b and rules.json: generated prose ↔ 2026-07-28 catalog", () => {
+  const defs = MODERN_TEST_DEFINITIONS;
+  const section = rubricSection("\n## 3b. Test Rules", "\n## 4. Rule Catalog");
+  const blocks = ruleBlocks(section);
+  const rules = new Map(catalog.rules.filter((r) => r.specVersion === MODERN_SPEC_VERSION).map((r) => [r.id, r]));
+
+  const onlyOn = (kind: "http" | "stdio") => (d: TestDefinition) =>
+    d.transports?.length === 1 && d.transports[0] === kind;
+  const inCategory = (category: string) => defs.filter((d) => d.category === category);
+
+  it("the section intro states the rule count", () => {
+    expect(section).toContain(`has ${defs.length} rules in the same 8 categories`);
+  });
+
+  it("the Counts line matches the per-category, required-by-default and per-transport totals", () => {
+    const transport = inCategory("transport");
+    const transportStdio = transport.filter(onlyOn("stdio")).length;
+    const perCategory = ["transport", "lifecycle", "tools", "resources", "prompts", "errors", "schema", "security"].map(
+      (category) =>
+        category === "transport"
+          ? `transport ${transport.length} (${transport.length - transportStdio} HTTP + ${transportStdio} stdio)`
+          : `${category} ${inCategory(category).length}`,
+    );
+    const httpOnly = defs.filter(onlyOn("http")).length;
+    const stdioOnly = defs.filter(onlyOn("stdio")).length;
+    const both = defs.length - httpOnly - stdioOnly;
+    const required = defs.filter((d) => d.required).length;
+    expect(section).toContain(
+      `Counts: ${perCategory.join(", ")}. Required by default: ${required}. ` +
+        `Runs on HTTP: ${httpOnly + both} (${httpOnly} HTTP-only + ${both} both); ` +
+        `on stdio: ${stdioOnly + both} (${stdioOnly} stdio-only + ${both} both).`,
+    );
+  });
+
+  it("the transport intro's HTTP-only / stdio-only figures and its one both-transport rule match", () => {
+    const transport = inCategory("transport");
+    const httpOnly = transport.filter(onlyOn("http")).length;
+    const stdioOnly = transport.filter(onlyOn("stdio")).length;
+    const intro = section.slice(section.indexOf("### 3b.1 transport"), section.indexOf("#### `"));
+    expect(intro).toContain(`${httpOnly} rules are HTTP-only (\`transports: ["http"]\`), ${stdioOnly} are stdio-only`);
+    expect(intro).toContain(`hence "${transport.length - stdioOnly} HTTP + ${stdioOnly} stdio"`);
+    // The intro names the single transport rule that runs on both.
+    const onBoth = transport.filter((d) => !onlyOn("http")(d) && !onlyOn("stdio")(d)).map((d) => d.id);
+    expect(onBoth).toEqual(["transport-no-server-requests"]);
+    expect(intro).toContain("`transport-no-server-requests` is a post-hoc scan of the recording that runs on both");
+  });
+
+  it("rules.json and the rubric Description bullet carry each rule's catalog description verbatim", () => {
+    const drift: string[] = [];
+    for (const def of defs) {
+      if (rules.get(def.id)?.description !== def.description) drift.push(`${def.id}: rules.json description`);
+      const block = blocks.get(def.id);
+      if (!block || bullet(block, "Description") !== def.description) drift.push(`${def.id}: rubric Description`);
+    }
+    expect(drift).toEqual([]);
+  });
+
+  it("the rubric's Default required bullet names the same capability gate as rules.json", () => {
+    // Both come from one script-only `gate` per rule (there is no catalog
+    // field for it); a hand edit to either file must not go unnoticed.
+    const drift: string[] = [];
+    for (const def of defs) {
+      const gate = rules.get(def.id)?.capabilityGated ?? null;
+      const block = blocks.get(def.id);
+      const named = (block ? bullet(block, "Default required") : null)?.match(/`([a-z.]+)`/)?.[1] ?? null;
+      if (named !== gate) drift.push(`${def.id}: rules.json ${gate}, rubric ${named}`);
+    }
+    expect(drift).toEqual([]);
+  });
+});

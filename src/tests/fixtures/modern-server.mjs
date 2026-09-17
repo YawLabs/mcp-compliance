@@ -50,6 +50,7 @@ const KNOBS = new Set([
   "accept-missing-meta",
   "meta-error-wrong-code",
   "require-client-info",
+  "reject-unknown-meta",
   "accept-any-version",
   "wrong-version-error",
   "version-error-no-data",
@@ -79,6 +80,7 @@ const KNOBS = new Set([
   "retired-codes",
   "no-id-echo",
   "wrong-id-type",
+  "string-id-coerced",
   "get-sse",
   "delete-ok",
   "mint-session",
@@ -329,6 +331,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function outId(id, isError) {
   if (isError && broken("no-id-echo")) return null;
   if (broken("wrong-id-type") && typeof id === "number") return String(id);
+  // Ids kept as numbers: a string id comes back as Number(id), which for a
+  // non-numeric string is NaN and goes on the wire as null.
+  if (broken("string-id-coerced") && typeof id === "string") return Number(id);
   return id;
 }
 
@@ -494,10 +499,16 @@ function headerProblem(headers, msg, params, meta) {
   return undefined;
 }
 
+/** `_meta` keys basic/index#meta reserves outside the io.modelcontextprotocol/ prefix. */
+const RESERVED_UNPREFIXED_META = new Set(["progressToken", "traceparent", "tracestate", "baggage"]);
+
 /**
  * The `_meta` fields every request MUST carry; returns what is missing, or
  * undefined. The `require-client-info` knob also demands the OPTIONAL
  * clientInfo, the violation lifecycle-meta-client-info-optional must see.
+ * The `reject-unknown-meta` knob validates `_meta` as a closed set (the
+ * reserved keys only), so a vendor-prefixed key draws -32602: the
+ * violation lifecycle-meta-tolerance must see.
  */
 function metaProblem(params, meta) {
   if (!isObject(params._meta)) return "params._meta is required";
@@ -505,6 +516,12 @@ function metaProblem(params, meta) {
   if (!isObject(meta[META.clientCapabilities])) return `params._meta["${META.clientCapabilities}"] must be an object`;
   if (broken("require-client-info") && !isObject(meta[META.clientInfo])) {
     return `params._meta["${META.clientInfo}"] must be an object`;
+  }
+  if (broken("reject-unknown-meta")) {
+    const unknown = Object.keys(meta).find(
+      (key) => !key.startsWith("io.modelcontextprotocol/") && !RESERVED_UNPREFIXED_META.has(key),
+    );
+    if (unknown !== undefined) return `params._meta["${unknown}"] is not a recognised key`;
   }
   return undefined;
 }

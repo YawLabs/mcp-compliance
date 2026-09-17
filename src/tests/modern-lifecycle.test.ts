@@ -1,11 +1,14 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { RpcResponse } from "../modern/client.js";
 import { runComplianceSuite } from "../runner.js";
 import { MODERN_SPEC_VERSION } from "../spec.js";
+import { listFailureReason } from "../suites/modern/context.js";
 import {
   acknowledgmentProblem,
   acknowledgmentSurplus,
@@ -105,6 +108,8 @@ function expectPassed(report: ComplianceReport, id: string) {
 }
 
 const lifecycleWarnings = (report: ComplianceReport) => report.warnings.filter((w) => w.startsWith("lifecycle-"));
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 for (const kind of KINDS) {
   describe(`modern lifecycle over ${kind}`, () => {
@@ -207,6 +212,11 @@ for (const kind of KINDS) {
       expect(expectFailed(report, "lifecycle-meta-client-info-optional").details).toBe(
         `server/discover without clientInfo rejected with -32601${status}; not evaluable: the conformant server/discover was itself rejected with -32601${status}, so this rejection proves nothing about omitting clientInfo`,
       );
+      // Nor is the vendor _meta key blamed for it: the discover carrying the
+      // key draws the very same -32601 as the one without it.
+      expect(expectFailed(report, "lifecycle-meta-tolerance").details).toBe(
+        `server/discover with unknown _meta key "com.example.compliance/probe" rejected with -32601${status}; not evaluable: the conformant server/discover was itself rejected with -32601${status}, so this rejection proves nothing about the unknown _meta key`,
+      );
       // No capabilities -> completions is gated out of the report entirely.
       expect(report.tests.some((t) => t.id === "lifecycle-completions")).toBe(false);
       expect(report.serverInfo.protocolVersion).toBeNull();
@@ -293,6 +303,23 @@ for (const kind of KINDS) {
         `server/discover without clientInfo rejected with -32602${kind === "http" ? " (HTTP 400)" : ""}; clientInfo is optional`,
       );
       expect(r.required).toBe(true);
+    });
+
+    it("reject-unknown-meta: meta-tolerance fails, blaming the vendor key, while the conformant discover is served", async () => {
+      const report = await runBroken(
+        kind,
+        ["reject-unknown-meta"],
+        ["lifecycle-discover", "lifecycle-meta-tolerance", "lifecycle-meta-client-info-optional"],
+      );
+      // The same envelope without the vendor key is served...
+      expectPassed(report, "lifecycle-discover");
+      expectPassed(report, "lifecycle-meta-client-info-optional");
+      // ...so the -32602 is the server validating _meta as a closed set.
+      const r = expectFailed(report, "lifecycle-meta-tolerance");
+      expect(r.details).toBe(
+        `server/discover with unknown _meta key "com.example.compliance/probe" rejected with -32602${kind === "http" ? " (HTTP 400)" : ""}; unknown keys must be ignored`,
+      );
+      expect(r.required).toBe(false);
     });
 
     it("meta-error-wrong-code: a -32600 rejection of the malformed _meta passes each rejection test with a warning", async () => {
@@ -504,6 +531,24 @@ for (const kind of KINDS) {
         kind === "http" ? /\(string\): MISMATCH/ : /no response matched request id/,
       );
       expectFailed(report, "lifecycle-jsonrpc", kind === "http" ? /does not echo request id/ : /no response/);
+    });
+
+    it("string-id-coerced: a string id answered as a number fails string-id, while numeric ids still match", async () => {
+      // The fixture answers id "compliance-str-N" with Number(id): null on the
+      // wire. HTTP hands the body back as-is; stdio matches responses by id,
+      // so the coerced one never resolves the request and the check times out.
+      const report = await runBroken(kind, ["string-id-coerced"], ["lifecycle-id-match", "lifecycle-string-id"], {
+        timeout: 1500,
+      });
+      expectPassed(report, "lifecycle-id-match");
+      const r = expectFailed(
+        report,
+        "lifecycle-string-id",
+        kind === "http"
+          ? /^String id "compliance-str-\d+" sent, got back id=null \(object\)$/
+          : /^no response echoed string id "compliance-str-\d+" within 1500ms; a coerced or dropped id never resolves \(stdio transport: request timed out after 1500ms/,
+      );
+      expect(r.required).toBe(false);
     });
 
     it("initialize-ok: the dual-era probe reports a served legacy handshake and the suite warns", async () => {
@@ -911,13 +956,36 @@ describe("lifecycle-subscriptions-listen: a listen answered by a bare HTTP statu
     const stub = await bareListen({}, 404, "Not Found", () => ({ status: 404, text: "Not Found" }));
     try {
       const report = await runModern(stub.url, { only: ["lifecycle-discover", LISTEN_ID] });
-      expectFailed(
-        report,
-        "lifecycle-discover",
-        /^server\/discover answered HTTP 404, non-JSON-RPC body \(HTTP 404\)$/,
-      );
+      expectFailed(report, "lifecycle-discover", /^server\/discover answered non-JSON-RPC body \(HTTP 404\)$/);
       expect(expectFailed(report, LISTEN_ID).details).toBe(
         "subscriptions/listen rejected with HTTP 404; not evaluable: the conformant server/discover was itself rejected with no JSON-RPC error code (HTTP 404), so this rejection proves nothing about the injected defect",
+      );
+      expect(lifecycleWarnings(report)).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("lifecycle-subscriptions-listen: a listen answered with a result instead of a stream (HTTP)", () => {
+  it("fails: the response closed the subscription before any acknowledgment", async () => {
+    // A port that treats subscriptions/listen as an ordinary request: plain
+    // JSON, the closure result straight away, no SSE stream and no ack.
+    const stub = await startModernStub((method, msg) => {
+      if (method === "server/discover") return discoverReply(msg.id, { tools: { listChanged: true } });
+      if (method === "subscriptions/listen") {
+        return {
+          status: 200,
+          body: { jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", _meta: { [SUB]: msg.id } } },
+        };
+      }
+      return notFound(msg.id, method);
+    });
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-discover", "lifecycle-subscriptions-listen"] });
+      expectPassed(report, "lifecycle-discover");
+      expect(expectFailed(report, "lifecycle-subscriptions-listen").details).toBe(
+        "subscriptions/listen ended with a result before any acknowledgment (HTTP 200)",
       );
       expect(lifecycleWarnings(report)).toEqual([]);
     } finally {
@@ -1251,6 +1319,44 @@ describe("rejections answered by a transport-level gate are not evaluable", () =
     }
   });
 
+  it("a gate on the vendor-key discover fails meta-tolerance as not evaluable, without blaming the key", async () => {
+    // A rate limiter (bare 429) or an auth gate with a JSON-RPC body (403)
+    // tripping on the probe that carries the vendor key: neither is the
+    // server refusing the key.
+    const gates: Array<[number, (id: unknown) => StubReply, string, string]> = [
+      [
+        429,
+        () => ({ status: 429, text: "rate limited" }),
+        "server/discover with an extra _meta key: no result (HTTP 429)",
+        "rate limiting",
+      ],
+      [
+        403,
+        (id) => ({ status: 403, body: { jsonrpc: "2.0", id, error: { code: -32001, message: "Forbidden" } } }),
+        'server/discover with unknown _meta key "com.example.compliance/probe" rejected with -32001 (HTTP 403)',
+        "an auth gate",
+      ],
+    ];
+    for (const [status, reply, refusal, source] of gates) {
+      const stub = await startModernStub(
+        conformantRoute((method, msg) =>
+          method === "server/discover" && "com.example.compliance/probe" in (msg.params?._meta ?? {})
+            ? reply(msg.id)
+            : undefined,
+        ),
+      );
+      try {
+        const report = await runModern(stub.url, { only: ["lifecycle-discover", "lifecycle-meta-tolerance"] });
+        expectPassed(report, "lifecycle-discover");
+        expect(expectFailed(report, "lifecycle-meta-tolerance").details).toBe(
+          `${refusal}; not evaluable: HTTP ${status} is a transport-level rejection (${source} answered before the JSON-RPC layer read the request), so it proves nothing about the unknown _meta key`,
+        );
+      } finally {
+        await stub.close();
+      }
+    }
+  });
+
   it("the late lifecycle block runs before the security burst, so a gateway that rate-limits the burst cannot feed it 429s", async () => {
     // An intermediary that answers 429 for two seconds once more than 20
     // requests land within 100 ms -- exactly what security-rate-limiting's
@@ -1337,6 +1443,189 @@ describe("a server that rejects everything (SDK v1 'Server not initialized') ove
         `subscriptions/listen rejected with -32000 (HTTP 400); ${reason}`,
       );
       expect(lifecycleWarnings(report)).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("lifecycle-removed-methods: removed methods answered without a -32601 body (HTTP)", () => {
+  const REMOVED_ID = "lifecycle-removed-methods";
+  const EXPECTED = "no JSON-RPC error body (expected HTTP 404 with JSON-RPC error -32601)";
+  /** The conformant stub, with each removed method named in `replies` answered by it. */
+  const removedStub = (replies: Record<string, (id: unknown) => StubReply>) =>
+    startModernStub(conformantRoute((method, msg) => replies[method]?.(msg.id)));
+
+  it("a bare 404 (the status the spec requires, without the body) passes with a warning per method", async () => {
+    const bare404 = () => ({ status: 404, text: "Not Found" });
+    const stub = await removedStub({ ping: bare404, "logging/setLevel": bare404, "resources/subscribe": bare404 });
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-discover", REMOVED_ID] });
+      expectPassed(report, "lifecycle-discover");
+      expect(expectPassed(report, REMOVED_ID).details).toBe(
+        "ping HTTP 404, logging/setLevel HTTP 404, resources/subscribe HTTP 404 (see warnings)",
+      );
+      expect(lifecycleWarnings(report)).toEqual([
+        "lifecycle-removed-methods: ping rejected with HTTP 404 but no JSON-RPC error body",
+        "lifecycle-removed-methods: logging/setLevel rejected with HTTP 404 but no JSON-RPC error body",
+        "lifecycle-removed-methods: resources/subscribe rejected with HTTP 404 but no JSON-RPC error body",
+      ]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("any other bare status fails naming it: a 400 validator, a 500 crash page, a 405 route", async () => {
+    const stub = await removedStub({
+      ping: () => ({ status: 400, text: "Bad Request" }),
+      "logging/setLevel": () => ({ status: 500, text: "Internal Server Error" }),
+      "resources/subscribe": () => ({ status: 405, text: "" }),
+    });
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-discover", REMOVED_ID] });
+      expectPassed(report, "lifecycle-discover");
+      expect(expectFailed(report, REMOVED_ID).details).toBe(
+        `ping: rejected with HTTP 400 and ${EXPECTED}; logging/setLevel: rejected with HTTP 500 and ${EXPECTED}; resources/subscribe: rejected with HTTP 405 and ${EXPECTED}`,
+      );
+      expect(lifecycleWarnings(report)).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("a transport-level gate is not evaluable, with or without a JSON-RPC body", async () => {
+    const stub = await removedStub({
+      ping: () => ({ status: 429, text: "rate limited" }),
+      "logging/setLevel": (id) => ({
+        status: 403,
+        body: { jsonrpc: "2.0", id, error: { code: -32001, message: "Forbidden" } },
+      }),
+    });
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-discover", REMOVED_ID] });
+      expectPassed(report, "lifecycle-discover");
+      const gate = (status: number, source: string) =>
+        `not evaluable: HTTP ${status} is a transport-level rejection (${source} answered before the JSON-RPC layer read the request), so it proves nothing about the injected defect`;
+      expect(expectFailed(report, REMOVED_ID).details).toBe(
+        `ping: ${gate(429, "rate limiting")}; logging/setLevel: ${gate(403, "an auth gate")}`,
+      );
+      // Neither gate was credited as a rejection with the wrong code or body.
+      expect(lifecycleWarnings(report)).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("lifecycle-removed-methods: another error code, an empty envelope, no answer (HTTP)", () => {
+  const REMOVED_ID = "lifecycle-removed-methods";
+  /** The conformant stub, with each removed method named in `replies` answered by it. */
+  const removedStub = (replies: Record<string, (id: unknown) => StubReply>) =>
+    startModernStub(conformantRoute((method, msg) => replies[method]?.(msg.id)));
+
+  it("a JSON-RPC error other than -32601 is a rejection: passes, with a warning naming the code", async () => {
+    // A router that validates the method name before dispatch.
+    const stub = await removedStub({
+      ping: (id) => ({
+        status: 400,
+        body: { jsonrpc: "2.0", id, error: { code: -32600, message: "Invalid Request: unknown method ping" } },
+      }),
+      "logging/setLevel": (id) => invalidParams(id, "method is not supported"),
+    });
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-discover", REMOVED_ID] });
+      expectPassed(report, "lifecycle-discover");
+      expect(expectPassed(report, REMOVED_ID).details).toBe(
+        "ping -32600/400, logging/setLevel -32602/400, resources/subscribe -32601/404 (see warnings)",
+      );
+      expect(lifecycleWarnings(report)).toEqual([
+        "lifecycle-removed-methods: ping rejected with -32600 (expected -32601 Method not found)",
+        "lifecycle-removed-methods: logging/setLevel rejected with -32602 (expected -32601 Method not found)",
+      ]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("no response, or an envelope with neither result nor error, fails naming the method", async () => {
+    const stub = await removedStub({
+      // A handler that never answers ping: the request times out.
+      ping: () => ({ hang: true }),
+      "logging/setLevel": (id) => ({ status: 200, body: { jsonrpc: "2.0", id } }),
+    });
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-discover", REMOVED_ID], timeout: 1500 });
+      expectPassed(report, "lifecycle-discover");
+      const r = expectFailed(report, REMOVED_ID);
+      expect(r.details).toBe(
+        "ping: no response (The operation was aborted due to timeout); logging/setLevel: neither result nor JSON-RPC error (HTTP 200)",
+      );
+      expect(r.required).toBe(false);
+      expect(lifecycleWarnings(report)).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("lifecycle-dual-era over HTTP: an initialize answer that carries no era signal", () => {
+  const DUAL_ID = "lifecycle-dual-era";
+  const cases: Array<{ name: string; reply: (id: unknown) => StubReply; details: string; warnings: string[] }> = [
+    {
+      // A modern server whose router 404s any method it does not know.
+      name: "a bare 404 with no JSON-RPC body",
+      reply: () => ({ status: 404, text: "Not Found" }),
+      details: "modern-only: initialize rejected with HTTP 404 and no JSON-RPC error body (see warning)",
+      warnings: [
+        "lifecycle-dual-era: initialize rejected with HTTP 404 and no JSON-RPC error body; a modern-only server SHOULD name its supported versions in the error",
+      ],
+    },
+    {
+      // A catch-all handler answering every unknown method with an empty result.
+      name: "a result without protocolVersion",
+      reply: (id) => ({ status: 200, body: { jsonrpc: "2.0", id, result: {} } }),
+      details: "initialize returned a result without protocolVersion (HTTP 200); era ambiguous",
+      warnings: [],
+    },
+    {
+      // A catch-all route answering 200 text.
+      name: "a 200 that is not JSON-RPC",
+      reply: () => ({ status: 200, text: "OK" }),
+      details: "initialize answered with neither result nor error (HTTP 200); era undetermined",
+      warnings: [],
+    },
+  ];
+
+  it.each(cases)("$name", async ({ reply, details, warnings }) => {
+    const stub = await startModernStub(
+      conformantRoute((method, msg) => (method === "initialize" ? reply(msg.id) : undefined)),
+    );
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-discover", DUAL_ID] });
+      expectPassed(report, "lifecycle-discover");
+      expect(expectPassed(report, DUAL_ID).details).toBe(details);
+      expect(lifecycleWarnings(report)).toEqual(warnings);
+      // None of these served the legacy handshake: no era warning at suite level.
+      expect(report.warnings.filter((w) => /^Server is (dual-era|legacy-only)/.test(w))).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("an initialize that is never answered is reported as a timeout within the per-request budget", async () => {
+    // undici rejects with a DOMException named TimeoutError whose message
+    // ("The operation was aborted due to timeout") never says "timed out".
+    const stub = await startModernStub(
+      conformantRoute((method) => (method === "initialize" ? { hang: true } : undefined)),
+    );
+    try {
+      const report = await runModern(stub.url, { only: [DUAL_ID], timeout: 1500 });
+      const r = expectPassed(report, DUAL_ID);
+      expect(r.details).toBe("No response to legacy initialize within 1500ms; era undetermined (see warning)");
+      expect(r.durationMs).toBeLessThan(10_000);
+      expect(lifecycleWarnings(report)).toEqual([
+        "lifecycle-dual-era: legacy initialize got no response within 1500ms; a modern-only server SHOULD reject it with an error naming its supported versions",
+      ]);
     } finally {
       await stub.close();
     }
@@ -1474,7 +1763,7 @@ describe("lifecycle-jsonrpc: the envelope rules on the discover response (HTTP)"
       const stub = await answerDiscover((id) => ({ status: 200, body: body(id) }));
       try {
         const report = await runModern(stub.url, { only: ["lifecycle-discover", JSONRPC_ID] });
-        expectFailed(report, "lifecycle-discover", /^server\/discover answered HTTP 200, non-JSON-RPC body/);
+        expectFailed(report, "lifecycle-discover", /^server\/discover answered non-JSON-RPC body \(HTTP 200\)$/);
         const r = expectFailed(report, JSONRPC_ID);
         expect(r.details).toBe(`response body is ${type}, expected a JSON-RPC object`);
         expect(r.required).toBe(true);
@@ -1520,6 +1809,25 @@ describe("lifecycle-jsonrpc: the envelope rules on the discover response (HTTP)"
       expect(expectFailed(report, JSONRPC_ID).details).toBe(
         "Invalid JSON-RPC 2.0 envelope: result is string, expected an object",
       );
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("lifecycle-string-id: a response that drops a string id (HTTP)", () => {
+  it("fails naming the missing id, while numeric ids are echoed", async () => {
+    // A server that only knows numeric ids and leaves any other id off the response.
+    const stub = await startModernStub((method, msg) => {
+      if (method !== "server/discover") return notFound(msg.id, method);
+      const reply = discoverReply(msg.id, {});
+      if (typeof msg.id === "string" && "body" in reply) delete (reply.body as Record<string, unknown>).id;
+      return reply;
+    });
+    try {
+      const report = await runModern(stub.url, { only: ["lifecycle-id-match", "lifecycle-string-id"] });
+      expectPassed(report, "lifecycle-id-match");
+      expect(expectFailed(report, "lifecycle-string-id").details).toBe("No id in response (HTTP 200)");
     } finally {
       await stub.close();
     }
@@ -2054,6 +2362,97 @@ describe("lifecycle-capability-handlers-match: a declared capability whose list 
   });
 });
 
+describe("listFailureReason (why a list response yields no list)", () => {
+  const response = (body: unknown, statusCode = 200): RpcResponse => ({
+    body,
+    requestId: 1,
+    statusCode,
+    headers: {},
+    messages: [body],
+  });
+  const result = (extra: Record<string, unknown>) => response({ jsonrpc: "2.0", id: 1, result: extra });
+
+  it("names a JSON-RPC error, a missing result object, a missing array and non-object entries; null for a list", () => {
+    expect(
+      listFailureReason("tools", response({ jsonrpc: "2.0", id: 1, error: { code: -32603, message: "boom\nat x" } })),
+    ).toBe("JSON-RPC error -32603 (boom)");
+    expect(listFailureReason("tools", response({ jsonrpc: "2.0", id: 1, error: { code: -32601 } }))).toBe(
+      "JSON-RPC error -32601",
+    );
+    // A crash page: the HTTP transport hands back { _raw } for a non-JSON body.
+    expect(listFailureReason("tools", response({ _raw: "Internal Server Error" }, 500))).toBe(
+      "no result object (HTTP 500)",
+    );
+    expect(listFailureReason("prompts", response({ jsonrpc: "2.0", id: 1 }))).toBe("no result object (HTTP 200)");
+    expect(listFailureReason("tools", result({ tools: "x" }))).toBe("result has no tools array");
+    // The array is looked up under the list's own result key.
+    expect(listFailureReason("resourceTemplates", result({ templates: [] }))).toBe(
+      "result has no resourceTemplates array",
+    );
+    expect(listFailureReason("resources", result({ resources: [null, { uri: "a://b" }] }))).toBe(
+      "resources array has non-object entries",
+    );
+    expect(listFailureReason("prompts", result({ prompts: [["greet"]] }))).toBe("prompts array has non-object entries");
+    expect(listFailureReason("tools", result({ tools: [] }))).toBeNull();
+    expect(listFailureReason("tools", result({ tools: [{ name: "a" }] }))).toBeNull();
+  });
+});
+
+describe("a declared list whose response carries no list: the recorded reason reaches a --only run", () => {
+  /** Declares tools; tools/list answered by `list`; everything else -32601. */
+  const toolsStub = (list: (id: unknown) => StubReply) =>
+    startModernStub((method, msg) => {
+      if (method === "server/discover") return discoverReply(msg.id, { tools: {} });
+      if (method === "tools/list") return list(msg.id);
+      return notFound(msg.id, method);
+    });
+  const listResult = (id: unknown, result: Record<string, unknown>): StubReply => ({
+    status: 200,
+    body: { jsonrpc: "2.0", id, result: { resultType: "complete", ttlMs: 0, cacheScope: "public", ...result } },
+  });
+
+  for (const [label, list, reason] of [
+    [
+      "a plain-text 500 crash page",
+      () => ({ status: 500, text: "Internal Server Error" }),
+      "no result object (HTTP 500)",
+    ],
+    [
+      "a result whose tools is not an array",
+      (id: unknown) => listResult(id, { tools: "x" }),
+      "result has no tools array",
+    ],
+  ] as const) {
+    it(`${label}: progress-token fails naming it`, async () => {
+      const stub = await toolsStub(list);
+      try {
+        const report = await runModern(stub.url, { only: ["lifecycle-progress-token"] });
+        expect(expectFailed(report, "lifecycle-progress-token").details).toBe(
+          `tools/list failed (${reason}); no tool to call with a progressToken`,
+        );
+        expect(report.toolNames).toEqual([]);
+      } finally {
+        await stub.close();
+      }
+    });
+  }
+
+  it("a null entry is not published to later readers: tools-schema fails naming the list, not the entry", async () => {
+    const stub = await toolsStub((id) =>
+      listResult(id, { tools: [null, { name: "a", description: "d", inputSchema: { type: "object" } }] }),
+    );
+    try {
+      const report = await runModern(stub.url, { only: ["tools-schema"] });
+      expect(expectFailed(report, "tools-schema").details).toBe(
+        "tools/list failed (tools array has non-object entries); no tools list to validate",
+      );
+      expect(report.toolNames).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
 describe("--only lifecycle: lists obtained by capability-handlers-match are reused", () => {
   it("sends tools/list once for handlers-match + progress-token", async () => {
     const sent: string[] = [];
@@ -2115,12 +2514,18 @@ describe("--only lifecycle: lists obtained by capability-handlers-match are reus
  * takes an exclusive port or database). MINI_DISCOVER (v1-both | neither
  * | string-result) mis-shapes the discover ENVELOPE (the stdio transport
  * routes by id alone, so the reply still lands); MINI_LISTCHANGED=1
- * advertises tools.listChanged while subscriptions/listen stays -32601.
- * Written to a temp dir once per file.
+ * advertises tools.listChanged while subscriptions/listen stays -32601
+ * unless MINI_LISTEN (result | exit) answers it with the closure result
+ * at once or exits on it. MINI_MARK names a file the process writes its
+ * pid to when an initialize arrives (before acting on it), and
+ * MINI_STARTED a file every instance appends its pid to at startup, so a
+ * test can tell which instance is which and time an abort against a
+ * specific one. Written to a temp dir once per file.
  */
 const MINI_SERVER_SRC = `"use strict";
 const fs = require("node:fs");
 const readline = require("node:readline");
+if (process.env.MINI_STARTED) fs.appendFileSync(process.env.MINI_STARTED, process.pid + "\\n");
 const lock = process.env.MINI_LOCK;
 if (lock) {
   try {
@@ -2148,7 +2553,18 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     return;
   }
 
+  if (msg.method === "subscriptions/listen" && process.env.MINI_LISTEN) {
+    if (process.env.MINI_LISTEN === "exit") {
+      fs.writeSync(2, "Error: subscriptions are not implemented\\n");
+      process.exit(4);
+    }
+    out({ jsonrpc: "2.0", id: msg.id, result: { resultType: "complete",
+      _meta: { "io.modelcontextprotocol/subscriptionId": msg.id } } });
+    return;
+  }
+
   if (msg.method === "initialize") {
+    if (process.env.MINI_MARK) fs.writeFileSync(process.env.MINI_MARK, String(process.pid));
     const mode = process.env.MINI_INITIALIZE || "reject";
     if (mode === "silent") return;
     if (mode === "exit") {
@@ -2233,6 +2649,35 @@ describe("lifecycle-subscriptions-listen: a listen rejected -32601 over stdio", 
   });
 });
 
+describe("lifecycle-subscriptions-listen: a listen that ends without an acknowledgment (stdio)", () => {
+  const LISTEN_ID = "lifecycle-subscriptions-listen";
+
+  it("the closure result arriving first fails: the subscription ended before it was acknowledged", async () => {
+    const report = await runModern(miniTarget({ MINI_LISTCHANGED: "1", MINI_LISTEN: "result" }), {
+      only: ["lifecycle-discover", LISTEN_ID],
+    });
+    expectPassed(report, "lifecycle-discover");
+    expect(expectFailed(report, LISTEN_ID).details).toBe(
+      "subscriptions/listen ended with a result before any acknowledgment",
+    );
+    expect(lifecycleWarnings(report)).toEqual([]);
+  });
+
+  it("a server that exits on the listen fails naming the exit, as soon as it exits", async () => {
+    const report = await runModern(miniTarget({ MINI_LISTCHANGED: "1", MINI_LISTEN: "exit" }), {
+      only: ["lifecycle-discover", LISTEN_ID],
+    });
+    expectPassed(report, "lifecycle-discover");
+    const r = expectFailed(report, LISTEN_ID);
+    expect(r.details).toBe(
+      "server exited (code 4) after subscriptions/listen before any acknowledgment; tools.listChanged advertised",
+    );
+    // Ended by the exit, not by waiting out the 3000ms listen window.
+    expect(r.durationMs).toBeLessThan(2500);
+    expect(lifecycleWarnings(report)).toEqual([]);
+  }, 20_000);
+});
+
 describe("lifecycle-dual-era: fresh-process initialize on stdio", () => {
   const target = miniTarget;
 
@@ -2305,4 +2750,102 @@ describe("lifecycle-dual-era: fresh-process initialize on stdio", () => {
       expect(r.details).not.toMatch(/No response to legacy initialize/);
     }
   }, 20_000);
+
+  it("an abort while the idle instance is watched is not recorded as 'exits on the request'", async () => {
+    // The fresh child writes its pid to `mark` on the initialize, then exits
+    // on it; the suite then spawns an idle instance and watches it for at
+    // least 2000ms. Every instance logs its pid to `started` at startup, so
+    // the first pid logged after the fresh child's is the idle instance:
+    // abort as soon as it is up, inside that watch, however slow the machine.
+    const mark = join(mini.dir, "idle-abort-initialize");
+    const started = join(mini.dir, "idle-abort-started");
+    const idleUp = () => {
+      if (!existsSync(mark) || !existsSync(started)) return false;
+      const pids = readFileSync(started, "utf8").split("\n").filter(Boolean);
+      const fresh = pids.indexOf(readFileSync(mark, "utf8"));
+      return fresh !== -1 && pids.length > fresh + 1;
+    };
+    const controller = new AbortController();
+    const completed: TestResult[] = [];
+    const run = runComplianceSuite(target({ MINI_INITIALIZE: "exit", MINI_MARK: mark, MINI_STARTED: started }), {
+      specVersion: MODERN_SPEC_VERSION,
+      only: ["lifecycle-dual-era"],
+      timeout: 5000,
+      startupTimeout: 10_000,
+      signal: controller.signal,
+      onTestComplete: (r) => completed.push(r),
+    });
+    const rejected = expect(run).rejects.toThrow("user abort");
+    const deadline = Date.now() + 15_000;
+    while (!idleUp() && Date.now() < deadline) await sleep(20);
+    expect(idleUp(), "no idle instance was spawned after the fresh child exited on the initialize").toBe(true);
+    controller.abort(new Error("user abort"));
+    await rejected;
+    // The harness records the abort itself: no verdict about what the server exits on.
+    expect(completed.filter((r) => r.id === "lifecycle-dual-era").map((r) => [r.passed, r.details])).toEqual([
+      [false, "Error: user abort"],
+    ]);
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// The official SDK v2 over stdio, declaring only resources or only prompts
+// ---------------------------------------------------------------------------
+
+/**
+ * `serveStdio` from `@modelcontextprotocol/server@2.0.0` with a factory that
+ * registers ONLY a resource (SDK_ONLY=resources) or ONLY a prompt
+ * (SDK_ONLY=prompts). The SDK owns the era decision: server/discover does not
+ * pin the process, a modern non-discover request pins it modern, and a
+ * claim-less message before that is read as a legacy opening. CommonJS, and
+ * written to the temp dir, so the SDK is resolved from this package's
+ * node_modules through createRequire.
+ */
+const sdkOnlySource = (packageJson: string) => `"use strict";
+const { createRequire } = require("node:module");
+const load = createRequire(${JSON.stringify(packageJson)});
+const { McpServer } = load("@modelcontextprotocol/server");
+const { serveStdio } = load("@modelcontextprotocol/server/stdio");
+const only = process.env.SDK_ONLY;
+serveStdio(() => {
+  const mcp = new McpServer({ name: "sdk2-" + only + "-only", version: "2.0.0" });
+  if (only === "resources") {
+    mcp.registerResource("hello", "file:///test/hello.txt", { mimeType: "text/plain" }, async (uri) => ({
+      contents: [{ uri: uri.href, text: "Hello, world!" }],
+    }));
+  }
+  if (only === "prompts") {
+    mcp.registerPrompt("greeting", { description: "A simple greeting prompt" }, async () => ({
+      messages: [{ role: "user", content: { type: "text", text: "Hello!" } }],
+    }));
+  }
+  return mcp;
+}, { legacy: "serve", onerror: (err) => process.stderr.write("[sdk2-only] " + err.message + "\\n") });
+`;
+
+describe("--only <claim-less probe> against an SDK 2.0 stdio server without tools: the declared list pins the era", () => {
+  const sdk = { script: "" };
+  beforeAll(() => {
+    sdk.script = join(mini.dir, "sdk2-only-server.cjs");
+    const packageJson = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "package.json");
+    writeFileSync(sdk.script, sdkOnlySource(packageJson));
+  });
+
+  for (const only of ["resources", "prompts"] as const) {
+    it(`${only} only: ${only}/list is sent first, so the probe draws -32602, not the legacy -32601`, async () => {
+      const report = await runModern(
+        { type: "stdio", command: process.execPath, args: [sdk.script], env: { SDK_ONLY: only } },
+        { only: ["lifecycle-meta-required"] },
+      );
+      expect(report.tests.map((t) => t.id)).toEqual(["lifecycle-meta-required"]);
+      expect(Object.keys(report.serverInfo.capabilities ?? {})).toEqual([only]);
+      expect(expectPassed(report, "lifecycle-meta-required").details).toBe(
+        "server/discover without _meta: rejected with -32602",
+      );
+      expect(report.warnings.filter((w) => w.startsWith("lifecycle-meta-required:"))).toEqual([]);
+      // The pin request was the declared list, published to the report.
+      expect(report.resourceNames).toEqual(only === "resources" ? ["hello"] : []);
+      expect(report.promptNames).toEqual(only === "prompts" ? ["greeting"] : []);
+    }, 60_000);
+  }
 });

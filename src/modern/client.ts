@@ -1,4 +1,5 @@
 import type { Recorder } from "../recorder.js";
+import { parseSSEMessages } from "../sse.js";
 import type { HttpTransport } from "../transport/http.js";
 import type { JsonRpcId, Transport, TransportStream } from "../transport/index.js";
 import { HEADER_PROTOCOL_VERSION, standardHeadersFor } from "./headers.js";
@@ -260,14 +261,10 @@ export function createModernClient(options: ModernClientOptions): ModernClient {
 function recordRawBody(recorder: Recorder, text: string, contentType: string, statusCode: number) {
   if (!text) return;
   if (contentType.toLowerCase().includes("text/event-stream")) {
-    // Lazy import avoided: parse minimal SSE here to keep this module light.
-    for (const line of text.split(/\r?\n/)) {
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trimStart();
-      try {
-        recorder.recordReceived(JSON.parse(data), { statusCode });
-      } catch {}
-    }
+    // The transport's own SSE parser: an event's `data:` lines join into
+    // one payload, so a JSON message a server split across several lines
+    // (pretty-printed, one line per `data:`) is recorded, not dropped.
+    for (const message of parseSSEMessages(text)) recorder.recordReceived(message, { statusCode });
     return;
   }
   try {
@@ -295,10 +292,14 @@ export function resultOf(body: unknown): Record<string, unknown> | undefined {
   return r && typeof r === "object" ? (r as Record<string, unknown>) : undefined;
 }
 
-/** Short human summary of a response for test details. */
+/**
+ * Short human summary of a response for test details. Transport-neutral:
+ * it never names an HTTP status, because on stdio `statusCode` is the
+ * synthetic 200 and on HTTP every caller appends the status itself.
+ */
 export function describeResponse(res: RpcResponse): string {
   const err = errorOf(res.body);
   if (err) return `JSON-RPC error ${err.code}${err.message ? ` (${err.message})` : ""}`;
   if (resultOf(res.body)) return "result";
-  return `HTTP ${res.statusCode}, non-JSON-RPC body`;
+  return "non-JSON-RPC body";
 }

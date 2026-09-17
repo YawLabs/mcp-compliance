@@ -704,6 +704,53 @@ describe("tools/call answered against a stub", () => {
       typesPassed: true,
       typesDetails: "t: input_required result (content types not applicable)",
     },
+    {
+      // The expected answer when the picked tool needs arguments it was not given.
+      name: "-32602 Invalid params",
+      call: (msg) => rpcError(msg.id, -32602, "x is required"),
+      callPassed: true,
+      callDetails: "t: invalid params error (acceptable): code -32602",
+      typesPassed: true,
+      typesDetails: "t: tool returned error (content types not applicable): code -32602",
+    },
+    {
+      name: "-32600 Invalid request",
+      call: (msg) => rpcError(msg.id, -32600, "bad request"),
+      callPassed: true,
+      callDetails: "t: invalid params error (acceptable): code -32600",
+      typesPassed: true,
+      typesDetails: "t: tool returned error (content types not applicable): code -32600",
+    },
+    {
+      // Catalog policy: ANY JSON-RPC error passes tools-call, a code other
+      // than -32602 / -32600 noted as a protocol error (prompts-get, by
+      // contrast, fails it). With no result there are no content types to
+      // judge either.
+      name: "-32603: passes as a protocol error",
+      call: (msg) => rpcError(msg.id, -32603, "handler crashed"),
+      callPassed: true,
+      callDetails: "t: protocol error: JSON-RPC error -32603 (handler crashed)",
+      typesPassed: true,
+      typesDetails: "t: tool returned error (content types not applicable): code -32603",
+    },
+    {
+      // tools-call only asks that every item HAS a type; which types are
+      // valid is tools-content-types' check.
+      name: "a content item of an unknown type",
+      call: (msg) => ok(msg.id, { content: [{ type: "video", url: "https://example.com/v.mp4" }] }),
+      callPassed: true,
+      callDetails: "t: returned 1 content item(s)",
+      typesPassed: false,
+      typesDetails: 't: Unknown content type: "video"',
+    },
+    {
+      name: "an empty content array",
+      call: (msg) => ok(msg.id, { content: [] }),
+      callPassed: true,
+      callDetails: "t: returned 0 content item(s)",
+      typesPassed: true,
+      typesDetails: "t: no content items to validate",
+    },
   ];
 
   it.each(cases)("$name", async ({ call, callPassed, callDetails, typesPassed, typesDetails }) => {
@@ -729,6 +776,173 @@ describe("tools/call answered against a stub", () => {
       // One list for both checks; each sends its own call.
       expect(stub.sent.filter((m) => m === "tools/list")).toHaveLength(1);
       expect(stub.sent.filter((m) => m === "tools/call")).toHaveLength(2);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("tools-list-deterministic-order when the repeat calls differ", () => {
+  const tool = (name: string) => ({ name, description: "d", inputSchema: { type: "object" } });
+
+  interface OrderCase {
+    name: string;
+    /** The answer to each tools/list call, in order (the first is the baseline). */
+    calls: Array<(msg: Record<string, any>) => StubReply>;
+    passed: boolean;
+    details: string;
+  }
+
+  const list =
+    (...names: string[]) =>
+    (msg: Record<string, any>) =>
+      ok(msg.id, { tools: names.map(tool) });
+
+  const cases: OrderCase[] = [
+    {
+      // A dynamic tool set is not an order violation: there is no stable
+      // order to compare.
+      name: "a tool added: order not comparable",
+      calls: [list("a", "b"), list("a", "b", "c"), list("a", "b", "c")],
+      passed: true,
+      details: "tool set changed between calls (2 vs 3 tools); order not comparable",
+    },
+    {
+      // The set comparison runs before the order comparison, so a shrunken
+      // and shuffled list is not reported as a shuffle.
+      name: "a tool removed, the rest reordered",
+      calls: [list("a", "b", "c"), list("a", "b", "c"), list("c", "a")],
+      passed: true,
+      details: "tool set changed between calls (3 vs 2 tools); order not comparable",
+    },
+    {
+      name: "a JSON-RPC error on the second call",
+      calls: [list("a", "b"), (msg) => rpcError(msg.id, -32603, "boom")],
+      passed: false,
+      details: "tools/list call 2 returned JSON-RPC error -32603 (boom)",
+    },
+    {
+      name: "no tools array on the third call",
+      calls: [list("a", "b"), list("a", "b"), (msg) => ok(msg.id, {})],
+      passed: false,
+      details: "tools/list call 3 returned no tools array",
+    },
+  ];
+
+  it.each(cases)("$name", async ({ calls, passed, details }) => {
+    let served = 0;
+    const stub = await startListStub(
+      featureRoute({ tools: {} }, (method, msg) => {
+        if (method !== "tools/list") return undefined;
+        const answer = calls[Math.min(served, calls.length - 1)];
+        served++;
+        return answer(msg);
+      }),
+    );
+    try {
+      // tools-list is not in the run, so the baseline is the on-demand fetch.
+      const report = await runModern(stub.url, { only: ["tools-list-deterministic-order"] });
+      expect(resultOf(report, "tools-list-deterministic-order")).toMatchObject({ passed, required: false, details });
+      // A failing repeat call ends the check: no call after it.
+      expect(stub.sent.filter((m) => m === "tools/list")).toHaveLength(calls.length);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+describe("resources/templates/list answered against a stub", () => {
+  const METHOD = "resources/templates/list";
+  const HINTS = `${METHOD}: ttlMs=0 cacheScope="public"`;
+  const notApplicable = (error: string) =>
+    `not applicable: ${METHOD} returned ${error}; no complete result to check caching hints on`;
+
+  interface TemplatesCase {
+    name: string;
+    reply: (msg: Record<string, any>) => StubReply;
+    templatesPassed: boolean;
+    templates: string;
+    cachingPassed: boolean;
+    caching: string;
+    warnings?: string[];
+  }
+
+  const cases: TemplatesCase[] = [
+    {
+      // Templates are optional: an unregistered method is the documented
+      // way not to implement them, and there is nothing to cache.
+      name: "-32601: templates not implemented",
+      reply: (msg) => rpcError(msg.id, -32601, "Method not found"),
+      templatesPassed: true,
+      templates: "Method not supported (acceptable): -32601",
+      cachingPassed: true,
+      caching: notApplicable("JSON-RPC error -32601 (Method not found)"),
+    },
+    {
+      // A broken implementation fails resources-templates; the caching test
+      // skips on any error (onError "skip"), so the one defect is reported once.
+      name: "-32603: fails; caching not applicable",
+      reply: (msg) => rpcError(msg.id, -32603, "boom"),
+      templatesPassed: false,
+      templates: `${METHOD} returned JSON-RPC error -32603 (boom)`,
+      cachingPassed: true,
+      caching: notApplicable("JSON-RPC error -32603 (boom)"),
+    },
+    {
+      name: "an envelope with no result object",
+      reply: (msg) => noResult(msg),
+      templatesPassed: false,
+      templates: `${METHOD}: no result object (HTTP 200)`,
+      cachingPassed: false,
+      caching: `${METHOD}: no result object (HTTP 200)`,
+    },
+    {
+      name: "no resourceTemplates array",
+      reply: (msg) => ok(msg.id, {}),
+      templatesPassed: false,
+      templates: "No resourceTemplates array",
+      cachingPassed: true,
+      caching: HINTS,
+    },
+    {
+      name: "a template with no uriTemplate",
+      reply: (msg) => ok(msg.id, { resourceTemplates: [{ name: "no-template", description: "d" }] }),
+      templatesPassed: false,
+      templates: "Template missing uriTemplate",
+      cachingPassed: true,
+      caching: HINTS,
+    },
+    {
+      name: "a template without {params}: warns",
+      reply: (msg) =>
+        ok(msg.id, { resourceTemplates: [{ uriTemplate: "test://flat", name: "flat", description: "d" }] }),
+      templatesPassed: true,
+      templates: "1 resource template(s)",
+      cachingPassed: true,
+      caching: HINTS,
+      warnings: ['Template "flat" has no URI template parameters (e.g., {id})'],
+    },
+  ];
+
+  it.each(cases)("$name", async ({ reply, templatesPassed, templates, cachingPassed, caching, warnings = [] }) => {
+    const stub = await startListStub(
+      featureRoute({ resources: {} }, (method, msg) => (method === METHOD ? reply(msg) : undefined)),
+    );
+    try {
+      const report = await runModern(stub.url, { only: ["resources-templates", "resources-templates-caching"] });
+      expect(resultOf(report, "resources-templates")).toMatchObject({
+        passed: templatesPassed,
+        required: false,
+        details: templates,
+      });
+      expect(resultOf(report, "resources-templates-caching")).toMatchObject({
+        passed: cachingPassed,
+        required: false,
+        details: caching,
+      });
+      expect(report.warnings.filter((w) => w.startsWith("Template "))).toEqual(warnings);
+      // Both checks read one response.
+      expect(stub.sent.filter((m) => m === METHOD)).toHaveLength(1);
     } finally {
       await stub.close();
     }
@@ -1056,6 +1270,108 @@ describe("resources-not-found against a stub", () => {
       ]);
     } finally {
       await stub.close();
+    }
+  });
+});
+
+// ── The schema checks end to end: each wired to its validator ──
+
+describe("the schema checks against a stub listing the definitions", () => {
+  interface Lists {
+    tools: unknown[];
+    prompts: unknown[];
+    resources: unknown[];
+  }
+
+  /** `--only schema` against a stub declaring all three capabilities and serving `lists`. */
+  async function runSchema(lists: Lists): Promise<Record<string, { passed: boolean; details: string }>> {
+    const stub = await startListStub(
+      featureRoute({ tools: {}, prompts: {}, resources: {} }, (method, msg) => {
+        if (method === "tools/list") return ok(msg.id, { tools: lists.tools });
+        if (method === "prompts/list") return ok(msg.id, { prompts: lists.prompts });
+        if (method === "resources/list") return ok(msg.id, { resources: lists.resources });
+        return undefined;
+      }),
+    );
+    try {
+      const report = await runModern(stub.url, { only: ["schema"] });
+      // One fetch per list for all six checks.
+      for (const method of ["tools/list", "prompts/list", "resources/list"]) {
+        expect(
+          stub.sent.filter((m) => m === method),
+          method,
+        ).toHaveLength(1);
+      }
+      return Object.fromEntries(
+        SCHEMA_IDS.map((id) => {
+          const { passed, details } = resultOf(report, id);
+          return [id, { passed, details }];
+        }),
+      );
+    } finally {
+      await stub.close();
+    }
+  }
+
+  const described = { description: "d" };
+  const objectInput = { inputSchema: { type: "object" } };
+
+  it("each check fails with its own validator's issue, and only that one", async () => {
+    const results = await runSchema({
+      tools: [
+        {
+          name: "a",
+          title: "A",
+          ...described,
+          ...objectInput,
+          annotations: { destructiveHint: "no" },
+          outputSchema: null,
+        },
+        { name: "b", title: 1, ...described, inputSchema: { type: "array" } },
+      ],
+      prompts: [{ name: "p", ...described, arguments: {} }],
+      resources: [{ uri: "not a uri", name: "r", ...described, mimeType: "text/plain" }],
+    });
+    expect(results).toEqual({
+      "tools-schema": { passed: false, details: 'b: inputSchema.type must be "object" (got "array")' },
+      "tools-annotations": { passed: false, details: "a: annotations.destructiveHint should be boolean, got string" },
+      "tools-title-field": { passed: false, details: "b: title should be a string, got number" },
+      "tools-output-schema": { passed: false, details: "a: outputSchema must be a JSON Schema object (got null)" },
+      "prompts-schema": { passed: false, details: "p: arguments must be an array" },
+      "resources-schema": { passed: false, details: "not a uri: invalid URI format" },
+    });
+  });
+
+  it("names the tools missing a title (at most five) when only some have one", async () => {
+    const names = ["t1", "t2", "t3", "t4", "t5", "t6", "t7"];
+    const results = await runSchema({
+      tools: names.map((name, i) => ({ name, ...(i === 0 ? { title: "T1" } : {}), ...described, ...objectInput })),
+      prompts: [{ name: "p", ...described }],
+      resources: [{ uri: "test://r", name: "r", ...described, mimeType: "text/plain" }],
+    });
+    expect(results).toEqual({
+      "tools-schema": { passed: true, details: "All 7 tool(s) have valid schemas" },
+      "tools-annotations": { passed: true, details: "No tools have annotations (optional)" },
+      "tools-title-field": { passed: true, details: "1/7 tool(s) have title field; missing: t2, t3, t4, t5, t6..." },
+      "tools-output-schema": { passed: true, details: "No tools have outputSchema (optional)" },
+      "prompts-schema": { passed: true, details: "All 1 prompt(s) valid" },
+      "resources-schema": { passed: true, details: "All 1 resource(s) valid" },
+    });
+  });
+
+  it("passes a title-less tool list and three declared but empty lists, saying so", async () => {
+    const untitled = await runSchema({
+      tools: [{ name: "t", ...described, ...objectInput }],
+      prompts: [],
+      resources: [],
+    });
+    expect(untitled["tools-title-field"]).toEqual({ passed: true, details: "No tools have title field (optional)" });
+    expect(untitled["prompts-schema"]).toEqual({ passed: true, details: "No prompts to validate" });
+    expect(untitled["resources-schema"]).toEqual({ passed: true, details: "No resources to validate" });
+
+    const empty = await runSchema({ tools: [], prompts: [], resources: [] });
+    for (const id of ["tools-schema", "tools-annotations", "tools-title-field", "tools-output-schema"]) {
+      expect(empty[id], id).toEqual({ passed: true, details: "No tools to validate" });
     }
   });
 });

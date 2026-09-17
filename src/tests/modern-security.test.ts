@@ -4,8 +4,8 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request } from "undici";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { INTERNAL_IP_PATTERNS, STACK_TRACE_PATTERNS } from "../checks/patterns.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { INJECTION_PAYLOADS, INTERNAL_IP_PATTERNS, STACK_TRACE_PATTERNS } from "../checks/patterns.js";
 import { getTestDefinitionMap } from "../definitions/index.js";
 import { createHarness } from "../harness.js";
 import { createModernClient, resultOf as rpcResultOf } from "../modern/client.js";
@@ -193,6 +193,10 @@ interface DirectOptions {
    * never opens TLS itself; it POSTs to the http variant of this URL).
    */
   backendUrl?: string;
+  /** RunOptions.signal, wired to the harness, the client and ctx.signal the way runModernSuite wires it. */
+  signal?: AbortSignal;
+  /** RunOptions.onTestComplete: sees every result the harness emits, including one a later abort never returns. */
+  onTestComplete?: (result: TestResult) => void;
 }
 
 interface DirectRun {
@@ -220,6 +224,8 @@ async function runDirect(opts: DirectOptions): Promise<DirectRun> {
     specBase: specBaseFor(MODERN_SPEC_VERSION),
     transportKind: kind,
     only: opts.only ?? SECURITY_IDS,
+    signal: opts.signal,
+    onTestComplete: opts.onTestComplete,
   });
   const timeout = opts.timeout ?? 5000;
   const client = createModernClient({
@@ -230,6 +236,7 @@ async function runDirect(opts: DirectOptions): Promise<DirectRun> {
     protocolVersion: MODERN_SPEC_VERSION,
     clientCapabilities: { elicitation: {} },
     clientInfo: { name: "mcp-compliance-test", version: "0.0.0" },
+    signal: opts.signal,
   });
   const userHeaders = opts.headers ?? {};
   const ctx: ModernSuiteContext = {
@@ -245,6 +252,7 @@ async function runDirect(opts: DirectOptions): Promise<DirectRun> {
     displayUrl: opts.url ?? "stdio:fixture",
     detection: undefined,
     hasAuth: Object.keys(userHeaders).some((h) => h.toLowerCase() === "authorization"),
+    signal: opts.signal,
     state: { ...createModernState(), supportedVersions: [MODERN_SPEC_VERSION] },
   };
   try {
@@ -866,7 +874,9 @@ describe("modern security suite: clean fixture over stdio (runModern, --only sec
 
   beforeAll(async () => {
     report = await runModern(stdioFixture().target, { only: SECURITY_IDS });
-  });
+    // Whole security-suite runs: more than the 10s default hook timeout
+    // allows on a loaded machine.
+  }, 30_000);
 
   it("passes every transport-agnostic security test", () => {
     expect(passedIds(report, BOTH_TRANSPORT_IDS)).toEqual(allPass(BOTH_TRANSPORT_IDS));
@@ -902,7 +912,9 @@ describe("modern security suite: clean fixture over HTTP (runModern, --only secu
   beforeAll(async () => {
     fixture = await startHttpFixture();
     report = await runModern(fixture.url, { only: SECURITY_IDS });
-  });
+    // Whole security-suite runs: more than the 10s default hook timeout
+    // allows on a loaded machine.
+  }, 30_000);
 
   afterAll(async () => {
     await fixture.stop();
@@ -968,7 +980,9 @@ describe("modern security suite: direct context on the clean fixture", () => {
     fixture = await startHttpFixture();
     http = await runDirect({ url: fixture.url });
     stdio = await runDirect({});
-  });
+    // Whole security-suite runs: more than the 10s default hook timeout
+    // allows on a loaded machine.
+  }, 30_000);
 
   afterAll(async () => {
     await fixture.stop();
@@ -1225,7 +1239,9 @@ describe("knob injection-echo: the injection detectors fire on execution evidenc
     fixture = await startHttpFixture({ breaks: ["injection-echo"] });
     http = await runDirect({ url: fixture.url });
     stdio = await runDirect({ fixture: { breaks: ["injection-echo"] } });
-  });
+    // Whole security-suite runs: more than the 10s default hook timeout
+    // allows on a loaded machine.
+  }, 30_000);
 
   afterAll(async () => {
     await fixture.stop();
@@ -1262,7 +1278,9 @@ describe("knob tool-no-input-schema: security-tool-schema-defined", () => {
     fixture = await startHttpFixture({ breaks: ["tool-no-input-schema"] });
     http = await runDirect({ url: fixture.url });
     stdio = await runDirect({ fixture: { breaks: ["tool-no-input-schema"] } });
-  });
+    // Whole security-suite runs: more than the 10s default hook timeout
+    // allows on a loaded machine.
+  }, 30_000);
 
   afterAll(async () => {
     await fixture.stop();
@@ -1298,7 +1316,9 @@ describe("knobs stacktrace-errors + internal-ip-errors: information disclosure",
     fixture = await startHttpFixture({ breaks });
     http = await runModern(fixture.url, { only: SECURITY_IDS });
     stdio = await runModern(stdioFixture({ breaks }).target, { only: SECURITY_IDS });
-  });
+    // Whole security-suite runs: more than the 10s default hook timeout
+    // allows on a loaded machine.
+  }, 30_000);
 
   afterAll(async () => {
     await fixture.stop();
@@ -1394,9 +1414,27 @@ interface InlineOptions {
    * "strict-400": like strict but the well-formed unknown token also 400s.
    */
   auth?: "strict" | "strict-400";
+  /**
+   * What an `auth` server answers a value outside the b64token grammar
+   * with instead of 400: 500 text/plain, a token parser that throws.
+   */
+  malformedStatus?: 500;
   /** The status an `auth` server answers a request with no Authorization: 401 (default) or 403. */
   unauthenticatedStatus?: 403;
-  cors?: "reflect" | "wildcard" | "none";
+  /**
+   * Any Authorization other than `Bearer tok` on /mcp: never answered
+   * ("hang") or its socket destroyed ("drop"), before any auth parsing.
+   */
+  badCredential?: "hang" | "drop";
+  /**
+   * A request to /mcp without `X-Api-Key: <apiKey>` is answered 401: a
+   * gateway key the server needs next to (not instead of) the bearer token.
+   */
+  apiKey?: string;
+  /** "fixed": every response carries Access-Control-Allow-Origin https://app.example.com. */
+  cors?: "reflect" | "wildcard" | "none" | "fixed";
+  /** "drop": the OPTIONS preflight's socket is destroyed; everything else is served. */
+  preflight?: "drop";
   /**
    * Where Protected Resource Metadata lives. "header": only at /oauth/prm,
    * advertised through WWW-Authenticate. "header-mismatch": the same, but
@@ -1475,8 +1513,28 @@ interface InlineOptions {
     | "none";
   /** Delay every tools/call answer by this many ms. */
   slowToolsCall?: number;
-  /** Destroy the socket on tools/call instead of answering. */
-  dropOnToolsCall?: boolean;
+  /**
+   * Destroy the socket on tools/call instead of answering: every call
+   * (true), or only a call whose raw body matches (a WAF or IPS dropping
+   * attack payloads while the server stays up).
+   */
+  dropOnToolsCall?: boolean | RegExp;
+  /**
+   * What the server does once it has dropped a tools/call: "die" stops
+   * listening (the process crashed, the next connection is refused);
+   * "bad-gateway" answers every later /mcp request with an HTML 502 (a
+   * proxy whose backend went away); "blocked" answers every later /mcp
+   * request with an HTML 403 (a WAF or IPS that blocks a client after an
+   * attack payload, the server behind it still up); "hang" never answers a
+   * later /mcp request.
+   */
+  afterDrop?: "die" | "bad-gateway" | "blocked" | "hang";
+  /**
+   * The answer to every tools/call: a -32602 naming the unknown argument
+   * ("rpc-error"), an HTTP 500 carrying a JSON-RPC error, or a 200 envelope
+   * with neither result nor error ("no-result").
+   */
+  toolsCallAnswer?: "rpc-error" | 500 | "no-result";
   /**
    * Stop listening once this many tools/call have been answered (the
    * answer carries Connection: close so the next call opens a new
@@ -1496,9 +1554,10 @@ interface InlineOptions {
   /**
    * The same for any request carrying an Origin header (the OPTIONS
    * preflight included). "drop-preflight": the OPTIONS preflight is dropped
-   * and the POST left hanging.
+   * and the POST left hanging. 400 / 302: answered with that status (a 302
+   * to /login) and no body.
    */
-  foreignOrigin?: "hang" | "drop" | "drop-preflight";
+  foreignOrigin?: "hang" | "drop" | "drop-preflight" | 400 | 302;
   /**
    * The answer to a request whose query string carries access_token (the
    * security-token-in-uri probe). Default: the token there is ignored and
@@ -1508,9 +1567,11 @@ interface InlineOptions {
    * error that carries no id. "json-error": HTTP 200 application/json with
    * a JSON-RPC error. "mislabeled-json-error": that JSON error body under
    * Content-Type text/event-stream. 404: an HTTP 404. "hang" / "drop": as
-   * for `unauthenticated`.
+   * for `unauthenticated`. "accept": `access_token=tok` counts as the
+   * `Bearer tok` credential of an `auth` server.
    */
   queryToken?:
+    | "accept"
     | "sse-error"
     | "sse-error-no-id"
     | "sse-result"
@@ -1771,6 +1832,8 @@ function sseFrame(message: unknown): string {
 }
 
 function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
+  /** Set once a tools/call was dropped under afterDrop "bad-gateway", "blocked" or "hang". */
+  let backendDown: "bad-gateway" | "blocked" | "hang" | null = null;
   let posts = 0;
   let unauthenticatedSeen = 0;
   let toolCalls = 0;
@@ -1846,6 +1909,7 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         cors["Access-Control-Allow-Credentials"] = "true";
       }
       if (opts.cors === "wildcard") cors["Access-Control-Allow-Origin"] = "*";
+      if (opts.cors === "fixed") cors["Access-Control-Allow-Origin"] = "https://app.example.com";
       const json = (status: number, obj: unknown, extra: Record<string, string> = {}) => {
         res.writeHead(status, { "Content-Type": "application/json", ...cors, ...extra });
         res.end(JSON.stringify(obj));
@@ -1889,15 +1953,23 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         res.writeHead(404);
         return res.end();
       }
+      if (backendDown === "bad-gateway") return html(502, "<html><body>502 Bad Gateway</body></html>");
+      if (backendDown === "blocked") return html(403, "<html><body>Request blocked</body></html>");
+      if (backendDown === "hang") return;
       // "hang" leaves the request pending until close() destroys the
       // connection; "drop" closes the accepted connection without a byte
       // of response, which undici reports as "other side closed".
       const silence = (how: "hang" | "drop") => (how === "drop" ? req.socket.destroy() : undefined);
       if (opts.foreignOrigin && typeof origin === "string") {
+        if (typeof opts.foreignOrigin === "number") {
+          res.writeHead(opts.foreignOrigin, opts.foreignOrigin === 302 ? { Location: "/login" } : {});
+          return res.end();
+        }
         if (opts.foreignOrigin !== "drop-preflight") return silence(opts.foreignOrigin);
         return silence(req.method === "OPTIONS" ? "drop" : "hang");
       }
       if (req.method === "OPTIONS") {
+        if (opts.preflight === "drop") return silence("drop");
         res.writeHead(204, cors);
         return res.end();
       }
@@ -1905,6 +1977,12 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         unauthenticatedSeen++;
         if (opts.unauthenticated !== "drop-after-first") return silence(opts.unauthenticated);
         if (unauthenticatedSeen > 1) return silence("drop");
+      }
+      if (opts.badCredential && req.headers.authorization && req.headers.authorization !== "Bearer tok") {
+        return silence(opts.badCredential);
+      }
+      if (opts.apiKey && req.headers["x-api-key"] !== opts.apiKey) {
+        return json(401, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Missing API key" } });
       }
       if (opts.queryToken && url.searchParams.has("access_token")) {
         const id = (() => {
@@ -1949,7 +2027,8 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         }
       }
       if (opts.auth) {
-        const authz = req.headers.authorization;
+        const queryCredential = opts.queryToken === "accept" && url.searchParams.get("access_token") === "tok";
+        const authz = req.headers.authorization ?? (queryCredential ? "Bearer tok" : undefined);
         const rejection = { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Unauthorized" } };
         if (!authz) {
           // A 403 carries no challenge: there is no scheme to negotiate.
@@ -1962,6 +2041,10 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
             return json(401, rejection, {
               "WWW-Authenticate": `Bearer error="invalid_token", ${challengeFor(prmUrl).replace(/^Bearer /, "")}`,
             });
+          }
+          if (!wellFormed && opts.malformedStatus === 500) {
+            res.writeHead(500, { "Content-Type": "text/plain" });
+            return res.end("Internal Server Error");
           }
           return json(400, rejection, { "WWW-Authenticate": 'Bearer error="invalid_request"' });
         }
@@ -2053,7 +2136,30 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         case "tools/call": {
           const name = String(msg?.params?.name);
           const args = (msg?.params?.arguments ?? {}) as Record<string, unknown>;
-          if (opts.dropOnToolsCall) return req.socket.destroy();
+          if (
+            opts.dropOnToolsCall === true ||
+            (opts.dropOnToolsCall instanceof RegExp && opts.dropOnToolsCall.test(body.toString("utf8")))
+          ) {
+            if (opts.afterDrop === "bad-gateway" || opts.afterDrop === "blocked" || opts.afterDrop === "hang") {
+              backendDown = opts.afterDrop;
+            }
+            if (opts.afterDrop === "die") {
+              server.close();
+              server.closeAllConnections?.();
+            }
+            return req.socket.destroy();
+          }
+          if (opts.toolsCallAnswer === "rpc-error") {
+            return error(-32602, "Invalid params: unknown argument __injected_param__");
+          }
+          if (opts.toolsCallAnswer === 500) {
+            return json(500, {
+              jsonrpc: "2.0",
+              id: msg?.id ?? null,
+              error: { code: -32603, message: "Internal error" },
+            });
+          }
+          if (opts.toolsCallAnswer === "no-result") return json(200, { jsonrpc: "2.0", id: msg?.id ?? null });
           if (opts.dieAfterToolsCalls !== undefined && toolCalls >= opts.dieAfterToolsCalls) {
             // Answer this call on a connection the client will not reuse,
             // then stop listening: the next call dials afresh and is refused.
@@ -3093,14 +3199,26 @@ describe("security-tls-required over an https URL: the plaintext probe", () => {
 // Injection payloads that take the server down. A server that goes away on
 // a payload fails naming it (the same crash security-extra-params fails as
 // "died"); one that was already gone stops the probe as unreachable; a
-// payload that merely times out stays "never reached", inconclusive.
+// payload that merely times out stays "never reached", inconclusive. On
+// HTTP a dropped connection is a crash only when a follow-up
+// server/discover is neither served nor refused by a transport-level gate:
+// a WAF or IPS drops attack payloads at the connection level (and may then
+// block the client) while the server stays up.
 // ---------------------------------------------------------------------------
 
 describe("inline servers: injection payloads that take the server down", () => {
   const CMD = "security-command-injection";
   const SQL = "security-sql-injection";
+  const DROP_WARNING =
+    "security injection tests: a tools/call to sink.data carrying a payload had its connection closed without a response, but the server still served a follow-up server/discover, so the payload is counted as never reaching the tool, not as a crash (a WAF or IPS dropping the request, or a keep-alive connection closed as it was sent). Refuse a payload with HTTP 4xx or a JSON-RPC error so a client can tell a refusal from a crash.";
   const servers: InlineServer[] = [];
   let dropped: DirectRun;
+  let waf: DirectRun;
+  let wafServer: InlineServer;
+  let droppedThenGone: DirectRun;
+  let droppedThenBadGateway: DirectRun;
+  let droppedThenBlocked: DirectRun;
+  let blockedServer: InlineServer;
   let slow: DirectRun;
   let goneMidRun: DirectRun;
   let goneAfterIssue: DirectRun;
@@ -3114,8 +3232,16 @@ describe("inline servers: injection payloads that take the server down", () => {
     goneServer = await startInlineServer({ dieAfterToolsCalls: 1 });
     // Answers the first payload with id(1) output, then stops listening.
     const c = await startInlineServer({ dieAfterToolsCalls: 1, dieReply: "uid=0(root) gid=0(root)" });
-    servers.push(a, b, goneServer, c);
+    wafServer = await startInlineServer({ dropOnToolsCall: /etc\/passwd|DROP TABLE|UNION SELECT/ });
+    const d = await startInlineServer({ dropOnToolsCall: true, afterDrop: "die" });
+    const e = await startInlineServer({ dropOnToolsCall: true, afterDrop: "bad-gateway" });
+    blockedServer = await startInlineServer({ dropOnToolsCall: true, afterDrop: "blocked" });
+    servers.push(a, b, goneServer, c, wafServer, d, e, blockedServer);
     dropped = await runDirect({ url: a.url, only: [CMD] });
+    waf = await runDirect({ url: wafServer.url, only: [CMD, SQL] });
+    droppedThenGone = await runDirect({ url: d.url, only: [CMD] });
+    droppedThenBadGateway = await runDirect({ url: e.url, only: [CMD] });
+    droppedThenBlocked = await runDirect({ url: blockedServer.url, only: [CMD] });
     slow = await runDirect({ url: b.url, only: [CMD], timeout: 300 });
     goneMidRun = await runDirect({ url: goneServer.url, only: [CMD] });
     goneAfterIssue = await runDirect({ url: c.url, only: [CMD] });
@@ -3149,15 +3275,74 @@ describe("inline servers: injection payloads that take the server down", () => {
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
-  it("an HTTP connection dropped on a payload fails naming the payload, as a possible crash", () => {
-    // Before: the throw counted as "never reached the tool" and, with
-    // every payload dropped, the test passed as inconclusive.
-    expect(verdicts(dropped.tests, [CMD])).toEqual({
-      [CMD]:
-        'FAIL: connection dropped on payload "; cat /etc/passwd" sent to sink.data: other side closed (server may have crashed)',
-    });
-    expect(dropped.warnings.filter((w) => w.startsWith("security injection"))).toEqual([]);
+  it("a WAF that drops only the attack payloads is not a crash: the drops never reached the tool, the rest are counted", () => {
+    // Before: FAIL 'connection dropped on payload "; cat /etc/passwd" sent
+    // to sink.data: other side closed (server may have crashed)', and the
+    // same for SQL, on a server that answered every other request.
+    expect(verdicts(waf.tests, [CMD, SQL])).toEqual({ [CMD]: "pass", [SQL]: "pass" });
+    expect(detailsOf(waf.tests, CMD)).toBe(
+      `Tested 5 payload(s) against sink.data: 0 rejected, 4 returned without evidence of execution, 1 ${UNREACHED}`,
+    );
+    expect(detailsOf(waf.tests, SQL)).toBe(
+      `Tested 3 payload(s) against sink.data: 0 rejected, 1 returned without evidence of execution, 2 ${UNREACHED}`,
+    );
+    // Every payload was sent once: a drop is followed by server/discover, not a resend.
+    expect(wafServer.calls.map((c) => c.args.data)).toEqual([...INJECTION_PAYLOADS.command, ...INJECTION_PAYLOADS.sql]);
+    // One follow-up discover per drop (3), after the seed discover.
+    expect(waf.recorder.sent.filter((m) => m.method === "server/discover")).toHaveLength(4);
+    expect(waf.warnings.filter((w) => w.startsWith("security injection"))).toEqual([DROP_WARNING]);
+  });
+
+  it("a server that drops every tools/call but keeps serving server/discover is inconclusive, not crashed", () => {
+    // Before this fix: FAIL 'connection dropped on payload ... (server may
+    // have crashed)'. Nothing reached the tool, so the all-unreached warning
+    // applies as for an all-timeout run.
+    expect(verdicts(dropped.tests, [CMD])).toEqual({ [CMD]: "pass" });
+    expect(detailsOf(dropped.tests, CMD)).toBe(
+      `Tested 5 payload(s) against sink.data: 0 rejected, 0 returned without evidence of execution, 5 ${UNREACHED} -- inconclusive (see warning)`,
+    );
+    expect(dropped.warnings.filter((w) => w.startsWith("security injection"))).toEqual([
+      DROP_WARNING,
+      "security injection tests: no payload sent to sink.data reached the tool (every tools/call drew a JSON-RPC or transport error), so the verdict is inconclusive; check that the placeholder arguments satisfy the tool's schema, or expose a read-only tool with a free-form string argument.",
+    ]);
     expectAsciiDetails(dropped.tests, [CMD]);
+  });
+
+  it("an HTTP connection dropped on a payload fails as a possible crash when server/discover is not served after it", () => {
+    // Stopped listening: the follow-up connection is refused.
+    expect(verdicts(droppedThenGone.tests, [CMD])[CMD]).toMatch(
+      /^FAIL: connection dropped on payload "; cat \/etc\/passwd" sent to sink\.data: other side closed; server\/discover then got no response \(connection failed: connect ECONNREFUSED 127\.0\.0\.1:\d+\) \(server may have crashed\)$/,
+    );
+    // A proxy whose backend went away: an answer, but not a served discover.
+    expect(verdicts(droppedThenBadGateway.tests, [CMD])).toEqual({
+      [CMD]:
+        'FAIL: connection dropped on payload "; cat /etc/passwd" sent to sink.data: other side closed; server/discover then answered HTTP 502, non-JSON-RPC body (server may have crashed)',
+    });
+    for (const run of [droppedThenGone, droppedThenBadGateway]) {
+      expect(run.warnings.filter((w) => w.startsWith("security injection"))).toEqual([]);
+      expectAsciiDetails(run.tests, [CMD]);
+    }
+  });
+
+  it("a drop followed by a gate refusing server/discover (a WAF blocking the client with 403) is not a crash", () => {
+    // Before: FAIL 'connection dropped on payload "; cat /etc/passwd" sent to
+    // sink.data: other side closed; server/discover then answered HTTP 403,
+    // non-JSON-RPC body (server may have crashed)'. A 403 is an answer from
+    // something still up; every later payload meets the same 403, so
+    // nothing reached the tool and the run is inconclusive, not failed.
+    expect(verdicts(droppedThenBlocked.tests, [CMD])).toEqual({ [CMD]: "pass" });
+    expect(detailsOf(droppedThenBlocked.tests, CMD)).toBe(
+      `Tested 5 payload(s) against sink.data: 0 rejected, 0 returned without evidence of execution, 5 ${UNREACHED} -- inconclusive (see warning)`,
+    );
+    expect(droppedThenBlocked.warnings.filter((w) => w.startsWith("security injection"))).toEqual([
+      "security injection tests: a tools/call to sink.data carrying a payload had its connection closed without a response, but a follow-up server/discover was still answered (HTTP 403, an auth gate), so the payload is counted as never reaching the tool, not as a crash (a WAF or IPS dropping the request, or a keep-alive connection closed as it was sent). Refuse a payload with HTTP 4xx or a JSON-RPC error so a client can tell a refusal from a crash.",
+      "security injection tests: no payload sent to sink.data reached the tool (every tools/call drew a JSON-RPC or transport error), so the verdict is inconclusive; check that the placeholder arguments satisfy the tool's schema, or expose a read-only tool with a free-form string argument.",
+    ]);
+    // Only the first payload reached the server's tools/call handler, and
+    // only it was followed by a discover: the rest were answered 403.
+    expect(blockedServer.calls).toHaveLength(1);
+    expect(droppedThenBlocked.recorder.sent.filter((m) => m.method === "server/discover")).toHaveLength(2);
+    expectAsciiDetails(droppedThenBlocked.tests, [CMD]);
   });
 
   it("a stdio child that exits on a payload fails as died; the next test finds it gone and is unreachable", () => {
@@ -3427,9 +3612,12 @@ describe("inline servers: the WWW-Authenticate challenge on the unauthenticated 
 
 describe("stdio servers: an oversized reply the runner drops, and a child that dies on the 1 MB argument", () => {
   const ID = "security-oversized-input";
+  const INJECTION = "security-command-injection";
   let dir = "";
   let dropped: DirectRun;
   let died: DirectRun;
+  let earlierDrop: DirectRun;
+  let spoofed: DirectRun;
 
   /** A stdio server exposing one read-only `data` tool, with `onCall` lines deciding what tools/call does. */
   const stdioScript = (name: string, tool: string, onCall: string[]) => {
@@ -3467,9 +3655,30 @@ describe("stdio servers: an oversized reply the runner drops, and a child that d
       "  }",
     ]);
     const exitOnCall = stdioScript("exit-on-call.mjs", "boom", ['  if (msg.method === "tools/call") process.exit(3);']);
+    // Answers the FIRST tools/call (a command-injection payload) with a
+    // ~2 MB reply the runner drops, the other payloads with a short
+    // result, and never answers the 1 MB call at all.
+    const staleDrop = stdioScript("stale-drop.mjs", "slow", [
+      '  if (msg.method === "tools/call") {',
+      '    const data = String(msg.params?.arguments?.data ?? "");',
+      "    if (data.length >= 1000000) return;",
+      '    if (!globalThis.padded) { globalThis.padded = true; return result({ content: [{ type: "text", text: "x".repeat(2000000) }] }); }',
+      '    return result({ content: [{ type: "text", text: "ok" }] });',
+      "  }",
+    ]);
+    // Never answers the 1 MB call, but writes the runner's own drop marker
+    // to its stderr first.
+    const markerOnStderr = stdioScript("marker-on-stderr.mjs", "slow", [
+      '  if (msg.method === "tools/call") {',
+      '    process.stderr.write("[mcp-compliance] stdout buffer exceeded 1048576 bytes without a newline; discarding buffered data\\n");',
+      "    return;",
+      "  }",
+    ]);
     dropped = await runDirect({ command: echoTwice, only: [ID] });
     died = await runDirect({ command: exitOnCall, only: [ID] });
-  }, 30_000);
+    earlierDrop = await runDirect({ command: staleDrop, only: [INJECTION, ID], timeout: 2000 });
+    spoofed = await runDirect({ command: markerOnStderr, only: [ID], timeout: 2000 });
+  }, 60_000);
 
   afterAll(() => {
     if (dir) rmSync(dir, { recursive: true, force: true });
@@ -3490,6 +3699,25 @@ describe("stdio servers: an oversized reply the runner drops, and a child that d
     expect(verdicts(died.tests, [ID])[ID]).toMatch(/^FAIL: server died on a 1 MB boom\.data: .*exit code 3/);
     expect(died.warnings.filter((w) => w.startsWith("security-oversized-input:"))).toEqual([]);
     expectAsciiDetails(died.tests, [ID]);
+  });
+
+  it("a reply dropped earlier in the run does not turn a later 1 MB timeout into survived", () => {
+    // The earlier drop happened: the first injection payload's reply never arrived.
+    expect(detailsOf(earlierDrop.tests, INJECTION)).toContain(
+      "0 rejected, 4 returned without evidence of execution, 1 never reached the tool",
+    );
+    // The 1 MB call itself drew nothing within the timeout: that is the verdict.
+    expect(verdicts(earlierDrop.tests, [ID])).toEqual({
+      [ID]: "FAIL: Request timed out -- server may be struggling with a 1 MB slow.data",
+    });
+    expect(earlierDrop.warnings.filter((w) => w.startsWith("security-oversized-input:"))).toEqual([]);
+  });
+
+  it("the drop marker written by the child on its own stderr is not a dropped reply", () => {
+    expect(verdicts(spoofed.tests, [ID])).toEqual({
+      [ID]: "FAIL: Request timed out -- server may be struggling with a 1 MB slow.data",
+    });
+    expect(spoofed.warnings.filter((w) => w.startsWith("security-oversized-input:"))).toEqual([]);
   });
 });
 
@@ -3814,5 +4042,299 @@ describe("inline servers: a PRM candidate that is not a usable document", () => 
     expect(rootServer.urls.filter((u) => u.includes("oauth-protected-resource"))).toEqual([
       "/.well-known/oauth-protected-resource",
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// security-auth-malformed reads a probe that got no HTTP answer the way
+// every other negative probe does (unansweredProbe), and fails a status
+// that is neither an acceptance nor a rejection.
+// ---------------------------------------------------------------------------
+
+describe("inline servers: security-auth-malformed when a bad credential draws a 5xx or no answer at all", () => {
+  const ID = "security-auth-malformed";
+  const AUTH = { Authorization: "Bearer tok" };
+  const servers: InlineServer[] = [];
+  let crashed: DirectRun;
+  let dropped: DirectRun;
+  let droppedUnserved: DirectRun;
+  let hung: DirectRun;
+
+  beforeAll(async () => {
+    // A strict parser that throws (500) on a value outside the b64token grammar.
+    const a = await startInlineServer({ auth: "strict", malformedStatus: 500 });
+    // Every credential other than the configured one is dropped at the connection.
+    const b = await startInlineServer({ badCredential: "drop" });
+    // The same drop, but the credentialed setup discover drew a JSON-RPC error.
+    const c = await startInlineServer({ badCredential: "drop", discover: "error" });
+    // Every credential other than the configured one is left hanging.
+    const d = await startInlineServer({ badCredential: "hang" });
+    servers.push(a, b, c, d);
+    crashed = await runDirect({ url: a.url, headers: AUTH, only: [ID] });
+    dropped = await runDirect({ url: b.url, headers: AUTH, only: [ID] });
+    droppedUnserved = await runDirect({ url: c.url, headers: AUTH, only: [ID] });
+    hung = await runDirect({ url: d.url, headers: AUTH, only: [ID], timeout: 800 });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("a 500 on the malformed credential fails: only 400, 401 or 403 answers it", () => {
+    expect(verdicts(crashed.tests, [ID])).toEqual({
+      [ID]: "FAIL: malformed credential: HTTP 500, non-JSON-RPC body -- expected 400 or 401",
+    });
+  });
+
+  it("a connection dropped on both bad credentials passes as rejected when the valid credential was served", () => {
+    expect(verdicts(dropped.tests, [ID])).toEqual({ [ID]: "pass" });
+    expect(detailsOf(dropped.tests, ID)).toBe(
+      "well-formed invalid token: connection rejected; malformed credential: connection rejected",
+    );
+  });
+
+  it("the same drop without a served credentialed discover explains nothing: unreachable", () => {
+    expect(droppedUnserved.toolCount).toBe(0);
+    expect(verdicts(droppedUnserved.tests, [ID])).toEqual({
+      [ID]: "FAIL: server unreachable: server/discover with a well-formed invalid token got no response (connection closed: other side closed)",
+    });
+  });
+
+  it("a hang on the bad credentials is unreachable, not 'connection rejected'", () => {
+    // Before: both probes that timed out were "connection rejected" and the check passed.
+    expect(verdicts(hung.tests, [ID])).toEqual({
+      [ID]: "FAIL: server unreachable: server/discover with a well-formed invalid token got no response within 800ms",
+    });
+    for (const run of [crashed, dropped, droppedUnserved, hung]) expectAsciiDetails(run.tests, [ID]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A caller's abort while an auth probe is in flight is the abort, recorded
+// by the harness as such -- not a verdict about the server.
+// ---------------------------------------------------------------------------
+
+describe("inline servers: an abort during an auth probe is rethrown, not graded", () => {
+  const AUTH = { Authorization: "Bearer tok" };
+  const servers: InlineServer[] = [];
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  /**
+   * Run `id` alone against `server`, abort once the server has received
+   * `requests` requests (the setup discover, then the probe it holds open),
+   * and return every result the harness emitted.
+   */
+  const abortDuring = async (server: InlineServer, id: string, requests: number) => {
+    const controller = new AbortController();
+    const completed: TestResult[] = [];
+    const run = runDirect({
+      url: server.url,
+      headers: AUTH,
+      only: [id],
+      // Far past the abort, so the held probe cannot time out first on a loaded machine.
+      timeout: 30_000,
+      signal: controller.signal,
+      onTestComplete: (r) => completed.push(r),
+    });
+    const rejected = expect(run).rejects.toThrow("user abort");
+    await vi.waitFor(() => expect(server.urls.length).toBeGreaterThanOrEqual(requests), {
+      timeout: 20_000,
+      interval: 10,
+    });
+    controller.abort(new Error("user abort"));
+    await rejected;
+    return completed.map((r) => [r.id, r.passed, r.details]);
+  };
+
+  it("security-auth-required: the held unauthenticated discover is not graded as unreachable", async () => {
+    const server = await startInlineServer({ unauthenticated: "hang", tools: "none" });
+    servers.push(server);
+    expect(await abortDuring(server, "security-auth-required", 2)).toEqual([
+      ["security-auth-required", false, "Error: user abort"],
+    ]);
+  }, 60_000);
+
+  it("security-command-injection: an abort during the server/discover that follows a dropped payload is not graded as a crash", async () => {
+    // The setup discover, tools/list, the dropped payload, then the held
+    // follow-up discover.
+    const server = await startInlineServer({ dropOnToolsCall: true, afterDrop: "hang" });
+    servers.push(server);
+    expect(await abortDuring(server, "security-command-injection", 4)).toEqual([
+      ["security-command-injection", false, "Error: user abort"],
+    ]);
+  }, 60_000);
+
+  it("security-auth-malformed: the held invalid-token probe is not graded as 'connection rejected'", async () => {
+    // Before: both probes came back null and the check emitted a PASS
+    // ("well-formed invalid token: connection rejected; ...") before the
+    // harness gate rethrew the abort.
+    const server = await startInlineServer({ badCredential: "hang", tools: "none" });
+    servers.push(server);
+    expect(await abortDuring(server, "security-auth-malformed", 2)).toEqual([
+      ["security-auth-malformed", false, "Error: user abort"],
+    ]);
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// security-extra-params reads the answer: a 5xx fails even with a JSON-RPC
+// error body, a JSON-RPC error passes as rejected, an empty envelope fails.
+// Both unknown arguments must reach the wire for the probe to mean anything.
+// ---------------------------------------------------------------------------
+
+describe("inline servers: extra-params on a 5xx, a JSON-RPC error and an empty envelope", () => {
+  const ID = "security-extra-params";
+  const servers: InlineServer[] = [];
+  let serverError: DirectRun;
+  let rejected: DirectRun;
+  let empty: DirectRun;
+
+  beforeAll(async () => {
+    const a = await startInlineServer({ toolsCallAnswer: 500 });
+    const b = await startInlineServer({ toolsCallAnswer: "rpc-error" });
+    const c = await startInlineServer({ toolsCallAnswer: "no-result" });
+    servers.push(a, b, c);
+    serverError = await runDirect({ url: a.url, only: [ID] });
+    rejected = await runDirect({ url: b.url, only: [ID] });
+    empty = await runDirect({ url: c.url, only: [ID] });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("an HTTP 5xx fails even when its body carries a JSON-RPC error", () => {
+    expect(verdicts(serverError.tests, [ID])).toEqual({
+      [ID]: "FAIL: HTTP 500 -- server error on unknown tool arguments",
+    });
+  });
+
+  it("a JSON-RPC error passes as rejected, naming its code and message", () => {
+    expect(verdicts(rejected.tests, [ID])).toEqual({ [ID]: "pass" });
+    expect(detailsOf(rejected.tests, ID)).toBe(
+      "Extra params rejected with error: -32602 -- Invalid params: unknown argument __injected_param__",
+    );
+  });
+
+  it("an answer with neither result nor error fails as malformed", () => {
+    expect(verdicts(empty.tests, [ID])).toEqual({
+      [ID]: "FAIL: malformed response to unknown tool arguments (HTTP 200, no result or error)",
+    });
+    for (const run of [serverError, rejected, empty]) expectAsciiDetails(run.tests, [ID]);
+  });
+
+  it("sends both unknown arguments, __proto__ as an own key rather than a prototype", () => {
+    for (const server of servers) {
+      expect(server.calls.map((c) => c.name)).toEqual(["sink"]);
+      const args = server.calls[0].args;
+      expect(Object.keys(args)).toEqual(["__injected_param__", "__proto__"]);
+      expect(args.__injected_param__).toBe("malicious_value");
+      expect(Object.getOwnPropertyDescriptor(args, "__proto__")?.value).toEqual({ admin: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// security-cors-headers on a correctly restricted grant and a failed
+// preflight; security-origin-validation on a foreign Origin answered with a
+// 4xx other than 403 or with a redirect.
+// ---------------------------------------------------------------------------
+
+describe("inline servers: a fixed CORS grant, a failed preflight, and Origin answers other than 401/403", () => {
+  const CORS = "security-cors-headers";
+  const ORIGIN = "security-origin-validation";
+  const servers: InlineServer[] = [];
+  let fixed: DirectRun;
+  let noPreflight: DirectRun;
+  let origin400: DirectRun;
+  let origin302: DirectRun;
+
+  beforeAll(async () => {
+    const a = await startInlineServer({ cors: "fixed" });
+    const b = await startInlineServer({ preflight: "drop" });
+    const c = await startInlineServer({ foreignOrigin: 400 });
+    const d = await startInlineServer({ foreignOrigin: 302 });
+    servers.push(a, b, c, d);
+    fixed = await runDirect({ url: a.url, only: [CORS] });
+    noPreflight = await runDirect({ url: b.url, only: [CORS] });
+    origin400 = await runDirect({ url: c.url, only: [ORIGIN] });
+    origin302 = await runDirect({ url: d.url, only: [ORIGIN] });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("an Allow-Origin naming one trusted origin passes as restricted, listing what each probe saw", () => {
+    expect(verdicts(fixed.tests, [CORS])).toEqual({ [CORS]: "pass" });
+    expect(detailsOf(fixed.tests, CORS)).toBe(
+      "CORS restricted to: https://app.example.com (OPTIONS HTTP 204 ACAO=https://app.example.com, POST HTTP 200 ACAO=https://app.example.com)",
+    );
+  });
+
+  it("a preflight that fails next to a served POST is noted, and the POST's headers decide", () => {
+    expect(verdicts(noPreflight.tests, [CORS])).toEqual({ [CORS]: "pass" });
+    expect(detailsOf(noPreflight.tests, CORS)).toBe(
+      "No CORS headers returned (OPTIONS failed, POST HTTP 200; server-to-server only, acceptable)",
+    );
+  });
+
+  it("a foreign Origin answered 400 passes as rejected; answered with a redirect it fails", () => {
+    expect(verdicts(origin400.tests, [ORIGIN])).toEqual({ [ORIGIN]: "pass" });
+    expect(detailsOf(origin400.tests, ORIGIN)).toBe("HTTP 400 (suspicious Origin rejected)");
+    expect(verdicts(origin302.tests, [ORIGIN])).toEqual({ [ORIGIN]: "FAIL: HTTP 302" });
+    for (const run of [fixed, noPreflight]) expectAsciiDetails(run.tests, [CORS]);
+    for (const run of [origin400, origin302]) expectAsciiDetails(run.tests, [ORIGIN]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// security-token-in-uri moves only the token: every other configured header
+// stays on the query-string probe, so a server that also needs one of them
+// does not answer 401 for the missing header and mask an accepted token.
+// ---------------------------------------------------------------------------
+
+describe("inline servers: the query-string token probe keeps the other configured headers", () => {
+  const ID = "security-token-in-uri";
+  let server: InlineServer;
+  let run: DirectRun;
+
+  beforeAll(async () => {
+    // Needs X-Api-Key on every request and takes the bearer token from the
+    // Authorization header or from ?access_token alike.
+    server = await startInlineServer({ auth: "strict", queryToken: "accept", apiKey: "k" });
+    run = await runDirect({
+      url: server.url,
+      headers: { Authorization: "Bearer tok", "X-Api-Key": "k" },
+      only: [ID],
+    });
+  }, 30_000);
+
+  afterAll(async () => {
+    await server.close();
+  });
+
+  it("fails a server that accepts the token in the query string when the other header rides along", () => {
+    expect(verdicts(run.tests, [ID])).toEqual({
+      [ID]: "FAIL: HTTP 200, result -- server accepted the auth token in the query string (MUST NOT)",
+    });
+    expect(server.urls.filter((u) => u.includes("access_token"))).toEqual(["/mcp?access_token=tok"]);
+  });
+
+  it("fixture contract: the query-string token is served with the key and answered 401 without it", async () => {
+    const post = async (headers: Record<string, string>) => {
+      const res = await request(`${server.url}?access_token=tok`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "server/discover", params: {} }),
+      });
+      await res.body.text();
+      return res.statusCode;
+    };
+    expect(await post({ "X-Api-Key": "k" })).toBe(200);
+    expect(await post({})).toBe(401);
   });
 });

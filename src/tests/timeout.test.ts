@@ -85,6 +85,58 @@ function startSlowServer(
 
 const startSlowModernServer = (firstDelayMs: number) => startSlowServer(firstDelayMs, "modern");
 
+/**
+ * A 2025-11-25 server that never answers a request it does not know: the
+ * shape of a Streamable HTTP bridge in front of a stdio server that
+ * ignores unknown methods. `server/discover` (the preflight and the era
+ * re-probe) is held open with no reply; `initialize` and `ping` are
+ * answered at once and notifications get 202. Records every method.
+ */
+function startDiscoverIgnoringServer(): Promise<{ server: Server; url: string; methods: string[] }> {
+  const methods: string[] = [];
+  const server = createServer((req: IncomingMessage, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (c: string) => {
+      body += c;
+    });
+    req.on("end", () => {
+      let msg: { id?: unknown; method?: unknown } = {};
+      try {
+        msg = JSON.parse(body);
+      } catch {}
+      const method = typeof msg.method === "string" ? msg.method : "";
+      methods.push(method);
+      if (msg.id === undefined) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      let result: Record<string, unknown>;
+      if (method === "initialize") {
+        result = {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          serverInfo: { name: "ignores-discover", version: "1" },
+        };
+      } else if (method === "ping") {
+        result = {};
+      } else {
+        return; // held open: never answered
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = addr && typeof addr === "object" ? addr.port : 0;
+      resolve({ server, url: `http://127.0.0.1:${port}/mcp`, methods });
+    });
+  });
+}
+
 function closeServer(server: Server): Promise<void> {
   return new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
 }
@@ -362,6 +414,44 @@ describe("timeout handling", () => {
       );
     } finally {
       await closeServer(slow.server);
+    }
+  }, 20000);
+
+  it("auto: a server that never answers server/discover but serves initialize settles the warning, saying the era defaulted and how to skip the re-probe", async () => {
+    // Missed the preflight AND the re-probe, then answered the handshake
+    // (bounded by `timeout`). The settled warning used to blame only a slow
+    // cold start and send the user to raise both timeouts, which for this
+    // server only lengthens the wait, and never said the grade is 2025-11-25
+    // by default rather than by detection.
+    const srv = await startDiscoverIgnoringServer();
+    try {
+      const report = await runComplianceSuite(srv.url, {
+        timeout: 3000,
+        preflightTimeout: 300,
+        startupTimeout: 1000,
+        only: ["lifecycle-init", "lifecycle-ping"],
+      });
+      expect(report.tests.map((t) => [t.id, t.passed])).toEqual([
+        ["lifecycle-init", true],
+        ["lifecycle-ping", true],
+      ]);
+      expect(report.specVersion).toBe("2025-11-25");
+      expect(report.serverInfo.name).toBe("ignores-discover");
+      expect(report.warnings.some((w) => w.includes("treating it as unreachable"))).toBe(false);
+      expect(report.warnings.some((w) => w.includes("auto-detected"))).toBe(false);
+      expect(report.warnings).toContain(
+        `Server at ${srv.url} did not answer the preflight within 300ms or the era probe within 1000ms but did answer initialize, so its era was not detected and this run defaulted to 2025-11-25. A slow cold start needs a higher --preflight-timeout / --startup-timeout; a server that never answers server/discover costs that wait on every auto run, and --spec-version 2025-11-25 skips the re-probe.`,
+      );
+      // The preflight and the re-probe, then the handshake.
+      expect(srv.methods.slice(0, 4)).toEqual([
+        "server/discover",
+        "server/discover",
+        "initialize",
+        "notifications/initialized",
+      ]);
+    } finally {
+      srv.server.closeAllConnections();
+      await closeServer(srv.server);
     }
   }, 20000);
 

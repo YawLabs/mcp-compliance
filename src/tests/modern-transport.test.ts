@@ -70,7 +70,11 @@ function allPass(ids: string[]): Record<string, string> {
 }
 
 function transportWarnings(report: ComplianceReport): string[] {
-  return report.warnings.filter((w) => w.startsWith("transport-"));
+  return transportWarningsOf(report.warnings);
+}
+
+function transportWarningsOf(warnings: string[]): string[] {
+  return warnings.filter((w) => w.startsWith("transport-"));
 }
 
 // ---------------------------------------------------------------------------
@@ -532,6 +536,52 @@ describe("transport-header-name-mismatch: direct context", () => {
     });
   });
 
+  it("one failed list is not hidden behind the other listing nothing readable by name", async () => {
+    // resources/list failed while prompts/list worked but lists only
+    // prompts that need an argument. Before the fix this skip-passed with
+    // "no listed resource has a uri and no listed prompt is callable
+    // without arguments" -- naming neither the failure nor the list, so a
+    // --only transport run graded a broken resources/list A.
+    const resourcesFailed = {
+      resources: null,
+      prompts: [{ name: "greet", arguments: [{ name: "name", required: true }] }],
+      listAttempts: new Set<"resources" | "prompts">(["resources"]),
+      listFailures: { resources: "JSON-RPC error -32603 (boom)" },
+    };
+    const unreported = directContext(clean.url, resourcesFailed);
+    expect(await unreported.run()).toMatchObject({
+      passed: false,
+      details: "resources/list failed (JSON-RPC error -32603 (boom)); no resource or prompt to read by name",
+    });
+    // Asked for once and failed: not asked again.
+    expect(unreported.ctx.recorder.sent.map((s) => s.method)).toEqual([]);
+    expect(
+      await directContext(clean.url, resourcesFailed, {
+        only: ["transport-header-name-mismatch", "resources-list"],
+      }).run(),
+    ).toMatchObject({
+      passed: true,
+      details: "skipped: resources/list failed, no resource or prompt to read by name (see resources-list)",
+    });
+    // The mirror: resources listed nothing, prompts/list failed.
+    const promptsFailed = {
+      resources: [],
+      prompts: null,
+      listAttempts: new Set<"resources" | "prompts">(["prompts"]),
+      listFailures: { prompts: "no result object (HTTP 500)" },
+    };
+    expect(await directContext(clean.url, promptsFailed).run()).toMatchObject({
+      passed: false,
+      details: "prompts/list failed (no result object (HTTP 500)); no resource or prompt to read by name",
+    });
+    expect(
+      await directContext(clean.url, promptsFailed, { only: ["transport-header-name-mismatch", "prompts-list"] }).run(),
+    ).toMatchObject({
+      passed: true,
+      details: "skipped: prompts/list failed, no resource or prompt to read by name (see prompts-list)",
+    });
+  });
+
   it("accept-header-mismatch: a served read with the wrong Mcp-Name fails", async () => {
     const broken = await startHttpFixture({ breaks: ["accept-header-mismatch"] });
     try {
@@ -589,10 +639,18 @@ describe("modern transport suite: stub servers for knob-less branches", () => {
       );
     });
     try {
-      const report = await runModern(stub.url, { only: ["lifecycle-discover", ...ATTRIBUTABLE_REJECTION_IDS] });
+      const report = await runModern(stub.url, {
+        only: ["lifecycle-discover", "transport-post", "transport-concurrent", ...ATTRIBUTABLE_REJECTION_IDS],
+      });
       expect(failed(report, "lifecycle-discover")).toBe(
         "server/discover answered JSON-RPC error -32000 (Bad Request: Server not initialized) (HTTP 400)",
       );
+      // The baseline POST and the concurrent POSTs are plain failures: they
+      // are the conformant requests, so there is no defect to attribute.
+      expect(failed(report, "transport-post")).toBe(
+        "HTTP 400, JSON-RPC error -32000 (Bad Request: Server not initialized)",
+      );
+      expect(failed(report, "transport-concurrent")).toMatch(/^id=\d+: HTTP 400; id=\d+: HTTP 400; id=\d+: HTTP 400$/);
       const reason =
         "not evaluable: the conformant server/discover was itself rejected with -32000 (HTTP 400), so this rejection proves nothing about the injected defect";
       for (const id of ATTRIBUTABLE_REJECTION_IDS) {
@@ -794,14 +852,17 @@ describe("modern transport suite: stub servers for knob-less branches", () => {
   });
 
   it("transport-batch-reject accepts a JSON-RPC error on 200 and fails a 200 without one", async () => {
-    let mode: "error" | "silent" = "error";
+    let mode: "error" | "silent" | "array-of-one-error" = "error";
+    const rejection = { jsonrpc: "2.0", id: null, error: { code: -32600, message: "no batches" } };
     const stub = await startStub((_req, res, body) => {
       if (body.trimStart().startsWith("[")) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
           mode === "error"
-            ? JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "no batches" } })
-            : JSON.stringify({ jsonrpc: "2.0", id: null, result: { resultType: "complete" } }),
+            ? JSON.stringify(rejection)
+            : mode === "array-of-one-error"
+              ? JSON.stringify([rejection])
+              : JSON.stringify({ jsonrpc: "2.0", id: null, result: { resultType: "complete" } }),
         );
         return;
       }
@@ -817,6 +878,12 @@ describe("modern transport suite: stub servers for knob-less branches", () => {
         passed: false,
         details: "HTTP 200 without a JSON-RPC error (expected 4xx or error)",
       });
+      // An array reply is the processed-batch shape (JSON-RPC 2.0 answers a
+      // rejected batch with a single Response object), even when its one
+      // element is an error. The text/event-stream twin is in the next test.
+      mode = "array-of-one-error";
+      const arrayOfOne = await directContext(stub.url, {}, { only: ["transport-batch-reject"] }).run();
+      expect(arrayOfOne).toMatchObject({ passed: false, details: "HTTP 200: server processed the batch (1 replies)" });
     } finally {
       await stub.close();
     }
@@ -851,6 +918,17 @@ describe("modern transport suite: stub servers for knob-less branches", () => {
       "a response per element": responses.map(frame).join(""),
       // A JSON-RPC batch answered as one array frame: processed, not "1 non-response message".
       "the batch array in one frame": frame(responses),
+      // The same one-element array that fails over application/json (the
+      // previous test): an array frame is the processed-batch shape
+      // whatever its element says. Before the fix the frame was flattened
+      // and this passed as "JSON-RPC error -32600 (batch rejected)".
+      "a one-element array frame holding the error": frame([
+        { jsonrpc: "2.0", id: 99903, error: { code: -32600, message: "batch element rejected" } },
+      ]),
+      // Its elements are counted whatever else the stream carries, loose
+      // responses included.
+      "a notification, then a one-element array frame": progress + frame([responses[0]]),
+      "a loose response, then a one-element array frame": frame(responses[0]) + frame([responses[1]]),
     };
     let mode = "";
     const stub = await startStub((_req, res, body) => {
@@ -893,6 +971,15 @@ describe("modern transport suite: stub servers for knob-less branches", () => {
         },
         "a response per element": processed,
         "the batch array in one frame": processed,
+        "a one-element array frame holding the error": {
+          passed: false,
+          details: "HTTP 200: server processed the batch (1 replies)",
+        },
+        "a notification, then a one-element array frame": {
+          passed: false,
+          details: "HTTP 200: server processed the batch (1 replies)",
+        },
+        "a loose response, then a one-element array frame": processed,
       });
     } finally {
       await stub.close();
@@ -907,6 +994,163 @@ describe("modern transport suite: stub servers for knob-less branches", () => {
     try {
       const r = await directContext(stub.url, {}, { only: ["transport-content-type"] }).run();
       expect(r).toMatchObject({ passed: false, details: "HTTP 200, Content-Type: text/html; charset=utf-8" });
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("transport-content-type accepts a text/event-stream answer, and the result checks read it", async () => {
+    // An SSE-default server: every request answered with a one-frame
+    // request-scoped stream. Content-Type is the only thing that differs
+    // from the clean fixture's application/json.
+    const stub = await startStub((_req, res, body) => {
+      if (isNotification(body)) {
+        res.writeHead(202).end();
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end(`event: message\ndata: ${discoverResult(body)}\n\n`);
+    });
+    try {
+      const ids = ["transport-post", "transport-content-type", "transport-concurrent", "transport-session-ignored"];
+      expect(await directContext(stub.url, {}, { only: ids }).all()).toEqual({
+        "transport-post": { passed: true, details: "HTTP 200" },
+        "transport-content-type": { passed: true, details: "HTTP 200, Content-Type: text/event-stream" },
+        "transport-concurrent": { passed: true, details: "3 concurrent requests answered with matching ids" },
+        "transport-session-ignored": { passed: true, details: "HTTP 200 result, no Mcp-Session-Id on the response" },
+      });
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("a server failing with 5xx fails each method / status test naming the status", async () => {
+    // Down behind its proxy: POSTs draw 503 with a JSON-RPC error whose
+    // message is long and not ASCII, GET and DELETE a bare 500.
+    const message = "upstream connect error or disconnect/reset before headers — reset reason: connection failure";
+    const stub = await startStub((req, res, body) => {
+      if (req.method !== "POST") {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("internal error");
+        return;
+      }
+      if (isNotification(body)) {
+        res.writeHead(503, { "Content-Type": "text/plain" });
+        res.end("unavailable");
+        return;
+      }
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: JSON.parse(body).id, error: { code: -32603, message } }));
+    });
+    try {
+      const ids = [
+        "transport-post",
+        "transport-notification-202",
+        "transport-concurrent",
+        "transport-get-removed",
+        "transport-delete-removed",
+        "transport-session-ignored",
+      ];
+      const run = directContext(stub.url, {}, { only: ids });
+      expect(await run.all()).toEqual({
+        // The server's message, clipped to 80 ASCII characters.
+        "transport-post": {
+          passed: false,
+          details:
+            "HTTP 503, JSON-RPC error -32603 (upstream connect error or disconnect/reset before headers ? reset reason: con...)",
+        },
+        "transport-notification-202": { passed: false, details: "HTTP 503 (expected 202 Accepted)" },
+        "transport-concurrent": {
+          passed: false,
+          details: "id=5001: HTTP 503; id=5002: HTTP 503; id=5003: HTTP 503",
+        },
+        "transport-get-removed": { passed: false, details: "HTTP 500, Content-Type: text/plain (expected 405)" },
+        "transport-delete-removed": { passed: false, details: "HTTP 500 (expected 405)" },
+        "transport-session-ignored": { passed: false, details: "HTTP 503, JSON-RPC error -32603 (expected a result)" },
+      });
+      expect(transportWarningsOf(run.warnings())).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("a 2xx without a result fails the checks that need one; a JSON 200 for GET is not a refusal", async () => {
+    const stub = await startStub((req, res, body) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.method !== "POST") {
+        res.end("{}");
+        return;
+      }
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: JSON.parse(body).id, error: { code: -32000, message: "nope" } }));
+    });
+    try {
+      const ids = ["transport-concurrent", "transport-get-removed", "transport-session-ignored"];
+      const run = directContext(stub.url, {}, { only: ids });
+      expect(await run.all()).toEqual({
+        "transport-concurrent": {
+          passed: false,
+          details: "id=5000: JSON-RPC error -32000; id=5001: JSON-RPC error -32000; id=5002: JSON-RPC error -32000",
+        },
+        "transport-get-removed": { passed: false, details: "HTTP 200, Content-Type: application/json (expected 405)" },
+        "transport-session-ignored": { passed: false, details: "HTTP 200, JSON-RPC error -32000 (expected a result)" },
+      });
+      expect(transportWarningsOf(run.warnings())).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("--only transport-header-name-mismatch fails on a broken resources/list even when prompts/list works", async () => {
+    // End to end through the runner, the input the direct-context test
+    // above models: resources/list errors, prompts/list lists only a prompt
+    // that needs an argument. Before the fix this run graded A / 100.
+    const stub = await startStub((_req, res, body) => {
+      if (isNotification(body)) {
+        res.writeHead(202).end();
+        return;
+      }
+      const msg = JSON.parse(body);
+      const reply = (payload: Record<string, unknown>) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, ...payload }));
+      };
+      if (msg.method === "server/discover") {
+        return reply({
+          result: {
+            resultType: "complete",
+            supportedVersions: [MODERN_SPEC_VERSION],
+            capabilities: { resources: {}, prompts: {} },
+            ttlMs: 0,
+            cacheScope: "public",
+          },
+        });
+      }
+      if (msg.method === "resources/list") return reply({ error: { code: -32603, message: "boom" } });
+      if (msg.method === "prompts/list") {
+        return reply({
+          result: {
+            resultType: "complete",
+            prompts: [{ name: "greet", description: "d", arguments: [{ name: "name", required: true }] }],
+            ttlMs: 0,
+            cacheScope: "public",
+          },
+        });
+      }
+      return reply({ error: { code: -32601, message: "Method not found" } });
+    });
+    try {
+      const report = await runModern(stub.url, { only: ["transport-header-name-mismatch"] });
+      expect(failed(report, "transport-header-name-mismatch")).toBe(
+        "resources/list failed (JSON-RPC error -32603 (boom)); no resource or prompt to read by name",
+      );
+      expect(report.score).toBeLessThan(100);
+      // With resources-list in the run, that test carries the failure instead.
+      const withList = await runModern(stub.url, { only: ["resources-list", "transport-header-name-mismatch"] });
+      expect(failed(withList, "resources-list")).toBe("resources/list returned JSON-RPC error -32603 (boom)");
+      expect(resultOf(withList, "transport-header-name-mismatch")).toMatchObject({
+        passed: true,
+        details: "skipped: resources/list failed, no resource or prompt to read by name (see resources-list)",
+      });
     } finally {
       await stub.close();
     }

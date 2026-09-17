@@ -1,4 +1,6 @@
-import { rmSync, writeFileSync } from "node:fs";
+import { spawn as spawnProcess } from "node:child_process";
+import { getEventListeners } from "node:events";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -142,6 +144,8 @@ describe("StdioTransport", () => {
       stdoutBufferSize: 512 * 1024,
     });
     openTransports.push(t);
+    // Read before any 'data' event can have been delivered.
+    expect(t.stdoutOverflows).toBe(0);
     // Wait on the diagnostic itself instead of racing it against a fixed
     // request timeout. The overflow cannot happen before the child has
     // started writing, and spawn-to-first-stdout-chunk measured 0.3-2.6s on a
@@ -152,6 +156,10 @@ describe("StdioTransport", () => {
       timeout: 10000,
       interval: 10,
     });
+    // The drop is also counted, which is what lets a caller scope "was THIS
+    // reply dropped" to one request. 800 KB against a 512 KB cap overflows
+    // exactly once: what is left after the first discard stays under the cap.
+    expect(t.stdoutOverflows).toBe(1);
     // The caller-visible symptom is still a timeout (the server never answers),
     // but the error carries the diagnostic -- which is what tells it apart
     // from a generic unresponsive server.
@@ -202,6 +210,30 @@ describe("StdioTransport", () => {
     expect(stream.exit).toEqual({ code: 3, signal: null });
     expect(t.exited).toBe(true);
     await stream.close();
+  });
+
+  it("stream() on a child that already exited rejects with the exit diagnostic and leaves nothing attached", async () => {
+    // A server that crashed on an earlier probe of the run: it exits on the
+    // first line it reads, before the listen is ever opened.
+    const t = scriptedChild("  process.exit(3);");
+    // The exit settles the request; the budget only has to outlast a slow spawn.
+    await expect(t.request("ping", undefined, createIdCounter(7300), { timeout: 30_000 })).rejects.toThrow(
+      /^server crashed with exit code 3 before completing the request/,
+    );
+    expect(t.exited).toBe(true);
+    const controller = new AbortController();
+    // A timer far past the test: only the catch's cleanup can clear it.
+    const opening = t.stream("subscriptions/listen", { notifications: {} }, createIdCounter(7400), {
+      timeout: 60_000,
+      signal: controller.signal,
+    });
+    await expect(opening).rejects.toThrow(
+      /^stdio transport: server crashed with exit code 3 before completing the request/,
+    );
+    // The abort hook the stream attached is gone again (and with it the
+    // message listener, the exit listener and the timer, removed by the
+    // same finish()).
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
   });
 
   it("stream().close() sends notifications/cancelled after the timer fired without a response", async () => {
@@ -265,4 +297,110 @@ describe("StdioTransport", () => {
     // No cancel was written, so none is reported: onSent mirrors the wire, not the close() call.
     expect(reported).toEqual([]);
   });
+
+  it("close() does not wait out the grace period for a server that exits on stdin EOF", async () => {
+    const t = spawn();
+    // Answered first, so the child is up and reading stdin when EOF arrives.
+    await t.request("ping", undefined, createIdCounter(600), { timeout: 5000 });
+    const started = Date.now();
+    await t.close();
+    const elapsed = Date.now() - started;
+    expect(t.exited).toBe(true);
+    // The forced kill comes 2000ms after EOF; the echo fixture exits on EOF in tens of ms.
+    expect(elapsed).toBeLessThan(1500);
+  });
+
+  it("close() returns at once when the child never spawned: there is no process to wait for", async () => {
+    // A working directory that does not exist fails the spawn itself on every
+    // platform (a missing command does not on Windows, where cmd.exe starts
+    // and exits 1), so no pid is ever assigned and no 'exit' event will come.
+    const t = createStdioTransport({
+      command: process.execPath,
+      cwd: join(tmpdir(), `mcp-compliance-no-such-dir-${Date.now()}`),
+    });
+    openTransports.push(t);
+    expect(t.pid).toBeUndefined();
+    await expect(t.request("ping", undefined, createIdCounter(700), { timeout: 5000 })).rejects.toThrow(/ENOENT/);
+    const started = Date.now();
+    await t.close();
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+
+  it("close() resolves only once a server that outlives EOF and SIGTERM is gone, so a caller exiting right after leaves nothing running", async () => {
+    // A server still busy with earlier work does not exit on stdin EOF (a
+    // live timer stands in for the work here) and this one ignores SIGTERM
+    // too, so only the forced kill after the grace period stops it. On
+    // Windows the transport spawns it through cmd.exe: the server is the
+    // shell's child, outside the kill-on-close job Node puts its own
+    // children in.
+    const stamp = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const pidFile = join(tmpdir(), `mcp-compliance-busy-${stamp}.pid`);
+    const serverPath = join(tmpdir(), `mcp-compliance-busy-${stamp}.cjs`);
+    const callerPath = join(tmpdir(), `mcp-compliance-closer-${stamp}.mts`);
+    tempFiles.push(pidFile, serverPath, callerPath);
+    writeFileSync(
+      serverPath,
+      [
+        'process.on("SIGTERM", () => {});',
+        "setInterval(() => {}, 1000);",
+        "process.stdin.resume();",
+        'require("node:fs").writeFileSync(process.argv[2], String(process.pid));',
+      ].join("\n"),
+      "utf8",
+    );
+    // The caller closes the transport and exits at once, the way a test
+    // worker is torn down after its last test (the integration-dogfood run
+    // left dist/mcp/server.js running that way): nothing close() merely
+    // started gets to finish.
+    const stdioModule = new URL("../transport/stdio.ts", import.meta.url).href;
+    writeFileSync(
+      callerPath,
+      [
+        'import { readFileSync } from "node:fs";',
+        `import { createStdioTransport } from ${JSON.stringify(stdioModule)};`,
+        "const [server, pidFile] = process.argv.slice(2);",
+        "const started = () => { try { return readFileSync(pidFile, 'utf8').length > 0; } catch { return false; } };",
+        "const t = createStdioTransport({ command: process.execPath, args: [server, pidFile] });",
+        "const deadline = Date.now() + 20000;",
+        "while (!started() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));",
+        "await t.close();",
+        "process.stdout.write(JSON.stringify({ started: started(), exited: t.exited }));",
+        "process.exit(0);",
+      ].join("\n"),
+      "utf8",
+    );
+    // tsx as a loader in one process: its cli would add a wrapper process.
+    const tsx = new URL("../../node_modules/tsx/dist/loader.mjs", import.meta.url).href;
+    const caller = spawnProcess(process.execPath, ["--import", tsx, callerPath, serverPath, pidFile], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    caller.stdout?.on("data", (d) => {
+      out += d;
+    });
+    caller.stderr?.on("data", (d) => {
+      err += d;
+    });
+    const code = await new Promise<number | null>((resolve) => caller.once("exit", resolve));
+    expect(code, err).toBe(0);
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    const alive = () => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      // Process teardown is asynchronous in the OS, so allow it a moment; an
+      // orphan whose killer never ran stays alive however long this waits.
+      await vi.waitFor(() => expect(alive()).toBe(false), { timeout: 3000, interval: 50 });
+    } finally {
+      if (alive()) process.kill(pid, "SIGKILL");
+    }
+    // And close() itself resolved only after the child was reaped.
+    expect(JSON.parse(out)).toEqual({ started: true, exited: true });
+  }, 30_000);
 });

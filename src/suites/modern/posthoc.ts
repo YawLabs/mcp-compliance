@@ -436,7 +436,8 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
   // scopes the id MUST to those): an auth gate's `{"error":"..."}` body
   // or a GCP-style `{"error":{"code":400,...}}` is not one. A null or
   // missing id is exempt only when no id-bearing request owns the reply
-  // (a raw probe, a client notification) or the reply is a
+  // (a raw probe, a client notification, or nothing pending at all -- a
+  // stray at boot, noted as such) or the reply is a
   // transport-level rejection (HTTP 401/403/413/415/429, answered before
   // the JSON-RPC layer read the id). A PRESENT but wrong id is an
   // offender whatever the status: the id was read and then retyped or
@@ -449,6 +450,8 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
     const nonJsonRpc = recorder.errors().length - errors.length;
     let scanned = 0;
     let ownerless = 0;
+    /** Unmatched replies that arrived while nothing at all was pending (a stray at boot, or after every request was answered). */
+    let unowned = 0;
     let rejected = 0;
     const offenders: { method: string; expected: unknown; got: unknown }[] = [];
     for (const entry of errors) {
@@ -461,7 +464,11 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
         continue;
       }
       const owner = timeline.unmatched.get(entry) ?? null;
-      if (!owner || owner.id === undefined || owner.raw !== undefined) {
+      if (!owner) {
+        unowned++;
+        continue;
+      }
+      if (owner.id === undefined || owner.raw !== undefined) {
         ownerless++;
         continue;
       }
@@ -474,6 +481,7 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
     }
     const exemptions: string[] = [];
     if (ownerless > 0) exemptions.push(`${ownerless} answering raw probes or client notifications`);
+    if (unowned > 0) exemptions.push(`${unowned} received while no request was pending`);
     if (rejected > 0) {
       exemptions.push(`${rejected} without an id on transport-level rejections (HTTP 401/403/413/415/429)`);
     }

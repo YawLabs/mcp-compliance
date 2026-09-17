@@ -33,6 +33,16 @@ export interface StdioTransport extends Transport {
   readonly pid: number | undefined;
   /** Last N bytes of stderr as a string, for debugging failures. */
   stderrTail(): string;
+  /**
+   * How many times stdout outgrew `stdoutBufferSize` without a newline and
+   * the buffered line was discarded (each time also leaves a "stdout buffer
+   * exceeded" line in stderrTail()). Monotonic for the transport's life:
+   * compare the value before and after a request to learn whether output
+   * produced during THAT request was dropped. stderrTail() cannot say --
+   * it is a rolling buffer that still holds the marker of an earlier drop,
+   * and the child can write the same text to its own stderr.
+   */
+  readonly stdoutOverflows: number;
   /** Whether the child has exited. */
   readonly exited: boolean;
   /** Exit code once the child has exited, null otherwise. */
@@ -88,6 +98,7 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
   const listeners = new Set<MessageListener>();
   let stdoutBuffer = "";
   let stderrBuffer = "";
+  let stdoutOverflows = 0;
 
   function emit(message: unknown) {
     for (const l of listeners) {
@@ -147,6 +158,7 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     // un-newlined output before the real JSON reply) is diagnosable
     // rather than manifesting only as a request timeout.
     if (stdoutBuffer.length > stdoutBufferSize) {
+      stdoutOverflows++;
       stderrBuffer += `[mcp-compliance] stdout buffer exceeded ${stdoutBufferSize} bytes without a newline; discarding buffered data\n`;
       if (stderrBuffer.length > stderrBufferSize) {
         stderrBuffer = stderrBuffer.slice(stderrBuffer.length - stderrBufferSize);
@@ -256,6 +268,9 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     },
     stderrTail() {
       return stderrBuffer;
+    },
+    get stdoutOverflows() {
+      return stdoutOverflows;
     },
     async request(method, params, nextId, init): Promise<TransportResponse> {
       const id = nextId();
@@ -415,40 +430,68 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     },
     async close() {
       if (exited) return;
+      const childExit = new Promise<void>((resolve) => child.once("exit", () => resolve()));
       // Signal EOF via stdin close; many stdio servers exit cleanly on this.
       try {
         child.stdin?.end();
       } catch {}
+      // No pid: the spawn itself failed (ENOENT, EACCES), so there is no
+      // process to wait for or kill.
+      if (child.pid === undefined) {
+        rejectAllPending(new Error("stdio transport: closed"));
+        return;
+      }
+      const pid = String(child.pid);
       // Kill the whole process tree, not just the direct child. On Windows
       // the child is spawned via a shell (shell:true, for .cmd/.bat shims
       // like npx), so child.kill() would only reach cmd.exe and orphan the
       // real server (the node/npx grandchild); `taskkill /t` walks the tree.
       // On POSIX we spawn with shell:false, so signalling the child directly
-      // is sufficient.
-      const treeKill = (force: boolean) => {
-        if (isWindows && child.pid !== undefined) {
-          try {
-            spawn("taskkill", ["/pid", String(child.pid), "/t", ...(force ? ["/f"] : [])], { stdio: "ignore" });
-          } catch {}
-        } else {
+      // is sufficient. Settles once the kill has been carried out: on
+      // Windows when taskkill exits, on POSIX as soon as the signal is sent.
+      const treeKill = (force: boolean): Promise<void> => {
+        if (!isWindows) {
           try {
             child.kill(force ? "SIGKILL" : "SIGTERM");
           } catch {}
+          return Promise.resolve();
         }
-      };
-      // Grace period, then force-kill the tree.
-      const gracePeriodMs = 2000;
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          treeKill(true);
-          resolve();
-        }, gracePeriodMs);
-        child.once("exit", () => {
-          clearTimeout(timer);
-          resolve();
+        return new Promise<void>((resolve) => {
+          try {
+            const killer = spawn("taskkill", ["/pid", pid, "/t", ...(force ? ["/f"] : [])], { stdio: "ignore" });
+            killer.once("exit", () => resolve());
+            killer.once("error", () => resolve());
+          } catch {
+            resolve();
+          }
         });
-        treeKill(false);
-      });
+      };
+      /** Resolves true when `promise` settles within `ms`, false when the bound runs out first. */
+      const within = (promise: Promise<unknown>, ms: number) =>
+        new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(false), ms);
+          void promise.then(() => {
+            clearTimeout(timer);
+            resolve(true);
+          });
+        });
+      // Grace period for a clean exit on EOF (or SIGTERM), then force-kill
+      // the tree. A non-forced taskkill cannot end a console process, so on
+      // Windows the grace period is really the EOF window.
+      const gracePeriodMs = 2000;
+      void treeKill(false);
+      if (!(await within(childExit, gracePeriodMs))) {
+        // Wait for the forced kill to be carried out and the child to be
+        // reaped, not merely for taskkill to be spawned. Node puts its direct
+        // children (cmd.exe, taskkill) in a kill-on-close job object that the
+        // shell's own children are outside of, so a caller that exits right
+        // after close() resolves -- a test worker torn down after its last
+        // test -- takes taskkill and cmd.exe down with it before the kill is
+        // carried out, and the real server (the grandchild), still busy and
+        // so not gone on EOF, is left running as an orphan. Bounded, in case
+        // taskkill itself hangs.
+        await within(Promise.all([treeKill(true), childExit]), 5000);
+      }
       rejectAllPending(new Error("stdio transport: closed"));
     },
     setSessionId(_id) {

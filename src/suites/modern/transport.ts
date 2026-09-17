@@ -1,3 +1,4 @@
+import { authRefusalHint, refusedCredential } from "../../detect.js";
 import type { TestOutcome } from "../../harness.js";
 import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
 import { HEADER_METHOD, HEADER_NAME, HEADER_PROTOCOL_VERSION } from "../../modern/headers.js";
@@ -135,10 +136,14 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
     const res = await client.rpc(DISCOVER, {});
     if (is2xx(res.statusCode)) return { passed: true, details: `HTTP ${res.statusCode}` };
     if (res.statusCode === 401 || res.statusCode === 403) {
-      return {
-        passed: false,
-        details: `HTTP ${res.statusCode} (${ctx.hasAuth ? "credential rejected -- check --auth" : "auth required -- pass --auth"})`,
-      };
+      // "credential rejected" only when the status says so: a 403 without a
+      // Bearer insufficient_scope challenge may be Host/Origin validation.
+      const hint = authRefusalHint(
+        ctx.hasAuth,
+        refusedCredential(res.statusCode, res.headers),
+        "auth required -- pass --auth",
+      );
+      return { passed: false, details: `HTTP ${res.statusCode} (${hint})` };
     }
     return { passed: false, details: `HTTP ${res.statusCode}, ${summarize(res, true)}` };
   });
@@ -178,11 +183,19 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
       // The stream MAY carry notifications before the response
       // (streamable-http "Receiving Messages") and a comment-only or empty
       // stream carries nothing, so only JSON-RPC responses count as
-      // replies -- a batch answered as one array frame by its elements. A
-      // 2xx stream with no response is neither the 4xx nor the JSON-RPC
-      // error the rule expects, not "0 replies".
-      const messages = parseSSEMessages(res.body).flatMap((m) => (Array.isArray(m) ? m : [m]));
+      // replies. A frame holding an array is the batch answered as a batch
+      // -- JSON-RPC 2.0 answers a rejected batch with a single Response
+      // object -- so it fails as processed, counting its elements, exactly
+      // as the same array does over application/json below, even when its
+      // one element is an error. A 2xx stream with no response is neither
+      // the 4xx nor the JSON-RPC error the rule expects, not "0 replies".
+      const messages = parseSSEMessages(res.body);
       const replies = messages.filter(isJsonRpcResponse);
+      const arrays = messages.filter((m): m is unknown[] => Array.isArray(m));
+      if (arrays.length > 0) {
+        const count = arrays.reduce((n, a) => n + a.length, 0) + replies.length;
+        return { passed: false, details: `HTTP ${res.statusCode}: server processed the batch (${count} replies)` };
+      }
       if (replies.length === 0) {
         const carried =
           messages.length === 0 ? "no JSON-RPC message" : `${messages.length} message(s) but no JSON-RPC response`;
@@ -404,9 +417,10 @@ type NameHeaderProbe = { method: string; params: Record<string, unknown> } | { o
  * arguments (prompts/get). The lists are fetched once on demand through
  * the context (so `--only transport` still measures the server). When no
  * probe exists the outcome names why: the capability is undeclared or
- * nothing listed is readable with a name alone (skip-pass), or every
- * declared list call failed -- a skip-pass pointing at the `-list` tests
- * when they are in this run, else a failure carrying the recorded reason
+ * nothing listed is readable with a name alone (skip-pass), or a declared
+ * list call failed (even if the other list worked but held nothing
+ * readable) -- a skip-pass pointing at the failed `-list` tests when they
+ * are in this run, else a failure carrying the recorded reason
  * (`listUnavailable`), so a broken list is never a silent pass.
  */
 async function nameHeaderProbe(ctx: ModernSuiteContext): Promise<NameHeaderProbe> {
@@ -425,8 +439,10 @@ async function nameHeaderProbe(ctx: ModernSuiteContext): Promise<NameHeaderProbe
   if (hasResources(ctx)) declared.push("resources");
   if (hasPrompts(ctx)) declared.push("prompts");
   if (declared.length === 0) return skip("skipped: server declares no resources or prompts");
+  // Any declared list that failed is named, even when the other one worked
+  // but listed nothing readable: the failed list may have held the probe.
   const failed = declared.filter((key) => (key === "resources" ? !resources : !prompts));
-  if (failed.length === declared.length) {
+  if (failed.length > 0) {
     const what = "no resource or prompt to read by name";
     // Filtered-out `-list` tests report nothing: fail with their reasons.
     const unreported = failed.filter((key) => !listUnavailable(ctx, key, what).passed);

@@ -10,7 +10,8 @@ import { runComplianceSuite } from "../runner.js";
 //
 // Requires a built dist/mcp/server.js. The regular `npm test` does not
 // build, so we skip silently in that case; `npm run test:ci` builds
-// first and runs this for real. (CI runs test:ci on every push.)
+// first and runs this for real. (There is no hosted CI: release.sh
+// builds before its full test gate, so a release always runs it.)
 const serverPath = fileURLToPath(new URL("../../dist/mcp/server.js", import.meta.url));
 const hasBuild = existsSync(serverPath);
 const maybeDescribe = hasBuild ? describe : describe.skip;
@@ -30,7 +31,7 @@ maybeDescribe("integration (dogfood) — mcp-compliance tests its own MCP server
     const requiredFails = report.tests.filter((t) => t.required && !t.passed);
     if (requiredFails.length > 0) {
       // Produce a useful failure message: list ids + details so a broken
-      // commit is diagnosable from CI logs alone.
+      // commit is diagnosable from the test output alone.
       const lines = requiredFails.map((t) => `  - ${t.id}: ${t.details}`).join("\n");
       throw new Error(`Required test failures when grading self:\n${lines}`);
     }

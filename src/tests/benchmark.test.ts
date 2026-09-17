@@ -530,6 +530,36 @@ describe("runBenchmark warm-up (what is sent around the timed loop)", () => {
     expectAllSucceeded(result);
     expect(result.latencyMs.max, `max ${result.latencyMs.max}ms`).toBeLessThan(100);
   });
+
+  it("pinned 2026-07-28 against a server that never answers: the warm-up waits out startupTimeout, then the loop measures and says why it failed", async () => {
+    // The silent legacy fixture ignores every pre-initialize request, so
+    // the unmeasured warm-up discover gets no reply. That wait is bounded
+    // by startupTimeout -- not the per-request timeout, and not the CLI's
+    // 60s default -- and its timeout is swallowed so the timed loop still
+    // runs; each sample then times out on its own budget and the first
+    // reason is kept. No status line: "Probing spec era" belongs to the
+    // auto probe, and its advice (pin 2025-11-25 to skip the probe) does
+    // not apply to a run that is already pinned.
+    const status: string[] = [];
+    const started = Date.now();
+    const result = await runBenchmark(
+      { type: "stdio", command: process.execPath, args: [LEGACY_SILENT_FIXTURE] },
+      { requests: 2, timeout: 500, startupTimeout: 3000, specVersion: "2026-07-28", onStatus: (m) => status.push(m) },
+    );
+    const elapsed = Date.now() - started;
+    expect(result.specVersion).toBe("2026-07-28");
+    expect(result.method).toBe("server/discover");
+    expect(result.succeeded).toBe(0);
+    expect(result.failed).toBe(2);
+    expect(result.firstError).toMatch(/timed out after 500ms \(method=server\/discover\)/);
+    // durationMs covers only the timed loop, so what is left is spawn +
+    // warm-up + close: at least the whole startup budget.
+    expect(elapsed - result.durationMs, `elapsed ${elapsed}ms, loop ${result.durationMs}ms`).toBeGreaterThanOrEqual(
+      3000,
+    );
+    expect(elapsed).toBeLessThan(15_000);
+    expect(status).toEqual([]);
+  }, 30_000);
 });
 
 describe("runBenchmark auto on stdio: the era probe and the child it can kill", () => {

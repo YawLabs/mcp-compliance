@@ -571,6 +571,29 @@ describe("dispatch", () => {
       "both result and error",
     );
   });
+
+  it.each([
+    [null, "null"],
+    ["ok", '"ok"'],
+    [42, "42"],
+    [[], "[]"],
+  ])("a non-object result (%j) skips the concrete def: only the envelope's 'must be object'", (result, got) => {
+    // result: null is what generic JSON-RPC libraries return for a void handler.
+    expect(validator.validateServerMessage({ jsonrpc: "2.0", id: 1, result }, { requestMethod: "tools/list" })).toEqual(
+      [{ def: "JSONRPCResultResponse", path: "/result", message: `must be object (got ${got})` }],
+    );
+  });
+
+  it.each([
+    ["boom", '"boom"'],
+    [null, "null"],
+    [-32601, "-32601"],
+    [[{ code: -32601, message: "x" }], '[{"code":-32601,"message":"x"}]'],
+  ])("a non-object error member (%j) skips code dispatch: only the envelope's 'must be object'", (error, got) => {
+    expect(validator.validateServerMessage({ jsonrpc: "2.0", id: 1, error })).toEqual([
+      { def: "JSONRPCErrorResponse", path: "/error", message: `must be object (got ${got})` },
+    ]);
+  });
 });
 
 describe("negative cases", () => {

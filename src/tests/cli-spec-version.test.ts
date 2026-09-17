@@ -66,6 +66,7 @@ describe("mcp-compliance test --list --spec-version", () => {
   let omitted: Run;
   let modernStdio: Run;
   let fromConfig: Run;
+  let autoOverConfig: Run;
   let invalid: Run;
   let wrongCatalog: Run;
   let gatedOnly: Run;
@@ -74,28 +75,31 @@ describe("mcp-compliance test --list --spec-version", () => {
     workDir = mkdtempSync(join(tmpdir(), "mcp-compliance-cli-"));
     const configPath = join(workDir, "pinned.json");
     writeFileSync(configPath, JSON.stringify({ specVersion: "2026-07-28" }));
-    [modern, legacy, omitted, modernStdio, fromConfig, invalid, wrongCatalog, gatedOnly] = await Promise.all([
-      cli(["test", "--list", "--no-color", "--spec-version", "2026-07-28"]),
-      cli(["test", "--list", "--no-color", "--spec-version", "2025-11-25"]),
-      cli(["test", "--list", "--no-color"]),
-      cli(["test", "--list", "--no-color", "--spec-version", "2026-07-28", "--transport", "stdio"]),
-      cli(["test", "--list", "--no-color", "--config", configPath]),
-      cli(["test", "--list", "--no-color", "--spec-version", "1999-01-01"]),
-      // A 2025-11-25 id under auto: matches one catalog, not the other.
-      cli(["test", "--list", "--no-color", "--only", "lifecycle-init"]),
-      // A valid HTTP-only id on a stdio target.
-      cli([
-        "test",
-        "--list",
-        "--no-color",
-        "--spec-version",
-        "2025-11-25",
-        "--transport",
-        "stdio",
-        "--only",
-        "transport-post",
-      ]),
-    ]);
+    [modern, legacy, omitted, modernStdio, fromConfig, autoOverConfig, invalid, wrongCatalog, gatedOnly] =
+      await Promise.all([
+        cli(["test", "--list", "--no-color", "--spec-version", "2026-07-28"]),
+        cli(["test", "--list", "--no-color", "--spec-version", "2025-11-25"]),
+        cli(["test", "--list", "--no-color"]),
+        cli(["test", "--list", "--no-color", "--spec-version", "2026-07-28", "--transport", "stdio"]),
+        cli(["test", "--list", "--no-color", "--config", configPath]),
+        // The documented one-off auto run in a repo whose config pins a revision.
+        cli(["test", "--list", "--no-color", "--config", configPath, "--spec-version", "auto"]),
+        cli(["test", "--list", "--no-color", "--spec-version", "1999-01-01"]),
+        // A 2025-11-25 id under auto: matches one catalog, not the other.
+        cli(["test", "--list", "--no-color", "--only", "lifecycle-init"]),
+        // A valid HTTP-only id on a stdio target.
+        cli([
+          "test",
+          "--list",
+          "--no-color",
+          "--spec-version",
+          "2025-11-25",
+          "--transport",
+          "stdio",
+          "--only",
+          "transport-post",
+        ]),
+      ]);
   }, 180_000);
 
   afterAll(() => {
@@ -155,6 +159,16 @@ describe("mcp-compliance test --list --spec-version", () => {
     expect(ids(fromConfig.stdout)).toHaveLength(99);
     expect(fromConfig.stdout).toContain("spec=2026-07-28");
     expect(fromConfig.stdout).not.toContain("MCP 2025-11-25 catalog");
+  });
+
+  it("an explicit --spec-version auto beats a `specVersion` pin in the config file", () => {
+    // Same config as above (pinned to 2026-07-28); the flag must win, so
+    // both catalogs print, exactly as with no config at all.
+    expect(autoOverConfig.code, autoOverConfig.stderr).toBe(0);
+    expect(autoOverConfig.stdout).toContain("MCP 2025-11-25 catalog (85 tests)");
+    expect(autoOverConfig.stdout).toContain("MCP 2026-07-28 catalog (99 tests)");
+    expect(rows(autoOverConfig.stdout)).toHaveLength(85 + 99);
+    expect(autoOverConfig.stdout).not.toContain("spec=2026-07-28");
   });
 
   it("rejects a version the tool does not ship and names the accepted choices", () => {
@@ -250,6 +264,92 @@ describe("mcp-compliance benchmark --spec-version", () => {
     expect(run.stdout).toContain("0 succeeded");
     expect(run.stdout).toMatch(/first failure: JSON-RPC error -32\d{3}/);
   }, 120_000);
+});
+
+describe("mcp-compliance benchmark: `specVersion` and `startupTimeout` from the config file", () => {
+  // benchmark reads both keys only when the flag is omitted, and a flag
+  // beats the config value. Each pair is chosen so the wrong source gives
+  // a visibly different run: the modern fixture auto-detects 2026-07-28,
+  // so a config pin of 2025-11-25 must turn the probe into ping; the era
+  // probe's status line names the startup budget it is waiting out.
+  let workDir: string;
+  let specFromConfig: Run;
+  let specFlagOverConfig: Run;
+  let startupFromConfig: Run;
+  let startupFlagOverConfig: Run;
+
+  beforeAll(async () => {
+    workDir = mkdtempSync(join(tmpdir(), "mcp-compliance-bench-cfg-"));
+    const legacyPin = join(workDir, "legacy-pin.json");
+    writeFileSync(legacyPin, JSON.stringify({ specVersion: "2025-11-25" }));
+    const startup3500 = join(workDir, "startup-3500.json");
+    writeFileSync(startup3500, JSON.stringify({ startupTimeout: 3500 }));
+    const startup4000 = join(workDir, "startup-4000.json");
+    writeFileSync(startup4000, JSON.stringify({ startupTimeout: 4000 }));
+    [specFromConfig, specFlagOverConfig, startupFromConfig, startupFlagOverConfig] = await Promise.all([
+      cli(["benchmark", "--format", "json", "-r", "2", "--config", legacyPin, "node", MODERN_FIXTURE]),
+      cli([
+        "benchmark",
+        "--format",
+        "json",
+        "-r",
+        "2",
+        "--config",
+        legacyPin,
+        "--spec-version",
+        "2026-07-28",
+        "node",
+        MODERN_FIXTURE,
+      ]),
+      cli(["benchmark", "-r", "1", "--config", startup3500, "node", LEGACY_SILENT_FIXTURE]),
+      cli([
+        "benchmark",
+        "-r",
+        "1",
+        "--config",
+        startup4000,
+        "--startup-timeout",
+        "3000",
+        "node",
+        LEGACY_SILENT_FIXTURE,
+      ]),
+    ]);
+  }, 180_000);
+
+  afterAll(() => {
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("`specVersion` from the config pins the measured probe when the flag is omitted", () => {
+    // Pinned 2025-11-25 against a modern-only server: every ping is
+    // rejected, so exit 1 -- but the JSON still says what was measured.
+    expect(specFromConfig.code, specFromConfig.stderr).toBe(1);
+    const result = JSON.parse(specFromConfig.stdout) as { specVersion: string; method: string; failed: number };
+    expect(result.specVersion).toBe("2025-11-25");
+    expect(result.method).toBe("ping");
+    expect(result.failed).toBe(2);
+  });
+
+  it("--spec-version beats the config's `specVersion`", () => {
+    expect(specFlagOverConfig.code, specFlagOverConfig.stderr).toBe(0);
+    const result = JSON.parse(specFlagOverConfig.stdout) as { specVersion: string; method: string; failed: number };
+    expect(result.specVersion).toBe("2026-07-28");
+    expect(result.method).toBe("server/discover");
+    expect(result.failed).toBe(0);
+  });
+
+  it("`startupTimeout` from the config bounds the era probe when the flag is omitted", () => {
+    // Without it the budget would be max(--timeout, 60000) and the line would say "up to 60s".
+    expect(startupFromConfig.code, startupFromConfig.stderr).toBe(0);
+    expect(startupFromConfig.stderr).toContain("Probing spec era (server/discover, up to 3.5s).");
+    expect(startupFromConfig.stdout).toContain("spec 2025-11-25, probe method ping");
+  });
+
+  it("--startup-timeout beats the config's `startupTimeout`", () => {
+    expect(startupFlagOverConfig.code, startupFlagOverConfig.stderr).toBe(0);
+    expect(startupFlagOverConfig.stderr).toContain("Probing spec era (server/discover, up to 3s).");
+    expect(startupFlagOverConfig.stderr).not.toContain("up to 4s");
+  });
 });
 
 describe("mcp-compliance test: terminal-mode diagnostics", () => {

@@ -13,12 +13,15 @@ import { z } from "zod";
 import {
   classifyDiscoverResponse,
   probeAnswerShowsEra,
+  probeExitWarning,
   REASON_PREFIX,
+  refusedCredential,
   STDIO_PROBE_STATUS_DELAY_MS,
 } from "../detect.js";
 import { runComplianceSuite } from "../runner.js";
 import { AUTO_DETECT_NOTE_PREFIX, LEGACY_SPEC_VERSION, MODERN_SPEC_VERSION } from "../spec.js";
 import type { TransportResponse } from "../transport/index.js";
+import type { StdioTransport } from "../transport/stdio.js";
 import type { ComplianceReport, TransportTarget } from "../types.js";
 import {
   type HttpFixture,
@@ -76,11 +79,12 @@ async function startFixedServer(
   statusCode: number,
   body: string,
   contentType = "text/html",
+  headers: Record<string, string> = {},
 ): Promise<{ url: string; stop(): Promise<void> }> {
   const server = createServer((req, res) => {
     req.resume();
     req.on("end", () => {
-      res.writeHead(statusCode, { "content-type": contentType });
+      res.writeHead(statusCode, { "content-type": contentType, ...headers });
       res.end(body);
     });
   });
@@ -1007,15 +1011,122 @@ describe("auth-gated server with a rejected --auth credential", () => {
   }, 20_000);
 
   it("a 403 (insufficient scope) names a missing scope or permission instead of an invalid token", async () => {
-    const stub = await startFixedServer(403, JSON.stringify({ error: "insufficient_scope" }), "application/json");
+    // basic/authorization "Runtime Insufficient Scope Errors": 403 with a
+    // WWW-Authenticate: Bearer error="insufficient_scope" challenge.
+    const stub = await startFixedServer(403, JSON.stringify({ error: "insufficient_scope" }), "application/json", {
+      "WWW-Authenticate": 'Bearer error="insufficient_scope", scope="files:read"',
+    });
     try {
       const auto = await runComplianceSuite(stub.url, { timeout: 5000, headers: WRONG, only: ["transport-post"] });
       expect(auto.warnings[0]).toBe(
         `Server at ${stub.url} rejected the configured credential (the server/discover probe carried an Authorization header and got HTTP 403), so the era could not be determined and the 2025-11-25 grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): a 403 means the token lacks a required scope or permission.`,
       );
       expect(resultOf(auto, "transport-post").details).toBe("HTTP 403 (credential rejected — check --auth)");
+      const pinned = await runComplianceSuite(stub.url, {
+        timeout: 5000,
+        headers: WRONG,
+        specVersion: MODERN_SPEC_VERSION,
+        only: ["transport-post"],
+      });
+      expect(pinned.warnings[0]).toBe(
+        `Server at ${stub.url} rejected the configured credential (the preflight carried an Authorization header and got HTTP 403), so the 2026-07-28 grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): a 403 means the token lacks a required scope or permission.`,
+      );
+      expect(resultOf(pinned, "transport-post").details).toBe("HTTP 403 (credential rejected -- check --auth)");
     } finally {
       await stub.stop();
+    }
+  }, 20_000);
+
+  it("a 403 with no insufficient_scope challenge (the SDK's Host validation behind a tunnel) is not called a rejected credential", async () => {
+    // The official SDK's Host guard answering a request forwarded with a
+    // tunnel hostname: 403, a JSON-RPC -32000 body, no WWW-Authenticate.
+    // Before: "rejected the configured credential ... a 403 means the token
+    // lacks a required scope or permission" on a server with no auth at all.
+    const stub = await startFixedServer(
+      403,
+      JSON.stringify({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Invalid Host: abc.ngrok-free.app" },
+        id: null,
+      }),
+      "application/json",
+    );
+    const neutral = (probe: string, era: string, spec: string) =>
+      `Server at ${stub.url} refused ${probe} with HTTP 403, so ${era}the ${spec} grade below is not meaningful. The request carried an Authorization header, but the 403 has no WWW-Authenticate: Bearer error="insufficient_scope" challenge, so it need not be about the credential: check the server's Host and Origin validation (a tunnel or proxy hostname it does not allow), any gateway in front of it, and the permissions of the --auth token.`;
+    try {
+      const auto = await runComplianceSuite(stub.url, { timeout: 5000, headers: WRONG, only: ["transport-post"] });
+      expect(auto.specVersion).toBe(LEGACY_SPEC_VERSION);
+      expect(auto.warnings[0]).toBe(
+        neutral("the server/discover probe", "the era could not be determined and ", LEGACY_SPEC_VERSION),
+      );
+      expect(autoNote(auto)).toBe(
+        "Spec version auto-detected as 2025-11-25 (server/discover -> HTTP 403 (forbidden -- no insufficient_scope challenge); era not determinable, using 2025-11-25). Pin with --spec-version to override.",
+      );
+      expect(resultOf(auto, "transport-post").details).toBe("HTTP 403 (forbidden — no insufficient_scope challenge)");
+      for (const specVersion of [LEGACY_SPEC_VERSION, MODERN_SPEC_VERSION] as const) {
+        const pinned = await runComplianceSuite(stub.url, {
+          timeout: 5000,
+          headers: WRONG,
+          specVersion,
+          only: ["transport-post"],
+        });
+        expect(pinned.warnings[0]).toBe(neutral("the preflight", "", specVersion));
+        expect(resultOf(pinned, "transport-post").details).toBe(
+          specVersion === MODERN_SPEC_VERSION
+            ? "HTTP 403 (forbidden -- no insufficient_scope challenge)"
+            : "HTTP 403 (forbidden — no insufficient_scope challenge)",
+        );
+      }
+      expect(auto.warnings.some((w) => w.includes("rejected the configured credential"))).toBe(false);
+      expect(auto.warnings.some((w) => w.includes("lacks a required scope"))).toBe(false);
+      // Without --auth the advice is unchanged: a bare 403 to a request with
+      // no credential still reads as authentication required.
+      const noAuth = await runComplianceSuite(stub.url, { timeout: 5000, only: ["transport-post"] });
+      expect(noAuth.warnings[0]).toBe(
+        `Server at ${stub.url} requires authentication (the server/discover probe got HTTP 403) and no Authorization header was sent, so the era could not be determined and the 2025-11-25 grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`,
+      );
+      expect(resultOf(noAuth, "transport-post").details).toBe("HTTP 403 (auth required — pass --auth)");
+    } finally {
+      await stub.stop();
+    }
+  }, 30_000);
+
+  it("auto re-probe after a preflight timeout: a bare 403 on the re-probe is read from the re-probe, not defaulted to 401", async () => {
+    let first = true;
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        const delay = first ? 1500 : 0;
+        first = false;
+        setTimeout(() => {
+          if (res.destroyed) return;
+          res.writeHead(403, { "content-type": "text/plain" });
+          res.end("Forbidden");
+        }, delay);
+      });
+    });
+    const url = await new Promise<string>((done) => {
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address();
+        done(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+      });
+    });
+    try {
+      const report = await runComplianceSuite(url, {
+        timeout: 5000,
+        preflightTimeout: 300,
+        startupTimeout: 5000,
+        headers: WRONG,
+        only: ["transport-post"],
+      });
+      expect(autoNote(report)).toContain("server/discover -> HTTP 403 (forbidden -- no insufficient_scope challenge)");
+      // Before: the preflight timed out, so the warning fell back to "HTTP 401 ... invalid or expired".
+      expect(report.warnings[0]).toMatch(
+        new RegExp(`^Server at ${url.replace(/[.]/g, "\\.")} refused the server/discover probe with HTTP 403, so `),
+      );
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((done) => server.close(() => done()));
     }
   }, 20_000);
 
@@ -1243,6 +1354,60 @@ describe("abort after the preflight: the era probe, the re-probe and the pinned 
   });
 });
 
+describe("probeExitWarning: the fresh child's exit can land after its initialize has already failed", () => {
+  // The fresh instance's write error (EPIPE) can reject initialize a beat
+  // before the child's 'exit' event lands. The runner quotes stderr first,
+  // which usually hides the gap; the benchmark calls probeExitWarning right
+  // after its warm-up fails. The fake exposes only what probeExitWarning
+  // reads: `exited`, `exitCode` and `stderrTail()`.
+  const STARTUP_STDERR = "Error: API_KEY environment variable is required";
+  const probeExit = { exitCode: 1, stderr: STARTUP_STDERR };
+  function freshChild(exitAfterMs: number | null): StdioTransport {
+    let exited = false;
+    if (exitAfterMs !== null) {
+      setTimeout(() => {
+        exited = true;
+      }, exitAfterMs);
+    }
+    return {
+      kind: "stdio",
+      get exited() {
+        return exited;
+      },
+      get exitCode() {
+        return exited ? 1 : null;
+      },
+      stderrTail: () => (exited ? `${STARTUP_STDERR}\n` : ""),
+    } as unknown as StdioTransport;
+  }
+
+  it("an exit that lands after the failed initialize still reads as a startup exit, with no pin advice", async () => {
+    const warning = await probeExitWarning(probeExit, freshChild(60), {
+      era: "legacy",
+      answered: false,
+      spawner: "benchmark",
+    });
+    expect(warning).toBe(
+      `Server exited (code 1) before answering the 2026-07-28 era probe (server/discover), and the fresh instance the benchmark spawned exited at startup as well (code 1) before answering initialize: the server exits at startup regardless of the probe; last stderr: ${STARTUP_STDERR}. Check the command, its arguments and its environment.`,
+    );
+  });
+
+  it("a fresh child that stays up is given a bounded wait, then the probe is blamed with the pin advice", async () => {
+    const started = Date.now();
+    const warning = await probeExitWarning(
+      { exitCode: 1, stderr: "Error: unhandled method server/discover" },
+      freshChild(null),
+      { era: "legacy", answered: false, spawner: "suite" },
+    );
+    const elapsed = Date.now() - started;
+    expect(warning).toBe(
+      "Server exited (code 1) after the 2026-07-28 era probe (server/discover); last stderr: Error: unhandled method server/discover. The suite spawned a fresh instance. A 2025-11-25 server must tolerate unknown pre-initialize requests (answer with a JSON-RPC error or ignore them, never exit); pin --spec-version 2025-11-25 to skip the probe.",
+    );
+    expect(elapsed).toBeGreaterThanOrEqual(250);
+    expect(elapsed).toBeLessThan(5000);
+  });
+});
+
 describe("probeAnswerShowsEra", () => {
   const res = (body: unknown, statusCode?: number): TransportResponse => ({ body, requestId: 0, statusCode });
 
@@ -1343,16 +1508,83 @@ describe("classifyDiscoverResponse", () => {
     );
   });
 
+  it("refusedCredential: a 401 always, a 403 only with a Bearer insufficient_scope challenge, read from a repeated header too", () => {
+    // undici hands a repeated header to the legacy transport-post as string[].
+    const scopeAmongOthers = { "www-authenticate": ['Basic realm="proxy"', 'Bearer error="insufficient_scope"'] };
+    expect(refusedCredential(403, scopeAmongOthers)).toBe(true);
+    expect(refusedCredential(403, { "www-authenticate": ['Basic realm="proxy"', 'Bearer realm="mcp"'] })).toBe(false);
+    expect(refusedCredential(403, undefined)).toBe(false);
+    expect(refusedCredential(401, undefined)).toBe(true);
+    // Neither status: no refusal to read, whatever the headers say.
+    expect(refusedCredential(400, scopeAmongOthers)).toBe(false);
+    expect(refusedCredential(undefined, scopeAmongOthers)).toBe(false);
+  });
+
+  const withHeaders = (body: unknown, statusCode: number, headers: Record<string, string>): TransportResponse => ({
+    body,
+    requestId: 0,
+    statusCode,
+    headers,
+  });
+  const SCOPE_CHALLENGE = 'Bearer error="insufficient_scope", scope="files:read", resource_metadata="https://x/prm"';
+
   it.each([
-    401, 403,
-  ])("HTTP %i with an Authorization header on the probe: the credential was rejected, and the reason does not say to pass --auth", (status) => {
-    const d = classifyDiscoverResponse(res({ error: "invalid_token", error_description: "x" }, status), {
-      authorizationSent: true,
-    });
+    ["a 401 without a challenge", res({ error: "invalid_token", error_description: "x" }, 401)],
+    [
+      "a 401 with a Bearer challenge",
+      withHeaders({ error: "invalid_token" }, 401, { "www-authenticate": 'Bearer error="invalid_token"' }),
+    ],
+    [
+      "a 403 with a Bearer insufficient_scope challenge",
+      withHeaders({ error: "insufficient_scope" }, 403, { "www-authenticate": SCOPE_CHALLENGE }),
+    ],
+    // Header names are matched case-insensitively (a hand-built response map).
+    ["the same 403, header name capitalised", withHeaders({}, 403, { "WWW-Authenticate": SCOPE_CHALLENGE })],
+  ])("%s with an Authorization header on the probe: the credential was rejected, and the reason does not say to pass --auth", (_name, response) => {
+    const d = classifyDiscoverResponse(response, { authorizationSent: true });
     expect(d.version).toBe(LEGACY_SPEC_VERSION);
     expect(d.eraUndetermined).toBe(true);
     expect(d.reason).toBe(
-      `server/discover -> HTTP ${status} (credential rejected -- check --auth); era not determinable, using 2025-11-25`,
+      `server/discover -> HTTP ${response.statusCode} (credential rejected -- check --auth); era not determinable, using 2025-11-25`,
+    );
+    expect(d.refusal).toEqual({ statusCode: response.statusCode, credentialRefused: true });
+  });
+
+  it.each([
+    // The SDK's Host validation answering a tunnel hostname: 403, a JSON-RPC
+    // -32000 body, no WWW-Authenticate. streamable-http requires the same
+    // bare 403 for an invalid Origin.
+    [
+      "the SDK Host guard's 403",
+      withHeaders(
+        { jsonrpc: "2.0", error: { code: -32000, message: "Invalid Host: abc.ngrok-free.app" }, id: null },
+        403,
+        {
+          "content-type": "application/json",
+        },
+      ),
+    ],
+    ["a 403 with a JSON body naming a scope but no challenge", res({ error: "insufficient_scope" }, 403)],
+    [
+      "a 403 whose Bearer challenge is not insufficient_scope",
+      withHeaders({}, 403, { "www-authenticate": 'Bearer realm="mcp"' }),
+    ],
+    [
+      "a 403 whose insufficient_scope is not a Bearer challenge",
+      withHeaders({}, 403, { "www-authenticate": 'DPoP error="insufficient_scope"' }),
+    ],
+  ])("%s with an Authorization header on the probe: not called a credential rejection", (_name, response) => {
+    const d = classifyDiscoverResponse(response, { authorizationSent: true });
+    expect(d.version).toBe(LEGACY_SPEC_VERSION);
+    expect(d.eraUndetermined).toBe(true);
+    // Before: "(credential rejected -- check --auth)" for every 403.
+    expect(d.reason).toBe(
+      "server/discover -> HTTP 403 (forbidden -- no insufficient_scope challenge); era not determinable, using 2025-11-25",
+    );
+    expect(d.refusal).toEqual({ statusCode: 403, credentialRefused: false });
+    // Without the header the no-credential advice is unchanged.
+    expect(classifyDiscoverResponse(response).reason).toBe(
+      "server/discover -> HTTP 403 (authentication required -- pass --auth); era not determinable, using 2025-11-25",
     );
   });
 

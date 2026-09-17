@@ -21,15 +21,18 @@
 #   - GitHub CLI authenticated
 #       gh auth login
 #
-# Prerequisites for CI runs:
+# Prerequisites for CI runs (dormant in this repo -- see below):
 #   - $CI=true
-#   - $GITHUB_REF_NAME=vX.Y.Z (set automatically by the tag-push trigger)
+#   - $GITHUB_REF_NAME=vX.Y.Z (set by whatever tag-push job invokes the script)
 #   - $NODE_AUTH_TOKEN populated from secrets.NPM_TOKEN (org-level)
 #   - $GITHUB_TOKEN populated automatically by Actions
 #
-# Either path produces an identical artifact; the typical workflow is to bump
-# + commit + tag + push locally and let CI handle the publish steps via the
-# tag-push trigger in .github/workflows/release.yml.
+# Either path produces an identical artifact. This repo has no GitHub Actions
+# workflows (removed in fe1185a; Actions and Dependabot are disabled org-wide),
+# so nothing invokes CI mode and there is no .github/workflows/release.yml to
+# hand the publish to: a release is `./release.sh <version>` run locally, and
+# the workstation does every step, publish included. The CI branches below are
+# kept so the script still works if a tag-push workflow is ever restored.
 # =============================================================================
 
 set -euo pipefail
@@ -420,6 +423,8 @@ step 4 "Publish to npm"
 #                                       version. CI is authoritative.
 #   3. IS_CI=false + no CI publish   -> Workstation IS the publisher. Try locally
 #      path                             with EOTP retry for fresh WebAuthn sessions.
+# This repo has no .github/workflows/release.yml (see the header), so path 3 is
+# the one that runs; paths 1 and 2 are dormant.
 PUBLISHED_VERSION=$(npm view "@yawlabs/mcp-compliance@${VERSION}" version 2>/dev/null || echo "")
 if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   info "v${VERSION} already published on npm -- skipping"

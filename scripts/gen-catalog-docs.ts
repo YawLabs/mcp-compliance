@@ -52,7 +52,7 @@ const C: Record<string, Criteria> = {
   // ── transport ──
   "transport-post": {
     pass: "HTTP 2xx for a POST carrying a conformant server/discover request (standard headers plus _meta).",
-    fail: "Any non-2xx status; 401/403 is annotated as authentication required, or as the configured credential rejected when --auth was given.",
+    fail: 'Any non-2xx status; 401/403 is annotated as authentication required, or, when --auth was given, as the configured credential rejected (a 401, or a 403 with a WWW-Authenticate: Bearer error="insufficient_scope" challenge) or as forbidden (any other 403, which may be Host/Origin validation or a gateway).',
     gate: null,
   },
   "transport-content-type": {
@@ -67,7 +67,7 @@ const C: Record<string, Criteria> = {
   },
   "transport-batch-reject": {
     pass: "A JSON array of two valid server/discover requests draws HTTP 4xx or a JSON-RPC error body.",
-    fail: "A 2xx status without a JSON-RPC error, an array response, or a text/event-stream carrying no JSON-RPC response (notifications before an error frame are ignored).",
+    fail: "A 2xx status without a JSON-RPC error, an array response (a JSON array body, or an SSE data frame holding an array), or a text/event-stream carrying no JSON-RPC response (notifications before an error frame are ignored).",
     gate: null,
   },
   "transport-notification-202": {
@@ -116,8 +116,8 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "transport-header-name-mismatch": {
-    pass: `HTTP 400 for a resources/read of the first listed resource (else a prompts/get of the first prompt without required arguments) whose Mcp-Name header names a different object than the body, ${NOT_EVALUABLE}; a missing -32020 code is reported as a warning. The lists are fetched on demand; skipped when the server declares neither resources nor prompts or nothing listed is readable by name alone, and skipped pointing at the -list rules when every declared list call failed and those rules are in the run.`,
-    fail: `Any status other than 400, a 400 from a server whose conformant server/discover was itself rejected, or every declared list call failed while the -list rules were filtered out of the run (the recorded reasons are named).`,
+    pass: `HTTP 400 for a resources/read of the first listed resource (else a prompts/get of the first prompt without required arguments) whose Mcp-Name header names a different object than the body, ${NOT_EVALUABLE}; a missing -32020 code is reported as a warning. The lists are fetched on demand; skipped when the server declares neither resources nor prompts or nothing listed is readable by name alone, and skipped pointing at the failed -list rules when a declared list call failed (even if the other list worked but held nothing readable by name) and those rules are in the run.`,
+    fail: `Any status other than 400, a 400 from a server whose conformant server/discover was itself rejected, or a declared list call failed while its -list rule was filtered out of the run (the recorded reasons are named).`,
     gate: null,
   },
   "transport-header-case-insensitive": {
@@ -137,7 +137,7 @@ const C: Record<string, Criteria> = {
   },
   "stdio-unicode": {
     pass: `The chosen tool (one named echo, else the first with a string property named message/text/input/query, else the first tool; tools/list fetched on demand) reproduces the CJK/emoji probe byte-for-byte, or reproduces every non-ASCII piece of it somewhere in the reply (a tokenizing tool); or, when the tool merely does not echo its input, a server/discover whose clientInfo name carries the probe is answered with a result.`,
-    fail: `The tool reply or the discover reply shows mangling (U+FFFD, a Latin-1 mis-decode, the non-ASCII characters replaced by '?', or the probe's first word present with neither the CJK word nor the emoji anywhere in the reply), the tool call draws -32700, or the discover carrying the probe in clientInfo is rejected or answered with a non-JSON-RPC reply.`,
+    fail: `The tool reply or the discover reply shows mangling (U+FFFD, a Latin-1 mis-decode, the non-ASCII characters replaced by '?', or the probe's first word present with neither the CJK word nor the emoji anywhere in the reply), the tool call draws -32700, the discover carrying the probe in clientInfo is rejected or answered with a non-JSON-RPC reply, or the server crashes or never answers either probe (the details give a one-line reason, such as the exit code or the timeout).`,
     gate: null,
   },
   "stdio-unknown-method-recovers": {
@@ -222,8 +222,8 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "lifecycle-removed-methods": {
-    pass: `ping, logging/setLevel and resources/subscribe each draw a JSON-RPC error (or a bare HTTP 4xx), credited only when the conformant server/discover was served; -32601 (HTTP 404 on HTTP) is expected and another code or status is reported as a warning.`,
-    fail: `Any of the three methods returns a result, gets no response, or draws neither a result nor an error; or all three are rejected by a server whose conformant server/discover was itself rejected or unanswered (not evaluable).`,
+    pass: `ping, logging/setLevel and resources/subscribe each draw a JSON-RPC error (or, on HTTP, a bare 404 with no JSON-RPC body), credited only when the conformant server/discover was served; -32601 (HTTP 404 on HTTP) is expected, and another code, another status with -32601, or a bare 404 is reported as a warning.`,
+    fail: `Any of the three methods returns a result, gets no response, or draws neither a result nor an error; on HTTP, a bare status other than 404 with no JSON-RPC body, or a transport-level status (401, 403, 413, 415, 429) on any of the three (not evaluable); or all three are rejected by a server whose conformant server/discover was itself rejected or unanswered (not evaluable).`,
     gate: null,
   },
   "lifecycle-dual-era": {
@@ -248,7 +248,7 @@ const C: Record<string, Criteria> = {
   },
   "lifecycle-meta-tolerance": {
     pass: "A server/discover carrying an extra vendor-prefixed _meta key returns a normal result.",
-    fail: "A JSON-RPC error or rejection attributable to the unknown key.",
+    fail: "A JSON-RPC error or no result for the probe carrying the unknown key. When the conformant server/discover was itself rejected or unanswered, or the probe drew a transport-level status (401, 403, 413, 415, 429), it fails as not evaluable instead of blaming the key.",
     gate: null,
   },
   "lifecycle-completions": {
@@ -406,7 +406,7 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "error-id-echo": {
-    pass: `Every recorded JSON-RPC error response (jsonrpc 2.0 with an error object carrying a numeric code) that answers an id-bearing request carries that same id; an id-less reply is attributed by timeline to the nearest earlier request that never got its own reply, or to a more recent client notification or raw probe (which counts only while no request sent after it was answered before the stray arrived). Exempt: replies to the suite's raw probes and client notifications, and replies without an id on HTTP 401/403/413/415/429 transport-level rejections; non-JSON-RPC error bodies (a gateway's {"error":...}) are not counted.`,
+    pass: `Every recorded JSON-RPC error response (jsonrpc 2.0 with an error object carrying a numeric code) that answers an id-bearing request carries that same id; an id-less reply is attributed by timeline to the nearest earlier request that never got its own reply, or to a more recent client notification or raw probe (which counts only while no request sent after it was answered before the stray arrived). Exempt: replies to the suite's raw probes and client notifications, and replies without an id on HTTP 401/403/413/415/429 transport-level rejections; non-JSON-RPC error bodies (a gateway's {"error":...}) are not counted. A reply that arrives while no request at all is pending (a stray written at boot) is exempt too and noted as such.`,
     fail: `A JSON-RPC error with a null or missing id in reply to a well-formed request, whatever the error code (-32600 and -32700 included), or a present but wrong id whatever the HTTP status. ${EMPTY_RECORDING}`,
     gate: null,
   },
@@ -478,8 +478,8 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "security-auth-malformed": {
-    pass: "In place of the configured credential, Authorization: Bearer aW52YWxpZC10b2tlbg (well-formed, unissued) draws HTTP 401 or 403 and a value outside the RFC 6750 b64token grammar draws 400, 401 or 403 (a refused connection also passes). Requires --auth; skipped otherwise.",
-    fail: "Either credential is accepted (2xx), the well-formed invalid token draws a status other than 401/403, or the malformed credential draws a status other than 400/401/403.",
+    pass: "In place of the configured credential, Authorization: Bearer aW52YWxpZC10b2tlbg (well-formed, unissued) draws HTTP 401 or 403 and a value outside the RFC 6750 b64token grammar draws 400, 401 or 403 (a connection closed without an answer also counts as a rejection when the credentialed server/discover was served). Requires --auth; skipped otherwise.",
+    fail: "Either credential is accepted (2xx), the well-formed invalid token draws a status other than 401/403, or the malformed credential draws a status other than 400/401/403; without such a status, a probe that got no HTTP answer (a timeout, a refused connection, or a drop when the credentialed server/discover was not served) fails as server unreachable.",
     gate: null,
   },
   "security-tls-required": {
@@ -508,27 +508,27 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "security-command-injection": {
-    pass: `No result from the single target -- a tool with a string argument from the safest annotation tier (readOnlyHint true, then destructiveHint false, then unannotated, then destructiveHint true; the spec defaults destructiveHint to true), a free-form argument before an enum/const/pattern one, other required arguments filled with schema-honouring placeholders -- shows evidence of executing an injected shell payload (passwd lines, id output, directory listings) without rejection wording or isError; the details count rejected, benign and never-reached payloads, and a run where no payload reached the tool passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
-    fail: `Any result containing evidence of execution that is not also a rejection, or a server that dies or drops the connection on a payload. ${LIST_FAILED_FAIL("tools")}`,
+    pass: `No result from the single target -- a tool with a string argument from the safest annotation tier (readOnlyHint true, then destructiveHint false, then unannotated, then destructiveHint true; the spec defaults destructiveHint to true), a free-form argument before an enum/const/pattern one, other required arguments filled with schema-honouring placeholders -- shows evidence of executing an injected shell payload (passwd lines, id output, directory listings) without rejection wording or isError; the details count rejected, benign and never-reached payloads (a dropped HTTP connection the server outlives counts as never reached, with a warning), and a run where no payload reached the tool passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `Any result containing evidence of execution that is not also a rejection, or a server that dies on a payload (the stdio child exits, or on HTTP the connection is dropped and a follow-up server/discover is neither served nor refused with 401/403/413/415/429). ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-sql-injection": {
     pass: `No result from the same single target contains database error text or unexpected row dumps for the SQL payloads without rejection wording or isError; all never-reached passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
-    fail: `Any result containing database error text or dumped rows that is not also a rejection, or a server that dies or drops the connection on a payload. ${LIST_FAILED_FAIL("tools")}`,
+    fail: `Any result containing database error text or dumped rows that is not also a rejection, or a server that dies on a payload (the stdio child exits, or on HTTP the connection is dropped and a follow-up server/discover is neither served nor refused with 401/403/413/415/429). ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-path-traversal": {
     pass: `No result from the target (a path-named string argument when one exists in the safest annotation tier, else a URL-named one, else the shared injection target) contains file contents from outside the tool's scope for the traversal payloads without rejection wording or isError; all never-reached passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
-    fail: `Any result containing out-of-scope file contents that is not also a rejection, or a server that dies or drops the connection on a payload. ${LIST_FAILED_FAIL("tools")}`,
+    fail: `Any result containing out-of-scope file contents that is not also a rejection, or a server that dies on a payload (the stdio child exits, or on HTTP the connection is dropped and a follow-up server/discover is neither served nor refused with 401/403/413/415/429). ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-ssrf-internal": {
     pass: `No result from the target (a URL-named string argument when one exists in the safest annotation tier, else a path-named one, else the shared injection target) contains cloud-metadata or internal-service content for the internal targets without rejection wording or isError; all never-reached passes as inconclusive with a warning. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
-    fail: `Any result containing metadata or internal-service content that is not also a rejection, or a server that dies or drops the connection on a payload. ${LIST_FAILED_FAIL("tools")}`,
+    fail: `Any result containing metadata or internal-service content that is not also a rejection, or a server that dies on a payload (the stdio child exits, or on HTTP the connection is dropped and a follow-up server/discover is neither served nor refused with 401/403/413/415/429). ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-oversized-input": {
-    pass: `A roughly 1 MB string in the first string argument that is not header-mirrored (a mirrored one only when no other exists, noted in the details) draws HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport; a completed result passes with a warning, and so does a reply that overflowed the runner's stdio line buffer. Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    pass: `A roughly 1 MB string in the first string argument that is not header-mirrored (a mirrored one only when no other exists, noted in the details) draws HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport; a completed result passes with a warning, and so does a reply to that call that overflowed the runner's stdio line buffer (an earlier overflow in the run, or the same marker text on the server's own stderr, does not count). Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
     fail: `A 5xx status, a timeout, a broken stdio frame, or a stdio child that dies. ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },

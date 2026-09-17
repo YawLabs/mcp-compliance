@@ -880,6 +880,158 @@ describe("modern fixture break knobs over HTTP", () => {
     expect(r.json.result.resultType).toBe("complete");
   });
 
+  it("slow-discover holds only server/discover, for about 1500ms", async () => {
+    const f = await knob("slow-discover");
+    const started = Date.now();
+    const discover = post(f.url, req("server/discover")).then((r) => ({ r, ms: Date.now() - started }));
+    const list = await post(f.url, req("tools/list"));
+    const listMs = Date.now() - started;
+    const { r, ms } = await discover;
+    expect(r.status).toBe(200);
+    expect(r.json.result.supportedVersions).toEqual([MODERN]);
+    expect(ms).toBeGreaterThanOrEqual(1400);
+    // A request sent after it is not queued behind the sleep.
+    expect(list.json.result.tools).toHaveLength(11);
+    expect(listMs).toBeLessThan(ms);
+  });
+
+  it("require-client-info rejects a request whose _meta omits the optional clientInfo", async () => {
+    const f = await knob("require-client-info");
+    const without = await post(f.url, req("server/discover", { _meta: { [META_VERSION]: MODERN, [META_CAPS]: {} } }));
+    expect(without.status).toBe(400);
+    expect(without.json.error).toEqual({
+      code: -32602,
+      message: `Invalid params: params._meta["${META_INFO}"] must be an object`,
+    });
+    const full = await post(f.url, req("server/discover"));
+    expect(full.status).toBe(200);
+    expect(full.json.result.supportedVersions).toEqual([MODERN]);
+  });
+
+  it("reject-unknown-meta rejects a vendor _meta key with -32602 and still serves every reserved key", async () => {
+    const f = await knob("reject-unknown-meta");
+    const vendor = await post(f.url, req("server/discover", { _meta: meta({ "com.example.compliance/probe": "x" }) }));
+    expect(vendor.status).toBe(400);
+    expect(vendor.json.error).toEqual({
+      code: -32602,
+      message: 'Invalid params: params._meta["com.example.compliance/probe"] is not a recognised key',
+    });
+    const reserved = await post(
+      f.url,
+      req("server/discover", {
+        _meta: meta({
+          progressToken: "p-1",
+          traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+          tracestate: "vendor=1",
+          baggage: "k=v",
+          [META_LOG]: "info",
+        }),
+      }),
+    );
+    expect(reserved.status).toBe(200);
+    expect(reserved.json.result.supportedVersions).toEqual([MODERN]);
+  });
+
+  it("meta-error-wrong-code answers a malformed _meta with -32600 instead of -32602, still on HTTP 400", async () => {
+    const f = await knob("meta-error-wrong-code");
+    const r = await post(f.url, { jsonrpc: "2.0", id: 1, method: "server/discover", params: {} });
+    expect(r.status).toBe(400);
+    expect(r.json.error).toEqual({ code: -32600, message: "Invalid Request: params._meta is required" });
+    expect(r.json.id).toBe(1);
+  });
+
+  it("accept-any-version serves a request declaring a version the server does not implement", async () => {
+    const f = await knob("accept-any-version");
+    const r = await post(f.url, req("server/discover", { _meta: meta({ [META_VERSION]: "1999-01-01" }) }), {
+      "MCP-Protocol-Version": "1999-01-01",
+    });
+    expect(r.status).toBe(200);
+    expect(r.json.error).toBeUndefined();
+    expect(r.json.result.supportedVersions).toEqual([MODERN]);
+  });
+
+  it("boolean-capability declares tools as true instead of an object, and still serves tools/list", async () => {
+    const f = await knob("boolean-capability");
+    const r = await post(f.url, req("server/discover"));
+    expect(r.json.result.capabilities).toEqual({
+      tools: true,
+      resources: { listChanged: true, subscribe: true },
+      prompts: { listChanged: true },
+      completions: {},
+    });
+    const list = await post(f.url, req("tools/list"));
+    expect(list.json.result.tools).toHaveLength(11);
+  });
+
+  it("prompts-list-error fails prompts/list with -32603 on HTTP 500; prompts stay declared and the template list is served", async () => {
+    const f = await knob("prompts-list-error");
+    const r = await post(f.url, req("prompts/list"));
+    expect(r.status).toBe(500);
+    expect(r.json.error).toEqual({ code: -32603, message: "Internal error: prompt store unavailable" });
+    const discover = await post(f.url, req("server/discover"));
+    expect(discover.json.result.capabilities.prompts).toEqual({ listChanged: true });
+    const templates = await post(f.url, req("resources/templates/list"));
+    expect(templates.status).toBe(200);
+    expect(templates.json.result.resourceTemplates).toHaveLength(1);
+  });
+
+  it("templates-list-error fails resources/templates/list with -32603 on HTTP 500; resources and prompts are served", async () => {
+    const f = await knob("templates-list-error");
+    const r = await post(f.url, req("resources/templates/list"));
+    expect(r.status).toBe(500);
+    expect(r.json.error).toEqual({ code: -32603, message: "Internal error: resource template store unavailable" });
+    const resources = await post(f.url, req("resources/list"));
+    expect(resources.json.result.resources).toHaveLength(2);
+    const prompts = await post(f.url, req("prompts/list"));
+    expect(prompts.status).toBe(200);
+    expect(prompts.json.result.prompts).toHaveLength(2);
+  });
+
+  const completeGreet = () =>
+    req("completion/complete", { ref: { type: "ref/prompt", name: "greet" }, argument: { name: "name", value: "" } });
+
+  it("completion-rejects-argument answers completion/complete for a listed argument with -32602 on HTTP 400", async () => {
+    const f = await knob("completion-rejects-argument");
+    const r = await post(f.url, completeGreet());
+    expect(r.status).toBe(400);
+    expect(r.json.error).toEqual({ code: -32602, message: 'Invalid params: cannot complete argument "name"' });
+  });
+
+  it("completion-no-values answers completion/complete with a completion that has no values array", async () => {
+    const f = await knob("completion-no-values");
+    const r = await post(f.url, completeGreet());
+    expect(r.status).toBe(200);
+    expect(r.json.result.completion).toEqual({});
+  });
+
+  it("listen-silent opens the listen stream (200, SSE) and never writes a frame, not even the ack", async () => {
+    const f = await knob("listen-silent");
+    const stream = await openStream(f.url, req("subscriptions/listen", { notifications: { toolsListChanged: true } }));
+    try {
+      expect(stream.status).toBe(200);
+      expect(String(stream.headers["content-type"])).toContain("text/event-stream");
+      await expect(stream.nextFrame(750)).rejects.toThrow("stream: no frame within 750ms");
+    } finally {
+      stream.close();
+    }
+  });
+
+  it("string-id-coerced answers a string id as Number(id) (null when not numeric); numeric ids are untouched", async () => {
+    const f = await knob("string-id-coerced");
+    const named = await post(f.url, req("server/discover", {}, "discover-abc"));
+    expect(named.status).toBe(200);
+    expect(named.text).toContain('"id":null');
+    expect(named.json.result.supportedVersions).toEqual([MODERN]);
+    const digits = await post(f.url, req("server/discover", {}, "42"));
+    expect(digits.json.id).toBe(42);
+    // Error responses carry the coerced id too.
+    const unknown = await post(f.url, req("no/such/method", {}, "m-1"));
+    expect(unknown.json.error.code).toBe(-32601);
+    expect(unknown.json.id).toBeNull();
+    const numeric = await post(f.url, req("server/discover", {}, 7));
+    expect(numeric.json.id).toBe(7);
+  });
+
   it("no-result-type drops resultType", async () => {
     const f = await knob("no-result-type");
     const r = await post(f.url, req("tools/list"));

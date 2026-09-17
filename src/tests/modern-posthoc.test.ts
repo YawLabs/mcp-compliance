@@ -1332,6 +1332,218 @@ describe("2026-07-28 post-hoc tests: schema-result-type value set", () => {
   });
 });
 
+describe("2026-07-28 post-hoc tests: messages that arrive while no request is pending", () => {
+  const bootLog = { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "server ready" } };
+  const discoverReply = { jsonrpc: "2.0", id: 1000, result: DISCOVER_RESULT };
+  const sendDiscover = (recorder: Recorder) =>
+    recorder.recordSent({ id: 1000, method: "server/discover", params: {}, meta: undefined });
+  const OUTSIDE =
+    '1 notifications/message (level "info") outside any request without _meta logLevel; 2 server messages scanned (1 notification)';
+
+  it.each<[string, (recorder: Recorder) => void]>([
+    [
+      "before the first request is sent (a boot-time log)",
+      (recorder) => {
+        recorder.recordReceived(bootLog);
+        sendDiscover(recorder);
+        recorder.recordReceived(discoverReply);
+      },
+    ],
+    [
+      "after every request was answered by id",
+      (recorder) => {
+        sendDiscover(recorder);
+        recorder.recordReceived(discoverReply);
+        recorder.recordReceived(bootLog);
+      },
+    ],
+  ])("lifecycle-log-level-gating attributes a log %s to no request (scripted)", async (_label, script) => {
+    const { results } = await scanRecording("stdio", script);
+    const r = results["lifecycle-log-level-gating"] as TestResult;
+    expect(r.passed).toBe(false);
+    expect(r.details).toBe(OUTSIDE);
+    expectPassed(
+      results,
+      POSTHOC_IDS.filter((id) => id !== "lifecycle-log-level-gating"),
+    );
+  });
+
+  it("over real stdio: a server that logs 'server ready' on stdout at boot fails lifecycle-log-level-gating, outside any request", async () => {
+    const transport = createStdioTransport({
+      command: process.execPath,
+      args: [
+        scriptedChild(
+          ['if (msg.method === "server/discover") send({ jsonrpc: "2.0", id: msg.id, result: discover });'],
+          [`send(${JSON.stringify(bootLog)});`],
+        ),
+      ],
+    });
+    try {
+      const ctx = makeContext(transport);
+      // The transport reads stdout from spawn: the boot line is recorded before the suite sends anything.
+      await vi.waitFor(() => expect(ctx.recorder.received).toHaveLength(1), { timeout: 5000, interval: 10 });
+      await fire(ctx.client, "server/discover");
+      expect(ctx.recorder.received.map((r) => r.message)).toEqual([bootLog, discoverReply]);
+      expect(ctx.recorder.received[0]?.seq).toBeLessThan(ctx.recorder.sent[0]?.seq as number);
+      await runPostHoc(ctx);
+      const results = collect(ctx);
+      expect(results["lifecycle-log-level-gating"]?.passed).toBe(false);
+      expect(results["lifecycle-log-level-gating"]?.details).toBe(OUTSIDE);
+      expectPassed(
+        results,
+        POSTHOC_IDS.filter((id) => id !== "lifecycle-log-level-gating"),
+      );
+    } finally {
+      await transport.close();
+    }
+  });
+
+  it("a null-id error written at boot is exempt from error-id-echo and says so, not 'answering raw probes or client notifications'", async () => {
+    const { results } = await scanRecording("stdio", (recorder) => {
+      recorder.recordReceived({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } });
+      sendDiscover(recorder);
+      recorder.recordReceived(discoverReply);
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed, echo.details).toBe(true);
+    expect(echo.details).toBe(
+      "no error responses to id-bearing requests recorded (exempt: 1 received while no request was pending)",
+    );
+    expectPassed(results, POSTHOC_IDS);
+  });
+
+  it("a raw-probe reply and a boot-time stray are exempt under their own labels in one run", async () => {
+    const { results } = await scanRecording("http", (recorder) => {
+      recorder.recordReceived({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } });
+      recorder.recordSent({ id: undefined, method: "", params: undefined, meta: undefined, raw: "{not json" });
+      recorder.recordReceived(
+        { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
+        { statusCode: 400 },
+      );
+    });
+    expect(results["error-id-echo"]?.details).toBe(
+      "no error responses to id-bearing requests recorded (exempt: 1 answering raw probes or client notifications; 1 received while no request was pending)",
+    );
+  });
+
+  it("a stray result with an unknown id at boot is counted as unattributed by the result scans, never blamed on a method", async () => {
+    // An input_required result (malformed: neither inputRequests nor
+    // requestState) on an id the suite never issued, before any send.
+    const { results } = await scanRecording("stdio", (recorder) => {
+      recorder.recordReceived({ jsonrpc: "2.0", id: "boot-1", result: { resultType: "input_required" } });
+      sendDiscover(recorder);
+      recorder.recordReceived(discoverReply);
+    });
+    const lists = results["schema-no-input-required-on-lists"] as TestResult;
+    expect(lists.passed, lists.details).toBe(true);
+    expect(lists.details).toBe(
+      "1 input_required result among 2 results, all on tools/call, prompts/get, resources/read (1 could not be attributed to a request)",
+    );
+    const shape = results["schema-input-required-shape"] as TestResult;
+    expect(shape.passed).toBe(false);
+    expect(shape.details).toBe(
+      "1 of 1 input_required result violates the MRTR server requirements; first (unattributed response): neither inputRequests nor requestState present",
+    );
+    const wire = results["schema-wire-valid"] as TestResult;
+    expect(wire.passed).toBe(false);
+    expect(wire.details).toBe(
+      "1 of 2 server messages violate the 2026-07-28 schema (1 distinct violation): unattributed (input_required): InputRequiredResult at /result: must have at least one of inputRequests or requestState",
+    );
+    expectPassed(results, ["transport-no-server-requests", "error-id-echo", "schema-result-type"]);
+  });
+});
+
+describe("2026-07-28 post-hoc tests: result and error members that are not objects", () => {
+  it("a void handler's result: null fails schema-result-type ('result null') and schema-wire-valid (must be object)", async () => {
+    const { results } = await scanRecording("stdio", (recorder) => {
+      recorder.recordSent({ id: 1000, method: "tools/list", params: {}, meta: undefined });
+      recorder.recordReceived({ jsonrpc: "2.0", id: 1000, result: null });
+    });
+    const rt = results["schema-result-type"] as TestResult;
+    expect(rt.passed).toBe(false);
+    expect(rt.details).toBe("1 of 1 result lacks a valid resultType; first: tools/list (result null)");
+    const wire = results["schema-wire-valid"] as TestResult;
+    expect(wire.passed).toBe(false);
+    // Only the envelope violation: the concrete ListToolsResult pass is skipped for a non-object result.
+    expect(wire.details).toBe(
+      "1 of 1 server message violate the 2026-07-28 schema (1 distinct violation): tools/list: JSONRPCResultResponse at /result: must be object (got null)",
+    );
+    expectPassed(results, [
+      "transport-no-server-requests",
+      "lifecycle-log-level-gating",
+      "error-id-echo",
+      "error-retired-codes",
+      "schema-no-input-required-on-lists",
+      "schema-input-required-shape",
+    ]);
+  });
+
+  const WIRE_BOOM =
+    '1 of 1 server message violate the 2026-07-28 schema (1 distinct violation): server/discover: JSONRPCErrorResponse at /error: must be object (got "boom")';
+
+  it.each<[string, Kind, number | undefined, boolean, string]>([
+    ["on stdio", "stdio", undefined, false, WIRE_BOOM],
+    ["at HTTP 200", "http", 200, false, WIRE_BOOM],
+    [
+      "at HTTP 500 (an intermediary's body: noted, not validated)",
+      "http",
+      500,
+      true,
+      "no server messages to validate (1 non-JSON-RPC body on HTTP error responses not validated (HTTP 500 x1))",
+    ],
+  ])("a jsonrpc 2.0 reply whose error member is a string %s: not counted by error-id-echo, judged by schema-wire-valid", async (_label, kind, statusCode, wirePassed, wireDetails) => {
+    const { results } = await scanRecording(kind, (recorder) => {
+      recorder.recordSent({ id: 1000, method: "server/discover", params: {}, meta: undefined });
+      recorder.recordReceived({ jsonrpc: "2.0", id: 1000, error: "boom" }, { statusCode });
+    });
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed, echo.details).toBe(true);
+    expect(echo.details).toBe(
+      "no error responses to id-bearing requests recorded (exempt: 1 non-JSON-RPC error body not counted)",
+    );
+    const wire = results["schema-wire-valid"] as TestResult;
+    expect(wire.passed, wire.details).toBe(wirePassed);
+    expect(wire.details).toBe(wireDetails);
+  });
+});
+
+describe("2026-07-28 post-hoc tests: schema-wire-valid labels a notification by its own method", () => {
+  it("over real stdio: progress notifications without a progressToken are grouped under notifications/progress, not the tools/call they arrived on", async () => {
+    const transport = createStdioTransport({
+      command: process.execPath,
+      args: [
+        scriptedChild([
+          'if (msg.method !== "tools/call") return;',
+          'send({ jsonrpc: "2.0", method: "notifications/progress", params: { progress: 1, total: 2 } });',
+          'send({ jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", content: [{ type: "text", text: "ok" }] } });',
+        ]),
+      ],
+    });
+    try {
+      const ctx = makeContext(transport);
+      for (const token of ["p-1", "p-2"]) {
+        await fire(ctx.client, "tools/call", { name: "slow", arguments: {}, _meta: { progressToken: token } });
+      }
+      expect(
+        ctx.recorder.received.map((r) => (r.message as { method?: string; id?: unknown }).method ?? "reply"),
+      ).toEqual(["notifications/progress", "reply", "notifications/progress", "reply"]);
+      await runPostHoc(ctx);
+      const results = collect(ctx);
+      const wire = results["schema-wire-valid"] as TestResult;
+      expect(wire.passed).toBe(false);
+      expect(wire.details).toBe(
+        "2 of 4 server messages violate the 2026-07-28 schema (1 distinct violation): notifications/progress x2: ProgressNotification at /params: must have required property 'progressToken'",
+      );
+      expectPassed(
+        results,
+        POSTHOC_IDS.filter((id) => id !== "schema-wire-valid"),
+      );
+    } finally {
+      await transport.close();
+    }
+  });
+});
+
 describe("2026-07-28 post-hoc tests: no retries, one id table", () => {
   const NOTHING = "no JSON-RPC messages were received from the server during the run, so there is nothing to scan";
   /** Under --retries 3 the harness would sleep 1+2+3 s per failing test; a deterministic scan must not. */

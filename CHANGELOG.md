@@ -371,8 +371,11 @@ out explicitly here.
     a refusal only when the same request with the credential (or without the
     Origin) was served.
   - The injection checks passed as inconclusive when the server died on every
-    payload. A stdio child that exits, or an HTTP connection dropped on a
-    payload, now fails naming the payload.
+    payload. A stdio child that exits on a payload, or an HTTP connection
+    dropped on a payload after which the server neither serves
+    `server/discover` nor answers it with a 401/403/413/415/429 gate, now fails
+    naming the payload; a drop the server outlives (a WAF or IPS, a keep-alive
+    close) counts as never reached, with a warning.
   - `security-tls-required` passed any 3xx redirect without reading `Location`;
     a redirect must now resolve to a single https URL.
   - `security-token-in-uri` failed a server that answered the query-string
@@ -384,7 +387,8 @@ out explicitly here.
   - `transport-batch-reject` reported "server processed the batch (0 replies)"
     for an SSE answer with no data frames and failed an SSE answer whose error
     frame followed a notification. Only JSON-RPC responses on the stream count
-    now.
+    now. An SSE data frame holding an array now fails as a processed batch, as
+    the same array over `application/json` does.
   - `error-id-echo` exempted a double-answered request's stray id-less error
     whenever any client notification had been sent earlier in the run; a
     notification now owns a stray only while no later request was answered
@@ -395,9 +399,68 @@ out explicitly here.
     acknowledgment within Nms" instead of stopping.
 - **A rejected `--auth` credential got advice to pass `--auth`.** A 401/403 on
   the era probe or preflight with an Authorization header configured now gets a
-  first-position warning (auto and pinned runs) that the credential was rejected
-  and the grade is not meaningful, and the auto-detection note and
-  `transport-post` say "credential rejected -- check --auth".
+  first-position warning (auto and pinned runs) that the grade is not
+  meaningful. It says the credential was rejected for a 401, or a 403 with a
+  `WWW-Authenticate: Bearer error="insufficient_scope"` challenge, and the
+  auto-detection note and `transport-post` then say "credential rejected --
+  check --auth". Any other 403 (the SDK's Host validation behind a tunnel
+  hostname, Origin validation, a gateway) gets a neutral warning pointing at
+  Host/Origin validation or a gateway, and the note and `transport-post` say
+  "forbidden -- no insufficient_scope challenge". After a preflight timeout the
+  warning names the status of the re-probe that answered.
+- **False verdicts and misleading details found by a final coverage pass over
+  the 2026-07-28 suite:**
+  - `lifecycle-removed-methods` credited any bare HTTP 4xx and any
+    401/403/413/415/429. streamable-http requires 404 with `-32601` for a
+    method the server does not implement, so only a bare 404 still passes with a
+    warning; any other bare status (400, 405, 500) fails naming it, and a
+    transport-level status, with or without a JSON-RPC body, fails as not
+    evaluable.
+  - `lifecycle-meta-tolerance` blamed the unknown `_meta` key for a blanket
+    rejection or a transport-level gate; that is now reported as not evaluable,
+    as `lifecycle-meta-client-info-optional` already was.
+  - `transport-header-name-mismatch` skip-passed when one of `resources/list`
+    and `prompts/list` failed and the other listed nothing readable by name
+    (graded A under `--only`); it now names the failed list, and fails when that
+    `-list` test is filtered out of the run.
+  - `security-auth-malformed` passed as "connection rejected" when a bad
+    credential got no answer. A timeout, a refused connection, or a dropped
+    connection when the credentialed `server/discover` was not served is now
+    `server unreachable`, as for the other negative auth probes, and cancelling
+    the run during its probes no longer records it as passed.
+  - `security-oversized-input` (stdio) passed a timed-out 1 MB call as
+    "survived" when an earlier reply in the run had overflowed the runner's
+    stdio line buffer, or when the server printed the runner's drop marker on
+    its own stderr. Only an overflow during that call counts now.
+  - The reply to a raw-body probe (invalid JSON, invalid JSON-RPC, a batch)
+    sent as SSE with its JSON split across several `data:` lines was dropped
+    from the recording, so `error-retired-codes` could miss a retired code in
+    it. It is now recorded, and `error-id-echo`, `schema-wire-valid` and the
+    security error-sample scans see it too.
+  - `stdio-unicode` reported a crash or hang on the CJK/emoji probe as a harness
+    `Error:` carrying the server's multi-line stderr tail; it now fails with a
+    one-line reason (`server exited (code N)`, or the timeout). `error-id-echo`
+    notes a stray error reply that arrives while no request is pending as
+    `received while no request was pending` instead of counting it as a reply
+    to a raw probe or client notification.
+  - The "non-JSON-RPC body" detail printed the HTTP status twice
+    (`server/discover answered HTTP 404, non-JSON-RPC body (HTTP 404)`) and
+    claimed `HTTP 200` on stdio; it now reads `server/discover answered
+    non-JSON-RPC body (HTTP 404)`.
+  - Under `auto`, a server that missed both the preflight and the era re-probe
+    but answered `initialize` got a warning blaming only a slow cold start; it
+    now says the era was not detected, that the run defaulted to 2025-11-25, and
+    that `--spec-version 2025-11-25` skips the re-probe.
+- **`lifecycle-progress-token` (2025-11-25) never reached the tool on SDK
+  servers.** It sent `Accept: text/event-stream` alone, so Streamable HTTP
+  servers built on the official SDK answered 406 and the test reported `HTTP
+  406 — request with progressToken accepted`. It now sends both media types,
+  and a non-2xx answer says the `tools/call` was not served.
+- **stdio `close()` returned before the forced process-tree kill ran.** On
+  Windows a caller that exits right after closing (a test worker, a script)
+  took `taskkill` down with it and left a busy server that ignores stdin
+  closing running. `close()` now waits up to 5 s for the kill to finish and the
+  child to exit, and a transport whose spawn failed closes at once.
 
 ## [0.18.2] — 2026-09-15
 

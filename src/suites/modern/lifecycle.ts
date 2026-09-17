@@ -70,8 +70,10 @@ const LEGACY_INITIALIZE_ID = 1;
  * limiter answers BEFORE the JSON-RPC layer reads the request. None of
  * them is the server's verdict on the request body, so a negative probe
  * that draws one measured nothing (the same list error-id-echo exempts).
+ * The security injection checks read it the other way round: a follow-up
+ * that draws one after a dropped payload shows something is still up.
  */
-const TRANSPORT_LEVEL_STATUS: Record<number, string> = {
+export const TRANSPORT_LEVEL_STATUS: Record<number, string> = {
   401: "an auth gate",
   403: "an auth gate",
   413: "a body-size limit",
@@ -595,13 +597,30 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
         summary.push(`${method} ${err ? `${err.code}` : `HTTP ${res.statusCode}`}`);
         continue;
       }
+      // A gate that answered before the JSON-RPC layer (401/403/413/415/429,
+      // see transportLevelRejection) says nothing about the method, body or no.
+      const gated = transportLevelRejection(ctx, res);
+      if (gated) {
+        failures.push(`${method}: ${gated}`);
+        continue;
+      }
       if (!err) {
-        if (ctx.kind === "http" && res.statusCode >= 400) {
+        // streamable-http: a server that does not implement the method "MUST
+        // respond with 404 Not Found and a JSON-RPC error with code -32601".
+        // A bare 404 has the status but not the body that tells it from a
+        // legacy server's 404: credited with a warning, as expectRejection
+        // credits a bare 400. Any other bare status (a 400 validator, a 500
+        // crash page, a 405 route) is not that answer.
+        if (ctx.kind === "http" && res.statusCode === 404) {
           harness.warnings.push(
             `lifecycle-removed-methods: ${method} rejected with HTTP ${res.statusCode} but no JSON-RPC error body`,
           );
           warned = true;
           summary.push(`${method} HTTP ${res.statusCode}`);
+        } else if (ctx.kind === "http" && res.statusCode >= 400) {
+          failures.push(
+            `${method}: rejected with HTTP ${res.statusCode} and no JSON-RPC error body (expected HTTP 404 with JSON-RPC error -32601)`,
+          );
         } else {
           failures.push(`${method}: neither result nor JSON-RPC error${statusOf(ctx, res)}`);
         }
@@ -682,13 +701,23 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
     } catch (err) {
       return fail(`server/discover with an extra _meta key: no response (${short(messageOf(err))})`);
     }
+    const status = statusOf(ctx, res);
     const err = errorOf(res.body);
-    if (err) {
-      return fail(
-        `Server rejected _meta with unknown key "${VENDOR_META_KEY}": ${err.code}${statusOf(ctx, res)}; unknown keys must be ignored`,
-      );
+    const served = resultOf(res.body);
+    if (err || !served) {
+      const refusal = err
+        ? `server/discover with unknown _meta key "${VENDOR_META_KEY}" rejected with ${err.code}${status}`
+        : `server/discover with an extra _meta key: no result${status}`;
+      // Blame the key only when the conformant discover (the same envelope
+      // without it) was served and no gate answered before the JSON-RPC
+      // layer (see notEvaluable, transportLevelRejection), as
+      // lifecycle-meta-client-info-optional does: a server that rejects
+      // everything, or a rate limiter, says nothing about unknown keys.
+      const about = "the unknown _meta key";
+      const unattributable = served ? null : (notEvaluable(ctx, about) ?? transportLevelRejection(ctx, res, about));
+      if (unattributable) return fail(`${refusal}; ${unattributable}`);
+      return fail(err ? `${refusal}; unknown keys must be ignored` : refusal);
     }
-    if (!resultOf(res.body)) return fail(`server/discover with an extra _meta key: no result${statusOf(ctx, res)}`);
     return pass(`Served server/discover with unknown _meta key "${VENDOR_META_KEY}"`);
   });
 }

@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { describe, expect, it } from "vitest";
-import { dedupAndCapWarnings, isHeaderToken, runComplianceSuite } from "../runner.js";
+import { dedupAndCapWarnings, filterWarnings, isHeaderToken, previewTests, runComplianceSuite } from "../runner.js";
 
 // Use localhost on a port that's definitely not listening for instant ECONNREFUSED
 const DEAD_URL = "http://127.0.0.1:1/mcp";
@@ -94,6 +97,69 @@ describe("runComplianceSuite — filtering", () => {
     expect(report.tests).toHaveLength(1);
     expect(report.tests[0].id).toBe("transport-post");
   }, 15000);
+
+  it("a mistyped --skip value is named in the report's warnings", async () => {
+    const report = await runComplianceSuite(DEAD_URL, {
+      specVersion: "2025-11-25",
+      only: ["transport-post"],
+      skip: ["lifecycle-inti"],
+      timeout: 2000,
+    });
+    expect(report.warnings).toContain(
+      'Filter value(s) "lifecycle-inti" match no test id or category in the 2025-11-25 catalog; run --list --spec-version 2025-11-25 to see valid ids.',
+    );
+  }, 15000);
+});
+
+describe("filterWarnings", () => {
+  it("names a --skip value that matches no test id or category", () => {
+    expect(filterWarnings("2025-11-25", "http", undefined, ["lifecycle-inti"])).toEqual([
+      'Filter value(s) "lifecycle-inti" match no test id or category in the 2025-11-25 catalog; run --list --spec-version 2025-11-25 to see valid ids.',
+    ]);
+  });
+
+  it("valid --skip ids and categories draw no warning", () => {
+    expect(filterWarnings("2026-07-28", "stdio", undefined, ["security", "lifecycle-discover"])).toEqual([]);
+    expect(filterWarnings("2025-11-25", "http", undefined, ["transport", "lifecycle-init"])).toEqual([]);
+  });
+
+  it("names the --only and --skip misses together, --only first, against the resolved catalog", () => {
+    // lifecycle-init exists only in 2025-11-25.
+    expect(filterWarnings("2026-07-28", "http", ["tools", "tool-list"], ["lifecycle-init"])).toEqual([
+      'Filter value(s) "tool-list", "lifecycle-init" match no test id or category in the 2026-07-28 catalog; run --list --spec-version 2026-07-28 to see valid ids.',
+    ]);
+  });
+
+  it("2026-07-28 on stdio: an --only id every definition gates to HTTP is named as http-only", () => {
+    // "security" also matches tests that run on stdio, so only the id is named.
+    expect(filterWarnings("2026-07-28", "stdio", ["transport-header-version-required", "security"], undefined)).toEqual(
+      [
+        'Filter value(s) "transport-header-version-required" match only tests that do not apply to a stdio target (http-only), so they select nothing here; run --list --transport stdio --spec-version 2026-07-28 to see the ids that apply.',
+      ],
+    );
+  });
+
+  it("2026-07-28 on HTTP: a stdio-only --only id is named as stdio-only", () => {
+    expect(filterWarnings("2026-07-28", "http", ["stdio-framing"], undefined)).toEqual([
+      'Filter value(s) "stdio-framing" match only tests that do not apply to a http target (stdio-only), so they select nothing here; run --list --transport http --spec-version 2026-07-28 to see the ids that apply.',
+    ]);
+  });
+
+  it("2026-07-28 gates by the definitions alone: ids the 2025-11-25 suite keeps off stdio in code are not flagged there", () => {
+    // In 2025-11-25 the transport category and STDIO_INCOMPATIBLE_IDS are
+    // HTTP-only on stdio; in 2026-07-28 only `transports` decides, and these
+    // three carry none, so they run (and --list lists them) on stdio.
+    const ids = ["transport-no-server-requests", "lifecycle-progress-token", "lifecycle-string-id"];
+    expect(filterWarnings("2026-07-28", "stdio", ids, undefined)).toEqual([]);
+    expect(
+      previewTests({ transport: "stdio", specVersion: "2026-07-28", only: ids })
+        .map((d) => d.id)
+        .sort(),
+    ).toEqual([...ids].sort());
+    expect(filterWarnings("2025-11-25", "stdio", ["lifecycle-progress-token"], undefined)).toEqual([
+      'Filter value(s) "lifecycle-progress-token" match only tests that do not apply to a stdio target (http-only), so they select nothing here; run --list --transport stdio --spec-version 2025-11-25 to see the ids that apply.',
+    ]);
+  });
 });
 
 describe("runComplianceSuite — report structure", () => {
@@ -415,13 +481,15 @@ const STUB_SESSION = "9b2e4c7a1f3d4e8b";
  *   query parameter as well; ping and tools/* also need the session id.
  * - `toolCall`: `"executes"` answers like a tool that hands `cmd` to a
  *   shell (the command's output, not the payload); `"invalid-params"`
- *   answers every tools/call with a JSON-RPC -32602 error.
+ *   answers every tools/call with a JSON-RPC -32602 error; `"http-500"`
+ *   answers it with HTTP 500 and a JSON-RPC -32603 error (a tool handler
+ *   that crashes into the framework's error page).
  *
  * Records every POST.
  */
 async function startLegacyStub(opts: {
   gateway?: { apiKey: string; token: string; queryToken: boolean };
-  toolCall?: "executes" | "invalid-params";
+  toolCall?: "executes" | "invalid-params" | "http-500";
 }): Promise<{ url: string; hits: StubHit[]; stop(): Promise<void> }> {
   const SHELL_OUTPUT: Record<string, string> = {
     "; cat /etc/passwd": "root:x:0:0:root:/root:/bin/bash",
@@ -517,6 +585,8 @@ async function startLegacyStub(opts: {
         reply({ result: { content: [{ type: "text", text: SHELL_OUTPUT[cmd] ?? "" }] } });
       } else if (msg.method === "tools/call" && opts.toolCall === "invalid-params") {
         reply({ error: { code: -32602, message: "Invalid params: cmd must match ^[a-z]+$" } });
+      } else if (msg.method === "tools/call" && opts.toolCall === "http-500") {
+        json(500, { jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Internal error" } });
       } else {
         reply({ error: { code: -32601, message: "Method not found" } });
       }
@@ -629,6 +699,127 @@ describe("runComplianceSuite — legacy security-token-in-uri", () => {
         passed: true,
         details: "HTTP 401 (token in query string rejected)",
       });
+    } finally {
+      await stub.stop();
+    }
+  }, 15000);
+});
+
+/**
+ * An SDK v1 sessionful Streamable HTTP server (the shape integration.test.ts
+ * runs) whose one tool, `count`, takes no arguments and records the
+ * `_meta.progressToken` each call carried. With `progress`, a call that
+ * carried a token first sends two notifications/progress for it, which the
+ * SDK streams on that request's SSE response ahead of the result.
+ */
+async function startSdkProgressServer(progress: boolean): Promise<{
+  url: string;
+  tokens: unknown[];
+  stop(): Promise<void>;
+}> {
+  const tokens: unknown[] = [];
+  const transports = new Map<string, StreamableHTTPServerTransport>();
+  const server: Server = createServer(async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const known = sessionId ? transports.get(sessionId) : undefined;
+    if (known) {
+      await known.handleRequest(req, res);
+      return;
+    }
+    if (req.method !== "POST") {
+      res.writeHead(sessionId ? 404 : 405);
+      res.end();
+      return;
+    }
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
+    const mcp = new McpServer({ name: "sdk-progress", version: "1.0.0" });
+    mcp.tool("count", "Counts to two", async (extra) => {
+      const token = extra._meta?.progressToken;
+      tokens.push(token);
+      if (progress && token !== undefined) {
+        for (const n of [1, 2]) {
+          await extra.sendNotification({
+            method: "notifications/progress",
+            params: { progressToken: token, progress: n, total: 2 },
+          });
+        }
+      }
+      return { content: [{ type: "text", text: "2" }] };
+    });
+    await mcp.connect(transport);
+    await transport.handleRequest(req, res);
+    if (transport.sessionId) transports.set(transport.sessionId, transport);
+  });
+  const url = await new Promise<string>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      resolve(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+    });
+  });
+  return {
+    url,
+    tokens,
+    stop: async () => {
+      for (const t of transports.values()) await t.close().catch(() => {});
+      await new Promise<void>((resolve, reject) => {
+        server.closeAllConnections();
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    },
+  };
+}
+
+describe("runComplianceSuite — legacy lifecycle-progress-token", () => {
+  // tools-list discovers the tool the progress-token test calls.
+  const ONLY = ["tools-list", "lifecycle-progress-token"];
+  const run = (url: string) => runComplianceSuite(url, { timeout: 5000, specVersion: "2025-11-25", only: ONLY });
+  const progressToken = (report: Awaited<ReturnType<typeof run>>) => {
+    const t = report.tests.find((x) => x.id === "lifecycle-progress-token");
+    return { passed: t?.passed, details: t?.details };
+  };
+
+  it("an SDK v1 server's tool is called with the token, and the progress it streams is seen", async () => {
+    // The probe used to send Accept: text/event-stream alone. The SDK
+    // answers that with 406 before the tool runs, and the test reported
+    // "HTTP 406 — request with progressToken accepted".
+    const sdk = await startSdkProgressServer(true);
+    try {
+      const report = await run(sdk.url);
+      expect(progressToken(report)).toEqual({
+        passed: true,
+        details: "Server sent progress notifications via SSE with progressToken",
+      });
+      expect(sdk.tokens).toEqual(["compliance-progress-test"]);
+    } finally {
+      await sdk.stop();
+    }
+  }, 15000);
+
+  it("an SDK v1 tool that reports no progress: served, and the details say none was observed", async () => {
+    const sdk = await startSdkProgressServer(false);
+    try {
+      const report = await run(sdk.url);
+      expect(progressToken(report)).toEqual({
+        passed: true,
+        details: "Server accepted request with progressToken (no progress events observed — optional)",
+      });
+      expect(sdk.tokens).toEqual(["compliance-progress-test"]);
+    } finally {
+      await sdk.stop();
+    }
+  }, 15000);
+
+  it("an HTTP error on the tools/call is not reported as accepted", async () => {
+    const stub = await startLegacyStub({ toolCall: "http-500" });
+    try {
+      const report = await run(stub.url);
+      // Optional and informational: still a pass, but the details say the
+      // call was not served instead of claiming it was accepted.
+      expect(progressToken(report)).toEqual({
+        passed: true,
+        details: "HTTP 500 — tools/call with progressToken was not served (no progress events observed — optional)",
+      });
+      expect(stub.hits.filter((h) => h.method === "tools/call")).toHaveLength(1);
     } finally {
       await stub.stop();
     }

@@ -14,8 +14,9 @@ export interface DiffEntry {
 export interface DiffSummary {
   /**
    * The MCP spec revision both reports were graded against, or null
-   * when neither report records one (reports from tool versions before
-   * 0.13 carry no `specVersion`).
+   * when neither report records one. Every tool version has stamped
+   * `specVersion` (a required field of report.v1.json), so only a
+   * hand-edited or foreign JSON file lacks it.
    */
   specVersion: string | null;
   baselineGrade: string;

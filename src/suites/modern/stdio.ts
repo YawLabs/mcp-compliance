@@ -237,11 +237,22 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
     let note = "";
     const tool = await pickUnicodeTool(ctx);
     if (tool) {
-      const res = await client.rpc(
-        "tools/call",
-        { name: tool.name, arguments: Object.fromEntries(tool.args.map((arg) => [arg, UNICODE_PROBE])) },
-        { toolInputSchema: tool.inputSchema },
-      );
+      // A crash or a hang on non-ASCII stdin is the likeliest real failure
+      // here; shape it like the other stdio checks do, so the details never
+      // carry the transport's multi-line stderr tail (which can echo the probe).
+      let res: RpcResponse;
+      try {
+        res = await client.rpc(
+          "tools/call",
+          { name: tool.name, arguments: Object.fromEntries(tool.args.map((arg) => [arg, UNICODE_PROBE])) },
+          { toolInputSchema: tool.inputSchema },
+        );
+      } catch (e: unknown) {
+        return {
+          passed: false,
+          details: `tools/call ${tool.name} with a CJK/emoji argument got no reply (${explainFailure(ctx, e)})`,
+        };
+      }
       const serialized = JSON.stringify(res.body);
       if (serialized.includes(UNICODE_PROBE)) {
         return { passed: true, details: `tools/call ${tool.name} reproduced the CJK/emoji probe byte-for-byte` };
@@ -271,9 +282,17 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
         : `tools/call ${tool.name} did not echo the probe; `;
     }
 
-    const res = await client.rpc("server/discover", undefined, {
-      meta: { [META.clientInfo]: { name: UNICODE_PROBE, version: "1.0.0" } },
-    });
+    let res: RpcResponse;
+    try {
+      res = await client.rpc("server/discover", undefined, {
+        meta: { [META.clientInfo]: { name: UNICODE_PROBE, version: "1.0.0" } },
+      });
+    } catch (e: unknown) {
+      return {
+        passed: false,
+        details: `${note}server/discover with a CJK/emoji clientInfo name got no reply (${explainFailure(ctx, e)})`,
+      };
+    }
     const err = errorOf(res.body);
     if (err) {
       return {

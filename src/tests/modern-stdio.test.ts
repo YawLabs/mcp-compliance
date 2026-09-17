@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { getTestDefinitionMap } from "../definitions/index.js";
 import { createHarness } from "../harness.js";
 import { createModernClient } from "../modern/client.js";
+import { META } from "../modern/meta.js";
 import { createRecorder } from "../recorder.js";
 import { MODERN_SPEC_VERSION, specBaseFor } from "../spec.js";
 import { createModernState, type ModernState, type ModernSuiteContext } from "../suites/modern/context.js";
@@ -42,6 +43,9 @@ import { MODERN_FIXTURE, passedIds, runModern, startHttpFixture, stdioFixture } 
 const STDIO_IDS = ["stdio-framing", "stdio-unicode", "stdio-unknown-method-recovers", "stdio-cancellation"];
 const ALL_PASS = Object.fromEntries(STDIO_IDS.map((id) => [id, "pass"]));
 const TIMEOUT = 2000;
+/** The suite's bogus method and CJK/emoji probe, as the checks send them. */
+const BOGUS_METHOD = "this/method/does/not/exist-xyzzy";
+const UNICODE_PROBE = "héllo 世界 🚀";
 
 const EMPTY_STATE: ModernState = createModernState();
 
@@ -180,9 +184,12 @@ describe("2026-07-28 stdio-unicode: tools/call branch over a real fixture proces
 type Answer = "result" | "error" | "silent" | "crash";
 
 interface FakeScript {
-  answer: (method: string, id: JsonRpcId, n: number) => Answer;
+  /** `params` as sent (with the client's `_meta`), for a server that reacts to what it was sent. */
+  answer: (method: string, id: JsonRpcId, n: number, params?: unknown) => Answer;
   /** The `result` object for an answer of "result"; default: a minimal DiscoverResult. */
   result?: (method: string, params: unknown) => Record<string, unknown>;
+  /** The JSON-RPC error code for an answer of "error"; default -32601. */
+  errorCode?: (method: string) => number;
   onNotify?: (method: string, fake: FakeStdio) => void;
 }
 
@@ -209,7 +216,7 @@ function fakeStdio(script: FakeScript): FakeStdio {
       const id = nextId();
       fake.calls.push([method, params]);
       if (fake.exited) throw new Error(`stdio transport: server crashed with exit code ${fake.exitCode}`);
-      const answer = script.answer(method, id, count++);
+      const answer = script.answer(method, id, count++, params);
       if (answer === "crash") {
         fake.exited = true;
         fake.exitCode = 1;
@@ -219,9 +226,14 @@ function fakeStdio(script: FakeScript): FakeStdio {
         await new Promise((r) => setTimeout(r, Math.min(init.timeout, 50)));
         throw new Error(`stdio transport: request timed out after ${init.timeout}ms (method=${method})`);
       }
+      const code = script.errorCode?.(method) ?? -32601;
       const body =
         answer === "error"
-          ? { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } }
+          ? {
+              jsonrpc: "2.0",
+              id,
+              error: { code, message: code === -32601 ? `Method not found: ${method}` : "rejected" },
+            }
           : {
               jsonrpc: "2.0",
               id,
@@ -467,6 +479,198 @@ describe("2026-07-28 stdio tests: scripted misbehaviour (no fixture knob exists 
       expect(outcome(ctx, id).passed, `${id}: ${outcome(ctx, id).details}`).toBe(true);
     }
   });
+
+  it("stdio-cancellation names a RESULT written in reply to the notification (not only an error)", async () => {
+    // A generic dispatcher that answers every frame it reads, notifications included, with an empty result.
+    const fake = fakeStdio({
+      ...conformant,
+      onNotify: (method, f) => {
+        if (method === "notifications/cancelled") f.emit({ jsonrpc: "2.0", id: null, result: {} });
+      },
+    });
+    const ctx = makeContext(fake);
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-cancellation");
+    expect(r.passed).toBe(false);
+    expect(r.details).toBe(
+      "server replied to notifications/cancelled with a result (id null); notifications must not be answered",
+    );
+  });
+
+  it("stdio-cancellation fails when server/discover after notifications/cancelled draws a JSON-RPC error", async () => {
+    // A cancel handler that throws on the unknown id and leaves the server
+    // rejecting what follows: the discover is answered, but with an error.
+    let cancelled = false;
+    const fake = fakeStdio({
+      answer: (method) => (method !== "server/discover" ? "error" : cancelled ? "error" : "result"),
+      errorCode: (method) => (method === "server/discover" ? -32603 : -32601),
+      onNotify: (method) => {
+        if (method === "notifications/cancelled") cancelled = true;
+      },
+    });
+    const ctx = makeContext(fake);
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-cancellation");
+    expect(r.passed).toBe(false);
+    expect(r.details).toBe("server/discover after notifications/cancelled (unknown id) -> JSON-RPC error -32603");
+    // Every discover before the cancel was answered normally.
+    for (const id of STDIO_IDS.filter((i) => i !== "stdio-cancellation")) {
+      expect(outcome(ctx, id).passed, `${id}: ${outcome(ctx, id).details}`).toBe(true);
+    }
+  });
+
+  it.each([
+    [
+      "never answered (dropped silently)",
+      "silent" as const,
+      "unknown method drew no response (stdio transport: request timed out after 2000ms (method=this/method/does/not/exist-xyzzy))",
+      // stdio-cancellation's own discover.
+      ["server/discover"],
+    ],
+    // After a crash stdio-cancellation cannot even write its notification.
+    ["answered by a crash", "crash" as const, "unknown method drew no response (server exited (code 1))", []],
+  ])("stdio-unknown-method-recovers fails when the unknown method itself is %s", async (_label, answer, details, after) => {
+    const fake = fakeStdio({
+      answer: (method, id, n, params) => (method === BOGUS_METHOD ? answer : conformant.answer(method, id, n, params)),
+    });
+    const ctx = makeContext(fake);
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-unknown-method-recovers");
+    expect(r.passed).toBe(false);
+    expect(r.details).toBe(details);
+    // The verdict came at the unknown method: the check sent no follow-up discover of its own.
+    const methods = fake.calls.map(([m]) => m);
+    const bogusAt = methods.indexOf(BOGUS_METHOD);
+    expect(bogusAt).toBeGreaterThan(-1);
+    expect(methods.slice(bogusAt + 1)).toEqual(after);
+  });
+
+  it("stdio-unknown-method-recovers fails when server/discover right after the unknown method draws a JSON-RPC error (desynced)", async () => {
+    let desynced = false;
+    const fake = fakeStdio({
+      answer: (method) => {
+        if (method === BOGUS_METHOD) {
+          desynced = true;
+          return "error";
+        }
+        if (desynced) {
+          desynced = false;
+          return "error";
+        }
+        return "result";
+      },
+      errorCode: (method) => (method === "server/discover" ? -32603 : -32601),
+    });
+    const ctx = makeContext(fake);
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-unknown-method-recovers");
+    expect(r.passed).toBe(false);
+    expect(r.details).toBe(
+      "unknown method -> JSON-RPC error -32601, but server/discover afterwards -> JSON-RPC error -32603 (server may have desynced)",
+    );
+    // Only that one discover was rejected: the cancellation check's discover is answered.
+    expect(outcome(ctx, "stdio-cancellation").passed, outcome(ctx, "stdio-cancellation").details).toBe(true);
+  });
+
+  it.each([
+    -32600, -32000,
+  ])("stdio-unknown-method-recovers passes an unknown method answered %d, with a warning naming the code", async (code) => {
+    const fake = fakeStdio({ ...conformant, errorCode: (method) => (method === BOGUS_METHOD ? code : -32601) });
+    const ctx = makeContext(fake);
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-unknown-method-recovers");
+    expect(r.passed, r.details).toBe(true);
+    expect(r.details).toBe(
+      `unknown method -> JSON-RPC error ${code}; server/discover answered afterwards on the same process`,
+    );
+    expect(ctx.harness.warnings).toEqual([
+      `stdio-unknown-method-recovers: unknown method drew JSON-RPC error ${code}; -32601 Method not found is the expected code.`,
+    ]);
+  });
+
+  it("stdio-unknown-method-recovers warns about nothing when the unknown method draws -32601 (control)", async () => {
+    const ctx = makeContext(fakeStdio(conformant));
+    await runStdio(ctx);
+    expect(outcome(ctx, "stdio-unknown-method-recovers").details).toBe(
+      "unknown method -> JSON-RPC error -32601; server/discover answered afterwards on the same process",
+    );
+    expect(ctx.harness.warnings).toEqual([]);
+  });
+
+  /**
+   * stdio-unicode's envelope probe on a server with no tools, so the
+   * discover carrying the probe in clientInfo.name decides. The fake
+   * answers each discover by looking at the name it was sent: the framing
+   * burst's ASCII name is always served, the probe gets `onProbe`.
+   */
+  function envelopeFake(onProbe: "reject" | "echo" | "echo-latin1") {
+    const nameOf = (params: unknown) =>
+      (params as { _meta?: Record<string, { name?: unknown }> } | undefined)?._meta?.[META.clientInfo]?.name;
+    const fake = fakeStdio({
+      answer: (method, _id, _n, params) => {
+        if (method !== "server/discover") return "error";
+        return onProbe === "reject" && nameOf(params) === UNICODE_PROBE ? "error" : "result";
+      },
+      // An ASCII-only validator on clientInfo.name.
+      errorCode: (method) => (method === "server/discover" ? -32602 : -32601),
+      result: (_method, params) => {
+        const name = String(nameOf(params));
+        const echoed = onProbe === "echo-latin1" ? Buffer.from(name, "utf8").toString("latin1") : name;
+        return { resultType: "complete", supportedVersions: [MODERN_SPEC_VERSION], instructions: `Hello, ${echoed}` };
+      },
+    });
+    return { fake, ctx: makeContext(fake) };
+  }
+
+  it.each([
+    [
+      "rejects the CJK/emoji clientInfo name",
+      "reject" as const,
+      false,
+      "server/discover with a CJK/emoji clientInfo name -> JSON-RPC error -32602",
+    ],
+    [
+      "echoes the name mis-decoded as Latin-1",
+      "echo-latin1" as const,
+      false,
+      "server/discover mangled the CJK/emoji clientInfo name: the reply carries the probe decoded as Latin-1 (h\\u00c3\\u00a9llo)",
+    ],
+    [
+      "echoes the name intact",
+      "echo" as const,
+      true,
+      "server/discover reproduced the CJK/emoji clientInfo name byte-for-byte",
+    ],
+  ])("stdio-unicode with no tool decides on the envelope: a server that %s", async (_label, onProbe, passed, details) => {
+    const { fake, ctx } = envelopeFake(onProbe);
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-unicode");
+    expect(r.passed, r.details).toBe(passed);
+    expect(r.details).toBe(details);
+    // The probe really rode in clientInfo.name, and no tools/call was made.
+    const methods = fake.calls.map(([m]) => m);
+    expect(methods).not.toContain("tools/call");
+    const probed = fake.calls.filter(([, params]) => JSON.stringify(params).includes(UNICODE_PROBE));
+    expect(probed.map(([m]) => m)).toEqual(["server/discover"]);
+    // The ASCII-named discovers are served in every variant: only the probe differs.
+    expect(outcome(ctx, "stdio-framing").passed, outcome(ctx, "stdio-framing").details).toBe(true);
+  });
+
+  it("stdio-unicode fails with the transport reason, not a harness Error:, when the tools/call probe is never answered", async () => {
+    const fake = fakeStdio({
+      answer: (method) => (method === "tools/call" ? "silent" : method === "server/discover" ? "result" : "error"),
+    });
+    const ctx = makeContext(fake, { capabilities: { tools: {} }, tools: CLOCK_TOOLS, toolNames: ["get_time"] });
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-unicode");
+    expect(r.passed).toBe(false);
+    expect(r.details).toBe(
+      "tools/call get_time with a CJK/emoji argument got no reply (stdio transport: request timed out after 2000ms (method=tools/call))",
+    );
+    // The check stopped at the probe: no envelope discover carried the probe afterwards.
+    const probed = fake.calls.filter(([, params]) => JSON.stringify(params).includes(UNICODE_PROBE));
+    expect(probed.map(([m]) => m)).toEqual(["tools/call"]);
+  });
 });
 
 describe("2026-07-28 stdio-unicode: a JSON-RPC error on the tools/call probe, over a real stdio child", () => {
@@ -572,5 +776,63 @@ describe("2026-07-28 stdio-unicode: a JSON-RPC error on the tools/call probe, ov
     expect(envelope).toHaveLength(1);
     expect(envelope[0]?.seq).toBeGreaterThan(call?.seq as number);
     for (const id of STDIO_IDS) expect(outcome(ctx, id).passed, `${id}: ${outcome(ctx, id).details}`).toBe(true);
+  });
+
+  /**
+   * A stdio child that serves ASCII traffic but crashes on the first line
+   * carrying a non-ASCII character, the way a server logging its input to
+   * a legacy-code-page console does: a traceback echoing the line goes to
+   * stderr, then exit 1.
+   */
+  function crashOnNonAsciiChild(): string {
+    const script = [
+      'const rl = require("node:readline").createInterface({ input: process.stdin });',
+      'const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");',
+      `const discover = ${JSON.stringify({ resultType: "complete", supportedVersions: [MODERN_SPEC_VERSION], capabilities: {}, ttlMs: 1000, cacheScope: "public" })};`,
+      'rl.on("line", (line) => {',
+      "  if (/[^\\x00-\\x7f]/.test(line)) {",
+      '    process.stderr.write("Traceback (most recent call last):\\n  UnicodeEncodeError: \'charmap\' codec can\'t encode: " + line + "\\n", () => process.exit(1));',
+      "    return;",
+      "  }",
+      "  let msg;",
+      "  try { msg = JSON.parse(line); } catch { return; }",
+      "  if (msg.id === undefined) return;",
+      '  if (msg.method === "server/discover") return send({ jsonrpc: "2.0", id: msg.id, result: discover });',
+      '  send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });',
+      "});",
+      "setTimeout(() => {}, 30000);",
+    ].join("\n");
+    const path = join(tmpdir(), `mcp-compliance-stdio-crash-child-${process.pid}-${Date.now()}-${Math.random()}.cjs`);
+    writeFileSync(path, script, "utf8");
+    childScripts.push(path);
+    return path;
+  }
+
+  it.each([
+    [
+      "the tools/call probe",
+      GET_TIME_STATE,
+      "tools/call get_time with a CJK/emoji argument got no reply (server exited (code 1))",
+    ],
+    [
+      "the envelope discover (no tools)",
+      {},
+      "server/discover with a CJK/emoji clientInfo name got no reply (server exited (code 1))",
+    ],
+  ])("a server that crashes on %s FAILS with a one-line ASCII reason, not a harness Error: carrying the stderr tail", async (_label, state, details) => {
+    const transport = createStdioTransport({ command: process.execPath, args: [crashOnNonAsciiChild()] });
+    try {
+      const ctx = makeContext(transport, state, CHILD_TIMEOUT);
+      await runStdio(ctx);
+      const unicode = outcome(ctx, "stdio-unicode");
+      expect(unicode.passed).toBe(false);
+      expect(unicode.details).toBe(details);
+      expect(unicode.details).toMatch(/^[\x20-\x7e]+$/);
+      // The ASCII framing burst before it was served: the probe is what killed the process.
+      expect(outcome(ctx, "stdio-framing").passed, outcome(ctx, "stdio-framing").details).toBe(true);
+      expect(transport.exited).toBe(true);
+    } finally {
+      await transport.close();
+    }
   });
 });

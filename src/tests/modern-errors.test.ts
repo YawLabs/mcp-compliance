@@ -60,6 +60,8 @@ interface Canned {
   /** Verbatim body (HTML, empty, SSE); wins over `body`. */
   raw?: string;
   contentType?: string;
+  /** Drop the connection without answering (a server whose body parser kills the socket). */
+  destroy?: boolean;
 }
 
 interface Seen {
@@ -114,6 +116,10 @@ async function startBadHttp(): Promise<{ url: string; set(decide: Decide): void;
         params: obj.params && typeof obj.params === "object" ? (obj.params as Record<string, unknown>) : {},
         id: obj.id,
       });
+      if (canned.destroy) {
+        req.socket.destroy();
+        return;
+      }
       const payload = canned.raw ?? (canned.body === undefined ? "" : JSON.stringify(canned.body));
       res.writeHead(canned.status, { "Content-Type": canned.contentType ?? "application/json" });
       res.end(payload);
@@ -143,13 +149,15 @@ async function startBadHttp(): Promise<{ url: string; set(decide: Decide): void;
  * BAD_MODE=isError declares only tools, answers tools/call with
  * isError: true, and unknown methods with -32000. BAD_MODE=reject
  * answers every request, server/discover included, with -32601 (a
- * 2025-era server that knows no modern method).
+ * 2025-era server that knows no modern method). BAD_MODE=silent declares
+ * only tools and never answers resources/list or prompts/list (a server
+ * that drops requests for methods it has no handler for).
  */
 const BAD_STDIO_SCRIPT = `
 const rl = require("node:readline").createInterface({ input: process.stdin });
 rl.on("close", () => process.exit(0));
 const mode = process.env.BAD_MODE || "results";
-const caps = mode === "isError" ? { tools: {} } : { tools: {}, resources: {}, prompts: {} };
+const caps = mode === "isError" || mode === "silent" ? { tools: {} } : { tools: {}, resources: {}, prompts: {} };
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
 const reply = (id, result) => send({ jsonrpc: "2.0", id, result: { resultType: "complete", ...result } });
 rl.on("line", (line) => {
@@ -165,6 +173,7 @@ rl.on("line", (line) => {
     case "tools/list":
     case "resources/list":
     case "prompts/list":
+      if (mode === "silent" && msg.method !== "tools/list") return;
       return reply(msg.id, {});
     case "tools/call":
       return reply(msg.id, mode === "isError"
@@ -179,7 +188,7 @@ rl.on("line", (line) => {
 
 let badStdioDir: string | undefined;
 
-function badStdio(mode: "results" | "isError" | "reject"): TransportTarget {
+function badStdio(mode: "results" | "isError" | "reject" | "silent"): TransportTarget {
   if (!badStdioDir) {
     badStdioDir = mkdtempSync(join(tmpdir(), "mcp-compliance-bad-stdio-"));
     writeFileSync(join(badStdioDir, "bad-stdio.cjs"), BAD_STDIO_SCRIPT, "utf8");
@@ -486,11 +495,162 @@ describe("errors suite: canned bad HTTP server", () => {
     expectPass(report, "error-invalid-cursor", "No list methods available to test (skipped)");
   });
 
-  it("reads a JSON-RPC error carried on an SSE body", async () => {
+  it("passes the error codes it tolerates and reads an array body by its first element", async () => {
+    // Policy, per the catalog: capability gating, missing params, unknown
+    // tools and bad cursors each expect "a JSON-RPC error", the exact code
+    // only noted; error-invalid-json takes any error or a 4xx (the exact
+    // -32700 is error-parse-code's job).
+    bad.set(({ parseError, parsed, method, params, id }) => {
+      if (parseError) return { status: 400, body: rpcError(null, -32600, "Invalid Request") };
+      if (method === undefined) {
+        // The malformed envelope crashes the handler; the method-less
+        // request is answered as a one-element JSON-RPC batch reply.
+        if ((parsed as { not?: unknown }).not !== undefined) return { status: 500, raw: "", contentType: "text/plain" };
+        return { status: 400, body: [rpcError(99999, -32600, "Invalid Request")] };
+      }
+      if (method === "server/discover") return { status: 200, body: rpcResult(id, discoverResult({ tools: {} })) };
+      if (method === "tools/call") return { status: 200, body: rpcError(id, -32603, "handler crashed") };
+      if (method === "tools/list" && typeof params.cursor === "string") {
+        return { status: 200, body: rpcError(id, -32603, "cursor decode crashed") };
+      }
+      if (method === "resources/list" || method === "prompts/list") {
+        return { status: 200, body: rpcError(id, -32603, "Internal error") };
+      }
+      return { status: 404, body: rpcError(id, -32601, "Method not found") };
+    });
+    const report = await runModern(bad.url, { only: ALL });
+    expect(Object.fromEntries(report.tests.map((t) => [t.id, { passed: t.passed, details: t.details }]))).toEqual({
+      "error-unknown-method": { passed: true, details: "JSON-RPC error -32601 on HTTP 404, id echoed" },
+      "error-method-code": { passed: true, details: "-32601 (Method not found)" },
+      "error-invalid-jsonrpc": {
+        passed: false,
+        details: "HTTP 500 for a malformed envelope; expected a JSON-RPC error or 4xx",
+      },
+      "error-invalid-json": { passed: true, details: "JSON-RPC error -32600 on HTTP 400" },
+      "error-parse-code": {
+        passed: false,
+        details: "Expected -32700 (Parse error) for invalid JSON, got -32600 (Invalid Request)",
+      },
+      "error-invalid-request-code": { passed: true, details: "-32600 (Invalid Request) on HTTP 400" },
+      "error-missing-params": { passed: true, details: "JSON-RPC error -32603 (handler crashed)" },
+      "tools-call-unknown": { passed: true, details: "JSON-RPC error -32603 (handler crashed)" },
+      "error-capability-gated": {
+        passed: true,
+        details:
+          "Undeclared method(s) rejected: resources/list -> -32603 (expected -32601), prompts/list -> -32603 (expected -32601)",
+      },
+      "error-invalid-cursor": {
+        passed: true,
+        details: "tools/list rejected the cursor: -32603 (cursor decode crashed)",
+      },
+    });
+    expect(warned(report, BARE_4XX_WARNING)).toBe(false);
+  });
+
+  it("fails a probe answered with neither an error nor a result, and reads an SSE body with no response as no body", async () => {
+    bad.set(({ parseError, method, params, id }) => {
+      if (parseError) {
+        // A request-scoped stream carrying only a log notification.
+        const note = JSON.stringify({
+          jsonrpc: "2.0",
+          method: "notifications/message",
+          params: { level: "error", data: "unparseable body" },
+        });
+        return { status: 400, raw: `event: message\ndata: ${note}\n\n`, contentType: "text/event-stream" };
+      }
+      if (method === "server/discover") return { status: 200, body: rpcResult(id, discoverResult({ tools: {} })) };
+      if (method === "tools/call" || (method === "tools/list" && typeof params.cursor === "string")) {
+        return { status: 200, body: { jsonrpc: "2.0", id } };
+      }
+      return { status: 404, body: rpcError(id ?? null, -32601, "Method not found") };
+    });
+    const only = [
+      "error-invalid-json",
+      "error-parse-code",
+      "error-missing-params",
+      "tools-call-unknown",
+      "error-invalid-cursor",
+    ];
+    const report = await runModern(bad.url, { only });
+    expect(Object.fromEntries(report.tests.map((t) => [t.id, { passed: t.passed, details: t.details }]))).toEqual({
+      "error-invalid-json": { passed: true, details: "HTTP 400 without a JSON-RPC body (acceptable)" },
+      "error-parse-code": {
+        passed: true,
+        details: "HTTP 400 without a JSON-RPC body (expected -32700 Parse error); passes with a warning",
+      },
+      "error-missing-params": { passed: false, details: "No JSON-RPC error for tools/call without name (HTTP 200)" },
+      "tools-call-unknown": { passed: false, details: "No JSON-RPC error for unknown tool (HTTP 200)" },
+      "error-invalid-cursor": {
+        passed: false,
+        details: "No JSON-RPC error or result for an invalid cursor (HTTP 200)",
+      },
+    });
+    expect(report.warnings.filter((w) => w.includes(BARE_4XX_WARNING))).toEqual([
+      "HTTP 400 with no JSON-RPC body for invalid JSON; the spec expects a -32700 (Parse error) JSON-RPC error body.",
+    ]);
+  });
+
+  it("turns a dropped connection into a failure naming the probe, and keeps probing the other methods", async () => {
+    // The server kills the socket for every probe; only server/discover and
+    // unknown methods are answered.
+    const methods: string[] = [];
+    bad.set(({ parseError, method, id }) => {
+      methods.push(parseError ? "<invalid json>" : (method ?? "<no method>"));
+      if (method === "server/discover") return { status: 200, body: rpcResult(id, discoverResult({ tools: {} })) };
+      if (method?.startsWith("compliance/")) return { status: 404, body: rpcError(id, -32601, "Method not found") };
+      return { status: 0, destroy: true };
+    });
+    const report = await runModern(bad.url, { only: ALL });
+    const results = Object.fromEntries(report.tests.map((t) => [t.id, t]));
+    for (const id of [
+      "error-invalid-jsonrpc",
+      "error-invalid-json",
+      "error-parse-code",
+      "error-invalid-request-code",
+    ]) {
+      expect(results[id], id).toMatchObject({
+        passed: false,
+        details: expect.stringMatching(/^No response to the raw body probe: \S/),
+      });
+    }
+    for (const id of ["error-missing-params", "tools-call-unknown"]) {
+      expect(results[id], id).toMatchObject({
+        passed: false,
+        details: expect.stringMatching(/^No response to tools\/call: \S/),
+      });
+    }
+    expect(results["error-invalid-cursor"]).toMatchObject({
+      passed: false,
+      details: expect.stringMatching(/^No response to tools\/list: \S/),
+    });
+    // One dropped list method does not end the loop: both are named.
+    expect(results["error-capability-gated"]).toMatchObject({
+      passed: false,
+      details: expect.stringMatching(
+        /^resources\/list: No response to resources\/list: \S.*; prompts\/list: No response to prompts\/list: \S/,
+      ),
+    });
+    expect(methods.filter((m) => m === "resources/list" || m === "prompts/list")).toEqual([
+      "resources/list",
+      "prompts/list",
+    ]);
+    // The known methods still pass.
+    expect(results["error-unknown-method"]?.passed).toBe(true);
+    for (const t of report.tests) expect(t.details, t.id).not.toMatch(/^Error: /);
+  });
+
+  it("reads a JSON-RPC error carried on an SSE body, after a notification frame", async () => {
     bad.set(({ parseError, method, id }) => {
       if (parseError) {
+        // The stream MAY carry notifications before the response: the first
+        // JSON-RPC RESPONSE frame is the answer, not the first data frame.
+        const note = JSON.stringify({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info" } });
         const frame = JSON.stringify(rpcError(null, -32700, "Parse error"));
-        return { status: 400, raw: `event: message\ndata: ${frame}\n\n`, contentType: "text/event-stream" };
+        return {
+          status: 400,
+          raw: `event: message\ndata: ${note}\n\nevent: message\ndata: ${frame}\n\n`,
+          contentType: "text/event-stream",
+        };
       }
       if (method === "server/discover") return { status: 200, body: rpcResult(id, discoverResult({})) };
       return { status: 404, body: rpcError(id ?? null, -32601, "Method not found") };
@@ -681,6 +841,20 @@ describe("errors suite: canned bad stdio server", () => {
         details: `tools/list -> -32601, resources/list -> -32601, prompts/list -> -32601; ${notEvaluableReason("-32601", GATED_ABOUT)}`,
       },
       "error-invalid-cursor": { passed: true, details: "No list methods available to test (skipped)" },
+    });
+  });
+
+  it("fails error-capability-gated naming each undeclared list method that never answered", async () => {
+    // A stdio server that silently drops requests it has no handler for:
+    // each list method times out, is recorded, and the loop goes on.
+    const report = await runModern(badStdio("silent"), { only: ["error-capability-gated"], timeout: 1000 });
+    const timedOut = (method: string) =>
+      `${method}: No response to ${method}: stdio transport: request timed out after 1000ms (method=${method})`;
+    const details = `${timedOut("resources/list")}; ${timedOut("prompts/list")}`;
+    expect(resultOf(report, "error-capability-gated")).toMatchObject({
+      passed: false,
+      // Clipped to 200 characters.
+      details: details.length > 200 ? `${details.slice(0, 197)}...` : details,
     });
   });
 

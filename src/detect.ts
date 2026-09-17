@@ -78,6 +78,13 @@ export interface DetectionResult {
    */
   eraUndetermined?: boolean;
   /**
+   * With `eraUndetermined`: the refusing status, and whether it refused a
+   * credential rather than something else (see `refusedCredential`).
+   * Callers word their warning from this, not from the preflight, which a
+   * re-probe after a preflight timeout never saw.
+   */
+  refusal?: { statusCode: number; credentialRefused: boolean };
+  /**
    * The probe response when the server answered with a DiscoverResult.
    * Seeds serverInfo/capabilities so the modern suite does not repeat
    * the request.
@@ -94,6 +101,53 @@ const MODERN_CODES = new Set<number>(Object.values(MODERN_ERROR_CODES));
 
 export function isModernErrorCode(code: unknown): boolean {
   return typeof code === "number" && MODERN_CODES.has(code);
+}
+
+/**
+ * Whether a 401/403 refused the credential a request carried, read the
+ * way basic/authorization splits the two statuses:
+ *
+ * - a 401 always does ("Authorization required or token invalid");
+ * - a 403 does only with a `WWW-Authenticate: Bearer
+ *   error="insufficient_scope"` challenge ("Runtime Insufficient Scope
+ *   Errors"). A bare 403 is also what streamable-http requires for an
+ *   invalid Origin and what the SDK's Host validation answers a tunnel or
+ *   proxy hostname with, so on its own it says nothing about the token.
+ *
+ * Header names are matched case-insensitively; the challenge is found by
+ * a Bearer scheme followed anywhere by that error parameter.
+ */
+export function refusedCredential(
+  statusCode: number | undefined,
+  headers: Record<string, string | string[] | undefined> | undefined,
+): boolean {
+  if (statusCode === 401) return true;
+  if (statusCode !== 403 || !headers) return false;
+  return Object.entries(headers).some(
+    ([name, value]) =>
+      name.toLowerCase() === "www-authenticate" &&
+      value !== undefined &&
+      /\bBearer\b[\s\S]*\berror\s*=\s*"?insufficient_scope\b/i.test(Array.isArray(value) ? value.join(", ") : value),
+  );
+}
+
+/**
+ * The parenthesised hint for a 401/403 in a note or a transport-post
+ * detail: "pass --auth" without a credential, "credential rejected" when
+ * the status refused the one sent (refusedCredential), and a neutral
+ * "forbidden" for a 403 that does not say it is about the credential.
+ * `dash` is the separator the caller's wording uses.
+ */
+export function authRefusalHint(
+  authorizationSent: boolean,
+  credentialRefused: boolean,
+  noCredential: string,
+  dash = "--",
+): string {
+  if (!authorizationSent) return noCredential;
+  return credentialRefused
+    ? `credential rejected ${dash} check --auth`
+    : `forbidden ${dash} no insufficient_scope challenge`;
 }
 
 /**
@@ -142,16 +196,21 @@ export function classifyDiscoverResponse(res: TransportResponse | null, opts: Cl
     // neither modern nor legacy is observable without credentials. The
     // legacy default still applies (spec: a 4xx without a modern error
     // body falls back to initialize). With an Authorization header on the
-    // probe the server refused that credential; "pass --auth" would send
-    // the user to do what they already did.
-    const why = opts.authorizationSent
-      ? "credential rejected -- check --auth"
-      : "authentication required -- pass --auth";
+    // probe, "pass --auth" would send the user to do what they already
+    // did; the reason says the credential was rejected only when the
+    // status says so (a bare 403 may be Host/Origin validation).
+    const credentialRefused = refusedCredential(res.statusCode, res.headers);
+    const why = authRefusalHint(
+      opts.authorizationSent === true,
+      credentialRefused,
+      "authentication required -- pass --auth",
+    );
     return {
       version: LEGACY_SPEC_VERSION,
       era: "legacy",
       responded: true,
       eraUndetermined: true,
+      refusal: { statusCode: res.statusCode, credentialRefused },
       reason: `${REASON_PREFIX}HTTP ${res.statusCode} (${why}); era not determinable, using ${LEGACY_SPEC_VERSION}`,
     };
   }

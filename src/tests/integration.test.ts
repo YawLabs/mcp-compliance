@@ -158,6 +158,9 @@ describe("integration — full compliance suite against real server", () => {
     expect(t).toBeDefined();
     expect(t?.passed).toBe(true);
     expect(t?.details).not.toMatch(/No tools available/);
+    // The SDK answers a POST whose Accept lacks application/json with 406
+    // and never calls the tool; the details must show the call was served.
+    expect(t?.details).toBe("Server accepted request with progressToken (no progress events observed — optional)");
   }, 30000);
 
   it("has no preflight warning for reachable server", async () => {

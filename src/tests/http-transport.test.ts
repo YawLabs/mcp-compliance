@@ -207,6 +207,45 @@ describe("HttpTransport", () => {
     await expect(t.close()).resolves.toBeUndefined();
   });
 
+  it("a text/event-stream body that ends without the response keeps its notifications (tools/call stream cut off mid-way)", async () => {
+    // A server that crashes mid-call: progress and a log frame went out,
+    // the result never did. The body is no JSON-RPC response, but the
+    // notifications are still the server's messages: the post-hoc checks
+    // (notifications/message without a logLevel, progress tokens) must
+    // see them on res.messages and through the listeners.
+    const progress = {
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: "tok", progress: 1, total: 3 },
+    };
+    const log = { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "step 1" } };
+    const sse = `event: message\ndata: ${JSON.stringify(progress)}\n\nevent: message\ndata: ${JSON.stringify(log)}\n\n`;
+    responder = () => ({ status: 200, contentType: "text/event-stream", body: sse });
+    const t = createHttpTransport({ url: serverUrl });
+    const heard: { message: unknown; statusCode?: number }[] = [];
+    t.onMessage((message, meta) => heard.push({ message, statusCode: meta.statusCode }));
+    const res = await t.request("tools/call", { name: "slow" }, () => 700, { timeout: 5000 });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ _raw: sse });
+    expect(res.messages).toEqual([progress, log]);
+    expect(heard).toEqual([
+      { message: progress, statusCode: 200 },
+      { message: log, statusCode: 200 },
+    ]);
+  });
+
+  it("a plain JSON body mislabeled text/event-stream is still parsed, as the body and its one message", async () => {
+    const response = { jsonrpc: "2.0", id: 701, result: { ok: true } };
+    responder = () => ({ status: 200, contentType: "text/event-stream", body: JSON.stringify(response) });
+    const t = createHttpTransport({ url: serverUrl });
+    const heard: unknown[] = [];
+    t.onMessage((message) => heard.push(message));
+    const res = await t.request("ping", undefined, () => 701, { timeout: 5000 });
+    expect(res.body).toEqual(response);
+    expect(res.messages).toEqual([response]);
+    expect(heard).toEqual([response]);
+  });
+
   it("preserves multi-value response headers (undici returns them as string[])", async () => {
     // Regression: normalizeHeaders used to silently drop string[] headers.
     // Multi-value headers like Set-Cookie and WWW-Authenticate must reach
@@ -535,6 +574,43 @@ describe("HttpTransport stream(): the timer, close() and an upstream abort end a
     }
   });
 
+  it("ModernClient.stream() forwards the client's default signal (RunOptions.signal): an aborted run ends a held-open listen", async () => {
+    // lifecycle-subscriptions-listen calls client.stream() with no signal
+    // of its own; only the client's default carries a library caller's
+    // abort to the transport, or the listen waits out its whole window.
+    const { restore, closed } = holdNextStream();
+    try {
+      const transport = createHttpTransport({ url: serverUrl });
+      const controller = new AbortController();
+      const recorder = createRecorder();
+      let id = 2000;
+      const client = createModernClient({
+        transport,
+        recorder,
+        nextId: () => id++,
+        timeout: 10000,
+        protocolVersion: "2026-07-28",
+        clientCapabilities: { elicitation: {} },
+        clientInfo: { name: "test", version: "0" },
+        signal: controller.signal,
+      });
+      const stream = await client.stream("subscriptions/listen", { notifications: {} });
+      expect(stream.requestId).toBe(2000);
+      expect(recorder.sent).toMatchObject([{ id: 2000, method: "subscriptions/listen" }]);
+      const started = Date.now();
+      setTimeout(() => controller.abort(new Error("run aborted by the user")), 50);
+      const drained = await drain(stream.messages);
+      expect(drained.error).toBeUndefined();
+      expect(drained.outcome).toBe("ended");
+      expect(drained.seen).toEqual([]);
+      expect(Date.now() - started).toBeLessThan(4000);
+      expect(await settlesWithin(closed, 1000)).toBe("settled");
+      await stream.close();
+    } finally {
+      restore();
+    }
+  });
+
   it("an already-aborted upstream signal rejects stream() with its reason instead of sending the request", async () => {
     responder = () => ({
       status: 200,
@@ -630,6 +706,40 @@ describe("HttpTransport stream(): frames that arrive in pieces, and a body that 
         { message: result, statusCode: 200 },
       ]);
       // It was the end of the body that ended the stream, not the 10s timer.
+      expect(Date.now() - started).toBeLessThan(5000);
+    } finally {
+      restore();
+    }
+  });
+
+  it("keep-alive data: events that are not JSON (or empty) are skipped, mid-stream and at the unterminated end", async () => {
+    // A listen stream that pings before its acknowledgment. Neither a
+    // thrown parse error (the stream is not aborted, so it would propagate
+    // and crash lifecycle-subscriptions-listen) nor a raw "ping" string
+    // (the recorder would fill with non-JSON-RPC entries) is acceptable.
+    const ack = { jsonrpc: "2.0", method: "notifications/subscriptions/acknowledged", params: {} };
+    const restore = scriptNextStream(async (res) => {
+      res.write("data: ping\n\n");
+      await pause(50);
+      res.write("data:\n\n");
+      await pause(50);
+      res.write(`event: message\ndata: ${JSON.stringify(ack)}\n\n`);
+      await pause(50);
+      // The body ends on another keep-alive with no blank line after it,
+      // so it is the decoder's flush that hands it over.
+      res.end("data: keep-alive");
+    });
+    try {
+      const t = createHttpTransport({ url: serverUrl });
+      const heard: unknown[] = [];
+      t.onMessage((message) => heard.push(message));
+      const started = Date.now();
+      const stream = await t.stream("subscriptions/listen", { notifications: {} }, () => 602, { timeout: 10_000 });
+      const drained = await drain(stream.messages);
+      expect(drained.error).toBeUndefined();
+      expect(drained.outcome).toBe("ended");
+      expect(drained.seen).toEqual([ack]);
+      expect(heard).toEqual([ack]);
       expect(Date.now() - started).toBeLessThan(5000);
     } finally {
       restore();
