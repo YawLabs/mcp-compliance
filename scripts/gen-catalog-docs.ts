@@ -468,8 +468,8 @@ const C: Record<string, Criteria> = {
   },
   // ── security ──
   "security-auth-required": {
-    pass: "A conformant server/discover with the Authorization header removed draws HTTP 401 or 403 (probed with or without --auth), or -- with --auth and a served credentialed server/discover -- the connection is closed without an answer.",
-    fail: "Any other status: the server accepted an unauthenticated request (the details say when no --auth was provided); a timeout or refused connection fails as server unreachable.",
+    pass: "A conformant server/discover with the Authorization header removed draws HTTP 401, or a 403 carrying a WWW-Authenticate Bearer challenge (probed with or without --auth). With --auth and a served credentialed server/discover, a 403 without a Bearer challenge (the details note the spec expects 401) or a connection closed without an answer also passes.",
+    fail: "Any other status: the server accepted an unauthenticated request (the details say when no --auth was provided). A 403 without a Bearer challenge fails as not evaluable unless --auth was given and the credentialed server/discover was served; the details quote the server's error message and advise allowing the hostname you tested through when it names Host/Origin validation or the credentialed request drew a 403 too, and name --auth otherwise. A timeout or refused connection fails as server unreachable, and so does a closed connection without that served comparison.",
     gate: null,
   },
   "security-www-authenticate": {
@@ -528,8 +528,8 @@ const C: Record<string, Criteria> = {
     gate: "tools",
   },
   "security-oversized-input": {
-    pass: `A roughly 1 MB string in the first string argument that is not header-mirrored (a mirrored one only when no other exists, noted in the details) draws HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport; a completed result passes with a warning, and so does a reply to that call that overflowed the runner's stdio line buffer while the child kept running (an earlier overflow in the run, or the same marker text on the server's own stderr, does not count); on HTTP a connection closed on the 1 MB body passes only when a follow-up server/discover is then served or refused with 401/403 (a 429 retried once). Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
-    fail: `A 5xx status, a timeout, a broken stdio frame, no usable HTTP response (bytes that are not an HTTP response), a stdio child that dies (even after overflowing the line buffer, or partway through reading the 1 MB line), an HTTP connection dropped on the 1 MB body after which server/discover is neither served nor refused with 401/403, or a server already unreachable (a refused connection, a dead child). ${LIST_FAILED_FAIL("tools")}`,
+    pass: `A roughly 1 MB string in the first string argument that is not header-mirrored (a mirrored one only when no other exists, noted in the details) draws HTTP 413 or another 4xx on HTTP -- a 403 without a Bearer challenge included, the tool list having come from a served server/discover -- or a JSON-RPC error on either transport; a completed result passes with a warning, and so does a reply to that call that overflowed the runner's stdio line buffer while the child kept running (an earlier overflow in the run, or the same marker text on the server's own stderr, does not count); on HTTP a connection closed on the 1 MB body passes only when a follow-up server/discover is then served or refused with 401/403 (a 429 retried once). Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
+    fail: `A 5xx status, an HTTP 429 that answers the call again after one retry (Retry-After, capped at 2 s) or a 401 or auth-gate 403 -- each not evaluable, a gate having answered before the server read the request -- a timeout, a broken stdio frame, no usable HTTP response (bytes that are not an HTTP response), a stdio child that dies (even after overflowing the line buffer, or partway through reading the 1 MB line), an HTTP connection dropped on the 1 MB body after which server/discover is neither served nor refused with 401/403, or a server already unreachable (a refused connection, a dead child). ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-extra-params": {

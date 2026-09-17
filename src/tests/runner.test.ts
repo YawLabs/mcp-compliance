@@ -1,8 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { dedupAndCapWarnings, filterWarnings, isHeaderToken, previewTests, runComplianceSuite } from "../runner.js";
 
 // Use localhost on a port that's definitely not listening for instant ECONNREFUSED
@@ -824,4 +828,943 @@ describe("runComplianceSuite — legacy lifecycle-progress-token", () => {
       await stub.stop();
     }
   }, 15000);
+});
+
+// ---------------------------------------------------------------------------
+// Legacy security-auth-required and security-oversized-input: what a bare
+// 403, a request that got no HTTP answer, a 5xx and a stdio child's exit
+// say -- and what they do not.
+// ---------------------------------------------------------------------------
+
+/** One POST a {@link startSecurityStub} server received. */
+interface SecurityHit {
+  method: string;
+  authorization?: string;
+  bytes: number;
+}
+
+interface SecurityStubOptions {
+  /**
+   * When set, a request that does not carry `Authorization: Bearer <token>`
+   * is answered by `noAuth` instead of the server: a bare 403 (a JSON-RPC
+   * -32000 body, no WWW-Authenticate -- a gateway, or Host/Origin
+   * validation), a 403 or 401 carrying a Bearer challenge, a connection
+   * closed without an answer, or no answer at all.
+   */
+  token?: string;
+  noAuth?: "bare-403" | "bearer-403" | "401" | "drop" | "hang";
+  /** The JSON-RPC error message of every bare 403 the stub sends ("Forbidden" by default). */
+  bare403Message?: string;
+  /** A gateway method policy that answers server/discover (the preflight) with a bare 403, credential or not. */
+  discover403?: boolean;
+  /** Called when a request without the token reaches the `noAuth` gate. */
+  onNoAuth?: () => void;
+  /** How a ping that carries the token is answered: served by default. */
+  authedPing?: "drop" | "bare-403";
+  /** How the ~1 MB tools/call is answered: a result by default. */
+  bigCall?:
+    | 413
+    | 400
+    | 500
+    | "rpc-error"
+    | "html"
+    | "hang"
+    | "drop"
+    | "not-http"
+    /** A rate limiter answering every ~1 MB call 429 (Retry-After: 0), or only the first one. */
+    | 429
+    | "429-once"
+    /** A 401 with a Bearer invalid_token challenge: a credential that expired mid-run. */
+    | 401
+    /** A bare 403 (no challenge): a WAF rule blocking the body. */
+    | "bare-403";
+  /** Called when the ~1 MB tools/call arrives, before it is answered. */
+  onBigCall?: () => void;
+  /**
+   * Once the big call was dropped, how every later request is answered:
+   * served by default; "die" stops listening; "401" / "bare-403" is a gate
+   * now refusing; "429-then-serve" / "429-twice" throttles one or two
+   * requests (Retry-After: 0) and then serves; "502" is a proxy whose
+   * backend went away; "ping-rpc-error" answers a ping 200 with a JSON-RPC
+   * -32601 carrying its id (a live server that does not implement ping);
+   * "session-404" answers every request 404 with an id-null -32001 "Session
+   * not found" (a server that restarted and lost the session).
+   */
+  afterDrop?: "die" | "401" | "bare-403" | "429-then-serve" | "429-twice" | "502" | "ping-rpc-error" | "session-404";
+}
+
+/**
+ * A 2025-11-25 HTTP server with one tool, `sink(data)`, for the auth and
+ * oversized-input checks: a gate in front of it (`token` / `noAuth` /
+ * `authedPing`) and knobs for how the ~1 MB tools/call and what follows it
+ * are answered. Records every POST.
+ */
+async function startSecurityStub(
+  opts: SecurityStubOptions,
+): Promise<{ url: string; hits: SecurityHit[]; stop(): Promise<void> }> {
+  const hits: SecurityHit[] = [];
+  let dropped = false;
+  let throttles = opts.afterDrop === "429-twice" ? 2 : opts.afterDrop === "429-then-serve" ? 1 : 0;
+  let bigThrottles = opts.bigCall === "429-once" ? 1 : opts.bigCall === 429 ? Number.POSITIVE_INFINITY : 0;
+  const bare403Message = opts.bare403Message ?? "Forbidden";
+  const server: Server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      const text = Buffer.concat(chunks).toString("utf8");
+      let msg: { id?: unknown; method?: string } = {};
+      try {
+        msg = JSON.parse(text);
+      } catch {}
+      hits.push({ method: msg.method ?? "?", authorization: req.headers.authorization, bytes: text.length });
+      const send = (status: number, body: string, headers: Record<string, string>) => {
+        res.writeHead(status, headers);
+        res.end(body);
+      };
+      const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
+        send(status, JSON.stringify(body), { "content-type": "application/json", ...headers });
+      const rpcError = (status: number, code: number, message: string, headers?: Record<string, string>) =>
+        json(status, { jsonrpc: "2.0", id: msg.id ?? null, error: { code, message } }, headers);
+      if (dropped) {
+        switch (opts.afterDrop) {
+          case "401":
+            return rpcError(401, -32001, "Unauthorized", { "www-authenticate": 'Bearer error="invalid_token"' });
+          case "bare-403":
+            return rpcError(403, -32000, "Blocked");
+          case "session-404":
+            return json(404, { jsonrpc: "2.0", id: null, error: { code: -32001, message: "Session not found" } });
+          case "ping-rpc-error":
+            if (msg.method === "ping") return rpcError(200, -32601, "Method not found");
+            break;
+          case "502":
+            return send(502, "<h1>502 Bad Gateway</h1>", { "content-type": "text/html" });
+          case "429-then-serve":
+          case "429-twice":
+            if (throttles > 0) {
+              throttles--;
+              return send(429, "Too Many Requests", { "content-type": "text/plain", "retry-after": "0" });
+            }
+        }
+      }
+      if (opts.discover403 && msg.method === "server/discover") {
+        return rpcError(403, -32000, "Method not allowed by gateway policy");
+      }
+      if (opts.token && req.headers.authorization !== `Bearer ${opts.token}`) {
+        opts.onNoAuth?.();
+        switch (opts.noAuth) {
+          case "bare-403":
+            return rpcError(403, -32000, bare403Message);
+          case "bearer-403":
+            return json(403, { error: "forbidden" }, { "www-authenticate": 'Bearer realm="mcp"' });
+          case "401":
+            return rpcError(401, -32001, "Unauthorized", { "www-authenticate": 'Bearer realm="mcp"' });
+          case "drop":
+            return req.socket.destroy();
+          case "hang":
+            return;
+        }
+      }
+      if (msg.id === undefined) return send(202, "", {});
+      const reply = (body: Record<string, unknown>) => json(200, { jsonrpc: "2.0", id: msg.id, ...body });
+      switch (msg.method) {
+        case "initialize":
+          return reply({
+            result: {
+              protocolVersion: "2025-11-25",
+              capabilities: { tools: {} },
+              serverInfo: { name: "security-stub", version: "1" },
+            },
+          });
+        case "ping":
+          if (opts.token && opts.authedPing === "drop") return req.socket.destroy();
+          if (opts.token && opts.authedPing === "bare-403") return rpcError(403, -32000, bare403Message);
+          return reply({ result: {} });
+        case "tools/list":
+          return reply({
+            result: {
+              tools: [
+                {
+                  name: "sink",
+                  description: "Stores a value",
+                  inputSchema: { type: "object", properties: { data: { type: "string" } } },
+                },
+              ],
+            },
+          });
+        case "tools/call": {
+          if (text.length < 500_000) return reply({ result: { content: [{ type: "text", text: "stored" }] } });
+          opts.onBigCall?.();
+          if (bigThrottles > 0) {
+            bigThrottles--;
+            return send(429, "Too Many Requests", { "content-type": "text/plain", "retry-after": "0" });
+          }
+          switch (opts.bigCall) {
+            case 401:
+              return rpcError(401, -32001, "Unauthorized", { "www-authenticate": 'Bearer error="invalid_token"' });
+            case "bare-403":
+              return rpcError(403, -32000, "Request blocked");
+            case 413:
+              return rpcError(413, -32600, "Payload Too Large");
+            case 400:
+              return rpcError(400, -32600, "Bad Request");
+            case 500:
+              return rpcError(500, -32603, "Internal error");
+            case "rpc-error":
+              return reply({ error: { code: -32602, message: "data is too long" } });
+            case "html":
+              return send(200, "<html><body>ok</body></html>", { "content-type": "text/html" });
+            case "hang":
+              return;
+            case "not-http":
+              // A broken proxy or a handler writing to the raw socket.
+              return req.socket.end("NOT-HTTP garbage\r\n\r\n");
+            case "drop":
+              dropped = true;
+              if (opts.afterDrop === "die") {
+                server.close();
+                server.closeAllConnections();
+              }
+              return req.socket.destroy();
+          }
+          return reply({ result: { content: [{ type: "text", text: "stored" }] } });
+        }
+        default:
+          return reply({ error: { code: -32601, message: "Method not found" } });
+      }
+    });
+  });
+  const url = await new Promise<string>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      resolve(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+    });
+  });
+  return {
+    url,
+    hits,
+    stop: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        // A "die" stub has already stopped listening; close() then reports that, which is fine.
+        server.close(() => resolve());
+      }),
+  };
+}
+
+type Verdict = { passed: boolean | undefined; details: string | undefined };
+
+function verdictOf(report: { tests: { id: string; passed: boolean; details: string }[] }, id: string): Verdict {
+  const t = report.tests.find((x) => x.id === id);
+  return { passed: t?.passed, details: t?.details };
+}
+
+describe("runComplianceSuite — legacy security-auth-required reads a bare 403 and an unanswered probe", () => {
+  const ID = "security-auth-required";
+  const TOKEN = "tok-3e9d";
+  const AUTH = { Authorization: `Bearer ${TOKEN}` };
+
+  async function authRequired(stubOpts: SecurityStubOptions, runOpts: { auth: boolean; timeout?: number }) {
+    const stub = await startSecurityStub({ token: TOKEN, ...stubOpts });
+    try {
+      const report = await runComplianceSuite(stub.url, {
+        timeout: runOpts.timeout ?? 3000,
+        specVersion: "2025-11-25",
+        only: [ID],
+        ...(runOpts.auth ? { headers: AUTH } : {}),
+      });
+      return { verdict: verdictOf(report, ID), hits: stub.hits, report };
+    } finally {
+      await stub.stop();
+    }
+  }
+
+  it("--auth: a 401, or a 403 carrying a Bearer challenge, on the unauthenticated ping passes as today", async () => {
+    const unauthorized = await authRequired({ noAuth: "401" }, { auth: true });
+    expect(unauthorized.verdict).toEqual({ passed: true, details: "HTTP 401 (unauthenticated request rejected)" });
+    const challenged = await authRequired({ noAuth: "bearer-403" }, { auth: true });
+    expect(challenged.verdict).toEqual({ passed: true, details: "HTTP 403 (unauthenticated request rejected)" });
+    // No comparison ping is needed when the refusal reads as an auth rejection.
+    expect(challenged.hits.filter((h) => h.method === "ping").map((h) => h.authorization)).toEqual([undefined]);
+  }, 20_000);
+
+  it("--auth: a bare 403 that the same ping with the credential gets past passes, with the 401 the spec expects", async () => {
+    // Before: "HTTP 403 (unauthenticated request rejected)" without looking
+    // at whether the credential was what made the difference.
+    const { verdict, hits } = await authRequired({ noAuth: "bare-403" }, { auth: true });
+    expect(verdict).toEqual({
+      passed: true,
+      details:
+        "HTTP 403 (unauthenticated request rejected; the same ping with the credential was served) -- basic/authorization expects 401 with a WWW-Authenticate challenge for a missing token",
+    });
+    // The unauthenticated ping, then its twin carrying the credential.
+    expect(hits.filter((h) => h.method === "ping").map((h) => h.authorization)).toEqual([
+      undefined,
+      AUTH.Authorization,
+    ]);
+  }, 20_000);
+
+  it("--auth: a bare 403 the credential does not get past either is not evaluable, not a rejection", async () => {
+    // Before: PASS "HTTP 403 (unauthenticated request rejected)" for a 403
+    // that refuses the request whether or not it carries the credential --
+    // Host/Origin validation or a gateway, not authentication.
+    const { verdict } = await authRequired({ noAuth: "bare-403", authedPing: "bare-403" }, { auth: true });
+    expect(verdict).toEqual({
+      passed: false,
+      details:
+        'HTTP 403 ("Forbidden") on the unauthenticated ping with no WWW-Authenticate: Bearer challenge, and the same ping with the credential was refused (HTTP 403, JSON-RPC error -32000) -- not evaluable: the 403 may be Host/Origin validation or a gateway rather than authentication; allow the hostname you tested through or fix the gateway (--auth compares only when the request carrying the credential is served)',
+    });
+  }, 20_000);
+
+  it("without --auth: a bare 403 on the preflight is not evaluable, naming Host/Origin validation, a gateway and --auth", async () => {
+    // Before: PASS "HTTP 403 (unauthenticated preflight rejected; pass --auth ...)".
+    const { verdict } = await authRequired({ noAuth: "bare-403" }, { auth: false });
+    expect(verdict).toEqual({
+      passed: false,
+      details:
+        'HTTP 403 ("Forbidden") on the unauthenticated preflight with no WWW-Authenticate: Bearer challenge -- not evaluable: it may be Host/Origin validation or a gateway rather than authentication (a server that requires a token answers 401); re-run with --auth to compare the same request with and without the credential',
+    });
+  }, 20_000);
+
+  it("without --auth: a bare 403 on the preflight next to a handshake served without any credential fails as accepting unauthenticated requests", async () => {
+    // Before: PASS "HTTP 403 (unauthenticated preflight rejected; ...)" for a
+    // gateway that refuses server/discover by method policy and serves the
+    // unauthenticated initialize.
+    const { verdict, report } = await authRequired({ token: undefined, discover403: true }, { auth: false });
+    expect(report.serverInfo.name).toBe("security-stub");
+    expect(verdict).toEqual({
+      passed: false,
+      details: "Server does not require auth (no --auth provided and server accepted unauthenticated requests)",
+    });
+  }, 20_000);
+
+  it("without --auth: a 401, or a 403 carrying a Bearer challenge, on the preflight passes as today", async () => {
+    for (const noAuth of ["401", "bearer-403"] as const) {
+      const { verdict } = await authRequired({ noAuth }, { auth: false });
+      expect(verdict).toEqual({
+        passed: true,
+        details: `HTTP ${noAuth === "401" ? 401 : 403} (unauthenticated preflight rejected; pass --auth to run the authenticated suite and the remaining auth tests)`,
+      });
+    }
+  }, 20_000);
+
+  it("--auth: a connection closed on the unauthenticated ping passes only when the same ping with the credential is served", async () => {
+    // Before: PASS "Connection rejected (acceptable)" either way.
+    const pinned = await authRequired({ noAuth: "drop" }, { auth: true });
+    expect(pinned.verdict).toEqual({
+      passed: true,
+      details:
+        "Connection closed without a response (other side closed); the same request with the credential was served (unauthenticated request rejected)",
+    });
+    const dropsEverything = await authRequired({ noAuth: "drop", authedPing: "drop" }, { auth: true });
+    expect(dropsEverything.verdict).toEqual({
+      passed: false,
+      details:
+        "server unreachable: unauthenticated ping got no response (connection closed: other side closed); the same ping with the credential got no response (connection closed: other side closed)",
+    });
+  }, 20_000);
+
+  it("--auth: an unauthenticated ping that times out is 'server unreachable', not a rejection", async () => {
+    // Before: PASS "Connection rejected (acceptable)" for a request nothing answered.
+    const { verdict, hits } = await authRequired({ noAuth: "hang" }, { auth: true, timeout: 800 });
+    expect(verdict).toEqual({
+      passed: false,
+      details: "server unreachable: unauthenticated ping got no response within 800ms",
+    });
+    // A timeout measured nothing, so no comparison ping follows it.
+    expect(hits.filter((h) => h.method === "ping")).toHaveLength(1);
+  }, 20_000);
+
+  it("without --auth: a server that drops every unauthenticated request is 'server unreachable', not one that accepted them", async () => {
+    // Before: FAIL "Server does not require auth (... server accepted
+    // unauthenticated requests)" for a preflight nothing answered.
+    const { verdict } = await authRequired({ noAuth: "drop" }, { auth: false });
+    expect(verdict).toEqual({
+      passed: false,
+      details: "server unreachable: unauthenticated ping got no response (connection closed: other side closed)",
+    });
+  }, 20_000);
+
+  it("an abort while the unauthenticated ping waits is rethrown, not graded as a rejection", async () => {
+    const controller = new AbortController();
+    const reason = new Error("client went away");
+    const completed: Verdict[] = [];
+    const stub = await startSecurityStub({
+      token: TOKEN,
+      noAuth: "hang",
+      onNoAuth: () => setTimeout(() => controller.abort(reason), 50),
+    });
+    try {
+      const started = Date.now();
+      await expect(
+        runComplianceSuite(stub.url, {
+          timeout: 10_000,
+          headers: AUTH,
+          specVersion: "2025-11-25",
+          only: [ID, "security-www-authenticate"],
+          signal: controller.signal,
+          onTestComplete: (t) => {
+            if (t.id === ID) completed.push({ passed: t.passed, details: t.details });
+          },
+        }),
+      ).rejects.toBe(reason);
+      expect(Date.now() - started).toBeLessThan(5000);
+      // Before: the abort was caught and recorded as PASS "Connection rejected (acceptable)".
+      expect(completed.filter((c) => c.passed)).toEqual([]);
+    } finally {
+      await stub.stop();
+    }
+  }, 20_000);
+
+  it("without --auth: a bare 403 on the preflight next to a 401 on the unauthenticated initialize passes on that 401", async () => {
+    // A gateway whose method policy refuses server/discover with a bare 403
+    // and answers every method it allows, without a token, with 401 and a
+    // Bearer challenge. Before: FAIL "... not evaluable ...; re-run with
+    // --auth ..." -- claiming a token-requiring server answers 401 next to
+    // a server that did.
+    const { verdict, hits } = await authRequired({ discover403: true, noAuth: "401" }, { auth: false });
+    expect(verdict).toEqual({
+      passed: true,
+      details:
+        "HTTP 401 on initialize (unauthenticated request rejected; pass --auth to run the authenticated suite and the remaining auth tests)",
+    });
+    expect(hits.map((h) => h.method).slice(0, 2)).toEqual(["server/discover", "initialize"]);
+  }, 20_000);
+
+  it("a bare 403 whose message names Host validation advises allowing the hostname, not --auth", async () => {
+    const tunnel = "Invalid Host: gentle-river-4821.trycloudflare.com";
+    // Before: "... re-run with --auth to compare the same request with and
+    // without the credential" -- a Host guard refuses the credentialed
+    // request the same way.
+    const noAuth = await authRequired({ noAuth: "bare-403", bare403Message: tunnel }, { auth: false });
+    expect(noAuth.verdict).toEqual({
+      passed: false,
+      details: `HTTP 403 (${JSON.stringify(tunnel)}) on the unauthenticated preflight with no WWW-Authenticate: Bearer challenge -- not evaluable: the message names Host/Origin validation, which refuses the request with or without a credential (--auth does not get past it); allow the hostname you tested through in the server's allowed hosts/origins, or test an address it allows`,
+    });
+    const withAuth = await authRequired(
+      { noAuth: "bare-403", authedPing: "bare-403", bare403Message: tunnel },
+      { auth: true },
+    );
+    expect(withAuth.verdict).toEqual({
+      passed: false,
+      details: `HTTP 403 (${JSON.stringify(tunnel)}) on the unauthenticated ping with no WWW-Authenticate: Bearer challenge, and the same ping with the credential was refused (HTTP 403, JSON-RPC error -32000) -- not evaluable: the message names Host/Origin validation rather than authentication; allow the hostname you tested through in the server's allowed hosts/origins, or test an address it allows`,
+    });
+  }, 20_000);
+});
+
+describe("runComplianceSuite — legacy auth probes next to security-auth-required", () => {
+  const TOKEN = "tok-3e9d";
+  const AUTH = { Authorization: `Bearer ${TOKEN}` };
+  const SIBLINGS = [
+    "security-www-authenticate",
+    "security-auth-malformed",
+    "security-session-not-auth",
+    "security-token-in-uri",
+  ];
+
+  async function authProbes(stubOpts: SecurityStubOptions, auth: boolean) {
+    const stub = await startSecurityStub({ token: TOKEN, ...stubOpts });
+    try {
+      const report = await runComplianceSuite(stub.url, {
+        timeout: 3000,
+        specVersion: "2025-11-25",
+        only: ["security-auth-required", ...SIBLINGS, "security-oauth-metadata"],
+        ...(auth ? { headers: AUTH } : {}),
+      });
+      return Object.fromEntries(
+        report.tests.map((t) => [t.id, `${t.passed ? "PASS" : "FAIL"}: ${t.details}`]),
+      ) as Record<string, string>;
+    } finally {
+      await stub.stop();
+    }
+  }
+
+  it("--auth: when auth-required cannot attribute a bare 403, the probes that would credit the same 403 skip instead", async () => {
+    // Before: PASS "HTTP 403 (WWW-Authenticate not applicable for 403)",
+    // "HTTP 403 (malformed auth rejected)", "HTTP 403 (session ID alone not
+    // sufficient for auth)" and "HTTP 403 (token in query string rejected)"
+    // -- a Host guard's 403 credited next to auth-required calling the
+    // same 403 not evaluable.
+    const verdicts = await authProbes({ noAuth: "bare-403", authedPing: "bare-403" }, true);
+    expect(verdicts["security-auth-required"]).toMatch(/^FAIL: HTTP 403 \("Forbidden"\) .* -- not evaluable: /);
+    for (const id of SIBLINGS) {
+      expect(verdicts[id], id).toBe("PASS: Skipped: not evaluable (see security-auth-required)");
+    }
+  }, 30_000);
+
+  it("--auth against a server that answers a missing token with 401: the probes still measure it", async () => {
+    const verdicts = await authProbes({ noAuth: "401" }, true);
+    expect(verdicts).toMatchObject({
+      "security-auth-required": "PASS: HTTP 401 (unauthenticated request rejected)",
+      "security-www-authenticate": 'PASS: WWW-Authenticate: Bearer realm="mcp"',
+      "security-auth-malformed": "PASS: HTTP 401 (malformed auth rejected)",
+      "security-token-in-uri": "PASS: HTTP 401 (token in query string rejected)",
+    });
+  }, 30_000);
+
+  it("without --auth the skipped probes say no --auth was provided, not that the server does not require auth", async () => {
+    // Before: "Skipped: server does not require auth" next to auth-required
+    // passing on the server's 401.
+    const verdicts = await authProbes({ noAuth: "401" }, false);
+    expect(verdicts["security-auth-required"]).toBe(
+      "PASS: HTTP 401 (unauthenticated preflight rejected; pass --auth to run the authenticated suite and the remaining auth tests)",
+    );
+    for (const id of [...SIBLINGS, "security-oauth-metadata"]) {
+      expect(verdicts[id], id).toBe("PASS: Skipped: no --auth provided");
+    }
+  }, 30_000);
+});
+
+describe("runComplianceSuite — legacy security-oversized-input over HTTP", () => {
+  const ID = "security-oversized-input";
+  const ONLY = ["tools-list", ID];
+
+  async function oversized(stubOpts: SecurityStubOptions, timeout = 3000) {
+    const stub = await startSecurityStub(stubOpts);
+    try {
+      const report = await runComplianceSuite(stub.url, { timeout, specVersion: "2025-11-25", only: ONLY });
+      return { verdict: verdictOf(report, ID), hits: stub.hits, warnings: report.warnings };
+    } finally {
+      await stub.stop();
+    }
+  }
+
+  it("a 413, another 4xx, a JSON-RPC error and a completed result pass with the details they had", async () => {
+    expect((await oversized({ bigCall: 413 })).verdict).toEqual({
+      passed: true,
+      details: "HTTP 413 Payload Too Large (good)",
+    });
+    expect((await oversized({ bigCall: 400 })).verdict).toEqual({
+      passed: true,
+      details: "HTTP 400 (oversized input rejected)",
+    });
+    for (const bigCall of ["rpc-error", undefined] as const) {
+      const { verdict, hits } = await oversized({ bigCall });
+      expect(verdict).toEqual({ passed: true, details: "HTTP 200 — server handled 1MB payload without crashing" });
+      // The 1 MB value went to the listed tool, and nothing followed it.
+      const calls = hits.filter((h) => h.method === "tools/call");
+      expect(calls).toHaveLength(1);
+      expect(calls[0].bytes).toBeGreaterThan(1_048_576);
+      expect(hits.at(-1)?.method).toBe("tools/call");
+    }
+  }, 30_000);
+
+  it("a 5xx on the 1 MB call fails as a server error", async () => {
+    // Before: PASS "HTTP 500 (oversized input rejected)" -- any status >= 400 passed.
+    expect((await oversized({ bigCall: 500 })).verdict).toEqual({
+      passed: false,
+      details: "HTTP 500 -- server error on a 1 MB sink.data (should answer 413/4xx or a JSON-RPC error)",
+    });
+  }, 20_000);
+
+  it("a 2xx that is not a JSON-RPC response fails: no result or error came back", async () => {
+    // Before: PASS "HTTP 200 — server handled 1MB payload without crashing" for an HTML page.
+    expect((await oversized({ bigCall: "html" })).verdict).toEqual({
+      passed: false,
+      details: "HTTP 200, non-JSON-RPC body -- no result or error for a 1 MB sink.data",
+    });
+  }, 20_000);
+
+  it("a timeout still fails as struggling", async () => {
+    expect((await oversized({ bigCall: "hang" }, 800)).verdict).toEqual({
+      passed: false,
+      details: "Request timed out — server may be struggling with oversized input",
+    });
+  }, 20_000);
+
+  it("a connection closed on the 1 MB body passes when a follow-up ping is served, or refused by a gate", async () => {
+    // Before: PASS "Connection rejected (acceptable for oversized input)" without looking.
+    const served = await oversized({ bigCall: "drop" });
+    expect(served.verdict).toEqual({
+      passed: true,
+      details:
+        "Connection rejected (acceptable for oversized input): other side closed; the server still served a follow-up ping",
+    });
+    expect(served.hits.map((h) => h.method).slice(-2)).toEqual(["tools/call", "ping"]);
+    expect((await oversized({ bigCall: "drop", afterDrop: "401" })).verdict).toEqual({
+      passed: true,
+      details:
+        "Connection rejected (acceptable for oversized input): other side closed; a follow-up ping was still answered (HTTP 401, an auth gate)",
+    });
+    expect((await oversized({ bigCall: "drop", afterDrop: "bare-403" })).verdict).toEqual({
+      passed: true,
+      details:
+        "Connection rejected (acceptable for oversized input): other side closed; a follow-up ping was still answered (HTTP 403, a gate in front of the server such as a WAF or IPS now blocking this client)",
+    });
+    const throttled = await oversized({ bigCall: "drop", afterDrop: "429-then-serve" });
+    expect(throttled.verdict).toEqual({
+      passed: true,
+      details:
+        "Connection rejected (acceptable for oversized input): other side closed; a follow-up ping answered HTTP 429, then after 0ms was served",
+    });
+    expect(throttled.hits.map((h) => h.method).slice(-3)).toEqual(["tools/call", "ping", "ping"]);
+  }, 40_000);
+
+  it("a connection closed on the 1 MB body fails as a possible crash when the follow-up ping is not served", async () => {
+    // Before: every one of these PASSED "Connection rejected (acceptable for oversized input)".
+    const died = await oversized({ bigCall: "drop", afterDrop: "die" });
+    expect(died.verdict.passed).toBe(false);
+    expect(died.verdict.details).toMatch(
+      /^server may have crashed: connection dropped on a 1 MB sink\.data: other side closed; ping then got no response \(connection failed: connect ECONNREFUSED 127\.0\.0\.1:\d+\)$/,
+    );
+    expect((await oversized({ bigCall: "drop", afterDrop: "502" })).verdict).toEqual({
+      passed: false,
+      details:
+        "server may have crashed: connection dropped on a 1 MB sink.data: other side closed; ping then answered HTTP 502",
+    });
+    const throttled = await oversized({ bigCall: "drop", afterDrop: "429-twice" });
+    expect(throttled.verdict).toEqual({
+      passed: false,
+      details:
+        "server may have crashed: connection dropped on a 1 MB sink.data: other side closed; ping then answered HTTP 429, then after 0ms answered HTTP 429",
+    });
+    // One retry, not a loop.
+    expect(throttled.hits.map((h) => h.method).slice(-3)).toEqual(["tools/call", "ping", "ping"]);
+  }, 40_000);
+
+  it("bytes that are not an HTTP response fail as no usable response", async () => {
+    // Before: PASS "Connection rejected (acceptable for oversized input)".
+    const { verdict } = await oversized({ bigCall: "not-http" });
+    expect(verdict.passed).toBe(false);
+    expect(verdict.details).toMatch(/^no usable response to a 1 MB sink\.data: \S/);
+  }, 20_000);
+
+  it("a server already unreachable is 'server unreachable', not a connection rejected", async () => {
+    // Before: PASS "Connection rejected (acceptable for oversized input)" though nothing was sent.
+    const report = await runComplianceSuite(DEAD_URL, { timeout: 2000, specVersion: "2025-11-25", only: [ID] });
+    const verdict = verdictOf(report, ID);
+    expect(verdict.passed).toBe(false);
+    expect(verdict.details).toMatch(
+      /^server unreachable: tools\/call test\.data with a 1 MB value got no response \(connection failed: connect ECONNREFUSED 127\.0\.0\.1:1\)$/,
+    );
+  }, 15_000);
+
+  it("an abort while the 1 MB call waits ends the run at once instead of after the timeout", async () => {
+    const controller = new AbortController();
+    const reason = new Error("client went away");
+    const stub = await startSecurityStub({
+      bigCall: "hang",
+      onBigCall: () => setTimeout(() => controller.abort(reason), 50),
+    });
+    try {
+      const completed: string[] = [];
+      const started = Date.now();
+      await expect(
+        runComplianceSuite(stub.url, {
+          timeout: 15_000,
+          specVersion: "2025-11-25",
+          only: [...ONLY, "security-extra-params"],
+          signal: controller.signal,
+          onTestComplete: (t) => {
+            if (t.id === ID) completed.push(t.details);
+          },
+        }),
+      ).rejects.toBe(reason);
+      // Before: the raw POST ignored the caller's signal and ran to its 15 s
+      // timeout, then recorded "Request timed out".
+      expect(Date.now() - started).toBeLessThan(8000);
+      expect(completed.filter((d) => d.includes("timed out"))).toEqual([]);
+    } finally {
+      await stub.stop();
+    }
+  }, 30_000);
+});
+
+describe("runComplianceSuite — legacy security-oversized-input: gates in front of the server measure nothing", () => {
+  const ID = "security-oversized-input";
+  const TOKEN = "tok-3e9d";
+  const AUTH = { Authorization: `Bearer ${TOKEN}` };
+
+  async function oversized(stubOpts: SecurityStubOptions, auth = false) {
+    const stub = await startSecurityStub(stubOpts);
+    try {
+      const report = await runComplianceSuite(stub.url, {
+        timeout: 3000,
+        specVersion: "2025-11-25",
+        only: ["tools-list", ID],
+        ...(auth ? { headers: AUTH } : {}),
+      });
+      return { verdict: verdictOf(report, ID), hits: stub.hits };
+    } finally {
+      await stub.stop();
+    }
+  }
+
+  const bigCalls = (hits: SecurityHit[]) => hits.filter((h) => h.method === "tools/call" && h.bytes > 1_048_576);
+
+  it("a 429 on the 1 MB call is resent once; a second 429 is not evaluable", async () => {
+    // Before: PASS "HTTP 429 (oversized input rejected)" -- a rate limiter's answer.
+    const limited = await oversized({ bigCall: 429 });
+    expect(limited.verdict).toEqual({
+      passed: false,
+      details:
+        "HTTP 429, then after 0ms HTTP 429 on a 1 MB sink.data -- not evaluable: a rate limiter answered before the server read the request",
+    });
+    expect(bigCalls(limited.hits)).toHaveLength(2);
+    // Before: PASS "HTTP 429 (oversized input rejected)" without resending.
+    const once = await oversized({ bigCall: "429-once" });
+    expect(once.verdict).toEqual({ passed: true, details: "HTTP 200 — server handled 1MB payload without crashing" });
+    expect(bigCalls(once.hits)).toHaveLength(2);
+  }, 30_000);
+
+  it("an auth gate's 401 or Bearer 403 on the 1 MB call is not evaluable", async () => {
+    // Before: PASS "HTTP 401 (oversized input rejected)" for a credential
+    // refused mid-run, and PASS "HTTP 403 (oversized input rejected)" for a
+    // gateway asking for a token the run never sent.
+    expect((await oversized({ token: TOKEN, bigCall: 401 }, true)).verdict).toEqual({
+      passed: false,
+      details:
+        "HTTP 401 on a 1 MB sink.data -- not evaluable: an auth gate answered before the server read the request (credential rejected -- check --auth)",
+    });
+    expect((await oversized({ token: TOKEN, noAuth: "bearer-403" })).verdict).toEqual({
+      passed: false,
+      details:
+        "HTTP 403 on a 1 MB test.data -- not evaluable: an auth gate answered before the server read the request (pass --auth)",
+    });
+  }, 30_000);
+
+  it("a bare 403 on the 1 MB call passes next to a served initialize, and is not evaluable when nothing was served", async () => {
+    // A WAF rule blocking the body: initialize went through with the same headers.
+    expect((await oversized({ bigCall: "bare-403" })).verdict).toEqual({
+      passed: true,
+      details: "HTTP 403 (oversized input rejected)",
+    });
+    // Before: PASS "HTTP 403 (oversized input rejected)" for a gate that
+    // refuses every request (a Host guard, a gateway) and never let the
+    // handshake through.
+    expect((await oversized({ token: TOKEN, noAuth: "bare-403" })).verdict).toEqual({
+      passed: false,
+      details:
+        'HTTP 403 ("Forbidden") on a 1 MB test.data -- not evaluable: initialize was not served either, so the 403 may be Host/Origin validation or a gateway refusing every request rather than a size limit',
+    });
+  }, 30_000);
+
+  it("--auth against a gate whose credentialed requests are served: the 1 MB call is measured as usual", async () => {
+    expect((await oversized({ token: TOKEN, noAuth: "401", bigCall: 413 }, true)).verdict).toEqual({
+      passed: true,
+      details: "HTTP 413 Payload Too Large (good)",
+    });
+  }, 30_000);
+
+  it("after a dropped 1 MB call, a ping answered with a JSON-RPC error by its id shows the server is up", async () => {
+    // Before: FAIL "server may have crashed: ...; ping then answered HTTP
+    // 200, JSON-RPC error -32601" -- then said the server answered.
+    expect((await oversized({ bigCall: "drop", afterDrop: "ping-rpc-error" })).verdict).toEqual({
+      passed: true,
+      details:
+        "Connection rejected (acceptable for oversized input): other side closed; a follow-up ping was answered (HTTP 200, JSON-RPC error -32601)",
+    });
+    // An id-null "Session not found" is a server that restarted, not one that answered the ping.
+    expect((await oversized({ bigCall: "drop", afterDrop: "session-404" })).verdict).toEqual({
+      passed: false,
+      details:
+        "server may have crashed: connection dropped on a 1 MB sink.data: other side closed; ping then answered HTTP 404, JSON-RPC error -32001",
+    });
+  }, 30_000);
+
+  it("a server that answered nothing in this run is 'server unreachable', not one that crashed on the 1 MB value", async () => {
+    // A gateway that drops every request without the credential; no --auth.
+    // Before: FAIL "server may have crashed: connection dropped on a 1 MB test.data: ...".
+    const { verdict } = await oversized({ token: TOKEN, noAuth: "drop" });
+    expect(verdict.passed).toBe(false);
+    expect(verdict.details).toMatch(
+      /^server unreachable: tools\/call test\.data with a 1 MB value got no response \(connection closed: [^)]+\); ping then got no response \(connection closed: [^)]+\) \(the preflight and initialize got no answer either\)$/,
+    );
+  }, 30_000);
+});
+
+/**
+ * A 2025-11-25 stdio server with one tool, `echo(data)`, whose answer to a
+ * tools/call carrying more than 500 KB depends on its mode: "exit" exits
+ * with code 3 once it has read the line, "hang" never answers, "rpc-error"
+ * answers -32602, "echo" writes the value back twice (a line well past the
+ * runner's 1 MiB stdio buffer); "exit-on-list" exits on tools/list instead.
+ * "exit-then-gone" exits on the 1 MB line like "exit" after writing the
+ * marker file named by the third argument, and an instance started while
+ * that marker exists exits at once with code 4 (a server that does not come
+ * back after a crash).
+ */
+const OVERSIZED_STDIO_SERVER = `
+import { existsSync, writeFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+const mode = process.argv[2];
+const marker = process.argv[3];
+if (mode === "exit-then-gone" && existsSync(marker)) process.exit(4);
+const rl = createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY });
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.id === undefined) return;
+  switch (msg.method) {
+    case "initialize":
+      return send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "stdio-oversized", version: "1" } } });
+    case "ping":
+      return send({ jsonrpc: "2.0", id: msg.id, result: {} });
+    case "tools/list":
+      if (mode === "exit-on-list") process.exit(3);
+      return send({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "echo", inputSchema: { type: "object", properties: { data: { type: "string" } } } }] } });
+    case "tools/call": {
+      const data = String(msg.params?.arguments?.data ?? "");
+      if (data.length > 500000) {
+        if (mode === "exit") process.exit(3);
+        if (mode === "exit-then-gone") {
+          writeFileSync(marker, "crashed");
+          process.exit(3);
+        }
+        if (mode === "hang") return;
+        if (mode === "rpc-error") return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "data is too long" } });
+        if (mode === "echo") return send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: data + data }] } });
+      }
+      return send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "ok" }] } });
+    }
+    default:
+      return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+  }
+});
+rl.on("close", () => process.exit(0));
+`;
+
+describe("runComplianceSuite — legacy security-oversized-input over stdio", () => {
+  // It used to POST to backendUrl, which is empty for a stdio target: undici
+  // rejected the URL client-side and every stdio server PASSED "Connection
+  // rejected (acceptable for oversized input)" without being sent anything.
+  const ID = "security-oversized-input";
+  let dir: string;
+  let script: string;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "mcp-legacy-oversized-"));
+    script = join(dir, "server.mjs");
+    writeFileSync(script, OVERSIZED_STDIO_SERVER);
+  });
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function overStdio(mode: string, timeout = 5000) {
+    const report = await runComplianceSuite(
+      { type: "stdio", command: process.execPath, args: [script, mode] },
+      { timeout, specVersion: "2025-11-25", only: ["tools-list", ID] },
+    );
+    return { verdict: verdictOf(report, ID), warnings: report.warnings };
+  }
+
+  it("the echo fixture is sent the 1 MB value and passes as having handled it", async () => {
+    const fixture = fileURLToPath(new URL("./fixtures/echo-server.mjs", import.meta.url));
+    const report = await runComplianceSuite(
+      { type: "stdio", command: process.execPath, args: [fixture] },
+      { timeout: 5000, specVersion: "2025-11-25", only: ["tools-list", ID] },
+    );
+    expect(verdictOf(report, ID)).toEqual({
+      passed: true,
+      details: "result -- server handled 1MB payload without crashing",
+    });
+  }, 30_000);
+
+  it("a JSON-RPC error passes naming the code", async () => {
+    expect((await overStdio("rpc-error")).verdict).toEqual({
+      passed: true,
+      details: "JSON-RPC error -32602 -- server handled 1MB payload without crashing",
+    });
+  }, 30_000);
+
+  it("a child that exits on the 1 MB line fails as died", async () => {
+    const { verdict } = await overStdio("exit");
+    expect(verdict.passed).toBe(false);
+    expect(verdict.details).toMatch(/^server died on a 1 MB echo\.data: .*exit code 3/);
+  }, 30_000);
+
+  /** The checks that run after security-oversized-input on stdio. */
+  const AFTER = [
+    "security-extra-params",
+    "security-tool-rug-pull",
+    "stdio-framing",
+    "stdio-unicode",
+    "stdio-unknown-method-recovers",
+  ];
+
+  it("a child that exits on the 1 MB line is restarted, so the checks after it measure the server, not the crash", async () => {
+    const report = await runComplianceSuite(
+      { type: "stdio", command: process.execPath, args: [script, "exit"] },
+      { timeout: 5000, specVersion: "2025-11-25", only: ["tools-list", ID, ...AFTER] },
+    );
+    expect(verdictOf(report, ID).passed).toBe(false);
+    expect(verdictOf(report, ID).details).toMatch(/^server died on a 1 MB echo\.data: .*exit code 3/);
+    // Before: every check after it ran against the dead child --
+    // stdio-framing (required) FAILED "5/5 rapid pings failed — framing likely
+    // broken", security-extra-params PASSED "Request rejected (acceptable)",
+    // and rug-pull, unicode and unknown-method-recovers FAILED on the crash.
+    expect(Object.fromEntries(AFTER.map((id) => [id, verdictOf(report, id)]))).toEqual({
+      "security-extra-params": { passed: true, details: "Server processed request (extra params likely ignored)" },
+      "security-tool-rug-pull": { passed: true, details: "1 tool(s) consistent across 2 calls" },
+      "stdio-framing": { passed: true, details: "5/5 rapid pings returned cleanly" },
+      "stdio-unicode": {
+        passed: true,
+        details: "Tool echoed something, but not the exact probe — likely still UTF-8-safe",
+      },
+      "stdio-unknown-method-recovers": {
+        passed: true,
+        details: "Unknown method returned JSON-RPC error; subsequent ping succeeded",
+      },
+    });
+    expect(report.warnings.filter((w) => w.startsWith("security-oversized-input"))).toEqual([
+      "security-oversized-input: the server exited on a 1 MB echo.data and was restarted with a fresh initialize handshake, so the tests after it ran against the new instance.",
+    ]);
+  }, 60_000);
+
+  it("a server that survives the 1 MB line is not restarted", async () => {
+    const report = await runComplianceSuite(
+      { type: "stdio", command: process.execPath, args: [script, "rpc-error"] },
+      { timeout: 5000, specVersion: "2025-11-25", only: ["tools-list", ID, ...AFTER] },
+    );
+    expect(report.tests.filter((t) => !t.passed)).toEqual([]);
+    expect(report.warnings.filter((w) => w.startsWith("security-oversized-input"))).toEqual([]);
+  }, 60_000);
+
+  it("a child that does not come back after the restart: the warning says so, and extra-params reports it unreachable", async () => {
+    const marker = join(dir, `crashed-${randomUUID()}`);
+    const report = await runComplianceSuite(
+      { type: "stdio", command: process.execPath, args: [script, "exit-then-gone", marker] },
+      { timeout: 5000, startupTimeout: 5000, specVersion: "2025-11-25", only: ["tools-list", ID, ...AFTER] },
+    );
+    expect(verdictOf(report, ID).details).toMatch(/^server died on a 1 MB echo\.data: .*exit code 3/);
+    const restart = report.warnings.filter((w) => w.startsWith("security-oversized-input"));
+    expect(restart).toHaveLength(1);
+    expect(restart[0]).toMatch(
+      /^security-oversized-input: the server exited on a 1 MB echo\.data and was restarted, but the new instance's initialize got no response \(connection closed: .*exit code 4.*; the tests after it ran against the new instance and may fail for that reason\.$/,
+    );
+    // Before: PASS "Request rejected (acceptable)" from a child that was gone.
+    const extra = verdictOf(report, "security-extra-params");
+    expect(extra.passed).toBe(false);
+    expect(extra.details).toMatch(
+      /^server unreachable: tools\/call echo with unknown arguments got no response \(connection closed: .*exit code 4/,
+    );
+  }, 60_000);
+
+  it("a child that never answers the 1 MB line fails as timed out", async () => {
+    expect((await overStdio("hang", 1500)).verdict).toEqual({
+      passed: false,
+      details: "Request timed out — server may be struggling with oversized input",
+    });
+  }, 30_000);
+
+  it("a reply longer than the runner's stdio buffer passes as survived, with a warning", async () => {
+    const { verdict, warnings } = await overStdio("echo", 1500);
+    expect(verdict).toEqual({
+      passed: true,
+      details: "response to a 1 MB echo.data exceeded the runner's stdio line buffer (server survived)",
+    });
+    expect(warnings).toContain(
+      "security-oversized-input: the server's reply to a 1 MB echo.data exceeded the runner's 1 MiB stdio line buffer and was dropped; treated as survived. Prefer rejecting oversized arguments with a JSON-RPC error.",
+    );
+  }, 30_000);
+
+  it("a child that already exited before the call is 'server unreachable', not a crash on the 1 MB value", async () => {
+    const { verdict } = await overStdio("exit-on-list");
+    expect(verdict.passed).toBe(false);
+    expect(verdict.details).toMatch(
+      /^server unreachable: tools\/call test\.data with a 1 MB value got no response \(connection closed: .*exit code 3/,
+    );
+  }, 30_000);
 });

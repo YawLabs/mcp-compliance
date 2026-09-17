@@ -166,6 +166,14 @@ for (const ex of EXPECTED) {
         required: report.tests.filter((t) => t.required).length,
         requiredPassed: report.tests.filter((t) => t.required).length,
       });
+      if (ex.kind === "http") {
+        // Localhost-inherent because the fixture needs no credential and
+        // serves the credential-less server/discover -- not a refusal the
+        // check failed to credit.
+        expect(resultOf(report, "security-auth-required").details).toBe(
+          "HTTP 200, result -- server accepted unauthenticated request (no --auth provided)",
+        );
+      }
     });
 
     it("takes serverInfo, capabilities and instructions from server/discover", () => {

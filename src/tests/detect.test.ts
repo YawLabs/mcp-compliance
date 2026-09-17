@@ -12,6 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
   classifyDiscoverResponse,
+  namesHostOrOriginValidation,
   probeAnswerShowsEra,
   probeExitWarning,
   REASON_PREFIX,
@@ -937,6 +938,65 @@ describe("auth-gated server without --auth", () => {
     expect(auth.details).not.toContain("accepted unauthenticated");
   }, 20_000);
 
+  it.each([
+    ["auto", undefined],
+    ["pinned 2025-11-25", LEGACY_SPEC_VERSION],
+  ] as const)(
+    "%s: a preflight that timed out is not read as accepted; security-auth-required asks again and reads the 401",
+    async (_label, specVersion) => {
+      // The first request (the preflight) outlives preflightTimeout; every
+      // request is refused with a Bearer 401. Before: the preflight held no
+      // status, so the check FAILED "Server does not require auth (... server
+      // accepted unauthenticated requests)" against a server that refuses them all.
+      let first = true;
+      const pings: Array<string | undefined> = [];
+      const server = createServer((req, res) => {
+        let text = "";
+        req.setEncoding("utf8");
+        req.on("data", (c: string) => {
+          text += c;
+        });
+        req.on("end", () => {
+          if (text.includes('"method":"ping"')) pings.push(req.headers.authorization);
+          const delay = first ? 1500 : 0;
+          first = false;
+          setTimeout(() => {
+            if (res.destroyed) return;
+            res.writeHead(401, { "content-type": "application/json", "www-authenticate": 'Bearer realm="mcp"' });
+            res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "Unauthorized" } }));
+          }, delay);
+        });
+      });
+      const url = await new Promise<string>((done) => {
+        server.listen(0, "127.0.0.1", () => {
+          const addr = server.address();
+          done(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+        });
+      });
+      try {
+        const report = await runComplianceSuite(url, {
+          timeout: 5000,
+          preflightTimeout: 300,
+          startupTimeout: 5000,
+          only: ["security-auth-required"],
+          ...(specVersion ? { specVersion } : {}),
+        });
+        expect(report.specVersion).toBe(LEGACY_SPEC_VERSION);
+        const auth = resultOf(report, "security-auth-required");
+        expect({ passed: auth.passed, details: auth.details }).toEqual({
+          passed: true,
+          details:
+            "HTTP 401 (unauthenticated request rejected; pass --auth to run the authenticated suite and the remaining auth tests)",
+        });
+        expect(pings).toEqual([undefined]);
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>((done) => server.close(() => done()));
+      }
+    },
+    20_000,
+  );
+
   it("pinned 2025-11-25 without --auth: the same first-position warning, worded for a pinned run", async () => {
     const report = await runComplianceSuite(http.target, {
       timeout: 5000,
@@ -1717,6 +1777,30 @@ describe("classifyDiscoverResponse", () => {
     );
     expect(noisy?.message).toMatch(/^Invalid \[31mHost: x+\.\.\.$/);
     expect(noisy?.message).toHaveLength(120);
+  });
+
+  it("namesHostOrOriginValidation: the SDK's Host and Origin guard messages, and nothing that merely contains the letters", () => {
+    for (const message of [
+      "Invalid Host: abc123.ngrok-free.app",
+      "Invalid Host header: evil.example:8080",
+      "Missing Host header",
+      "Invalid Origin: https://evil.example",
+      "Invalid Origin header: null",
+      "host not allowed",
+    ]) {
+      expect(namesHostOrOriginValidation(message), message).toBe(true);
+    }
+    for (const message of [
+      undefined,
+      "",
+      "Forbidden",
+      "Method not allowed by policy",
+      "localhost only",
+      "hostname mismatch",
+      "Original request blocked",
+    ]) {
+      expect(namesHostOrOriginValidation(message), String(message)).toBe(false);
+    }
   });
 
   it("readAuthRefusal: an escaped quote inside a quoted challenge value is part of the value, so an error parameter after it is still read", () => {

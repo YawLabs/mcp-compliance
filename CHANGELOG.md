@@ -219,10 +219,11 @@ out explicitly here.
     `Authorization` header was configured, the report's first warning (index 0,
     every format) says the server requires authentication, that the grade below
     is not meaningful, and to re-run with `--auth <token>`. The 2025-11-25
-    `security-auth-required` now passes on any 401/403 to that unauthenticated
-    preflight (`HTTP 401 (unauthenticated preflight rejected; pass --auth ...)`)
-    instead of claiming the server "accepted unauthenticated requests" next to
-    `transport-post`'s 401.
+    `security-auth-required` now passes on a 401, or a 403 carrying that
+    challenge, to the unauthenticated preflight (`HTTP 401 (unauthenticated
+    preflight rejected; pass --auth ...)`) instead of claiming the server
+    "accepted unauthenticated requests" next to `transport-post`'s 401. (A
+    *bare* 403 there is read separately -- see the entry below.)
   - **Injection targets follow the spec's annotation defaults.** The 2026-07-28
     suite treated an unannotated tool as safe and could send path-traversal
     payloads into a write tool; the spec defaults `destructiveHint` to true, so a
@@ -534,6 +535,70 @@ out explicitly here.
   (2026-07-28) now fails it as `server died on a 1 MB <tool>.<argument>` on both
   platforms, and a raw pipe-write failure reads as the server going away on
   Windows (`EOF`) as it already did on POSIX (`EPIPE`).
+- **The 2025-11-25 security checks now read a refusal the way the 2026-07-28
+  ones do, and both eras read a bare 403 as what it is:**
+  - `security-auth-required` (2025-11-25) passed any 401/403 on the
+    unauthenticated request, including the bare 403 the SDK's Host validation
+    sends a tunnel hostname, and passed a timeout or dropped connection as
+    "Connection rejected (acceptable)". A bare 403 (no `WWW-Authenticate:
+    Bearer` challenge) now passes only with `--auth` when the same ping carrying
+    the credential is served, noting the spec expects 401; otherwise it fails as
+    not evaluable, naming Host/Origin validation or a gateway (and `--auth` as
+    the way to compare when no credential was configured). A
+    timeout or refused connection fails as `server unreachable`, and a dropped
+    connection passes only with `--auth` when the credentialed ping is served.
+    Without `--auth`, a preflight that got no HTTP answer is no longer read as
+    "server accepted unauthenticated requests": a ping is sent after the
+    handshake and read the same way.
+  - `security-auth-required` (2025-11-25) without `--auth`: a gateway that
+    refuses the era probe with a bare 403 but answers every other
+    unauthenticated request with 401 and a Bearer challenge now passes on that
+    401 instead of failing as not evaluable.
+  - `security-oversized-input` (2025-11-25) passed any HTTP status >= 400, a
+    rate limiter's 429 and an auth gate's 401/403 included, passed any status
+    below 400 without reading the body, and passed every transport error except
+    a timeout as "Connection rejected (acceptable for oversized input)". That
+    included every stdio target, where the raw POST to an empty URL never left
+    the client. It now goes through the transport on HTTP and stdio and follows
+    the 2026-07-28 rules. A 5xx, or a 2xx without a JSON-RPC result or error,
+    fails. A dropped connection passes only when a follow-up ping is served or
+    refused with 401/403 (one 429 retried), and otherwise fails as a possible
+    crash. A refused connection is `server unreachable`, and unparseable bytes
+    are `no usable response`. On stdio, a child that exits on the 1 MB line
+    fails as died, and an over-long reply passes with a warning. A caller's
+    abort now cancels the 1 MB request instead of waiting out its timeout.
+  - `security-oversized-input` (2025-11-25) sends the 1 MB `tools/call` over
+    stdio now, and a server that exits on it used to leave every later check
+    running against a dead child: the required `stdio-framing` failed as
+    "framing likely broken", `security-extra-params` passed the crash as
+    "Request rejected (acceptable)", and the run went from pass to fail. The
+    runner now restarts the child and redoes the handshake (a warning says so),
+    so the crash is counted once, on the check that caused it;
+    `security-extra-params` reports a stdio child that is gone as
+    `server unreachable`.
+  - `security-oversized-input` (both eras): a 429 on the 1 MB call is resent
+    once after `Retry-After` (capped at 2 s) and a second 429 is not evaluable;
+    a 401, or a 403 an auth gate answers, is not evaluable; on 2025-11-25 a bare
+    403 counts only next to a served `initialize`. A follow-up ping answered by
+    its own id with a JSON-RPC error now counts as the server being alive, and a
+    drop in a run where nothing was ever answered reports `server unreachable`
+    rather than a crash.
+  - `security-auth-required` (2026-07-28): a 403 without a `WWW-Authenticate`
+    Bearer challenge on the credential-less `server/discover` no longer passes
+    as an authentication rejection -- Origin validation, the SDK's Host
+    validation and gateways answer the same bare 403. It passes only with
+    `--auth` when the credentialed `server/discover` was served (the details
+    note the spec expects 401), and otherwise fails as not evaluable, quoting
+    the server's message.
+  - `security-auth-required` (both eras): when the 403 quotes Host or Origin
+    validation (the SDK's `Invalid Host: ...`), or the credentialed request drew
+    the same 403, the details now say to allow the hostname you tested through
+    instead of suggesting `--auth`, and the 2026-07-28 details keep the whole
+    hostname inside the 220-character limit. The 2025-11-25 auth probes skip
+    with `Skipped: no --auth provided` instead of "server does not require
+    auth", and with `--auth` they skip as `Skipped: not evaluable (see
+    security-auth-required)` rather than crediting a bare 403 that
+    `security-auth-required` refused to credit.
 
 ## [0.18.2] — 2026-09-15
 

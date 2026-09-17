@@ -122,6 +122,9 @@ const TOOL_IDS = [
 ];
 
 const NO_AUTH_DETAILS = "HTTP 200, result -- server accepted unauthenticated request (no --auth provided)";
+/** security-auth-required's pass on a bare 403 that the served credentialed discover pins on the missing credential. */
+const BARE_403_ATTRIBUTED =
+  "HTTP 403 without a Bearer challenge (unauthenticated request rejected; the same request with the credential was served) -- the spec expects 401 when authorization is required";
 const UNREACHED = "never reached the tool (JSON-RPC or transport error)";
 
 /** Ids that FAIL on the clean HTTP fixture by design, with the details they must carry. */
@@ -1461,8 +1464,14 @@ interface InlineOptions {
    * with instead of 400: 500 text/plain, a token parser that throws.
    */
   malformedStatus?: 500;
-  /** The status an `auth` server answers a request with no Authorization: 401 (default) or 403. */
-  unauthenticatedStatus?: 403;
+  /**
+   * The status an `auth` server answers a request with no Authorization:
+   * 401 with its challenge (default), a bare 403 (no WWW-Authenticate), or
+   * "403-challenge": a 403 carrying `WWW-Authenticate: Bearer realm="mcp"`.
+   */
+  unauthenticatedStatus?: 403 | "403-challenge";
+  /** The JSON-RPC error message on an `auth` server's rejections (default "Unauthorized"). */
+  rejectionMessage?: string;
   /**
    * Any Authorization other than `Bearer tok` on /mcp: never answered
    * ("hang") or its socket destroyed ("drop"), before any auth parsing.
@@ -1517,9 +1526,11 @@ interface InlineOptions {
    * The answer to a body over 500 KB: an HTTP status, a 200 carrying a
    * JSON-RPC error ("rpc-error"; "rpc-error-no-code" the same error object
    * without its code), or a 200 carrying neither result nor error
-   * ("no-result").
+   * ("no-result"). 429 is a rate limiter answering every such body, and
+   * "429-once" only the first (both without Retry-After); 401 an auth gate
+   * refusing it; 403 a bare 403 (a WAF rule blocking the body).
    */
-  bigBody?: 413 | 500 | 400 | "rpc-error" | "rpc-error-no-code" | "no-result";
+  bigBody?: 413 | 500 | 400 | 429 | "429-once" | 401 | 403 | "rpc-error" | "rpc-error-no-code" | "no-result";
   /** Answer `server/discover` with a JSON-RPC error: capabilities stay unknown. */
   discover?: "error";
   /**
@@ -1944,6 +1955,8 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
   let throttleNext = 0;
   let posts = 0;
   let unauthenticatedSeen = 0;
+  /** Set once the "429-once" bigBody gate has throttled its one body. */
+  let bigBodyThrottled = false;
   let toolCalls = 0;
   let listCalls = 0;
   let base = "";
@@ -2185,10 +2198,16 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
       if (opts.auth) {
         const queryCredential = opts.queryToken === "accept" && url.searchParams.get("access_token") === "tok";
         const authz = req.headers.authorization ?? (queryCredential ? "Bearer tok" : undefined);
-        const rejection = { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Unauthorized" } };
+        const rejection = {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32600, message: opts.rejectionMessage ?? "Unauthorized" },
+        };
         if (!authz) {
-          // A 403 carries no challenge: there is no scheme to negotiate.
           if (opts.unauthenticatedStatus === 403) return json(403, rejection);
+          if (opts.unauthenticatedStatus === "403-challenge") {
+            return json(403, rejection, { "WWW-Authenticate": 'Bearer realm="mcp"' });
+          }
           return json(401, rejection, challengeHeader(prmUrl));
         }
         if (authz !== "Bearer tok") {
@@ -2240,7 +2259,12 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
           { "Retry-After": "1" },
         );
       }
-      if (opts.bigBody && body.length > 500_000) {
+      if (opts.bigBody === "429-once" && body.length > 500_000) {
+        if (!bigBodyThrottled) {
+          bigBodyThrottled = true;
+          return json(429, { jsonrpc: "2.0", id: null, error: { code: -32000, message: "slow down" } });
+        }
+      } else if (opts.bigBody && body.length > 500_000) {
         if (opts.bigBody === "rpc-error-no-code") {
           return json(200, { jsonrpc: "2.0", id: msg?.id ?? null, error: { message: "data exceeds maxLength" } });
         }
@@ -2253,7 +2277,9 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         }
         // Neither result nor error: a JSON-RPC envelope with nothing in it.
         if (opts.bigBody === "no-result") return json(200, { jsonrpc: "2.0", id: msg?.id ?? null });
-        return json(opts.bigBody, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "too big" } });
+        if (typeof opts.bigBody === "number") {
+          return json(opts.bigBody, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "too big" } });
+        }
       }
       const result = (r: Record<string, unknown>) =>
         json(200, { jsonrpc: "2.0", id: msg?.id ?? null, result: { resultType: "complete", ...r } });
@@ -4086,10 +4112,135 @@ describe("inline servers: the WWW-Authenticate challenge on the unauthenticated 
   it("a 403 is not a 401: no challenge is expected, and the well-known lookup still runs", () => {
     expect(verdicts(forbidden.tests, IDS)).toEqual(allPass(IDS));
     expect(detailsOf(forbidden.tests, WWW)).toBe("HTTP 403 (WWW-Authenticate not applicable for 403)");
-    expect(detailsOf(forbidden.tests, "security-auth-required")).toBe("HTTP 403 (unauthenticated request rejected)");
+    // The credentialed discover was served, so the credential is the only
+    // variable (see the next describe block for a 403 that is not).
+    expect(detailsOf(forbidden.tests, "security-auth-required")).toBe(BARE_403_ATTRIBUTED);
     expect(detailsOf(forbidden.tests, "security-oauth-metadata")).toBe(
       `Protected Resource Metadata found at /.well-known/oauth-protected-resource/mcp: resource=${servers[2].base}/mcp, 1 auth server(s)`,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// security-auth-required reads a 401/403 the way readAuthRefusal does. A 401,
+// or a 403 carrying a Bearer challenge, asks for a credential. A 403 without
+// one is also what Origin validation (streamable-http), the SDK's Host
+// validation and gateways answer, so it is credited to authentication only
+// when the credential is the one variable: --auth, and the credentialed
+// server/discover served. (The SDK's own Host guard is exercised against the
+// real SDK in integration-sdk2.test.ts.)
+// ---------------------------------------------------------------------------
+
+describe("security-auth-required: a 403 without a Bearer challenge counts only when the credential is the one variable", () => {
+  const ID = "security-auth-required";
+  const AUTH = { Authorization: "Bearer tok" };
+  const servers: InlineServer[] = [];
+  let bareWithAuth: DirectRun;
+  let bareNoAuth: DirectRun;
+  let bareRefusedCredential: ComplianceReport;
+  let bareUnansweredCredential: ComplianceReport;
+  let bareLongMessage: DirectRun;
+  let challengeNoAuth: DirectRun;
+  let challengeWithAuth: DirectRun;
+  /** 120 characters once readAuthRefusal caps it: longer than the room the details leave. */
+  const LONG_HOST = `Invalid Host: ${"a".repeat(100)}.ngrok-free.app`;
+
+  beforeAll(async () => {
+    const bare = await startInlineServer({ auth: "strict", unauthenticatedStatus: 403, tools: "none" });
+    // Leaves any credential other than `Bearer tok` unanswered.
+    const hangs = await startInlineServer({
+      auth: "strict",
+      unauthenticatedStatus: 403,
+      badCredential: "hang",
+      tools: "none",
+    });
+    const long = await startInlineServer({
+      auth: "strict",
+      unauthenticatedStatus: 403,
+      rejectionMessage: LONG_HOST,
+      tools: "none",
+    });
+    const challenge = await startInlineServer({
+      auth: "strict",
+      unauthenticatedStatus: "403-challenge",
+      tools: "none",
+    });
+    servers.push(bare, hangs, long, challenge);
+    bareWithAuth = await runDirect({ url: bare.url, headers: AUTH, only: [ID] });
+    bareNoAuth = await runDirect({ url: bare.url, only: [ID] });
+    // A well-formed token the server refuses (401 invalid_token): through
+    // the real dispatcher, so the setup discover's rejection is recorded.
+    bareRefusedCredential = await runModern(bare.url, { headers: { Authorization: "Bearer wrong" }, only: [ID] });
+    // The credentialed setup discover gets no answer at all.
+    bareUnansweredCredential = await runModern(hangs.url, {
+      headers: { Authorization: "Bearer wrong" },
+      only: [ID],
+      timeout: 800,
+      startupTimeout: 800,
+    });
+    bareLongMessage = await runDirect({ url: long.url, only: [ID] });
+    challengeNoAuth = await runDirect({ url: challenge.url, only: [ID] });
+    challengeWithAuth = await runDirect({ url: challenge.url, headers: AUTH, only: [ID] });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("with --auth and the credentialed discover served, a bare 403 passes and still names the 401 the spec expects", () => {
+    expect(verdicts(bareWithAuth.tests, [ID])).toEqual({ [ID]: "pass" });
+    expect(detailsOf(bareWithAuth.tests, ID)).toBe(BARE_403_ATTRIBUTED);
+    expectAsciiDetails(bareWithAuth.tests, [ID]);
+  });
+
+  it("without --auth a bare 403 is not evaluable: it may be Host/Origin validation or a gateway, and --auth is the comparison", () => {
+    // Before: "HTTP 403 (unauthenticated request rejected); pass --auth to
+    // exercise the rest of the auth suite" -- a pass on a 403 that the
+    // conformant setup discover, sent without a credential too, drew as well.
+    expect(verdicts(bareNoAuth.tests, [ID])).toEqual({
+      [ID]: 'FAIL: not evaluable: HTTP 403 without a Bearer challenge ("Unauthorized") may be Host/Origin validation or a gateway; pass --auth to compare with a credentialed request',
+    });
+    expectAsciiDetails(bareNoAuth.tests, [ID]);
+  });
+
+  it("with --auth the server refuses, a bare 403 is not evaluable either, naming how the credentialed discover was answered", () => {
+    // Before: "HTTP 403 (unauthenticated request rejected)".
+    const result = resultOf(bareRefusedCredential, ID);
+    expect([result.passed, result.details]).toEqual([
+      false,
+      'not evaluable: HTTP 403 without a Bearer challenge ("Unauthorized") may be Host/Origin validation or a gateway; the credentialed request was not served either (HTTP 401)',
+    ]);
+    expectAsciiDetails(bareRefusedCredential.tests, [ID]);
+  });
+
+  it("with --auth whose server/discover got no answer, a bare 403 is not evaluable and names no status for it", () => {
+    // Before: "HTTP 403 (unauthenticated request rejected)".
+    const result = resultOf(bareUnansweredCredential, ID);
+    expect([result.passed, result.details]).toEqual([
+      false,
+      'not evaluable: HTTP 403 without a Bearer challenge ("Unauthorized") may be Host/Origin validation or a gateway; the credentialed request was not served either',
+    ]);
+  });
+
+  it("a long server message is clipped to the room the 220-character limit leaves; the advice after it survives", () => {
+    // Before: "HTTP 403 (unauthenticated request rejected); pass --auth to
+    // exercise the rest of the auth suite". A message naming Host
+    // validation gets the allowed-hosts advice, not --auth, and the short
+    // fixed text leaves room for 60 characters of the hostname.
+    expect(verdicts(bareLongMessage.tests, [ID])).toEqual({
+      [ID]: `FAIL: not evaluable: HTTP 403 without a Bearer challenge ("Invalid Host: ${"a".repeat(60)}...") names Host/Origin validation, not authentication: allow the hostname you tested through`,
+    });
+    expect(detailsOf(bareLongMessage.tests, ID)).toHaveLength(220);
+    expectAsciiDetails(bareLongMessage.tests, [ID]);
+  });
+
+  it("a 403 carrying a Bearer challenge asks for a credential: it passes with or without --auth, as before", () => {
+    expect(verdicts(challengeNoAuth.tests, [ID])).toEqual({ [ID]: "pass" });
+    expect(detailsOf(challengeNoAuth.tests, ID)).toBe(
+      "HTTP 403 (unauthenticated request rejected); pass --auth to exercise the rest of the auth suite",
+    );
+    expect(verdicts(challengeWithAuth.tests, [ID])).toEqual({ [ID]: "pass" });
+    expect(detailsOf(challengeWithAuth.tests, ID)).toBe("HTTP 403 (unauthenticated request rejected)");
   });
 });
 
@@ -4363,6 +4514,68 @@ describe("inline servers: the leak scans read non-JSON error bodies", () => {
     expect(detailsOf(clean.tests, IP)).toBe(
       "1 unique error response(s) checked -- no internal IP addresses or hostnames found",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// security-oversized-input: a status a gate answers before the server reads
+// the request (a rate limiter's 429, an auth gate's 401) measures nothing
+// about the 1 MB value; a bare 403 (a WAF rule blocking the body) is still
+// a rejection, the tool list having come from a served server/discover.
+// ---------------------------------------------------------------------------
+
+describe("inline servers: oversized-input behind a gate", () => {
+  const ID = "security-oversized-input";
+  const servers: InlineServer[] = [];
+  let limited: DirectRun;
+  let limitedOnce: DirectRun;
+  let unauthorized: DirectRun;
+  let blocked: DirectRun;
+  let limitedServer: InlineServer;
+  let limitedOnceServer: InlineServer;
+
+  beforeAll(async () => {
+    limitedServer = await startInlineServer({ bigBody: 429 });
+    limitedOnceServer = await startInlineServer({ bigBody: "429-once" });
+    const c = await startInlineServer({ bigBody: 401 });
+    const d = await startInlineServer({ bigBody: 403 });
+    servers.push(limitedServer, limitedOnceServer, c, d);
+    limited = await runDirect({ url: limitedServer.url, only: [ID] });
+    limitedOnce = await runDirect({ url: limitedOnceServer.url, only: [ID] });
+    unauthorized = await runDirect({ url: c.url, only: [ID] });
+    blocked = await runDirect({ url: d.url, only: [ID] });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("a 429 is resent once after the wait it asks for; a second 429 is not evaluable", () => {
+    // Before: PASS "HTTP 429 (oversized input rejected)" -- the rate limiter's answer, sent once.
+    expect(verdicts(limited.tests, [ID])).toEqual({
+      [ID]: "FAIL: HTTP 429, then after 1000ms HTTP 429 on a 1 MB sink.data -- not evaluable: a rate limiter answered before the server read the request",
+    });
+    expect(limitedServer.calls.filter((c) => String(c.args.data ?? "").length > 500_000)).toHaveLength(2);
+    // Before: PASS "HTTP 429 (oversized input rejected)"; the resent call is completed.
+    expect(verdicts(limitedOnce.tests, [ID])).toEqual({ [ID]: "pass" });
+    expect(detailsOf(limitedOnce.tests, ID)).toBe(
+      "HTTP 200, result -- server processed a 1 MB sink.data without rejecting it (survived)",
+    );
+    expect(limitedOnceServer.calls.filter((c) => String(c.args.data ?? "").length > 500_000)).toHaveLength(2);
+    expectAsciiDetails(limited.tests, [ID]);
+  });
+
+  it("an auth gate's 401 on the 1 MB call is not evaluable", () => {
+    // Before: PASS "HTTP 401 (oversized input rejected)".
+    expect(verdicts(unauthorized.tests, [ID])).toEqual({
+      [ID]: "FAIL: HTTP 401 on a 1 MB sink.data -- not evaluable: an auth gate answered before the server read the request (pass --auth)",
+    });
+    expectAsciiDetails(unauthorized.tests, [ID]);
+  });
+
+  it("a bare 403 on the 1 MB call still passes as a rejection", () => {
+    expect(verdicts(blocked.tests, [ID])).toEqual({ [ID]: "pass" });
+    expect(detailsOf(blocked.tests, ID)).toBe("HTTP 403 (oversized input rejected)");
   });
 });
 

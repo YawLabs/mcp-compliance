@@ -163,6 +163,30 @@ describe("integration — full compliance suite against real server", () => {
     expect(t?.details).toBe("Server accepted request with progressToken (no progress events observed — optional)");
   }, 30000);
 
+  it("security-auth-required and security-oversized-input keep their verdicts on the SDK server", async () => {
+    // No auth at all: the unauthenticated preflight was served (a JSON-RPC
+    // 400, not a 401/403). The 1 MB tools/call is answered over SSE with a
+    // result, which the check now parses through the transport instead of
+    // passing any status below 400 unread.
+    const report = await runComplianceSuite(serverUrl, {
+      timeout: 3000,
+      only: ["tools-list", "security-auth-required", "security-oversized-input"],
+    });
+    const verdict = (id: string) => {
+      const t = report.tests.find((x) => x.id === id);
+      return { passed: t?.passed, details: t?.details };
+    };
+    expect(verdict("security-auth-required")).toEqual({
+      passed: false,
+      details: "Server does not require auth (no --auth provided and server accepted unauthenticated requests)",
+    });
+    expect(verdict("security-oversized-input")).toEqual({
+      passed: true,
+      details: "HTTP 200 — server handled 1MB payload without crashing",
+    });
+    expect(report.warnings.filter((w) => w.startsWith("security-oversized-input"))).toEqual([]);
+  }, 30000);
+
   it("has no preflight warning for reachable server", async () => {
     const report = await runComplianceSuite(serverUrl, { timeout: 3000 });
     expect(report.warnings.some((w) => w.includes("unreachable"))).toBe(false);

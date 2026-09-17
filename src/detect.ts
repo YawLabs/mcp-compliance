@@ -295,6 +295,19 @@ export function authRefusalHint(refusal: AuthRefusal, noCredential: string, dash
 }
 
 /**
+ * Whether a refusal's JSON-RPC error message names Host or Origin
+ * validation: the official SDK's guards answer "Invalid Host: <name>",
+ * "Invalid Host header: <value>", "Missing Host header", "Invalid Origin:
+ * <name>" and "Invalid Origin header: <value>". Such a 403 refuses the
+ * request whatever credential it carries, so --auth cannot get past it; the
+ * fix is allowing the hostname the server was reached through. Whole words
+ * only: "localhost" or "hostname" in some other message does not count.
+ */
+export function namesHostOrOriginValidation(message: string | undefined): boolean {
+  return message !== undefined && /\b(?:host|origin)\b/i.test(message);
+}
+
+/**
  * Classify one response to a modern `server/discover` probe. Exported so
  * the classification rule is unit-testable without a live server.
  */

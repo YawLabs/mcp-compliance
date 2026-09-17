@@ -7,7 +7,7 @@ import {
   STACK_TRACE_PATTERNS,
 } from "../../checks/patterns.js";
 import { errorCodeText, errorWithCode } from "../../checks/validators.js";
-import { readAuthRefusal } from "../../detect.js";
+import { type AuthRefusal, authRefusalHint, namesHostOrOriginValidation, readAuthRefusal } from "../../detect.js";
 import type { TestOutcome } from "../../harness.js";
 import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
 import { parseSSEMessages } from "../../sse.js";
@@ -142,6 +142,9 @@ const DROPPED_CODES = new Set(["UND_ERR_SOCKET", "ECONNRESET", "EPIPE", "EOF", "
  */
 const STDIO_GONE = /crashed with exit code|exited cleanly|terminated by signal|stdin is closed/i;
 
+/** How classifyTransportError reads a request that produced no response. */
+export type TransportFailure = "connect" | "dropped" | "timeout" | "other";
+
 /**
  * What a request that produced no response ran into, read from the error
  * itself rather than guessed from its wording:
@@ -161,10 +164,9 @@ const STDIO_GONE = /crashed with exit code|exited cleanly|terminated by signal|s
  * the child's stderr below it, and a server that logs "timed out" or
  * "terminated by signal" must not change what happened to the request.
  *
- * @internal Exported for testing.
+ * @internal Exported for testing, and for the 2025-11-25 security checks
+ * in runner.ts, which read a missing answer the same way.
  */
-export type TransportFailure = "connect" | "dropped" | "timeout" | "other";
-
 export function classifyTransportError(err: unknown): TransportFailure {
   const e = err as { code?: unknown; name?: unknown } | null;
   // undici's request() (the HTTP transport and the raw probes) puts the
@@ -266,6 +268,72 @@ function unansweredProbe(
  */
 function credentialedDiscoverServed(ctx: ModernSuiteContext): boolean {
   return ctx.hasAuth && ctx.state.discover !== null;
+}
+
+/**
+ * security-auth-required's verdict for a 401 or 403 answering the
+ * server/discover sent without an Authorization header, read the way
+ * readAuthRefusal reads it:
+ *
+ * - a 401, or a 403 carrying a Bearer challenge (kind "auth-required"), asks
+ *   for a credential: the unauthenticated request was rejected;
+ * - a 403 without one (kind "forbidden") cannot be pinned on the missing
+ *   credential by itself. streamable-http requires a bare 403 for an invalid
+ *   Origin, the official SDK's Host validation answers a hostname it does not
+ *   allow (a tunnel or proxy name) with one -- `{"error":{"code":-32000,
+ *   "message":"Invalid Host: ..."}}`, no WWW-Authenticate -- and so may a
+ *   gateway, while basic/authorization answers missing authorization with 401
+ *   ("Authorization required or token invalid"). It counts only when the
+ *   credential is the one variable, the rule unansweredProbe applies to a
+ *   drop: --auth was given and the conformant setup server/discover, which
+ *   carried it, was served (credentialedDiscoverServed). That passes, still
+ *   naming the 401 the spec expects. Otherwise the check is not evaluable
+ *   and fails, naming the other readings and what the comparison saw -- or,
+ *   without --auth, that --auth is what makes the comparison possible.
+ *
+ * The advice depends on what refused. A message naming Host/Origin
+ * validation (namesHostOrOriginValidation: the SDK's "Invalid Host: ...")
+ * refuses every request whatever credential it carries, so --auth is no way
+ * past it: the details say to allow the hostname the server was reached
+ * through. A credentialed server/discover refused with 403 too points the
+ * same way (the gate stands in front of every request). Otherwise, without
+ * --auth, --auth is what makes the comparison possible.
+ *
+ * The server's JSON-RPC error message is quoted in the not-evaluable
+ * details when the 220-character limit leaves room for it; the fixed text
+ * is kept short so a tunnel hostname (the actionable part of "Invalid Host:
+ * abc123.ngrok-free.app") fits whole.
+ */
+function unauthenticatedRefusalVerdict(ctx: ModernSuiteContext, refusal: AuthRefusal): TestOutcome {
+  const status = refusal.statusCode;
+  if (refusal.kind !== "forbidden") {
+    const hint = ctx.hasAuth ? "" : "; pass --auth to exercise the rest of the auth suite";
+    return { passed: true, details: `HTTP ${status} (unauthenticated request rejected)${hint}` };
+  }
+  const bare = `HTTP ${status} without a Bearer challenge`;
+  if (credentialedDiscoverServed(ctx)) {
+    return {
+      passed: true,
+      details: `${bare} (unauthenticated request rejected; the same request with the credential was served) -- the spec expects 401 when authorization is required`,
+    };
+  }
+  const head = `not evaluable: ${bare}`;
+  const rejection = ctx.state.discoverRejection;
+  let tail: string;
+  if (namesHostOrOriginValidation(refusal.message)) {
+    tail = " names Host/Origin validation, not authentication: allow the hostname you tested through";
+  } else if (!ctx.hasAuth) {
+    tail = " may be Host/Origin validation or a gateway; pass --auth to compare with a credentialed request";
+  } else if (rejection?.statusCode === 403) {
+    tail =
+      " may be Host/Origin validation or a gateway; the credentialed request got 403 too: fix the gateway or allowed hosts";
+  } else {
+    tail = ` may be Host/Origin validation or a gateway; the credentialed request was not served either${rejection ? ` (HTTP ${rejection.statusCode})` : ""}`;
+  }
+  // ` ("` and `")` around the message; a message clipped below 16 characters says too little to keep.
+  const room = 220 - head.length - tail.length - 5;
+  const quoted = refusal.message && room >= 16 ? ` ("${clip(refusal.message, room)}")` : "";
+  return { passed: false, details: clip(`${head}${quoted}${tail}`, 220) };
 }
 
 /** "Connection closed without a response (<first line of the error>)" for a drop that counted as a refusal. */
@@ -855,10 +923,9 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
     // carries no Authorization is the fact under test either way.
     try {
       const res = await unauthenticatedDiscover();
-      if (res.statusCode === 401 || res.statusCode === 403) {
-        const hint = ctx.hasAuth ? "" : "; pass --auth to exercise the rest of the auth suite";
-        return { passed: true, details: `HTTP ${res.statusCode} (unauthenticated request rejected)${hint}` };
-      }
+      // The probe carried no Authorization, whatever --auth says.
+      const refusal = readAuthRefusal(res, false);
+      if (refusal) return unauthenticatedRefusalVerdict(ctx, refusal);
       const hint = ctx.hasAuth ? "" : " (no --auth provided)";
       return {
         passed: false,
@@ -1720,7 +1787,8 @@ const RETRY_AFTER_DEFAULT_MS = 1000;
  * RFC 9110 section 10.2.3), capped at RETRY_AFTER_CAP_MS;
  * RETRY_AFTER_DEFAULT_MS when the header is missing or unparseable.
  *
- * @internal Exported for testing.
+ * @internal Exported for testing, and for the 2025-11-25 security checks
+ * in runner.ts, which retry a follow-up request after a 429 the same way.
  */
 export function retryAfterMs(headers: Record<string, string>): number {
   const value = headerOf(headers, "retry-after")?.trim() ?? "";
@@ -1855,16 +1923,56 @@ async function checkOversizedInput(ctx: ModernSuiteContext, tools: any[]): Promi
   // A child already gone was not killed by the 1 MB value (see runInjectionTest).
   const exited = () => ctx.kind === "stdio" && stdio.exited === true;
   const alreadyGone = exited();
-  try {
-    const res = await ctx.client.rpc(
+  const callBig = () =>
+    ctx.client.rpc(
       TOOLS_CALL,
       { name: tool.name, arguments: { [target.param]: largeValue } },
       { toolInputSchema: tool.inputSchema },
     );
+  try {
+    let res = await callBig();
+    /** "HTTP 429, then after Nms " once a throttled call was resent. */
+    let throttled = "";
+    if (ctx.kind === "http" && res.statusCode === 429) {
+      // A rate limiter answers before the server reads the request, so a 429
+      // says nothing about the 1 MB value: wait what it asks (capped,
+      // retryAfterMs) and send the call once more.
+      const wait = retryAfterMs(res.headers);
+      await pause(wait, ctx.signal);
+      throttled = `HTTP 429, then after ${wait}ms `;
+      res = await callBig();
+    }
     const status = res.statusCode;
     if (ctx.kind === "http") {
       if (status === 413)
         return withNote({ passed: true, details: `HTTP 413 Payload Too Large on a 1 MB ${where} (good)` });
+      if (status === 429) {
+        return withNote({
+          passed: false,
+          details: clip(
+            `${throttled}HTTP 429 on a 1 MB ${where} -- not evaluable: a rate limiter answered before the server read the request`,
+            220,
+          ),
+        });
+      }
+      // A 401, or a 403 that reads as an auth gate (readAuthRefusal),
+      // answered before the server read the request: nothing about the 1 MB
+      // value was measured. A bare 403 is also what a WAF or size rule
+      // blocking the body answers, and it passes like any other 4xx: the
+      // tool list this call needs came from a served server/discover (its
+      // tools capability) with the same headers, so the value is the one
+      // variable. (The 2025-11-25 check, which falls back to a tool named
+      // "test" with no list at all, needs that comparison spelled out.)
+      const refusal = readAuthRefusal(res, ctx.hasAuth);
+      if (refusal && refusal.kind !== "forbidden") {
+        return withNote({
+          passed: false,
+          details: clip(
+            `HTTP ${status} on a 1 MB ${where} -- not evaluable: an auth gate answered before the server read the request (${authRefusalHint(refusal, "pass --auth")})`,
+            220,
+          ),
+        });
+      }
       if (is4xx(status)) return withNote({ passed: true, details: `HTTP ${status} (oversized input rejected)` });
       if (status >= 500) {
         return withNote({

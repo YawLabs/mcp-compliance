@@ -1,7 +1,12 @@
 import { createServer, type Server } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { localhostHostValidation, localhostOriginValidation, toNodeHandler } from "@modelcontextprotocol/node";
+import {
+  hostHeaderValidation,
+  localhostHostValidation,
+  localhostOriginValidation,
+  toNodeHandler,
+} from "@modelcontextprotocol/node";
 import { createMcpHandler, type McpHttpHandler, McpServer } from "@modelcontextprotocol/server";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
@@ -38,6 +43,14 @@ const SDK2_STDIO_FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "fixtur
  */
 const LOCALHOST_INHERENT = ["security-auth-required", "security-tls-required"];
 const LEGACY_LOCALHOST_INHERENT = [...LOCALHOST_INHERENT, "security-rate-limiting"];
+
+/**
+ * Why security-auth-required is localhost-inherent here: the loopback Host
+ * guard lets 127.0.0.1 through and the SDK serves the credential-less
+ * server/discover. A 403 from the guard would read differently (see the
+ * Host guard block at the end of the file).
+ */
+const LOCALHOST_AUTH_REQUIRED = "HTTP 200, result -- server accepted unauthenticated request (no --auth provided)";
 
 /** The auto-detection note every run against the SDK opens with. */
 const AUTO_DETECT_NOTE = `${AUTO_DETECT_NOTE_PREFIX}2026-07-28 (${REASON_PREFIX}supportedVersions [2026-07-28]). Pin with --spec-version to override.`;
@@ -138,14 +151,41 @@ interface Mounted {
   url: string;
 }
 
+interface MountOptions {
+  /**
+   * The hostnames the SDK's Host guard (hostHeaderValidation) allows.
+   * Default: the loopback names localhostHostValidation allows, which the
+   * run's 127.0.0.1 URL passes.
+   */
+  allowedHosts?: string[];
+  /**
+   * A gate in front of the SDK: a request whose Authorization is not this
+   * value is answered with a bare HTTP 403 (a JSON-RPC error, no
+   * WWW-Authenticate) and never reaches the SDK.
+   */
+  bare403Unless?: string;
+  /**
+   * The Host header every request arrives with, as through a tunnel or
+   * reverse proxy (ngrok, cloudflared) that forwards the public hostname to
+   * this loopback server: the loopback Host guard refuses it.
+   */
+  tunnelHost?: string;
+}
+
 /** Mount exactly as the @modelcontextprotocol/node README shows for plain node:http. */
-async function mount(legacy: "stateless" | "reject"): Promise<Mounted> {
+async function mount(legacy: "stateless" | "reject", opts: MountOptions = {}): Promise<Mounted> {
   const handler = createMcpHandler(() => createSdkServer(), { legacy });
   const mcpHandler = toNodeHandler(handler);
-  const validateHost = localhostHostValidation();
+  const validateHost = opts.allowedHosts ? hostHeaderValidation(opts.allowedHosts) : localhostHostValidation();
   const validateOrigin = localhostOriginValidation();
   const server = createServer(async (req, res) => {
+    if (opts.tunnelHost) req.headers.host = opts.tunnelHost;
     if (!validateHost(req, res) || !validateOrigin(req, res)) return;
+    if (opts.bare403Unless !== undefined && req.headers.authorization !== opts.bare403Unless) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Forbidden" }, id: null }));
+      return;
+    }
     await mcpHandler(req, res);
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -230,6 +270,7 @@ describe("SDK v2 over HTTP, default (dual-era) serving", () => {
 
   it("fails exactly the localhost-inherent checks plus the documented SDK deviation", () => {
     expectFailingSets(report, SDK_HTTP_REQUIRED_DEVIATIONS, LOCALHOST_INHERENT);
+    expect(resultOf(report, "security-auth-required").details).toBe(LOCALHOST_AUTH_REQUIRED);
   });
 
   it("grades A on score; the single required miss keeps overall at fail", () => {
@@ -315,6 +356,9 @@ describe("SDK v2 over HTTP, pinned --spec-version 2025-11-25", () => {
       ...LEGACY_LOCALHOST_INHERENT,
       "lifecycle-reinit-reject",
     ]);
+    // Without --auth the legacy check reads the preflight, which the SDK
+    // served: an accepted request, not a refusal.
+    expect(resultOf(report, "security-auth-required").details).toMatch(/accepted unauthenticated/);
   });
 });
 
@@ -348,7 +392,162 @@ describe("SDK v2 over HTTP, legacy: 'reject' (modern-only)", () => {
   it("fails exactly the localhost-inherent checks plus the header deviation (a MUST in this mode)", () => {
     expect(report.tests).toHaveLength(HTTP_TEST_COUNT);
     expectFailingSets(report, SDK_HTTP_REQUIRED_DEVIATIONS, LOCALHOST_INHERENT);
+    expect(resultOf(report, "security-auth-required").details).toBe(LOCALHOST_AUTH_REQUIRED);
     expectClaimLessProbesClean(report, " (HTTP 400)");
+  });
+});
+
+/**
+ * The SDK's Host guard answers a hostname it does not allow -- a tunnel or
+ * proxy name in front of a server that allows only loopback names -- with a
+ * bare HTTP 403: `{"error":{"code":-32000,"message":"Invalid Host: ..."}}`
+ * and no WWW-Authenticate. Reproduced by allowing only a hostname the run
+ * does not use, so every request draws it, credentialed or not: the 403
+ * says nothing about authentication (basic/authorization answers missing
+ * authorization with 401), and security-auth-required must not credit it.
+ */
+describe("SDK v2 behind its Host guard: a bare 403 on every request is not an authentication rejection", () => {
+  const ID = "security-auth-required";
+  let mounted: Mounted;
+  let noAuth: ComplianceReport;
+  let withAuth: ComplianceReport;
+
+  beforeAll(async () => {
+    mounted = await mount("reject", { allowedHosts: ["mcp.example.com"] });
+    const pinned = { timeout: 5000, specVersion: "2026-07-28" as const, only: [ID] };
+    noAuth = await runComplianceSuite(mounted.url, pinned);
+    withAuth = await runComplianceSuite(mounted.url, { ...pinned, headers: { Authorization: "Bearer tok" } });
+  }, 60_000);
+
+  afterAll(async () => {
+    await unmount(mounted);
+  });
+
+  it("fixture contract: the guard answers the credentialed request with the same bare 403 and the SDK's Invalid Host error", async () => {
+    const res = await fetch(mounted.url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        Authorization: "Bearer tok",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "server/discover", params: {} }),
+    });
+    expect(res.status).toBe(403);
+    expect(res.headers.get("www-authenticate")).toBeNull();
+    expect(await res.json()).toEqual({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Invalid Host: 127.0.0.1" },
+      id: null,
+    });
+  });
+
+  it("without --auth: not evaluable, quoting the guard and pointing at the allowed hosts, not --auth", () => {
+    // Before: passed as "HTTP 403 (unauthenticated request rejected); pass
+    // --auth to exercise the rest of the auth suite".
+    const result = resultOf(noAuth, ID);
+    expect([result.passed, result.details]).toEqual([
+      false,
+      'not evaluable: HTTP 403 without a Bearer challenge ("Invalid Host: 127.0.0.1") names Host/Origin validation, not authentication: allow the hostname you tested through',
+    ]);
+  });
+
+  it("with --auth: the credentialed server/discover drew the same 403, so the credential is not the variable either", () => {
+    // Before: passed as "HTTP 403 (unauthenticated request rejected)".
+    const result = resultOf(withAuth, ID);
+    expect([result.passed, result.details]).toEqual([
+      false,
+      'not evaluable: HTTP 403 without a Bearer challenge ("Invalid Host: 127.0.0.1") names Host/Origin validation, not authentication: allow the hostname you tested through',
+    ]);
+  });
+});
+
+/**
+ * The SDK behind a gate that answers a missing (or wrong) credential with a
+ * bare 403 instead of the 401 the spec requires. With --auth the SDK serves
+ * the credentialed server/discover, so the credential is the only variable
+ * and the 403 is credited; without it the same 403 cannot be told from the
+ * Host guard's above.
+ */
+/**
+ * The loopback server a README tells you to mount, reached through a tunnel
+ * that forwards its public hostname: the SDK's default Host guard answers
+ * "Invalid Host: <tunnel hostname>" to every request. The hostname is the
+ * one actionable part of the details, so it must survive the 220-character
+ * limit whole, with and without --auth.
+ */
+describe("SDK v2 reached through a tunnel hostname", () => {
+  const ID = "security-auth-required";
+  const HOST = "gentle-river-shadow-4821.trycloudflare.com";
+  let mounted: Mounted;
+  let noAuth: ComplianceReport;
+  let withAuth: ComplianceReport;
+
+  beforeAll(async () => {
+    mounted = await mount("reject", { tunnelHost: HOST });
+    const pinned = { timeout: 5000, specVersion: "2026-07-28" as const, only: [ID] };
+    noAuth = await runComplianceSuite(mounted.url, pinned);
+    withAuth = await runComplianceSuite(mounted.url, { ...pinned, headers: { Authorization: "Bearer tok" } });
+  }, 60_000);
+
+  afterAll(async () => {
+    await unmount(mounted);
+  });
+
+  it("quotes the whole tunnel hostname and advises allowing it, with and without --auth", () => {
+    // Before: with --auth the quoted message was clipped to "Invalid Host:
+    // gentle-..." (the fixed text left 24 characters), and both runs advised
+    // --auth, which a Host guard refuses the same way.
+    const expected = `not evaluable: HTTP 403 without a Bearer challenge ("Invalid Host: ${HOST}") names Host/Origin validation, not authentication: allow the hostname you tested through`;
+    for (const report of [noAuth, withAuth]) {
+      const result = resultOf(report, ID);
+      expect([result.passed, result.details]).toEqual([false, expected]);
+    }
+  });
+});
+
+describe("SDK v2 behind a gate that answers a missing credential with a bare 403", () => {
+  const ID = "security-auth-required";
+  let mounted: Mounted;
+  let noAuth: ComplianceReport;
+  let withAuth: ComplianceReport;
+  let wrongAuth: ComplianceReport;
+
+  beforeAll(async () => {
+    mounted = await mount("reject", { bare403Unless: "Bearer tok" });
+    const pinned = { timeout: 5000, specVersion: "2026-07-28" as const, only: [ID] };
+    noAuth = await runComplianceSuite(mounted.url, pinned);
+    withAuth = await runComplianceSuite(mounted.url, { ...pinned, headers: { Authorization: "Bearer tok" } });
+    wrongAuth = await runComplianceSuite(mounted.url, { ...pinned, headers: { Authorization: "Bearer wrong" } });
+  }, 60_000);
+
+  afterAll(async () => {
+    await unmount(mounted);
+  });
+
+  it("with --auth: the SDK served the credentialed server/discover, so the 403 passes, naming the 401 the spec expects", () => {
+    expect(withAuth.serverInfo.name).toBe("sdk2-http-server");
+    const result = resultOf(withAuth, ID);
+    expect([result.passed, result.details]).toEqual([
+      true,
+      "HTTP 403 without a Bearer challenge (unauthenticated request rejected; the same request with the credential was served) -- the spec expects 401 when authorization is required",
+    ]);
+  });
+
+  it("without --auth: the same 403 is not evaluable", () => {
+    const result = resultOf(noAuth, ID);
+    expect([result.passed, result.details]).toEqual([
+      false,
+      'not evaluable: HTTP 403 without a Bearer challenge ("Forbidden") may be Host/Origin validation or a gateway; pass --auth to compare with a credentialed request',
+    ]);
+  });
+
+  it("with a credential the gate refuses the same way: not evaluable, pointing at the gate rather than --auth", () => {
+    const result = resultOf(wrongAuth, ID);
+    expect([result.passed, result.details]).toEqual([
+      false,
+      'not evaluable: HTTP 403 without a Bearer challenge ("Forbidden") may be Host/Origin validation or a gateway; the credentialed request got 403 too: fix the gateway or allowed hosts',
+    ]);
   });
 });
 
@@ -411,7 +610,48 @@ describe("SDK v2 over stdio (serveStdio)", () => {
     expect(report.serverInfo.name).toBe("sdk2-stdio-server");
     expect(report.toolNames).toEqual(["echo"]);
     expectFailingSets(report, [], []);
+    expect(report.warnings.filter((w) => w.startsWith("security-oversized-input"))).toEqual([]);
   }, 60_000);
+
+  it("pinned 2025-11-25, a process that exits on a stdin line over 500 KB: only oversized-input fails, the rest run against a restarted child", async () => {
+    // The same SDK server, preloaded with a stdin reader that exits the
+    // process once a line passes 500 KB -- what a server with a line-length
+    // guard (or one that runs out of memory) does with the 1 MB tools/call.
+    const exitOnLongLine = [
+      "let n = 0;",
+      'process.stdin.on("data", (c) => {',
+      '  const s = c.toString("utf8");',
+      '  const i = s.lastIndexOf("\\n");',
+      "  n = i === -1 ? n + s.length : s.length - i - 1;",
+      "  if (n > 500000) process.exit(3);",
+      "});",
+    ].join("\n");
+    const report = await runComplianceSuite(
+      {
+        type: "stdio",
+        command: process.execPath,
+        args: ["--import", `data:text/javascript,${encodeURIComponent(exitOnLongLine)}`, SDK2_STDIO_FIXTURE],
+      },
+      { timeout: 5000, startupTimeout: 15_000, specVersion: "2025-11-25" },
+    );
+    expect(report.serverInfo.name).toBe("sdk2-stdio-server");
+    // Before: the child stayed dead, so the required stdio-framing failed
+    // ("5/5 rapid pings failed — framing likely broken"), overall "fail",
+    // security-extra-params passed "Request rejected (acceptable)" and
+    // rug-pull, stdio-unicode and stdio-unknown-method-recovers failed.
+    expectFailingSets(report, [], ["security-oversized-input"]);
+    expect(resultOf(report, "security-oversized-input").details).toMatch(
+      /^server died on a 1 MB echo\.data: .*exit code 3/,
+    );
+    expect(report.overall).not.toBe("fail");
+    expect(resultOf(report, "stdio-framing").details).toBe("5/5 rapid pings returned cleanly");
+    expect(resultOf(report, "security-extra-params").details).toBe(
+      "Server processed request (extra params likely ignored)",
+    );
+    expect(report.warnings.filter((w) => w.startsWith("security-oversized-input"))).toEqual([
+      "security-oversized-input: the server exited on a 1 MB echo.data and was restarted with a fresh initialize handshake, so the tests after it ran against the new instance.",
+    ]);
+  }, 90_000);
 
   it("--only <claim-less probe>: the process is pinned modern first, so the verdict matches the full run", async () => {
     // Only the setup discover has run, and discover does not pin: without a

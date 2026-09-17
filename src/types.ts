@@ -866,7 +866,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization",
     description:
-      "Sends a request without an Authorization header and verifies the server returns HTTP 401. Servers exposed over the network should require authentication. Without --auth the unauthenticated preflight stands in for the probe: a 401/403 there passes (the details suggest --auth to run the authenticated suite and the remaining auth tests), and a server that served it fails as not requiring auth.",
+      "Sends a ping without an Authorization header (with --auth, the configured header removed) and expects HTTP 401. A 401, or a 403 carrying a WWW-Authenticate: Bearer challenge, passes. A bare 403 (no Bearer challenge) is not attributed to authentication on its own: streamable-http requires a 403 for an invalid Origin, the SDK's Host validation answers a tunnel or proxy hostname with one, and gateways send them. With --auth it passes only when the same ping carrying the credential is served (the details note that basic/authorization expects 401), and otherwise fails as not evaluable. Without --auth the unauthenticated preflight stands in for the probe; when the preflight got no HTTP answer, a ping is sent after the handshake instead. A 401 or Bearer 403 there passes (the details suggest --auth to run the authenticated suite and the remaining auth tests). A bare 403 fails as not requiring auth when initialize was served without any credential, and passes when the unauthenticated initialize itself drew a 401 or Bearer 403 (a gateway whose method policy refuses server/discover answers the methods it allows that way); otherwise it fails as not evaluable. The not-evaluable details advise allowing the hostname the server was reached through when the refusal's message names Host or Origin validation (the SDK's 'Invalid Host: ...'), or when the ping carrying the credential was refused with 403 too, and name --auth only when no credential was configured. A request with no HTTP answer fails as 'server unreachable': a timeout or a connection never established always, and a connection closed without an answer unless --auth was given and the same ping with the credential was served, which passes as a rejection. When --auth is given and a bare 403 is not evaluable, security-www-authenticate, security-auth-malformed, security-session-not-auth and security-token-in-uri skip as not evaluable instead of crediting the same 403.",
     recommendation:
       "Implement authentication on your MCP endpoint. Return HTTP 401 Unauthorized for requests without valid credentials. Use OAuth 2.1 or Bearer tokens as recommended by the MCP spec.",
   },
@@ -877,7 +877,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization",
     description:
-      "When the server returns HTTP 401, checks for a WWW-Authenticate header indicating the required authentication scheme. Per HTTP spec (RFC 9110), servers SHOULD include this header.",
+      "When the server returns HTTP 401, checks for a WWW-Authenticate header indicating the required authentication scheme. Per HTTP spec (RFC 9110), servers SHOULD include this header. Skipped without --auth ('Skipped: no --auth provided'), and skipped as not evaluable when security-auth-required found a bare 403 it could not attribute to authentication.",
     recommendation:
       "Include a WWW-Authenticate header in 401 responses to indicate the required auth scheme (e.g., 'WWW-Authenticate: Bearer realm=\"mcp\"').",
   },
@@ -888,7 +888,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization",
     description:
-      "Sends a request with a malformed Authorization header (garbage value) and verifies the server returns HTTP 401 or 403. Servers must validate auth tokens, not just check for presence.",
+      "Sends a request with a malformed Authorization header (garbage value) and verifies the server returns HTTP 401 or 403. Servers must validate auth tokens, not just check for presence. Skipped without --auth ('Skipped: no --auth provided'), and skipped as not evaluable when security-auth-required found a bare 403 it could not attribute to authentication.",
     recommendation:
       "Validate the format and signature of Authorization header values. Reject malformed or invalid tokens with HTTP 401. Do not treat any non-empty Authorization header as valid.",
   },
@@ -921,7 +921,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/transports#streamable-http",
     description:
-      "Verifies that presenting a valid MCP-Session-Id without an Authorization header is still rejected. Per spec, servers MUST NOT use sessions for authentication.",
+      "Verifies that presenting a valid MCP-Session-Id without an Authorization header is still rejected. Per spec, servers MUST NOT use sessions for authentication. Skipped without --auth ('Skipped: no --auth provided'), and skipped as not evaluable when security-auth-required found a bare 403 it could not attribute to authentication.",
     recommendation:
       "Always validate the Authorization header independently of the MCP-Session-Id. Sessions are for request routing, not authentication. Reject requests that lack valid auth even if they have a valid session ID.",
   },
@@ -932,7 +932,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization",
     description:
-      "Checks for a Protected Resource Metadata (RFC 9728) endpoint at /.well-known/oauth-protected-resource. Per MCP 2025-11-25, the MCP server publishes PRM with a resource identifier and authorization_servers array. Falls back to legacy /.well-known/oauth-authorization-server with a warning.",
+      "Checks for a Protected Resource Metadata (RFC 9728) endpoint at /.well-known/oauth-protected-resource. Per MCP 2025-11-25, the MCP server publishes PRM with a resource identifier and authorization_servers array. Falls back to legacy /.well-known/oauth-authorization-server with a warning. Skipped without --auth ('Skipped: no --auth provided').",
     recommendation:
       "Publish a Protected Resource Metadata document at /.well-known/oauth-protected-resource on your server's origin. Include 'resource' (your server's URL) and 'authorization_servers' (array of OAuth AS URLs). See RFC 9728.",
   },
@@ -943,7 +943,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization",
     description:
-      "Sends a request with the auth token in the URL query string instead of the Authorization header. The MCP spec forbids transmitting credentials in URIs.",
+      "Sends a request with the auth token in the URL query string instead of the Authorization header. The MCP spec forbids transmitting credentials in URIs. Skipped without --auth ('Skipped: no --auth provided'), and skipped as not evaluable when security-auth-required found a bare 403 it could not attribute to authentication.",
     recommendation:
       "Never accept authentication tokens from URL query parameters. Tokens in URIs are logged by proxies, appear in browser history, and leak via the Referer header. Only accept tokens in the Authorization header.",
   },
@@ -1023,7 +1023,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "Sends a tools/call request with an extremely large argument value (1MB+ string). Verifies the server rejects it with an error instead of crashing or consuming excessive resources.",
+      "Sends a tools/call to the first listed tool ('test' when none was listed) with a 1 MiB string in a 'data' argument, through the transport on HTTP and stdio. On HTTP, 413 passes. A 429 is a rate limiter answering before the server reads the request: the call is resent once after Retry-After (capped at 2 s) and a second 429 fails as not evaluable. A 401, or a 403 that reads as an auth gate, fails as not evaluable. A bare 403 passes when initialize was served with the same headers (a WAF or size rule blocking the body) and otherwise fails as not evaluable. Any other 4xx passes, and a JSON-RPC result or error passes as handled without crashing. A 5xx fails as a server error, and a 2xx or 3xx with no JSON-RPC result or error fails. A connection closed or reset on the 1 MB body passes as a connection-level rejection only when a follow-up ping (with the session) is served, is answered by its own id with a JSON-RPC error on a 2xx, or is refused with 401/403; a 429 is retried once after Retry-After, capped at 2 s. Otherwise it fails as a possible crash naming what the ping got -- or as 'server unreachable' when neither the preflight nor initialize was answered in this run. A refused connection fails as 'server unreachable', bytes that are not an HTTP response fail as 'no usable response', and a timeout fails. On stdio a JSON-RPC result or error passes. A child that exits on the call fails as died, and the runner then spawns a fresh instance and redoes the handshake so the tests after it measure the server rather than the crash (a warning says so, and says when the new instance did not complete initialize); a child already gone before the call fails as 'server unreachable'. A reply longer than the runner's 1 MiB line buffer passes as survived, with a warning, while the child is still running. A timeout, a frame with no result or error, or any other error fails.",
     recommendation:
       "Implement request body size limits. Return HTTP 413 or JSON-RPC error for oversized payloads. Set explicit maxBodyLength in your HTTP server configuration.",
   },
@@ -1034,7 +1034,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "Calls a tool with unexpected additional parameters beyond what the schema defines. Verifies the server either rejects them (strict) or silently ignores them (permissive) without errors.",
+      "Calls a tool with unexpected additional parameters beyond what the schema defines. Verifies the server either rejects them (strict) or silently ignores them (permissive) without errors. On stdio a child that is gone (it exited before or on this call) fails as 'server unreachable' instead of counting as a rejection.",
     recommendation:
       "Use JSON Schema validation with additionalProperties: false to reject unexpected parameters, or strip unknown properties before processing. Do not pass unvalidated properties to internal functions.",
   },

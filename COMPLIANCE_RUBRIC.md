@@ -996,9 +996,9 @@ All security tests are **optional** by default (severity: warning). They do not 
 
 - **Default required:** No
 - **Spec reference:** [basic/authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
-- **Description:** Sends a request without an Authorization header and verifies the server returns HTTP 401 or 403.
-- **Pass criteria:** HTTP 401 or 403 for an unauthenticated request. With `--auth` the test re-sends a request without its Authorization header; without `--auth` the unauthenticated preflight stands in for the probe, and a 401/403 there passes (the details suggest `--auth` to run the authenticated suite and the remaining auth tests).
-- **Fail criteria:** Server accepts an unauthenticated request (without `--auth`: the unauthenticated preflight was served).
+- **Description:** Sends a request without an Authorization header and verifies the server returns HTTP 401.
+- **Pass criteria:** HTTP 401, or a 403 carrying a WWW-Authenticate: Bearer challenge, for the unauthenticated request (with `--auth`, a ping with its Authorization header removed; without `--auth`, the unauthenticated preflight, or a ping when the preflight got no HTTP answer). Without `--auth`, a 401 or Bearer 403 on the unauthenticated initialize also passes when the preflight drew a bare 403. With `--auth`, a bare 403 or a connection closed without an answer also passes when the same ping carrying the credential is served.
+- **Fail criteria:** The server accepts an unauthenticated request (without `--auth`: the preflight was served, or initialize was served without a credential next to a bare 403). A bare 403 that cannot be attributed to authentication fails as not evaluable; the details advise allowing the hostname you tested through when the message names Host/Origin validation or the credentialed ping drew a 403 too, and `--auth` otherwise. A timeout, a refused connection, or a dropped connection not pinned on the missing credential fails as server unreachable.
 - **Prerequisites:** None; `--auth` lets the test strip a working credential and verify the rejection directly.
 
 #### `security-auth-malformed` -- Rejects malformed auth credentials
@@ -1006,7 +1006,7 @@ All security tests are **optional** by default (severity: warning). They do not 
 - **Default required:** No
 - **Spec reference:** [basic/authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
 - **Description:** Sends a request with a garbage Authorization header value and verifies the server rejects it.
-- **Pass criteria:** HTTP 401 or 403 for malformed auth token.
+- **Pass criteria:** HTTP 401 or 403 for malformed auth token. Skipped without `--auth` (`Skipped: no --auth provided`), and skipped as not evaluable when `security-auth-required` found a bare 403 it could not attribute to authentication.
 - **Fail criteria:** Server accepts malformed auth token.
 
 #### `security-www-authenticate` -- 401 responses include `WWW-Authenticate` header
@@ -1014,7 +1014,7 @@ All security tests are **optional** by default (severity: warning). They do not 
 - **Default required:** No
 - **Spec reference:** [basic/authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
 - **Description:** Triggers a 401 response (by sending no Authorization header) and checks that the response includes a `WWW-Authenticate` header indicating the required auth scheme. RFC 9110 requires 401 responses to carry this header; MCP inherits that requirement via the Streamable HTTP transport.
-- **Pass criteria:** 401 responses include a `WWW-Authenticate` header (e.g., `WWW-Authenticate: Bearer realm="mcp"`). **Auto-pass** if the server does not require auth.
+- **Pass criteria:** 401 responses include a `WWW-Authenticate` header (e.g., `WWW-Authenticate: Bearer realm="mcp"`). **Skipped** without `--auth` (`Skipped: no --auth provided`), and skipped as not evaluable when `security-auth-required` found a bare 403 it could not attribute to authentication.
 - **Fail criteria:** The server returns 401 without a `WWW-Authenticate` header.
 
 #### `security-tls-required` -- Enforces HTTPS/TLS
@@ -1038,7 +1038,7 @@ All security tests are **optional** by default (severity: warning). They do not 
 - **Default required:** No
 - **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
 - **Description:** Sends a request with a valid MCP-Session-Id but no Authorization header. Per spec, servers MUST NOT use sessions for authentication.
-- **Pass criteria:** HTTP 401 or 403 when session ID is sent without auth.
+- **Pass criteria:** HTTP 401 or 403 when session ID is sent without auth. Skipped without `--auth` (`Skipped: no --auth provided`), and skipped as not evaluable when `security-auth-required` found a bare 403 it could not attribute to authentication.
 - **Fail criteria:** Server accepts request with session ID but no auth token.
 
 #### `security-oauth-metadata` -- OAuth metadata endpoint exists
@@ -1046,7 +1046,7 @@ All security tests are **optional** by default (severity: warning). They do not 
 - **Default required:** No
 - **Spec reference:** [basic/authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
 - **Description:** Fetches `/.well-known/oauth-authorization-server` and validates it returns JSON with `issuer` and `token_endpoint` fields.
-- **Pass criteria:** Endpoint returns valid OAuth metadata JSON. Auto-passes if server does not require auth.
+- **Pass criteria:** Endpoint returns valid OAuth metadata JSON. Skipped without `--auth` (`Skipped: no --auth provided`).
 - **Fail criteria:** Endpoint missing, returns non-JSON, or lacks required fields.
 
 #### `security-token-in-uri` -- Rejects auth tokens in query string
@@ -1054,7 +1054,7 @@ All security tests are **optional** by default (severity: warning). They do not 
 - **Default required:** No
 - **Spec reference:** [basic/authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
 - **Description:** Extracts the token from the Authorization header and places it in the URL query string as `access_token`. Verifies the server rejects it.
-- **Pass criteria:** HTTP 401 or 403 when token is in query string.
+- **Pass criteria:** HTTP 401 or 403 when token is in query string. Skipped without `--auth` (`Skipped: no --auth provided`), and skipped as not evaluable when `security-auth-required` found a bare 403 it could not attribute to authentication.
 - **Fail criteria:** Server accepts token from query string (spec: MUST NOT transmit credentials in URIs).
 
 #### `security-cors-headers` -- CORS headers are restrictive
@@ -1113,9 +1113,9 @@ All security tests are **optional** by default (severity: warning). They do not 
 
 - **Default required:** No
 - **Spec reference:** [server/tools#calling-tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#calling-tools)
-- **Description:** Sends a 1MB+ payload in a tools/call request. Verifies the server rejects it or handles it without crashing.
-- **Pass criteria:** HTTP 413, any 4xx error, or server handles the request without timeout.
-- **Fail criteria:** Server times out or crashes.
+- **Description:** Sends a 1 MiB string in a tools/call over HTTP or stdio and verifies the server rejects it or handles it without crashing.
+- **Pass criteria:** HTTP 413; another 4xx that is not 401/403/429 (a bare 403 only next to a served `initialize`); a JSON-RPC result or error (HTTP or stdio); a connection closed on the 1 MB body after which a follow-up ping is served, answered by its id with a JSON-RPC error, or refused with 401/403 (one 429 retried); on stdio, a reply that overflows the runner's line buffer from a child still running (with a warning).
+- **Fail criteria:** A 5xx; a 2xx/3xx without a JSON-RPC result or error; a 429 that survives one retry, or a 401/403 from a gate that answered before the server read the request (not evaluable); a timeout; a dropped connection after which the ping is neither served nor refused (possible crash), or one in a run where nothing was ever answered (server unreachable); a refused connection; bytes that are not an HTTP response; on stdio, a child that exits on the call (the runner restarts it for the tests that follow) or a broken frame.
 
 #### `security-extra-params` -- Rejects or ignores extra tool params
 
@@ -1124,7 +1124,7 @@ All security tests are **optional** by default (severity: warning). They do not 
 - **Spec reference:** [server/tools#calling-tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#calling-tools)
 - **Description:** Calls a tool with unexpected additional parameters (`__injected_param__`, `__proto__`). Verifies the server handles them safely.
 - **Pass criteria:** Server rejects with error or silently ignores extra parameters.
-- **Fail criteria:** Server crashes or exhibits unexpected behavior from prototype pollution.
+- **Fail criteria:** Server crashes or exhibits unexpected behavior from prototype pollution; on stdio, a child that is gone (it exited before or on this call) fails as server unreachable rather than counting as a rejection.
 
 #### `security-tool-schema-defined` -- All tools define inputSchema
 
@@ -2175,9 +2175,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Default required:** No
 - **Transports:** http
 - **Spec reference:** [basic/authorization#token-handling](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#token-handling)
-- **Description:** Sends a fully conformant server/discover with the Authorization header removed and expects HTTP 401 (403 also passes). Servers acting as OAuth 2.1 resource servers MUST answer missing or invalid tokens with 401. The probe is sent with or without --auth: a 401 passes either way (without --auth the details suggest passing it to exercise the rest of the auth tests), and a 2xx fails as an accepted unauthenticated request. When the request gets no HTTP answer, a timeout or a connection that was never established fails as 'server unreachable'; a connection the server accepts and then closes without answering passes as a rejection only with --auth and when the same server/discover carrying the credential was served, and otherwise fails as 'server unreachable'.
-- **Pass criteria:** A conformant server/discover with the Authorization header removed draws HTTP 401 or 403 (probed with or without --auth), or -- with --auth and a served credentialed server/discover -- the connection is closed without an answer.
-- **Fail criteria:** Any other status: the server accepted an unauthenticated request (the details say when no --auth was provided); a timeout or refused connection fails as server unreachable.
+- **Description:** Sends a fully conformant server/discover with the Authorization header removed and expects HTTP 401. Servers acting as OAuth 2.1 resource servers MUST answer missing or invalid tokens with 401. The probe is sent with or without --auth: a 401, or a 403 carrying a WWW-Authenticate Bearer challenge, passes either way (without --auth the details suggest passing it to exercise the rest of the auth tests), and a 2xx fails as an accepted unauthenticated request. A 403 without a Bearer challenge is also what Origin validation, the SDK's Host validation and gateways answer, so it passes only with --auth when the same server/discover carrying the credential was served (the details note that the spec expects 401); otherwise it fails as not evaluable: the details quote the server's message and, when that message names Host or Origin validation (the SDK's 'Invalid Host: ...') or the credentialed server/discover drew a 403 too, advise allowing the hostname you tested through rather than --auth; without --auth and without such a message they name --auth as the way to compare. When the request gets no HTTP answer, a timeout or a connection that was never established fails as 'server unreachable'; a connection the server accepts and then closes without answering passes as a rejection only with --auth and when the same server/discover carrying the credential was served, and otherwise fails as 'server unreachable'.
+- **Pass criteria:** A conformant server/discover with the Authorization header removed draws HTTP 401, or a 403 carrying a WWW-Authenticate Bearer challenge (probed with or without --auth). With --auth and a served credentialed server/discover, a 403 without a Bearer challenge (the details note the spec expects 401) or a connection closed without an answer also passes.
+- **Fail criteria:** Any other status: the server accepted an unauthenticated request (the details say when no --auth was provided). A 403 without a Bearer challenge fails as not evaluable unless --auth was given and the credentialed server/discover was served; the details quote the server's error message and advise allowing the hostname you tested through when it names Host/Origin validation or the credentialed request drew a 403 too, and name --auth otherwise. A timeout or refused connection fails as server unreachable, and so does a closed connection without that served comparison.
 
 ---
 
@@ -2314,9 +2314,9 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 - **Category:** security
 - **Default required:** No (required at runtime when `tools` is declared)
 - **Spec reference:** [server/tools#security-considerations](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations)
-- **Description:** Calls a tool with a string argument of roughly 1 MB in the first string argument that is not header-mirrored (an x-mcp-header value would also travel in an Mcp-Param-* header and measure the header limit instead of the body; such an argument is used only when no other exists, and the details say so; a tool with no string argument at all gets the value as 'data'), far beyond what any reasonable tool needs, and expects a prompt rejection: HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport. A completed result passes with a warning (the server survived), while a 5xx, a timeout, a broken stdio frame or no usable HTTP response at all (bytes that are not an HTTP response) fails. On HTTP a connection closed or reset on the 1 MB body passes as a connection-level rejection only when a follow-up server/discover is then served or refused with 401/403 (a 429 retried once, as in security-command-injection); otherwise it fails as a possible crash, and a connection refused before anything was sent fails as 'server unreachable'. On stdio a child that exits on the call (including partway through reading the 1 MB line) fails as died even if it first wrote a reply longer than the runner's 1 MiB line buffer; such an overflow passes as survived (with a warning) only while the child is still running, and a child already gone before the call fails as 'server unreachable'. Skipped when the server declares or lists no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.
-- **Pass criteria:** A roughly 1 MB string in the first string argument that is not header-mirrored (a mirrored one only when no other exists, noted in the details) draws HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport; a completed result passes with a warning, and so does a reply to that call that overflowed the runner's stdio line buffer while the child kept running (an earlier overflow in the run, or the same marker text on the server's own stderr, does not count); on HTTP a connection closed on the 1 MB body passes only when a follow-up server/discover is then served or refused with 401/403 (a 429 retried once). Skipped when the server declares or lists no tools. When tools/list failed the rule skips (as passed) pointing at tools-list if that rule is in the run.
-- **Fail criteria:** A 5xx status, a timeout, a broken stdio frame, no usable HTTP response (bytes that are not an HTTP response), a stdio child that dies (even after overflowing the line buffer, or partway through reading the 1 MB line), an HTTP connection dropped on the 1 MB body after which server/discover is neither served nor refused with 401/403, or a server already unreachable (a refused connection, a dead child). Also fails when tools/list failed while tools-list was filtered out of the run (the recorded reason is named).
+- **Description:** Calls a tool with a string argument of roughly 1 MB in the first string argument that is not header-mirrored (an x-mcp-header value would also travel in an Mcp-Param-* header and measure the header limit instead of the body; such an argument is used only when no other exists, and the details say so; a tool with no string argument at all gets the value as 'data'), far beyond what any reasonable tool needs, and expects a prompt rejection: HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport. A 429 is a rate limiter answering before the server reads the request: the call is resent once after Retry-After (capped at 2 s) and a second 429 fails as not evaluable. A 401, or a 403 carrying a Bearer challenge that reads as an auth gate, fails as not evaluable; a 403 without one passes like any other 4xx, the tool list this call uses having come from a served server/discover. A completed result passes with a warning (the server survived), while a 5xx, a timeout, a broken stdio frame or no usable HTTP response at all (bytes that are not an HTTP response) fails. On HTTP a connection closed or reset on the 1 MB body passes as a connection-level rejection only when a follow-up server/discover is then served or refused with 401/403 (a 429 retried once, as in security-command-injection); otherwise it fails as a possible crash, and a connection refused before anything was sent fails as 'server unreachable'. On stdio a child that exits on the call (including partway through reading the 1 MB line) fails as died even if it first wrote a reply longer than the runner's 1 MiB line buffer; such an overflow passes as survived (with a warning) only while the child is still running, and a child already gone before the call fails as 'server unreachable'. Skipped when the server declares or lists no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.
+- **Pass criteria:** A roughly 1 MB string in the first string argument that is not header-mirrored (a mirrored one only when no other exists, noted in the details) draws HTTP 413 or another 4xx on HTTP -- a 403 without a Bearer challenge included, the tool list having come from a served server/discover -- or a JSON-RPC error on either transport; a completed result passes with a warning, and so does a reply to that call that overflowed the runner's stdio line buffer while the child kept running (an earlier overflow in the run, or the same marker text on the server's own stderr, does not count); on HTTP a connection closed on the 1 MB body passes only when a follow-up server/discover is then served or refused with 401/403 (a 429 retried once). Skipped when the server declares or lists no tools. When tools/list failed the rule skips (as passed) pointing at tools-list if that rule is in the run.
+- **Fail criteria:** A 5xx status, an HTTP 429 that answers the call again after one retry (Retry-After, capped at 2 s) or a 401 or auth-gate 403 -- each not evaluable, a gate having answered before the server read the request -- a timeout, a broken stdio frame, no usable HTTP response (bytes that are not an HTTP response), a stdio child that dies (even after overflowing the line buffer, or partway through reading the 1 MB line), an HTTP connection dropped on the 1 MB body after which server/discover is neither served nor refused with 401/403, or a server already unreachable (a refused connection, a dead child). Also fails when tools/list failed while tools-list was filtered out of the run (the recorded reason is named).
 
 ---
 

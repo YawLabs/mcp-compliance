@@ -820,8 +820,8 @@
       "capabilityGated": null,
       "specRef": "basic/authorization",
       "description": "Verifies the server rejects requests without an Authorization header",
-      "passCriteria": "HTTP 401 or 403 for an unauthenticated request: with --auth, the request re-sent without its Authorization header; without --auth, the unauthenticated preflight",
-      "failCriteria": "Server accepts an unauthenticated request (without --auth: the unauthenticated preflight was served)"
+      "passCriteria": "HTTP 401, or a 403 with a WWW-Authenticate: Bearer challenge, for the unauthenticated request (without --auth, a 401 on the unauthenticated initialize counts when the preflight drew a bare 403); with --auth a bare 403 or dropped connection also passes when the same ping with the credential is served",
+      "failCriteria": "Server accepts an unauthenticated request; a bare 403 that cannot be attributed to authentication is not evaluable (allow the hostname you tested through when the message names Host/Origin validation); a timeout, refused connection or unattributable drop is server unreachable"
     },
     {
       "id": "security-www-authenticate",
@@ -833,7 +833,7 @@
       "capabilityGated": null,
       "specRef": "basic/authorization",
       "description": "Checks that 401 responses include WWW-Authenticate header per RFC 9110",
-      "passCriteria": "401 response includes WWW-Authenticate header, or server returns 403",
+      "passCriteria": "401 response includes WWW-Authenticate header, or server returns 403; skipped without --auth, and skipped as not evaluable when security-auth-required found a bare 403 it could not attribute to authentication",
       "failCriteria": "401 response missing WWW-Authenticate header"
     },
     {
@@ -846,7 +846,7 @@
       "capabilityGated": null,
       "specRef": "basic/authorization",
       "description": "Verifies the server rejects malformed Authorization header values",
-      "passCriteria": "HTTP 401 or 403 for garbage auth token",
+      "passCriteria": "HTTP 401 or 403 for garbage auth token; skipped without --auth, and skipped as not evaluable when security-auth-required found a bare 403 it could not attribute to authentication",
       "failCriteria": "Server accepts malformed auth token"
     },
     {
@@ -885,7 +885,7 @@
       "capabilityGated": null,
       "specRef": "basic/transports#streamable-http",
       "description": "Verifies that a valid session ID alone is not sufficient for authentication",
-      "passCriteria": "HTTP 401 or 403 when session ID is sent without Authorization header",
+      "passCriteria": "HTTP 401 or 403 when session ID is sent without Authorization header; skipped without --auth, and skipped as not evaluable when security-auth-required found a bare 403 it could not attribute to authentication",
       "failCriteria": "Server accepts request with session ID but no auth"
     },
     {
@@ -898,7 +898,7 @@
       "capabilityGated": null,
       "specRef": "basic/authorization",
       "description": "Verifies the Protected Resource Metadata (RFC 9728) endpoint exists at /.well-known/oauth-protected-resource. Falls back to legacy /.well-known/oauth-authorization-server with a warning.",
-      "passCriteria": "/.well-known/oauth-protected-resource returns valid JSON with resource and authorization_servers, or legacy OAuth AS metadata exists",
+      "passCriteria": "/.well-known/oauth-protected-resource returns valid JSON with resource and authorization_servers, or legacy OAuth AS metadata exists; skipped without --auth",
       "failCriteria": "Neither PRM nor legacy OAuth AS metadata endpoint is reachable or valid"
     },
     {
@@ -911,7 +911,7 @@
       "capabilityGated": null,
       "specRef": "basic/authorization",
       "description": "Verifies the server does not accept auth tokens in the URL query string",
-      "passCriteria": "HTTP 401 or 403 when token is in query string instead of Authorization header",
+      "passCriteria": "HTTP 401 or 403 when token is in query string instead of Authorization header; skipped without --auth, and skipped as not evaluable when security-auth-required found a bare 403 it could not attribute to authentication",
       "failCriteria": "Server accepts token from query string"
     },
     {
@@ -1001,9 +1001,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "server/tools#calling-tools",
-      "description": "Verifies the server handles 1MB+ payloads without crashing",
-      "passCriteria": "HTTP 413, any 4xx error, or server handles gracefully without timeout",
-      "failCriteria": "Server times out or crashes under oversized input"
+      "description": "Verifies the server handles a 1 MiB string in a tools/call, sent through the transport on HTTP and stdio, without crashing",
+      "passCriteria": "HTTP 413 or another 4xx that is not a gate's 401/403/429, a JSON-RPC result or error, or a dropped connection the server outlives (follow-up ping served, answered by its id, or refused with 401/403)",
+      "failCriteria": "5xx, no JSON-RPC result or error, a gate's 429/401/403 (not evaluable), timeout, a crash (dropped connection with no follow-up answer, or a stdio exit), a run where nothing was answered, a refused connection, or an unparseable response"
     },
     {
       "id": "security-extra-params",
@@ -1016,7 +1016,7 @@
       "specRef": "server/tools#calling-tools",
       "description": "Verifies the server handles unexpected additional tool parameters safely",
       "passCriteria": "Server rejects extra params with error or silently ignores them",
-      "failCriteria": "Server crashes or processes __proto__ pollution attempts"
+      "failCriteria": "Server crashes or processes __proto__ pollution attempts; on stdio a child that is gone (it exited before or on this call) fails as server unreachable"
     },
     {
       "id": "security-tool-schema-defined",
@@ -2301,9 +2301,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/authorization#token-handling",
-      "description": "Sends a fully conformant server/discover with the Authorization header removed and expects HTTP 401 (403 also passes). Servers acting as OAuth 2.1 resource servers MUST answer missing or invalid tokens with 401. The probe is sent with or without --auth: a 401 passes either way (without --auth the details suggest passing it to exercise the rest of the auth tests), and a 2xx fails as an accepted unauthenticated request. When the request gets no HTTP answer, a timeout or a connection that was never established fails as 'server unreachable'; a connection the server accepts and then closes without answering passes as a rejection only with --auth and when the same server/discover carrying the credential was served, and otherwise fails as 'server unreachable'.",
-      "passCriteria": "A conformant server/discover with the Authorization header removed draws HTTP 401 or 403 (probed with or without --auth), or -- with --auth and a served credentialed server/discover -- the connection is closed without an answer.",
-      "failCriteria": "Any other status: the server accepted an unauthenticated request (the details say when no --auth was provided); a timeout or refused connection fails as server unreachable.",
+      "description": "Sends a fully conformant server/discover with the Authorization header removed and expects HTTP 401. Servers acting as OAuth 2.1 resource servers MUST answer missing or invalid tokens with 401. The probe is sent with or without --auth: a 401, or a 403 carrying a WWW-Authenticate Bearer challenge, passes either way (without --auth the details suggest passing it to exercise the rest of the auth tests), and a 2xx fails as an accepted unauthenticated request. A 403 without a Bearer challenge is also what Origin validation, the SDK's Host validation and gateways answer, so it passes only with --auth when the same server/discover carrying the credential was served (the details note that the spec expects 401); otherwise it fails as not evaluable: the details quote the server's message and, when that message names Host or Origin validation (the SDK's 'Invalid Host: ...') or the credentialed server/discover drew a 403 too, advise allowing the hostname you tested through rather than --auth; without --auth and without such a message they name --auth as the way to compare. When the request gets no HTTP answer, a timeout or a connection that was never established fails as 'server unreachable'; a connection the server accepts and then closes without answering passes as a rejection only with --auth and when the same server/discover carrying the credential was served, and otherwise fails as 'server unreachable'.",
+      "passCriteria": "A conformant server/discover with the Authorization header removed draws HTTP 401, or a 403 carrying a WWW-Authenticate Bearer challenge (probed with or without --auth). With --auth and a served credentialed server/discover, a 403 without a Bearer challenge (the details note the spec expects 401) or a connection closed without an answer also passes.",
+      "failCriteria": "Any other status: the server accepted an unauthenticated request (the details say when no --auth was provided). A 403 without a Bearer challenge fails as not evaluable unless --auth was given and the credentialed server/discover was served; the details quote the server's error message and advise allowing the hostname you tested through when it names Host/Origin validation or the credentialed request drew a 403 too, and name --auth otherwise. A timeout or refused connection fails as server unreachable, and so does a closed connection without that served comparison.",
       "transports": ["http"]
     },
     {
@@ -2465,9 +2465,9 @@
       "defaultRequired": false,
       "capabilityGated": "tools",
       "specRef": "server/tools#security-considerations",
-      "description": "Calls a tool with a string argument of roughly 1 MB in the first string argument that is not header-mirrored (an x-mcp-header value would also travel in an Mcp-Param-* header and measure the header limit instead of the body; such an argument is used only when no other exists, and the details say so; a tool with no string argument at all gets the value as 'data'), far beyond what any reasonable tool needs, and expects a prompt rejection: HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport. A completed result passes with a warning (the server survived), while a 5xx, a timeout, a broken stdio frame or no usable HTTP response at all (bytes that are not an HTTP response) fails. On HTTP a connection closed or reset on the 1 MB body passes as a connection-level rejection only when a follow-up server/discover is then served or refused with 401/403 (a 429 retried once, as in security-command-injection); otherwise it fails as a possible crash, and a connection refused before anything was sent fails as 'server unreachable'. On stdio a child that exits on the call (including partway through reading the 1 MB line) fails as died even if it first wrote a reply longer than the runner's 1 MiB line buffer; such an overflow passes as survived (with a warning) only while the child is still running, and a child already gone before the call fails as 'server unreachable'. Skipped when the server declares or lists no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.",
-      "passCriteria": "A roughly 1 MB string in the first string argument that is not header-mirrored (a mirrored one only when no other exists, noted in the details) draws HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport; a completed result passes with a warning, and so does a reply to that call that overflowed the runner's stdio line buffer while the child kept running (an earlier overflow in the run, or the same marker text on the server's own stderr, does not count); on HTTP a connection closed on the 1 MB body passes only when a follow-up server/discover is then served or refused with 401/403 (a 429 retried once). Skipped when the server declares or lists no tools. When tools/list failed the rule skips (as passed) pointing at tools-list if that rule is in the run.",
-      "failCriteria": "A 5xx status, a timeout, a broken stdio frame, no usable HTTP response (bytes that are not an HTTP response), a stdio child that dies (even after overflowing the line buffer, or partway through reading the 1 MB line), an HTTP connection dropped on the 1 MB body after which server/discover is neither served nor refused with 401/403, or a server already unreachable (a refused connection, a dead child). Also fails when tools/list failed while tools-list was filtered out of the run (the recorded reason is named)."
+      "description": "Calls a tool with a string argument of roughly 1 MB in the first string argument that is not header-mirrored (an x-mcp-header value would also travel in an Mcp-Param-* header and measure the header limit instead of the body; such an argument is used only when no other exists, and the details say so; a tool with no string argument at all gets the value as 'data'), far beyond what any reasonable tool needs, and expects a prompt rejection: HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport. A 429 is a rate limiter answering before the server reads the request: the call is resent once after Retry-After (capped at 2 s) and a second 429 fails as not evaluable. A 401, or a 403 carrying a Bearer challenge that reads as an auth gate, fails as not evaluable; a 403 without one passes like any other 4xx, the tool list this call uses having come from a served server/discover. A completed result passes with a warning (the server survived), while a 5xx, a timeout, a broken stdio frame or no usable HTTP response at all (bytes that are not an HTTP response) fails. On HTTP a connection closed or reset on the 1 MB body passes as a connection-level rejection only when a follow-up server/discover is then served or refused with 401/403 (a 429 retried once, as in security-command-injection); otherwise it fails as a possible crash, and a connection refused before anything was sent fails as 'server unreachable'. On stdio a child that exits on the call (including partway through reading the 1 MB line) fails as died even if it first wrote a reply longer than the runner's 1 MiB line buffer; such an overflow passes as survived (with a warning) only while the child is still running, and a child already gone before the call fails as 'server unreachable'. Skipped when the server declares or lists no tools; tools/list is fetched on demand under --only security, and when that call failed the test skips pointing at tools-list if that test is in the run, and fails with the recorded reason when it is not.",
+      "passCriteria": "A roughly 1 MB string in the first string argument that is not header-mirrored (a mirrored one only when no other exists, noted in the details) draws HTTP 413 or another 4xx on HTTP -- a 403 without a Bearer challenge included, the tool list having come from a served server/discover -- or a JSON-RPC error on either transport; a completed result passes with a warning, and so does a reply to that call that overflowed the runner's stdio line buffer while the child kept running (an earlier overflow in the run, or the same marker text on the server's own stderr, does not count); on HTTP a connection closed on the 1 MB body passes only when a follow-up server/discover is then served or refused with 401/403 (a 429 retried once). Skipped when the server declares or lists no tools. When tools/list failed the rule skips (as passed) pointing at tools-list if that rule is in the run.",
+      "failCriteria": "A 5xx status, an HTTP 429 that answers the call again after one retry (Retry-After, capped at 2 s) or a 401 or auth-gate 403 -- each not evaluable, a gate having answered before the server read the request -- a timeout, a broken stdio frame, no usable HTTP response (bytes that are not an HTTP response), a stdio child that dies (even after overflowing the line buffer, or partway through reading the 1 MB line), an HTTP connection dropped on the 1 MB body after which server/discover is neither served nor refused with 401/403, or a server already unreachable (a refused connection, a dead child). Also fails when tools/list failed while tools-list was filtered out of the run (the recorded reason is named)."
     },
     {
       "id": "security-extra-params",
