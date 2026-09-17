@@ -294,25 +294,24 @@ describe("integration — auth-stripping security tests against an auth-requirin
 /**
  * An SDK v1 sessionful McpServer + StreamableHTTPServerTransport behind
  * `front`, which may answer a request itself (and returns true when it
- * did). Records the Authorization header of every ping that reached the
- * SDK server.
+ * did). The POST body is read before `front` runs, so a gateway can route
+ * on the JSON-RPC method the way a real one does. Records the
+ * Authorization header of every ping that reached the SDK server.
  */
 async function startSdkBehind(
-  front: (req: IncomingMessage, res: ServerResponse) => boolean,
+  front: (req: IncomingMessage, res: ServerResponse, rpcMethod?: string) => boolean,
 ): Promise<{ url: string; servedPings: Array<string | undefined>; stop(): Promise<void> }> {
   const transports = new Map<string, StreamableHTTPServerTransport>();
   const servedPings: Array<string | undefined> = [];
   const gated: Server = createServer(async (req, res) => {
-    if (front(req, res)) {
-      req.resume();
-      return;
-    }
     const body = req.method === "POST" ? await readBody(req) : "";
     let parsed: unknown;
     try {
       parsed = body ? JSON.parse(body) : undefined;
     } catch {}
-    if ((parsed as { method?: unknown } | undefined)?.method === "ping") servedPings.push(req.headers.authorization);
+    const method = (parsed as { method?: unknown } | undefined)?.method;
+    if (front(req, res, typeof method === "string" ? method : undefined)) return;
+    if (method === "ping") servedPings.push(req.headers.authorization);
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     const known = sessionId ? transports.get(sessionId) : undefined;
     if (known) {
@@ -409,6 +408,20 @@ function policyThen401Gateway(req: IncomingMessage, res: ServerResponse): boolea
     return true;
   }
   if (req.headers.authorization === VALID_TOKEN) return false;
+  res.writeHead(401, { "content-type": "application/json", "www-authenticate": 'Bearer realm="mcp"' });
+  res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "Unauthorized" } }));
+  return true;
+}
+
+/**
+ * A deployment whose gateway exempts the handshake: `initialize` is served
+ * with no credential at all, and every other method that does not carry the
+ * valid token draws 401 with a Bearer challenge -- so the era probe the
+ * preflight sends is refused while the server itself serves an
+ * unauthenticated request.
+ */
+function initializeExemptGateway(req: IncomingMessage, res: ServerResponse, rpcMethod?: string): boolean {
+  if (req.headers.authorization === VALID_TOKEN || rpcMethod === "initialize") return false;
   res.writeHead(401, { "content-type": "application/json", "www-authenticate": 'Bearer realm="mcp"' });
   res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "Unauthorized" } }));
   return true;
@@ -561,5 +574,50 @@ describe("integration — legacy security-auth-required behind a bare 403 (the S
     } finally {
       await sdk.stop();
     }
+  }, 30000);
+
+  it("a gateway that exempts the handshake: the 401 on the preflight does not outrank the initialize it served (before: PASS)", async () => {
+    // The server answered `initialize` without any credential, so the run
+    // holds proof it serves unauthenticated requests -- whatever the era
+    // probe drew. Before: PASS "HTTP 401 (unauthenticated preflight
+    // rejected; pass --auth ...)".
+    const sdk = await startSdkBehind(initializeExemptGateway);
+    try {
+      const report = await run(sdk.url);
+      expect(report.serverInfo.name).toBe("auth-test-server");
+      expect(authRequired(report)).toEqual({
+        passed: false,
+        details:
+          "Server does not require auth: initialize was served with no credential, although the unauthenticated preflight got HTTP 401 (a server that requires authorization rejects every unauthenticated request, initialize included)",
+      });
+    } finally {
+      await sdk.stop();
+    }
+  }, 30000);
+});
+
+describe("integration — the legacy auth checks read an upper-case Authorization header as a credential", () => {
+  // HTTP header names are case-insensitive, so `-H "AUTHORIZATION: Bearer
+  // x"` configures the same credential `--auth` does. Before, `hasAuth`
+  // read only the `Authorization` / `authorization` spellings: every auth
+  // check behaved as if none had been passed, against a server that
+  // requires one.
+  it("security-auth-required and its siblings measure the server instead of skipping", async () => {
+    const report = await runComplianceSuite(serverUrl, {
+      timeout: 3000,
+      specVersion: "2025-11-25",
+      headers: { AUTHORIZATION: VALID_TOKEN },
+      only: ["security-auth-required", "security-www-authenticate", "security-session-not-auth"],
+    });
+    // The upper-case header got the suite through the handshake, as the
+    // canonical spelling does.
+    expect(report.serverInfo.name).toBe("auth-test-server");
+    const verdicts = Object.fromEntries(report.tests.map((t) => [t.id, `${t.passed ? "PASS" : "FAIL"}: ${t.details}`]));
+    // Before: FAIL "Server does not require auth (no --auth provided and
+    // server accepted unauthenticated requests)" plus two "Skipped: no
+    // --auth provided".
+    expect(verdicts["security-auth-required"]).toBe("PASS: HTTP 401 (unauthenticated request rejected)");
+    expect(verdicts["security-www-authenticate"]).toMatch(/^PASS: WWW-Authenticate: /);
+    expect(verdicts["security-session-not-auth"]).toBe("PASS: HTTP 401 (session ID alone not sufficient for auth)");
   }, 30000);
 });

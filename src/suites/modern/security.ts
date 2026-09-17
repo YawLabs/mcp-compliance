@@ -336,6 +336,35 @@ function unauthenticatedRefusalVerdict(ctx: ModernSuiteContext, refusal: AuthRef
   return { passed: false, details: clip(`${head}${quoted}${tail}`, 220) };
 }
 
+/**
+ * security-auth-required's verdict for an unauthenticated server/discover
+ * the server answered with neither 401 nor 403 (readAuthRefusal found no
+ * refusal to read). Only a 2xx is the accepted request the check is looking
+ * for. Every other status refused the request without asking for a
+ * credential -- a 404 from a wrong path, a gateway's or rate limiter's 4xx,
+ * a 3xx that sends the client somewhere else -- and a 5xx is the server
+ * breaking on the request rather than refusing it. All of them fail: none
+ * shows the server rejecting unauthenticated requests. They are worded
+ * apart because the fix differs (put an auth gate in front / fix the URL /
+ * fix the server), and calling a 500 an "accepted request" is simply untrue.
+ */
+function unauthenticatedOtherStatus(ctx: ModernSuiteContext, res: RpcResponse): TestOutcome {
+  const seen = `HTTP ${res.statusCode}, ${summarize(res)}`;
+  if (is2xx(res.statusCode)) {
+    const hint = ctx.hasAuth ? "" : " (no --auth provided)";
+    return { passed: false, details: `${seen} -- server accepted unauthenticated request${hint}` };
+  }
+  let what: string;
+  if (res.statusCode >= 500) {
+    what = "the server failed on the request rather than refusing it (a broken server, or a gateway with no backend)";
+  } else if (is4xx(res.statusCode)) {
+    what = "the request was refused, but not as an authentication refusal (a wrong path, a gateway or a rate limiter)";
+  } else {
+    what = "the server redirected the request instead of answering it";
+  }
+  return { passed: false, details: clip(`${seen} -- ${what}; the spec answers a missing credential with 401`, 220) };
+}
+
 /** "Connection closed without a response (<first line of the error>)" for a drop that counted as a refusal. */
 function closedWithoutResponse(err: unknown): string {
   return `Connection closed without a response (${clip(firstLine(errorMessage(err)), 60)})`;
@@ -917,6 +946,36 @@ export async function runSecurity(ctx: ModernSuiteContext): Promise<void> {
 async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDiscover: () => Promise<RpcResponse>) {
   const { check } = ctx.harness;
 
+  /**
+   * Whether the credential-less server/discover drew a refusal
+   * security-auth-required could not attribute to authentication: a 403
+   * with no Bearer challenge that no served credentialed request pins on
+   * the missing credential (unauthenticatedRefusalVerdict's not-evaluable
+   * branch). Its siblings send a request with no valid credential and
+   * credit the 401/403 that answers it -- a Host guard, an Origin check or
+   * a gateway answers every request with that same 403, so crediting it
+   * would turn one unattributable refusal into three passes. They skip
+   * instead, pointing at the check that explains it (the 2025-11-25
+   * siblings take the same skip, from a flag security-auth-required sets).
+   *
+   * Read from the memoized probe rather than from a flag another check
+   * sets, so `--only security-www-authenticate` reads it too. False when
+   * the probe got no HTTP answer at all: each caller reads a missing
+   * answer through unansweredProbe itself.
+   */
+  let attribution: Promise<boolean> | null = null;
+  const authNotEvaluable = () => {
+    attribution ??= unauthenticatedDiscover().then(
+      (res) => readAuthRefusal(res, false)?.kind === "forbidden" && !credentialedDiscoverServed(ctx),
+      () => false,
+    );
+    return attribution;
+  };
+  const AUTH_NOT_EVALUABLE: TestOutcome = {
+    passed: true,
+    details: "Skipped: not evaluable (see security-auth-required)",
+  };
+
   await check("security-auth-required", async () => {
     if (ctx.kind !== "http") return notApplicable("no HTTP auth");
     // Sent with or without --auth: the server's answer to a request that
@@ -926,11 +985,10 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
       // The probe carried no Authorization, whatever --auth says.
       const refusal = readAuthRefusal(res, false);
       if (refusal) return unauthenticatedRefusalVerdict(ctx, refusal);
-      const hint = ctx.hasAuth ? "" : " (no --auth provided)";
-      return {
-        passed: false,
-        details: `HTTP ${res.statusCode}, ${summarize(res)} -- server accepted unauthenticated request${hint}`,
-      };
+      // Neither 401 nor 403: a 2xx is the accepted request, and every
+      // other status is a refusal that is not an auth refusal (or a
+      // server that broke on it). See unauthenticatedOtherStatus.
+      return unauthenticatedOtherStatus(ctx, res);
     } catch (err) {
       // No HTTP answer: a refusal only when the server dropped a request
       // it served with the credential (see unansweredProbe).
@@ -947,7 +1005,15 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
     if (ctx.kind !== "http") return notApplicable("no HTTP auth");
     try {
       const res = await unauthenticatedDiscover();
-      if (res.statusCode === 401) {
+      // Read the refusal the way security-auth-required reads it. A 401,
+      // or a 403 carrying a Bearer challenge, asks for the credential the
+      // request lacked, and the challenge is what a client starts
+      // authorization from either way (the spec's insufficient-scope 403
+      // SHOULD carry resource_metadata "for consistency with 401
+      // responses"), so both are checked here -- the details name the
+      // status when it is not the 401 the spec expects.
+      const refusal = readAuthRefusal(res, false);
+      if (refusal && refusal.kind !== "forbidden") {
         const challenge = headerOf(res.headers, "www-authenticate");
         if (challenge) {
           const prm = parseResourceMetadata(challenge);
@@ -960,15 +1026,22 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
               `security-www-authenticate: the WWW-Authenticate resource_metadata value "${clip(prm.raw, 80)}" is not an absolute http(s) URL (RFC 9728 section 5.1 requires one); clients cannot locate the Protected Resource Metadata from it.`,
             );
           }
-          return { passed: true, details: `WWW-Authenticate: ${clip(challenge, 150)}` };
+          const where = refusal.statusCode === 401 ? "" : ` (HTTP ${refusal.statusCode})`;
+          return { passed: true, details: `WWW-Authenticate: ${clip(challenge, 150)}${where}` };
         }
+        // Only a 401 reaches this: a 403 reads as auth-required precisely
+        // when it carries a Bearer challenge.
         return {
           passed: false,
           details:
             "HTTP 401 but missing WWW-Authenticate header (spec: SHOULD include to indicate required auth scheme)",
         };
       }
-      if (res.statusCode === 403) {
+      if (refusal) {
+        // A bare 403. When security-auth-required could not attribute it to
+        // authentication, the same refusal is no evidence here either, so
+        // this skips rather than passing on it (see authNotEvaluable).
+        if (await authNotEvaluable()) return AUTH_NOT_EVALUABLE;
         return { passed: true, details: "HTTP 403 (WWW-Authenticate not applicable for 403)" };
       }
       return { passed: true, details: `HTTP ${res.statusCode} -- not a 401 response (skipped)` };
@@ -992,6 +1065,10 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
     // one, "rejects invalid tokens" cannot be told from "rejects everything".
     if (!ctx.hasAuth)
       return { passed: true, details: "Skipped: needs a valid credential to compare against (pass --auth)" };
+    // Nor when the credential-less server/discover drew a 403 nothing could
+    // attribute to authentication: the malformed credential draws the same
+    // 403 from the same guard, which proves nothing about token validation.
+    if (await authNotEvaluable()) return AUTH_NOT_EVALUABLE;
     return checkMalformedAuth(ctx);
   });
 
@@ -1030,22 +1107,46 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
   await check("security-oauth-metadata", async () => {
     if (ctx.kind !== "http") return notApplicable("no OAuth");
     // The challenge on the unauthenticated discover names the metadata
-    // URL clients try first; without --auth the same 401 is also what
-    // says the server is auth-protected at all. An rpc that throws got
-    // no HTTP answer of any status: an unreachable (or hung) server,
-    // never an auth refusal -- except a drop the credentialed discover
-    // pins on the missing credential (see unansweredProbe), which leaves
-    // an auth-protected server with no challenge, so the well-known
-    // locations are what a client has.
+    // URL clients try first; without --auth that refusal is also what
+    // says the server is auth-protected at all, so it is read the way
+    // security-auth-required reads it:
+    //
+    // - a 401, or a 403 carrying a Bearer challenge, is an authentication
+    //   refusal, and its challenge is the URL clients MUST use;
+    // - a bare 403 is not one on its own (Origin validation, the SDK's
+    //   Host guard and gateways answer with it). With --auth the run is
+    //   testing a protected resource whatever that 403 was, so the
+    //   well-known locations are still worth checking; without one there
+    //   is no evidence the server is auth-protected at all, so the check
+    //   skips instead of reporting a missing PRM document on a server
+    //   that may not be an OAuth resource server (see authNotEvaluable);
+    // - any other status is neither a served request nor a refusal: the
+    //   2xx says the server needs no credential, and the rest say only
+    //   that this run never reached an auth gate.
+    //
+    // An rpc that throws got no HTTP answer of any status: an unreachable
+    // (or hung) server, never an auth refusal -- except a drop the
+    // credentialed discover pins on the missing credential (see
+    // unansweredProbe), which leaves an auth-protected server with no
+    // challenge, so the well-known locations are what a client has.
     let challenge: string | undefined;
     try {
       const res = await unauthenticatedDiscover();
-      if (res.statusCode === 401) challenge = headerOf(res.headers, "www-authenticate");
-      if (!ctx.hasAuth && res.statusCode !== 401 && res.statusCode !== 403) {
-        return {
-          passed: true,
-          details: `Skipped: server does not require auth (unauthenticated server/discover answered HTTP ${res.statusCode})`,
-        };
+      const refusal = readAuthRefusal(res, false);
+      if (refusal && refusal.kind !== "forbidden") {
+        challenge = headerOf(res.headers, "www-authenticate");
+      } else if (refusal) {
+        if (!ctx.hasAuth && (await authNotEvaluable())) return AUTH_NOT_EVALUABLE;
+      } else if (!ctx.hasAuth) {
+        return is2xx(res.statusCode)
+          ? {
+              passed: true,
+              details: `Skipped: server does not require auth (unauthenticated server/discover answered HTTP ${res.statusCode})`,
+            }
+          : {
+              passed: true,
+              details: `Skipped: the unauthenticated server/discover answered HTTP ${res.statusCode}, neither a served request nor an authentication refusal (pass --auth to check the metadata anyway)`,
+            };
       }
     } catch (err) {
       const verdict = unansweredProbe(ctx, "unauthenticated server/discover", err, credentialedDiscoverServed(ctx));

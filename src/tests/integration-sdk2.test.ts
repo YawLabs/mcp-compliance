@@ -52,6 +52,18 @@ const LEGACY_LOCALHOST_INHERENT = [...LOCALHOST_INHERENT, "security-rate-limitin
  */
 const LOCALHOST_AUTH_REQUIRED = "HTTP 200, result -- server accepted unauthenticated request (no --auth provided)";
 
+/**
+ * The auth checks that send a request with no valid credential and read the
+ * 401/403 answering it. When security-auth-required cannot attribute that
+ * 403 to authentication, the same refusal is no evidence for them either
+ * and they skip (security-oauth-metadata only without --auth, which is the
+ * only thing that says the server is auth-protected at all).
+ */
+const AUTH_SIBLINGS = ["security-www-authenticate", "security-auth-malformed", "security-oauth-metadata"];
+const SIBLING_SKIP = "Skipped: not evaluable (see security-auth-required)";
+
+const detailsOf = (report: ComplianceReport, id: string) => resultOf(report, id).details;
+
 /** The auto-detection note every run against the SDK opens with. */
 const AUTO_DETECT_NOTE = `${AUTO_DETECT_NOTE_PREFIX}2026-07-28 (${REASON_PREFIX}supportedVersions [2026-07-28]). Pin with --spec-version to override.`;
 
@@ -414,7 +426,7 @@ describe("SDK v2 behind its Host guard: a bare 403 on every request is not an au
 
   beforeAll(async () => {
     mounted = await mount("reject", { allowedHosts: ["mcp.example.com"] });
-    const pinned = { timeout: 5000, specVersion: "2026-07-28" as const, only: [ID] };
+    const pinned = { timeout: 5000, specVersion: "2026-07-28" as const, only: [ID, ...AUTH_SIBLINGS] };
     noAuth = await runComplianceSuite(mounted.url, pinned);
     withAuth = await runComplianceSuite(mounted.url, { ...pinned, headers: { Authorization: "Bearer tok" } });
   }, 60_000);
@@ -458,6 +470,34 @@ describe("SDK v2 behind its Host guard: a bare 403 on every request is not an au
     expect([result.passed, result.details]).toEqual([
       false,
       'not evaluable: HTTP 403 without a Bearer challenge ("Invalid Host: 127.0.0.1") names Host/Origin validation, not authentication: allow the hostname you tested through',
+    ]);
+  });
+
+  it("the siblings skip that same 403 rather than crediting the guard, with and without --auth", () => {
+    // Before: security-www-authenticate PASSED "HTTP 403 (WWW-Authenticate
+    // not applicable for 403)" and security-auth-malformed PASSED "HTTP 403"
+    // on both probes -- the Host guard's blanket 403 read as three separate
+    // pieces of evidence that the server validates credentials.
+    expect(detailsOf(noAuth, "security-www-authenticate")).toBe(SIBLING_SKIP);
+    expect(detailsOf(withAuth, "security-www-authenticate")).toBe(SIBLING_SKIP);
+    expect(detailsOf(withAuth, "security-auth-malformed")).toBe(SIBLING_SKIP);
+    // Without a credential there is nothing to compare against, as before.
+    expect(detailsOf(noAuth, "security-auth-malformed")).toBe(
+      "Skipped: needs a valid credential to compare against (pass --auth)",
+    );
+  });
+
+  it("security-oauth-metadata skips without --auth and, with one, reports what the guard answered", () => {
+    // Before, without --auth: the bare 403 sent it to the well-known
+    // locations and it FAILED "No Protected Resource Metadata", blaming the
+    // server for metadata a Host guard was never going to serve.
+    expect(detailsOf(noAuth, "security-oauth-metadata")).toBe(SIBLING_SKIP);
+    // With --auth the run is testing a protected resource whatever the 403
+    // was, so the lookup still happens (and the guard answers it too).
+    const withCredential = resultOf(withAuth, "security-oauth-metadata");
+    expect([withCredential.passed, withCredential.details]).toEqual([
+      false,
+      "No Protected Resource Metadata (/.well-known/oauth-protected-resource/mcp -> HTTP 403; /.well-known/oauth-protected-resource -> HTTP 403) and no legacy OAuth metadata",
     ]);
   });
 });
@@ -515,7 +555,7 @@ describe("SDK v2 behind a gate that answers a missing credential with a bare 403
 
   beforeAll(async () => {
     mounted = await mount("reject", { bare403Unless: "Bearer tok" });
-    const pinned = { timeout: 5000, specVersion: "2026-07-28" as const, only: [ID] };
+    const pinned = { timeout: 5000, specVersion: "2026-07-28" as const, only: [ID, ...AUTH_SIBLINGS] };
     noAuth = await runComplianceSuite(mounted.url, pinned);
     withAuth = await runComplianceSuite(mounted.url, { ...pinned, headers: { Authorization: "Bearer tok" } });
     wrongAuth = await runComplianceSuite(mounted.url, { ...pinned, headers: { Authorization: "Bearer wrong" } });
@@ -548,6 +588,26 @@ describe("SDK v2 behind a gate that answers a missing credential with a bare 403
       false,
       'not evaluable: HTTP 403 without a Bearer challenge ("Forbidden") may be Host/Origin validation or a gateway; the credentialed request got 403 too: fix the gateway or allowed hosts',
     ]);
+  });
+
+  it("with --auth the credential is the variable, so the siblings measure the gate instead of skipping", () => {
+    // The gate answers every credential but `Bearer tok` with the same bare
+    // 403, which here is a real (if non-conformant) rejection: the SDK
+    // served the credentialed request.
+    expect(detailsOf(withAuth, "security-www-authenticate")).toBe("HTTP 403 (WWW-Authenticate not applicable for 403)");
+    expect(detailsOf(withAuth, "security-auth-malformed")).toBe(
+      "well-formed invalid token: HTTP 403; malformed credential: HTTP 403",
+    );
+  });
+
+  it("without a credential the gate accepts, the siblings skip rather than credit the same 403", () => {
+    // Before: both runs PASSED www-authenticate on "HTTP 403
+    // (WWW-Authenticate not applicable for 403)", and auth-malformed passed
+    // the wrongAuth run on the gate's 403.
+    expect(detailsOf(noAuth, "security-www-authenticate")).toBe(SIBLING_SKIP);
+    expect(detailsOf(wrongAuth, "security-www-authenticate")).toBe(SIBLING_SKIP);
+    expect(detailsOf(wrongAuth, "security-auth-malformed")).toBe(SIBLING_SKIP);
+    expect(detailsOf(noAuth, "security-oauth-metadata")).toBe(SIBLING_SKIP);
   });
 });
 

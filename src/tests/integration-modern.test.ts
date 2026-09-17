@@ -173,6 +173,15 @@ for (const ex of EXPECTED) {
         expect(resultOf(report, "security-auth-required").details).toBe(
           "HTTP 200, result -- server accepted unauthenticated request (no --auth provided)",
         );
+        // Its siblings read that same served 200: no refusal, so no
+        // challenge to check and no auth gate whose metadata to discover.
+        expect(resultOf(report, "security-www-authenticate").details).toBe("HTTP 200 -- not a 401 response (skipped)");
+        expect(resultOf(report, "security-oauth-metadata").details).toBe(
+          "Skipped: server does not require auth (unauthenticated server/discover answered HTTP 200)",
+        );
+        expect(resultOf(report, "security-auth-malformed").details).toBe(
+          "Skipped: needs a valid credential to compare against (pass --auth)",
+        );
       }
     });
 

@@ -1466,10 +1466,15 @@ interface InlineOptions {
   malformedStatus?: 500;
   /**
    * The status an `auth` server answers a request with no Authorization:
-   * 401 with its challenge (default), a bare 403 (no WWW-Authenticate), or
-   * "403-challenge": a 403 carrying `WWW-Authenticate: Bearer realm="mcp"`.
+   * 401 with its challenge (default), a bare 403 (no WWW-Authenticate),
+   * "403-challenge": a 403 carrying `WWW-Authenticate: Bearer realm="mcp"`,
+   * or "403-prm-challenge": a 403 carrying the same challenge the 401
+   * carries (resource_metadata included, per `prm` and `challenge`).
+   * A plain number other than 403 is answered with that status and the
+   * rejection body -- 404/429/500 (a wrong path, a rate limiter, a broken
+   * server) and 302 (a redirect to a login page, with its Location).
    */
-  unauthenticatedStatus?: 403 | "403-challenge";
+  unauthenticatedStatus?: 403 | "403-challenge" | "403-prm-challenge" | 302 | 404 | 429 | 500;
   /** The JSON-RPC error message on an `auth` server's rejections (default "Unauthorized"). */
   rejectionMessage?: string;
   /**
@@ -2204,9 +2209,15 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
           error: { code: -32600, message: opts.rejectionMessage ?? "Unauthorized" },
         };
         if (!authz) {
-          if (opts.unauthenticatedStatus === 403) return json(403, rejection);
           if (opts.unauthenticatedStatus === "403-challenge") {
             return json(403, rejection, { "WWW-Authenticate": 'Bearer realm="mcp"' });
+          }
+          if (opts.unauthenticatedStatus === "403-prm-challenge") {
+            return json(403, rejection, challengeHeader(prmUrl));
+          }
+          if (typeof opts.unauthenticatedStatus === "number") {
+            const extra: Record<string, string> = opts.unauthenticatedStatus === 302 ? { Location: "/login" } : {};
+            return json(opts.unauthenticatedStatus, rejection, extra);
           }
           return json(401, rejection, challengeHeader(prmUrl));
         }
@@ -4241,6 +4252,273 @@ describe("security-auth-required: a 403 without a Bearer challenge counts only w
     );
     expect(verdicts(challengeWithAuth.tests, [ID])).toEqual({ [ID]: "pass" });
     expect(detailsOf(challengeWithAuth.tests, ID)).toBe("HTTP 403 (unauthenticated request rejected)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The auth siblings send a request with no valid credential and credit the
+// 401/403 that answers it. When that 403 is the bare one security-auth-required
+// could not attribute to authentication, crediting it would turn one
+// unattributable refusal into three passes, so they skip instead -- the skip
+// the 2025-11-25 siblings take (runner.ts: "Skipped: not evaluable (see
+// security-auth-required)"). When the credential IS the one variable, they
+// measure the server exactly as before.
+// ---------------------------------------------------------------------------
+
+describe("the auth siblings skip the bare 403 security-auth-required could not attribute", () => {
+  const REQUIRED = "security-auth-required";
+  const WWW = "security-www-authenticate";
+  const MALFORMED = "security-auth-malformed";
+  const OAUTH = "security-oauth-metadata";
+  const TOKEN_IN_URI = "security-token-in-uri";
+  const NOT_EVALUABLE = "Skipped: not evaluable (see security-auth-required)";
+  const servers: InlineServer[] = [];
+  let noAuth: DirectRun;
+  let wrongAuth: ComplianceReport;
+  let goodAuth: DirectRun;
+  let onlyWww: DirectRun;
+  let capitalHeader: ComplianceReport;
+  let lowercaseHeader: ComplianceReport;
+  let prmDoc = "";
+
+  beforeAll(async () => {
+    // A bare 403 on the credential-less discover; every other credential is
+    // parsed strictly, and a valid PRM document sits at the endpoint path.
+    const bare = await startInlineServer({ auth: "strict", unauthenticatedStatus: 403, prm: "path", tools: "none" });
+    servers.push(bare);
+    prmDoc = `Protected Resource Metadata found at /.well-known/oauth-protected-resource/mcp: resource=${bare.base}/mcp, 1 auth server(s)`;
+    noAuth = await runDirect({ url: bare.url, only: AUTH_IDS });
+    // A credential the server refuses (401 invalid_token): through the real
+    // dispatcher, so the setup discover's rejection is recorded.
+    wrongAuth = await runModern(bare.url, { headers: { Authorization: "Bearer wrong" }, only: AUTH_IDS });
+    goodAuth = await runDirect({ url: bare.url, headers: { Authorization: "Bearer tok" }, only: AUTH_IDS });
+    // The sibling alone: nothing else in the run read the refusal for it.
+    onlyWww = await runDirect({ url: bare.url, only: [WWW] });
+    // The same credential under both spellings of the header name, through
+    // the real dispatcher (the only place ctx.hasAuth is computed from the
+    // user's headers).
+    capitalHeader = await runModern(bare.url, { headers: { Authorization: "Bearer tok" }, only: AUTH_IDS });
+    lowercaseHeader = await runModern(bare.url, { headers: { authorization: "Bearer tok" }, only: AUTH_IDS });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("without --auth: www-authenticate and oauth-metadata skip instead of reading the 403 as an auth refusal", () => {
+    // Before: www-authenticate PASSED "HTTP 403 (WWW-Authenticate not
+    // applicable for 403)" and oauth-metadata went on to well-known PRM
+    // discovery as though the 403 proved the server was auth-protected --
+    // both crediting the 403 auth-required calls not evaluable.
+    expect(verdicts(noAuth.tests, [REQUIRED])).toEqual({
+      [REQUIRED]: `FAIL: not evaluable: HTTP 403 without a Bearer challenge ("Unauthorized") may be Host/Origin validation or a gateway; pass --auth to compare with a credentialed request`,
+    });
+    expect(detailsOf(noAuth.tests, WWW)).toBe(NOT_EVALUABLE);
+    expect(detailsOf(noAuth.tests, OAUTH)).toBe(NOT_EVALUABLE);
+    // The two that need a credential of their own say so, as before.
+    expect(detailsOf(noAuth.tests, MALFORMED)).toBe(
+      "Skipped: needs a valid credential to compare against (pass --auth)",
+    );
+    expect(detailsOf(noAuth.tests, TOKEN_IN_URI)).toBe(
+      "Skipped: needs a valid credential to place in the URI (pass --auth)",
+    );
+    expect(
+      verdicts(
+        noAuth.tests,
+        AUTH_IDS.filter((id) => id !== REQUIRED),
+      ),
+    ).toEqual(allPass(AUTH_IDS.filter((id) => id !== REQUIRED)));
+    expectAsciiDetails(noAuth.tests, AUTH_IDS);
+  });
+
+  it("with a credential the server refuses too: www-authenticate and auth-malformed skip, oauth-metadata still looks for the document", () => {
+    // Before: www-authenticate PASSED "HTTP 403 (WWW-Authenticate not
+    // applicable for 403)" and auth-malformed PASSED on the same 403 the
+    // credential-less request drew.
+    expect(resultOf(wrongAuth, REQUIRED).details).toBe(
+      'not evaluable: HTTP 403 without a Bearer challenge ("Unauthorized") may be Host/Origin validation or a gateway; the credentialed request was not served either (HTTP 401)',
+    );
+    expect(resultOf(wrongAuth, WWW).details).toBe(NOT_EVALUABLE);
+    expect(resultOf(wrongAuth, MALFORMED).details).toBe(NOT_EVALUABLE);
+    // oauth-metadata asks a question the refusal does not decide: --auth
+    // says the run is testing a protected resource, and the well-known
+    // document is fetched without a credential anyway.
+    expect(resultOf(wrongAuth, OAUTH).details).toBe(prmDoc);
+  });
+
+  it("with the credential the server accepts, the 403 is attributed and every sibling measures the server as before", () => {
+    expect(verdicts(goodAuth.tests, AUTH_IDS)).toEqual(allPass(AUTH_IDS));
+    expect(detailsOf(goodAuth.tests, REQUIRED)).toBe(BARE_403_ATTRIBUTED);
+    expect(detailsOf(goodAuth.tests, WWW)).toBe("HTTP 403 (WWW-Authenticate not applicable for 403)");
+    expect(detailsOf(goodAuth.tests, MALFORMED)).toBe(
+      "well-formed invalid token: HTTP 401; malformed credential: HTTP 400 (RFC 6750 invalid_request)",
+    );
+    expect(detailsOf(goodAuth.tests, OAUTH)).toBe(prmDoc);
+    // Not addressed in this pass: token-in-uri still credits the bare 403
+    // its credential-less probe draws, whatever answered it.
+    expect(detailsOf(goodAuth.tests, TOKEN_IN_URI)).toBe("HTTP 403 (token in query string rejected)");
+  });
+
+  it("the skip survives --only: the sibling reads the refusal itself, not a flag security-auth-required set", () => {
+    // The 2025-11-25 siblings read a flag security-auth-required sets, so a
+    // run without it credits the 403; this one reads the memoized probe, so
+    // `--only security-www-authenticate` skips too. The details still point
+    // at the check that explains the refusal, which is how to get it.
+    expect(verdicts(onlyWww.tests, [WWW])).toEqual({ [WWW]: "pass" });
+    expect(detailsOf(onlyWww.tests, WWW)).toBe(NOT_EVALUABLE);
+  });
+
+  it("an `authorization` header counts as a credential exactly like `Authorization`", () => {
+    // ctx.hasAuth gates the whole auth suite and is computed from the user's
+    // header NAMES (runModernSuite in src/suites/modern/index.ts). HTTP
+    // header names are case-insensitive, so `--header authorization:...`
+    // must not read as "no --auth provided": a case-sensitive lookup would
+    // turn every verdict below into a skip.
+    const details = (report: ComplianceReport) =>
+      Object.fromEntries(AUTH_IDS.map((id) => [id, resultOf(report, id).details]));
+    expect(details(lowercaseHeader)).toEqual(details(capitalHeader));
+    // And it is the credentialed path, not two identical skips: the bare 403
+    // is attributed because the request carrying the credential was served.
+    expect(resultOf(lowercaseHeader, REQUIRED).details).toBe(BARE_403_ATTRIBUTED);
+    expect(resultOf(lowercaseHeader, MALFORMED).details).toBe(
+      "well-formed invalid token: HTTP 401; malformed credential: HTTP 400 (RFC 6750 invalid_request)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A 403 that DOES carry a Bearer challenge is an authentication refusal (the
+// spec's insufficient-scope 403 carries one, with resource_metadata "for
+// consistency with 401 responses"), so the challenge is read exactly as a
+// 401's: validated by security-www-authenticate and followed by
+// security-oauth-metadata.
+// ---------------------------------------------------------------------------
+
+describe("inline servers: the Bearer challenge on a 403 is read like a 401's", () => {
+  const WWW = "security-www-authenticate";
+  const OAUTH = "security-oauth-metadata";
+  const IDS = [WWW, OAUTH, "security-auth-required"];
+  const servers: InlineServer[] = [];
+  let realmOnly: DirectRun;
+  let advertised: DirectRun;
+
+  beforeAll(async () => {
+    // A 403 whose challenge carries no resource_metadata, next to a valid
+    // well-known document; and one whose challenge advertises a PRM
+    // document that lives nowhere else.
+    const a = await startInlineServer({
+      auth: "strict",
+      unauthenticatedStatus: "403-challenge",
+      prm: "path",
+      tools: "none",
+    });
+    const b = await startInlineServer({
+      auth: "strict",
+      unauthenticatedStatus: "403-prm-challenge",
+      prm: "header",
+      tools: "none",
+    });
+    servers.push(a, b);
+    realmOnly = await runDirect({ url: a.url, only: IDS });
+    advertised = await runDirect({ url: b.url, only: IDS });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("a challenge without resource_metadata is reported and warned about, naming the 403 it came on", () => {
+    // Before: "HTTP 403 (WWW-Authenticate not applicable for 403)", with no
+    // warning -- the challenge on the 403 was never looked at.
+    expect(verdicts(realmOnly.tests, IDS)).toEqual(allPass(IDS));
+    expect(detailsOf(realmOnly.tests, WWW)).toBe('WWW-Authenticate: Bearer realm="mcp" (HTTP 403)');
+    expect(realmOnly.warnings.filter((w) => w.startsWith("security-www-authenticate:"))).toEqual([
+      "security-www-authenticate: the WWW-Authenticate challenge carries no resource_metadata parameter; clients must fall back to the well-known Protected Resource Metadata URL.",
+    ]);
+    expect(detailsOf(realmOnly.tests, OAUTH)).toBe(
+      `Protected Resource Metadata found at /.well-known/oauth-protected-resource/mcp: resource=${servers[0].base}/mcp, 1 auth server(s)`,
+    );
+    expectAsciiDetails(realmOnly.tests, IDS);
+  });
+
+  it("a resource_metadata URL advertised on a 403 is the one clients must use, and oauth-metadata follows it", () => {
+    // Before: the challenge was ignored, so oauth-metadata fell back to the
+    // well-known locations and FAILED "No Protected Resource Metadata
+    // (/.well-known/oauth-protected-resource/mcp -> HTTP 404; ...)".
+    expect(verdicts(advertised.tests, IDS)).toEqual(allPass(IDS));
+    expect(detailsOf(advertised.tests, WWW)).toBe(
+      `WWW-Authenticate: Bearer resource_metadata="${servers[1].base}/oauth/prm" (HTTP 403)`,
+    );
+    expect(advertised.warnings.filter((w) => w.startsWith("security-www-authenticate:"))).toEqual([]);
+    expect(detailsOf(advertised.tests, OAUTH)).toBe(
+      `Protected Resource Metadata found at /oauth/prm (via WWW-Authenticate): resource=${servers[1].base}/mcp, 1 auth server(s)`,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A status that is neither 2xx nor a 401/403: the request was not served AND
+// not refused for want of a credential. security-auth-required still fails --
+// nothing shows the server rejecting unauthenticated requests -- but calling
+// a 404, a 429 or a 500 an "accepted unauthenticated request" was simply
+// false, and the fix each one needs is different.
+// ---------------------------------------------------------------------------
+
+describe("security-auth-required: a status the server never served is not an accepted request", () => {
+  const ID = "security-auth-required";
+  const WWW = "security-www-authenticate";
+  const OAUTH = "security-oauth-metadata";
+  const IDS = [ID, WWW, OAUTH];
+  const servers: InlineServer[] = [];
+  const runs: Record<string, DirectRun> = {};
+  const SPEC_TAIL = "; the spec answers a missing credential with 401";
+
+  beforeAll(async () => {
+    for (const status of [404, 429, 500, 302] as const) {
+      const server = await startInlineServer({ auth: "strict", unauthenticatedStatus: status, tools: "none" });
+      servers.push(server);
+      runs[String(status)] = await runDirect({ url: server.url, only: IDS });
+    }
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("a 4xx that is not 401/403 is a refusal that is not an authentication refusal", () => {
+    // Before, for both: "HTTP 404, JSON-RPC error -32600 -- server accepted
+    // unauthenticated request (no --auth provided)".
+    const refused = `-- the request was refused, but not as an authentication refusal (a wrong path, a gateway or a rate limiter)${SPEC_TAIL}`;
+    expect(verdicts(runs["404"].tests, [ID])).toEqual({
+      [ID]: `FAIL: HTTP 404, JSON-RPC error -32600 ${refused}`,
+    });
+    expect(verdicts(runs["429"].tests, [ID])).toEqual({
+      [ID]: `FAIL: HTTP 429, JSON-RPC error -32600 ${refused}`,
+    });
+    expectAsciiDetails(runs["404"].tests, IDS);
+  });
+
+  it("a 5xx is the server failing on the request, not accepting it", () => {
+    expect(verdicts(runs["500"].tests, [ID])).toEqual({
+      [ID]: `FAIL: HTTP 500, JSON-RPC error -32600 -- the server failed on the request rather than refusing it (a broken server, or a gateway with no backend)${SPEC_TAIL}`,
+    });
+  });
+
+  it("a 3xx is a redirect, not an answer", () => {
+    expect(verdicts(runs["302"].tests, [ID])).toEqual({
+      [ID]: `FAIL: HTTP 302, JSON-RPC error -32600 -- the server redirected the request instead of answering it${SPEC_TAIL}`,
+    });
+  });
+
+  it("the siblings say what they saw rather than that the server needs no auth", () => {
+    // www-authenticate is unchanged; oauth-metadata used to skip with
+    // "server does not require auth (... answered HTTP 404)", a claim about
+    // the server's auth posture that a 404 does not support.
+    expect(detailsOf(runs["404"].tests, WWW)).toBe("HTTP 404 -- not a 401 response (skipped)");
+    expect(detailsOf(runs["404"].tests, OAUTH)).toBe(
+      "Skipped: the unauthenticated server/discover answered HTTP 404, neither a served request nor an authentication refusal (pass --auth to check the metadata anyway)",
+    );
+    expect(verdicts(runs["404"].tests, [WWW, OAUTH])).toEqual(allPass([WWW, OAUTH]));
   });
 });
 

@@ -121,7 +121,14 @@ export interface ModernSuiteContext {
   displayUrl: string;
   /** Result of `auto` detection, undefined when the version was pinned. */
   detection: DetectionResult | undefined;
-  /** Whether the run was given credentials (`--auth` / an Authorization header). */
+  /**
+   * Whether the run was given credentials (`--auth` / an Authorization
+   * header). Matched on the header NAME case-insensitively (see
+   * `runModernSuite` in ./index.ts): HTTP header names are
+   * case-insensitive and `--header authorization:...` must count as a
+   * credential exactly like `--header Authorization:...`, or the whole
+   * auth suite silently reads as "no --auth provided".
+   */
   hasAuth: boolean;
   /** RunOptions.signal, for requests made outside the shared client. */
   signal?: AbortSignal;

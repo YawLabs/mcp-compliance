@@ -857,6 +857,17 @@ interface SecurityStubOptions {
   bare403Message?: string;
   /** A gateway method policy that answers server/discover (the preflight) with a bare 403, credential or not. */
   discover403?: boolean;
+  /**
+   * The gate lets `initialize` through without the token (a deployment
+   * that exempts the handshake): every other method still draws `noAuth`.
+   */
+  openInitialize?: boolean;
+  /** Whether the initialize response carries an Mcp-Session-Id (the session the session-only probe reuses). */
+  session?: boolean;
+  /** How a SECOND initialize is answered: like the first by default. */
+  reinit?: "drop" | "hang";
+  /** How a request carrying an Origin header is answered: like any other by default. */
+  foreignOrigin?: "drop" | "hang";
   /** Called when a request without the token reaches the `noAuth` gate. */
   onNoAuth?: () => void;
   /** How a ping that carries the token is answered: served by default. */
@@ -904,6 +915,7 @@ async function startSecurityStub(
 ): Promise<{ url: string; hits: SecurityHit[]; stop(): Promise<void> }> {
   const hits: SecurityHit[] = [];
   let dropped = false;
+  let initializes = 0;
   let throttles = opts.afterDrop === "429-twice" ? 2 : opts.afterDrop === "429-then-serve" ? 1 : 0;
   let bigThrottles = opts.bigCall === "429-once" ? 1 : opts.bigCall === 429 ? Number.POSITIVE_INFINITY : 0;
   const bare403Message = opts.bare403Message ?? "Forbidden";
@@ -949,7 +961,15 @@ async function startSecurityStub(
       if (opts.discover403 && msg.method === "server/discover") {
         return rpcError(403, -32000, "Method not allowed by gateway policy");
       }
-      if (opts.token && req.headers.authorization !== `Bearer ${opts.token}`) {
+      if (opts.foreignOrigin && req.headers.origin !== undefined) {
+        if (opts.foreignOrigin === "drop") return req.socket.destroy();
+        return;
+      }
+      if (
+        opts.token &&
+        req.headers.authorization !== `Bearer ${opts.token}` &&
+        !(opts.openInitialize && msg.method === "initialize")
+      ) {
         opts.onNoAuth?.();
         switch (opts.noAuth) {
           case "bare-403":
@@ -967,14 +987,26 @@ async function startSecurityStub(
       if (msg.id === undefined) return send(202, "", {});
       const reply = (body: Record<string, unknown>) => json(200, { jsonrpc: "2.0", id: msg.id, ...body });
       switch (msg.method) {
-        case "initialize":
-          return reply({
-            result: {
-              protocolVersion: "2025-11-25",
-              capabilities: { tools: {} },
-              serverInfo: { name: "security-stub", version: "1" },
+        case "initialize": {
+          initializes++;
+          if (initializes > 1 && opts.reinit) {
+            if (opts.reinit === "drop") return req.socket.destroy();
+            return;
+          }
+          return json(
+            200,
+            {
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: {
+                protocolVersion: "2025-11-25",
+                capabilities: { tools: {} },
+                serverInfo: { name: "security-stub", version: "1" },
+              },
             },
-          });
+            opts.session ? { "mcp-session-id": "sess-7c41f2a9b3d6" } : {},
+          );
+        }
         case "ping":
           if (opts.token && opts.authedPing === "drop") return req.socket.destroy();
           if (opts.token && opts.authedPing === "bare-403") return rpcError(403, -32000, bare403Message);
@@ -1311,6 +1343,298 @@ describe("runComplianceSuite — legacy auth probes next to security-auth-requir
     for (const id of [...SIBLINGS, "security-oauth-metadata"]) {
       expect(verdicts[id], id).toBe("PASS: Skipped: no --auth provided");
     }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// The legacy checks whose catch swallowed every transport error into
+// PASS "Connection rejected (acceptable)": a timeout, a connection that was
+// never established, an unparseable answer and a caller's abort all read as
+// the server refusing the probe. Each now reads the error the way the
+// 2026-07-28 suite does, and a drop counts as a refusal only next to the
+// comparison request the check relies on having been served.
+// ---------------------------------------------------------------------------
+describe("runComplianceSuite — legacy probes that got no answer are read, not credited", () => {
+  const TOKEN = "tok-3e9d";
+  const AUTH = { Authorization: `Bearer ${TOKEN}` };
+  const SIBLINGS = [
+    "security-www-authenticate",
+    "security-auth-malformed",
+    "security-session-not-auth",
+    "security-token-in-uri",
+  ];
+
+  async function probes(
+    stubOpts: SecurityStubOptions,
+    runOpts: { only: string[]; headers?: Record<string, string>; timeout?: number },
+  ): Promise<Record<string, string>> {
+    const stub = await startSecurityStub({ token: TOKEN, ...stubOpts });
+    try {
+      const report = await runComplianceSuite(stub.url, {
+        timeout: runOpts.timeout ?? 800,
+        specVersion: "2025-11-25",
+        only: runOpts.only,
+        ...(runOpts.headers ? { headers: runOpts.headers } : {}),
+      });
+      return Object.fromEntries(report.tests.map((t) => [t.id, `${t.passed ? "PASS" : "FAIL"}: ${t.details}`]));
+    } finally {
+      await stub.stop();
+    }
+  }
+
+  const REINIT = "lifecycle-reinit-reject";
+
+  it("lifecycle-reinit-reject: a second initialize nothing answers is 'server unreachable', not a rejection", async () => {
+    // Before: PASS "Connection rejected (acceptable)" for a request that
+    // sat unanswered until the deadline.
+    const hung = await probes({ reinit: "hang" }, { only: [REINIT] });
+    expect(hung[REINIT]).toBe("FAIL: server unreachable: the second initialize got no response within 800ms");
+  }, 30_000);
+
+  it("lifecycle-reinit-reject: a connection dropped on the duplicate, next to the served handshake, is a rejection", async () => {
+    const dropped = await probes({ reinit: "drop" }, { only: [REINIT] });
+    expect(dropped[REINIT]).toBe(
+      "PASS: Connection closed without a response (other side closed) (re-initialization rejected)",
+    );
+  }, 30_000);
+
+  it("lifecycle-reinit-reject: a server that dropped the handshake too pins nothing on the duplicate", async () => {
+    // Every request is dropped (no credential is configured, so the gate
+    // drops the handshake as well): there is no served comparison, and a
+    // server that drops everything must not read as one that rejects a
+    // second initialize.
+    const dropped = await probes({ noAuth: "drop" }, { only: [REINIT] });
+    expect(dropped[REINIT]).toBe(
+      "FAIL: server unreachable: the second initialize got no response (connection closed: other side closed)",
+    );
+  }, 30_000);
+
+  it("lifecycle-reinit-reject: a server that answers the duplicate keeps its verdict", async () => {
+    const served = await probes({}, { only: [REINIT] });
+    expect(served[REINIT]).toBe(
+      "FAIL: Server accepted second initialize (HTTP 200) — should reject duplicate initialization",
+    );
+  }, 30_000);
+
+  it("the auth probes: a connection dropped on each, next to the served credentialed handshake, is a rejection", async () => {
+    // Before: PASS "Connection rejected (acceptable)" -- the same verdict a
+    // server that drops every request got.
+    const verdicts = await probes({ noAuth: "drop", session: true }, { only: SIBLINGS, headers: AUTH });
+    expect(verdicts).toEqual({
+      "security-www-authenticate":
+        "PASS: Connection closed without a response (other side closed) — not a 401 response, no challenge to check",
+      "security-auth-malformed":
+        "PASS: Connection closed without a response (other side closed) (malformed auth rejected)",
+      "security-session-not-auth":
+        "PASS: Connection closed without a response (other side closed) (session ID alone not sufficient for auth)",
+      "security-token-in-uri":
+        "PASS: Connection closed without a response (other side closed) (token in query string not accepted)",
+    });
+  }, 30_000);
+
+  it("the auth probes: a timeout measured nothing, so each fails as 'server unreachable'", async () => {
+    const verdicts = await probes({ noAuth: "hang", session: true }, { only: SIBLINGS, headers: AUTH });
+    expect(verdicts).toEqual({
+      "security-www-authenticate": "FAIL: server unreachable: unauthenticated ping got no response within 800ms",
+      "security-auth-malformed":
+        "FAIL: server unreachable: the ping carrying a malformed credential got no response within 800ms",
+      "security-session-not-auth":
+        "FAIL: server unreachable: the ping carrying only the session ID got no response within 800ms",
+      "security-token-in-uri":
+        "FAIL: server unreachable: the ping with the token in the query string got no response within 800ms",
+    });
+  }, 30_000);
+
+  it("the auth probes: a server that drops the credentialed handshake too pins nothing on the missing credential", async () => {
+    // The credential does not match, so the gate drops every request, the
+    // handshake included: there is no served comparison, and a server that
+    // drops everything must not read as one that rejects unauthenticated
+    // requests.
+    const verdicts = await probes(
+      { noAuth: "drop", session: true },
+      { only: SIBLINGS, headers: { Authorization: "Bearer not-the-configured-token" } },
+    );
+    expect(verdicts["security-www-authenticate"]).toBe(
+      "FAIL: server unreachable: unauthenticated ping got no response (connection closed: other side closed)",
+    );
+    // session-not-auth needs a session id the dropped handshake never issued.
+    expect(verdicts["security-session-not-auth"]).toBe("PASS: Skipped: server does not issue session IDs");
+    for (const id of ["security-auth-malformed", "security-token-in-uri"]) {
+      expect(verdicts[id], id).toMatch(/^FAIL: server unreachable: /);
+    }
+  }, 30_000);
+
+  const ORIGIN = "security-origin-validation";
+
+  it("security-origin-validation: a connection dropped on the foreign Origin, next to the served handshake, is a rejection", async () => {
+    // Before: PASS "Connection rejected (acceptable)" whatever happened.
+    const dropped = await probes({ token: undefined, foreignOrigin: "drop" }, { only: [ORIGIN] });
+    expect(dropped[ORIGIN]).toBe(
+      "PASS: Connection closed without a response (other side closed) (suspicious Origin rejected)",
+    );
+  }, 30_000);
+
+  it("security-origin-validation: a probe nothing answers is 'server unreachable', not Origin validation", async () => {
+    const hung = await probes({ token: undefined, foreignOrigin: "hang" }, { only: [ORIGIN] });
+    expect(hung[ORIGIN]).toMatch(/^FAIL: server unreachable: the ping carrying a foreign Origin got no response/);
+  }, 30_000);
+
+  it("security-origin-validation: a server that drops the handshake too pins nothing on the Origin", async () => {
+    const verdicts = await probes({ noAuth: "drop" }, { only: [ORIGIN] });
+    expect(verdicts[ORIGIN]).toBe(
+      "FAIL: server unreachable: the ping carrying a foreign Origin got no response (connection closed: other side closed)",
+    );
+  }, 30_000);
+
+  it("security-origin-validation: a server that answers the foreign Origin keeps its verdict", async () => {
+    const served = await probes({ token: undefined }, { only: [ORIGIN] });
+    expect(served[ORIGIN]).toBe(
+      "FAIL: HTTP 200 — server accepted request with untrusted Origin header (spec: MUST validate Origin for DNS rebinding protection)",
+    );
+  }, 30_000);
+
+  it("nothing listening at the address: every one of these probes fails as unreachable", async () => {
+    // The other branch of the reading: a connection that was never
+    // established (ECONNREFUSED) means the server never saw the probe, so
+    // nothing about the defect it carried was decided -- and no served
+    // comparison exists either, since the handshake could not connect.
+    // Before: PASS "Connection rejected (acceptable)" on all five, so a
+    // dead address collected five free passes.
+    const stub = await startSecurityStub({ token: TOKEN, session: true });
+    const dead = stub.url;
+    await stub.stop();
+    const report = await runComplianceSuite(dead, {
+      timeout: 800,
+      specVersion: "2025-11-25",
+      headers: AUTH,
+      only: [REINIT, ...SIBLINGS, ORIGIN],
+    });
+    const verdicts = Object.fromEntries(report.tests.map((t) => [t.id, `${t.passed ? "PASS" : "FAIL"}: ${t.details}`]));
+    const refused = String.raw`got no response \(connection failed: connect ECONNREFUSED 127\.0\.0\.1:\d+\)$`;
+    expect(verdicts[REINIT]).toMatch(new RegExp(`^FAIL: server unreachable: the second initialize ${refused}`));
+    expect(verdicts["security-www-authenticate"]).toMatch(
+      new RegExp(`^FAIL: server unreachable: unauthenticated ping ${refused}`),
+    );
+    expect(verdicts["security-auth-malformed"]).toMatch(
+      new RegExp(`^FAIL: server unreachable: the ping carrying a malformed credential ${refused}`),
+    );
+    expect(verdicts["security-token-in-uri"]).toMatch(
+      new RegExp(`^FAIL: server unreachable: the ping with the token in the query string ${refused}`),
+    );
+    expect(verdicts[ORIGIN]).toMatch(
+      new RegExp(`^FAIL: server unreachable: the ping carrying a foreign Origin ${refused}`),
+    );
+    // No session ID was ever issued, so the session probe has nothing to send.
+    expect(verdicts["security-session-not-auth"]).toBe("PASS: Skipped: server does not issue session IDs");
+  }, 30_000);
+});
+
+describe("runComplianceSuite — legacy auth checks read the configured Authorization header case-insensitively", () => {
+  const TOKEN = "tok-3e9d";
+
+  it("-H 'AUTHORIZATION: ...' configures a credential, so the auth checks run instead of reading the server as open", async () => {
+    // Before: `hasAuth` read only the `Authorization` / `authorization`
+    // keys, so an upper-case header (HTTP header names are
+    // case-insensitive, and the transport's own merge treats them so) made
+    // every auth check behave as if none had been passed: auth-required
+    // graded the served preflight as "does not require auth" and its
+    // siblings skipped.
+    const stub = await startSecurityStub({ token: TOKEN, noAuth: "401", session: true });
+    try {
+      const report = await runComplianceSuite(stub.url, {
+        timeout: 3000,
+        specVersion: "2025-11-25",
+        headers: { AUTHORIZATION: `Bearer ${TOKEN}` },
+        only: [
+          "security-auth-required",
+          "security-www-authenticate",
+          "security-token-in-uri",
+          "security-oauth-metadata",
+        ],
+      });
+      const verdicts = Object.fromEntries(
+        report.tests.map((t) => [t.id, `${t.passed ? "PASS" : "FAIL"}: ${t.details}`]),
+      );
+      expect(verdicts).toEqual({
+        "security-auth-required": "PASS: HTTP 401 (unauthenticated request rejected)",
+        "security-www-authenticate": 'PASS: WWW-Authenticate: Bearer realm="mcp"',
+        // The token really was extracted from the upper-case header and
+        // placed in the query string (before: "Skipped: no --auth provided").
+        "security-token-in-uri": "PASS: HTTP 401 (token in query string rejected)",
+        // The whole --auth-gated set is measured, this one included: the
+        // stub has no Protected Resource Metadata to find.
+        "security-oauth-metadata": "FAIL: PRM endpoint returned HTTP 401 and no legacy OAuth metadata found",
+      });
+      // The probes reached the server carrying no Authorization header,
+      // while the handshake carried the configured one.
+      expect(stub.hits.filter((h) => h.method === "initialize").map((h) => h.authorization)).toEqual([
+        `Bearer ${TOKEN}`,
+      ]);
+      expect(stub.hits.filter((h) => h.method === "ping").map((h) => h.authorization)).toEqual([
+        undefined,
+        undefined,
+        undefined,
+      ]);
+    } finally {
+      await stub.stop();
+    }
+  }, 30_000);
+});
+
+describe("runComplianceSuite — legacy security-auth-required without --auth, next to a served handshake", () => {
+  const ID = "security-auth-required";
+  const TOKEN = "tok-3e9d";
+
+  async function authRequired(stubOpts: SecurityStubOptions): Promise<Verdict> {
+    const stub = await startSecurityStub({ token: TOKEN, ...stubOpts });
+    try {
+      const report = await runComplianceSuite(stub.url, {
+        timeout: 3000,
+        specVersion: "2025-11-25",
+        only: [ID],
+      });
+      return verdictOf(report, ID);
+    } finally {
+      await stub.stop();
+    }
+  }
+
+  it("a 401 on the preflight does not make a server that served initialize unauthenticated one that requires auth", async () => {
+    // A gate that exempts the handshake: every other method without a token
+    // draws 401 with a Bearer challenge, and initialize is served. Before:
+    // PASS "HTTP 401 (unauthenticated preflight rejected; pass --auth ...)"
+    // -- crediting the 401 while the same run holds proof the server served
+    // an unauthenticated request.
+    expect(await authRequired({ noAuth: "401", openInitialize: true })).toEqual({
+      passed: false,
+      details:
+        "Server does not require auth: initialize was served with no credential, although the unauthenticated preflight got HTTP 401 (a server that requires authorization rejects every unauthenticated request, initialize included)",
+    });
+  }, 30_000);
+
+  it("the same holds for a 403 carrying a Bearer challenge", async () => {
+    expect(await authRequired({ noAuth: "bearer-403", openInitialize: true })).toEqual({
+      passed: false,
+      details:
+        "Server does not require auth: initialize was served with no credential, although the unauthenticated preflight got HTTP 403 (a server that requires authorization rejects every unauthenticated request, initialize included)",
+    });
+  }, 30_000);
+
+  it("a gate that refuses the handshake too still passes on its 401, with the wording it had", async () => {
+    expect(await authRequired({ noAuth: "401" })).toEqual({
+      passed: true,
+      details:
+        "HTTP 401 (unauthenticated preflight rejected; pass --auth to run the authenticated suite and the remaining auth tests)",
+    });
+  }, 30_000);
+
+  it("a bare 403 next to a served handshake keeps the plain 'does not require auth' wording", async () => {
+    // A bare 403 says nothing about authentication on its own, so there is
+    // no refusal to reconcile with the served handshake.
+    expect(await authRequired({ noAuth: "bare-403", openInitialize: true })).toEqual({
+      passed: false,
+      details: "Server does not require auth (no --auth provided and server accepted unauthenticated requests)",
+    });
   }, 30_000);
 });
 

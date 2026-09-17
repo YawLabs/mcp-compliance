@@ -132,6 +132,53 @@ function noResponse(err: unknown, timeoutMs: number): string {
   return `no response (${how}: ${errorLine(err, 90)})`;
 }
 
+/** One check's verdict, as the legacy suite's test bodies return it. */
+type LegacyOutcome = { passed: boolean; details: string };
+
+/** The verdict for a probe that got no HTTP answer at all: "server unreachable: <what> got no response ...". */
+function unreachable(what: string, err: unknown, timeoutMs: number): LegacyOutcome {
+  return { passed: false, details: `server unreachable: ${what} got ${noResponse(err, timeoutMs)}` };
+}
+
+/**
+ * The verdict for a negative probe (no credential, a token in the query
+ * string, a foreign Origin, a duplicate initialize) that got no HTTP
+ * response, or null when the missing answer counts as the server refusing
+ * the probe. The 2026-07-28 suite's `unansweredProbe` rule, applied to the
+ * 2025-11-25 checks:
+ *
+ * - a run the caller aborted is rethrown, never graded;
+ * - a timeout is never a refusal: the connection stayed open and nothing
+ *   came back, so the probe measured nothing (a hung server or gateway);
+ * - a connection that was never established (ECONNREFUSED, ENOTFOUND, a
+ *   connect timeout) is never a refusal either: the server never saw the
+ *   request, so nothing about the probe's defect was decided;
+ * - an accepted connection the server closed or reset without answering is
+ *   the one shape a connection-level refusal takes (some gateways drop a
+ *   request that lacks a credential instead of answering 401). A drop
+ *   carries no reason, so it counts only when `attributable` -- the
+ *   comparison request that differs from the probe in nothing but the
+ *   defect (the same request carrying the credential, or without the
+ *   offending header) was served, so the defect is what drew the drop.
+ *   Without that comparison a server that drops everything would pass.
+ */
+function unansweredProbe(
+  what: string,
+  err: unknown,
+  attributable: boolean,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+): LegacyOutcome | null {
+  if (signal?.aborted) throw err;
+  if (attributable && classifyTransportError(err) === "dropped") return null;
+  return unreachable(what, err, timeoutMs);
+}
+
+/** "Connection closed without a response (<first line of the error>)" for a drop that counted as a refusal. */
+function closedWithoutResponse(err: unknown): string {
+  return `Connection closed without a response (${errorLine(err, 60)})`;
+}
+
 /** ", JSON-RPC error <code>" when a response body carries a JSON-RPC error, "" otherwise. */
 function rpcErrorSuffix(body: unknown): string {
   const error = (body as { error?: unknown } | null | undefined)?.error;
@@ -1070,6 +1117,16 @@ export async function runComplianceSuite(
     // ── 2. LIFECYCLE SETUP (always runs) ─────────────────────────────
 
     let initRes: any = null;
+    /**
+     * Whether the handshake was served. It is the conformant twin of every
+     * negative probe the suite sends later -- the same request without a
+     * foreign Origin, without a duplicate, without a token in the query
+     * string, and (with `hasAuth`) carrying the credential -- so a probe
+     * that got dropped is pinned on its defect only when this is true. The
+     * 2026-07-28 suite pins the same drops on its setup server/discover
+     * (credentialedDiscoverServed).
+     */
+    const handshakeServed = () => initRes?.body?.result !== undefined;
     // Why the handshake produced no response at all (transport error:
     // timeout, crashed child, refused connection); lifecycle-init prints it.
     let initError: string | null = null;
@@ -1416,8 +1473,15 @@ export async function runComplianceSuite(
             passed: false,
             details: `Server accepted second initialize (HTTP ${res.statusCode}) — should reject duplicate initialization`,
           };
-        } catch {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+        } catch (err: unknown) {
+          // The comparison is the handshake: the same request, served.
+          // A connection dropped on the duplicate is then a (crude)
+          // rejection of it; a timeout or a connection never established
+          // measured nothing, and neither does a drop from a server whose
+          // handshake was not served either.
+          const verdict = unansweredProbe("the second initialize", err, handshakeServed(), timeout, options.signal);
+          if (verdict) return verdict;
+          return { passed: true, details: `${closedWithoutResponse(err)} (re-initialization rejected)` };
         }
       },
     );
@@ -2751,7 +2815,25 @@ export async function runComplianceSuite(
     // Auth & Transport security tests
     // These tests detect whether the server requires authentication.
     // If --auth was passed and the server accepted it, we test with auth stripped.
-    const hasAuth = !!userHeaders.Authorization || !!userHeaders.authorization;
+    //
+    // HTTP header names are case-insensitive (RFC 9110 5.1) and so is the
+    // transport's own merge, so `-H "AUTHORIZATION: Bearer x"` configures a
+    // credential just as `--auth` does: reading only the two spellings
+    // `Authorization` and `authorization` made every auth check behave as
+    // if none had been passed (2026-07-28's context does the same lookup,
+    // case-insensitively).
+    const authorizationHeader = (): string => {
+      const key = Object.keys(userHeaders).find((h) => h.toLowerCase() === "authorization");
+      return key ? userHeaders[key] : "";
+    };
+    const hasAuth = authorizationHeader() !== "";
+
+    /**
+     * Whether a drop on a credential-less probe can be pinned on the
+     * missing credential: --auth was given and the handshake, which carried
+     * it, was served (`handshakeServed`).
+     */
+    const credentialedRequestServed = () => hasAuth && handshakeServed();
 
     /**
      * The legacy ping the auth tests probe with, sent without the
@@ -2853,24 +2935,36 @@ export async function runComplianceSuite(
               if (options.signal?.aborted) throw err;
               // Nothing to compare a dropped connection with: no credential
               // was configured, so it is not pinned on the missing one.
-              return { passed: false, details: `server unreachable: ${what} got ${noResponse(err, timeout)}` };
+              return unreachable(what, err, timeout);
             }
           }
           const refusal = readAuthRefusal(probe, false);
+          const accepted = {
+            passed: false,
+            details: "Server does not require auth (no --auth provided and server accepted unauthenticated requests)",
+          };
+          // Whatever refused this probe, a handshake served with no
+          // credential IS the server serving an unauthenticated request:
+          // the run holds proof of acceptance, so no refusal of another
+          // request makes the server one that requires authorization.
+          if (handshakeServed()) {
+            // A bare 403 (or no refusal at all) says nothing about
+            // authentication on its own, so the plain wording stands. A
+            // 401, or a 403 with a Bearer challenge, did ask for a
+            // credential: name both halves rather than either alone.
+            if (!refusal || refusal.kind === "forbidden") return accepted;
+            return {
+              passed: false,
+              details: `Server does not require auth: initialize was served with no credential, although the ${what} got HTTP ${refusal.statusCode} (a server that requires authorization rejects every unauthenticated request, initialize included)`,
+            };
+          }
           if (refusal && refusal.kind !== "forbidden") {
             return {
               passed: true,
               details: `HTTP ${refusal.statusCode} (${rejected}; pass --auth to run the authenticated suite and the remaining auth tests)`,
             };
           }
-          const accepted = {
-            passed: false,
-            details: "Server does not require auth (no --auth provided and server accepted unauthenticated requests)",
-          };
           if (refusal) {
-            // Whatever refused this request, a handshake served without any
-            // credential shows the server accepts unauthenticated requests.
-            if (initRes?.body?.result !== undefined) return accepted;
             // The handshake was the other unauthenticated request of this
             // run. A gateway can refuse server/discover (a method outside its
             // policy) with a bare 403 and every method it allows, without a
@@ -2900,20 +2994,25 @@ export async function runComplianceSuite(
           res = await unauthenticatedPing();
         } catch (err: unknown) {
           if (options.signal?.aborted) throw err;
-          const unreachable = `server unreachable: unauthenticated ping got ${noResponse(err, timeout)}`;
+          const unmeasured = unreachable("unauthenticated ping", err, timeout);
           // A timeout or a connection never established measured nothing. A
           // connection the server accepted and closed without answering is
           // how some gateways refuse a request that lacks a credential, but
           // it carries no reason: it counts only when the same ping with the
           // credential is served, so the credential is what drew the drop.
-          if (classifyTransportError(err) !== "dropped") return { passed: false, details: unreachable };
+          // This check asks a twin ping live (its outcome goes into the
+          // details); its siblings read the served handshake instead.
+          if (classifyTransportError(err) !== "dropped") return unmeasured;
           const twin = await credentialedPing();
           if (!twin.served) {
-            return { passed: false, details: `${unreachable}; the same ping with the credential ${twin.outcome}` };
+            return {
+              passed: false,
+              details: `${unmeasured.details}; the same ping with the credential ${twin.outcome}`,
+            };
           }
           return {
             passed: true,
-            details: `Connection closed without a response (${errorLine(err, 60)}); the same request with the credential was served (unauthenticated request rejected)`,
+            details: `${closedWithoutResponse(err)}; the same request with the credential was served (unauthenticated request rejected)`,
           };
         }
         const refusal = readAuthRefusal(res, false);
@@ -2987,8 +3086,23 @@ export async function runComplianceSuite(
             return { passed: true, details: "HTTP 403 (WWW-Authenticate not applicable for 403)" };
           }
           return { passed: true, details: `HTTP ${res.statusCode} — not a 401 response` };
-        } catch {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+        } catch (err: unknown) {
+          // A drop is a refusal only next to the served handshake, which
+          // carried the credential this ping omits. Either way there is no
+          // 401 and no challenge to read: the refusal is the "not a 401"
+          // pass, the rest is a server that answered nothing.
+          const verdict = unansweredProbe(
+            "unauthenticated ping",
+            err,
+            credentialedRequestServed(),
+            timeout,
+            options.signal,
+          );
+          if (verdict) return verdict;
+          return {
+            passed: true,
+            details: `${closedWithoutResponse(err)} — not a 401 response, no challenge to check`,
+          };
         }
       },
     );
@@ -3020,8 +3134,19 @@ export async function runComplianceSuite(
             return { passed: true, details: `HTTP ${res.statusCode} (malformed auth rejected)` };
           }
           return { passed: false, details: `HTTP ${res.statusCode} — server accepted malformed auth token` };
-        } catch (_err: unknown) {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+        } catch (err: unknown) {
+          // The probe differs from the served handshake only in the
+          // credential it carries, so a drop is pinned on that; a timeout
+          // or a failed connection measured nothing.
+          const verdict = unansweredProbe(
+            "the ping carrying a malformed credential",
+            err,
+            credentialedRequestServed(),
+            timeout,
+            options.signal,
+          );
+          if (verdict) return verdict;
+          return { passed: true, details: `${closedWithoutResponse(err)} (malformed auth rejected)` };
         }
       },
     );
@@ -3126,8 +3251,18 @@ export async function runComplianceSuite(
             passed: false,
             details: `HTTP ${res.statusCode} — server accepted session ID without auth (spec: MUST NOT use sessions for authentication)`,
           };
-        } catch {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+        } catch (err: unknown) {
+          // The session-only probe differs from the served handshake in
+          // nothing but the missing credential, so a drop is pinned on it.
+          const verdict = unansweredProbe(
+            "the ping carrying only the session ID",
+            err,
+            credentialedRequestServed(),
+            timeout,
+            options.signal,
+          );
+          if (verdict) return verdict;
+          return { passed: true, details: `${closedWithoutResponse(err)} (session ID alone not sufficient for auth)` };
         }
       },
     );
@@ -3215,8 +3350,7 @@ export async function runComplianceSuite(
           return { passed: true, details: "Skipped: no --auth provided" };
         }
         if (authNotEvaluable) return authNotEvaluableSkip;
-        const authValue = userHeaders.Authorization || userHeaders.authorization || "";
-        const token = authValue.replace(/^Bearer\s+/i, "");
+        const token = authorizationHeader().replace(/^Bearer\s+/i, "");
         if (!token) {
           return { passed: true, details: "Skipped: could not extract token from auth header" };
         }
@@ -3255,8 +3389,18 @@ export async function runComplianceSuite(
             };
           }
           return { passed: true, details: `HTTP ${res.statusCode} (token in query string not accepted)` };
-        } catch {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+        } catch (err: unknown) {
+          // The probe differs from the served handshake only in where the
+          // token travels, so a drop is pinned on that.
+          const verdict = unansweredProbe(
+            "the ping with the token in the query string",
+            err,
+            credentialedRequestServed(),
+            timeout,
+            options.signal,
+          );
+          if (verdict) return verdict;
+          return { passed: true, details: `${closedWithoutResponse(err)} (token in query string not accepted)` };
         }
       },
     );
@@ -3334,8 +3478,19 @@ export async function runComplianceSuite(
             return { passed: true, details: `HTTP ${res.statusCode} (suspicious Origin rejected)` };
           }
           return { passed: false, details: `HTTP ${res.statusCode}` };
-        } catch {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+        } catch (err: unknown) {
+          // The probe is the handshake's request plus a foreign Origin, so
+          // a drop is pinned on the Origin when that handshake was served
+          // (no credential needed here: the Origin is the one variable).
+          const verdict = unansweredProbe(
+            "the ping carrying a foreign Origin",
+            err,
+            handshakeServed(),
+            timeout,
+            options.signal,
+          );
+          if (verdict) return verdict;
+          return { passed: true, details: `${closedWithoutResponse(err)} (suspicious Origin rejected)` };
         }
       },
     );
@@ -3712,7 +3867,7 @@ export async function runComplianceSuite(
                 details: `HTTP ${status} on a 1 MB ${where} -- not evaluable: an auth gate answered before the server read the request (${authRefusalHint(refusal, "pass --auth")})`,
               };
             }
-            if (refusal && initRes?.body?.result === undefined) {
+            if (refusal && !handshakeServed()) {
               const quoted = refusal.message ? ` (${JSON.stringify(refusal.message)})` : "";
               return {
                 passed: false,

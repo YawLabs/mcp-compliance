@@ -599,6 +599,38 @@ out explicitly here.
     auth", and with `--auth` they skip as `Skipped: not evaluable (see
     security-auth-required)` rather than crediting a bare 403 that
     `security-auth-required` refused to credit.
+- **Every auth and transport probe now reads a refusal the same way, in both
+  suites.** Follow-ups to the entry above, which had left the sibling checks
+  behind:
+  - The five 2025-11-25 probes that still answered a transport error with
+    `Connection rejected (acceptable)` -- `security-www-authenticate`,
+    `security-auth-malformed`, `security-session-not-auth`,
+    `security-token-in-uri`, `security-origin-validation`, and the
+    re-initialization check -- passed a timeout, a refused connection, an
+    unparseable answer and even a cancelled run as a rejection. Each now fails
+    as `server unreachable` unless the comparison it relies on was served (the
+    same request carrying the credential, or without the offending Origin), and
+    a caller's abort is rethrown instead of graded.
+  - `--auth` was detected by looking for the literal header keys
+    `Authorization` and `authorization`, so `-H "AUTHORIZATION: Bearer ..."`
+    made the whole auth suite behave as if no credential had been given. Header
+    names are now matched case-insensitively in both suites.
+  - Without `--auth`, a 401 on the preflight passed even when `initialize` was
+    then served with no credential at all. A server that answers an
+    unauthenticated `initialize` has accepted an unauthenticated request,
+    whatever the preflight said, so that now fails as not requiring auth -- the
+    reading a bare 403 already got.
+  - 2026-07-28 `security-www-authenticate` passed *any* 403 as "not
+    applicable", including the bare 403 `security-auth-required` refuses to
+    attribute to authentication. It now reads a Bearer-challenged 403 as the
+    refusal it is and skips as not evaluable on a bare one, like its
+    2025-11-25 counterpart; `security-auth-malformed` takes the same skip, and
+    `security-oauth-metadata` no longer treats a bare 403 as proof the server
+    is auth-protected before going on to well-known discovery.
+  - 2026-07-28 `security-auth-required` called every non-401/403 answer an
+    accepted unauthenticated request. Only a 2xx is; a 4xx that is not 401/403
+    refused the request without asking for a credential, a 5xx failed on it,
+    and a 3xx redirected it. Each is worded for what it is.
 
 ## [0.18.2] — 2026-09-15
 

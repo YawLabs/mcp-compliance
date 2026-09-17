@@ -187,6 +187,36 @@ describe("integration — full compliance suite against real server", () => {
     expect(report.warnings.filter((w) => w.startsWith("security-oversized-input"))).toEqual([]);
   }, 30000);
 
+  it("the checks that used to swallow a transport error keep their verdicts on the SDK server", async () => {
+    // Every one of these answered its probe, so reading the failure the
+    // 2026-07-28 way changes nothing: the server rejects the duplicate
+    // initialize, the auth probes have no credential to strip, and the
+    // foreign Origin is accepted (the SDK's DNS-rebinding protection is
+    // off by default in this setup).
+    const report = await runComplianceSuite(serverUrl, {
+      timeout: 3000,
+      only: [
+        "lifecycle-reinit-reject",
+        "security-www-authenticate",
+        "security-auth-malformed",
+        "security-session-not-auth",
+        "security-token-in-uri",
+        "security-origin-validation",
+      ],
+    });
+    const verdicts = Object.fromEntries(report.tests.map((t) => [t.id, `${t.passed ? "PASS" : "FAIL"}: ${t.details}`]));
+    expect(verdicts).toEqual({
+      "lifecycle-reinit-reject":
+        "PASS: Re-initialization rejected with error: -32600 — Invalid Request: Server already initialized",
+      "security-www-authenticate": "PASS: Skipped: no --auth provided",
+      "security-auth-malformed": "PASS: Skipped: no --auth provided",
+      "security-session-not-auth": "PASS: Skipped: no --auth provided",
+      "security-token-in-uri": "PASS: Skipped: no --auth provided",
+      "security-origin-validation":
+        "FAIL: HTTP 200 — server accepted request with untrusted Origin header (spec: MUST validate Origin for DNS rebinding protection)",
+    });
+  }, 30000);
+
   it("has no preflight warning for reachable server", async () => {
     const report = await runComplianceSuite(serverUrl, { timeout: 3000 });
     expect(report.warnings.some((w) => w.includes("unreachable"))).toBe(false);
