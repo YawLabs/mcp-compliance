@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -799,6 +800,25 @@ describe("classifyTransportError: reads what the error is, from real transport f
     }
   });
 
+  it("a pipe write to a stdio child that exited partway through reading the line is 'dropped' on every platform: EOF on Windows, EPIPE on POSIX", async () => {
+    // The raw failure itself, as the pipe reports it: the child takes 200 KB
+    // of a 1 MB line and exits while the rest is still being written.
+    const child = spawn(
+      process.execPath,
+      ["-e", "let n = 0; process.stdin.on('data', (c) => { n += c.length; if (n > 200 * 1024) process.exit(3); });"],
+      { stdio: ["pipe", "ignore", "ignore"] },
+    );
+    const exitCode = new Promise((resolve) => child.once("exit", resolve));
+    // The write callback reports the failure; the stream's 'error' event repeats it.
+    child.stdin.on("error", () => {});
+    const broken = await new Promise<unknown>((resolve) => {
+      child.stdin.write(`${"A".repeat(1024 * 1024)}\n`, (err) => resolve(err ?? new Error("the write succeeded")));
+    });
+    expect(await exitCode).toBe(3);
+    expect(broken).toMatchObject({ code: process.platform === "win32" ? "EOF" : "EPIPE", syscall: "write" });
+    expect(classifyTransportError(broken)).toBe("dropped");
+  });
+
   it("anything else is 'other', and a user abort is not a timeout", () => {
     expect(classifyTransportError(new Error("Aborted by user"))).toBe("other");
     expect(classifyTransportError(new Error("stdio transport: spawn failed -- ENOENT"))).toBe("other");
@@ -1561,7 +1581,17 @@ interface InlineOptions {
    * request with an HTML 429 (Retry-After: 1) and serves the rest (a rate
    * limiter in front of a server that is still up); "throttled-then-bad-
    * gateway" answers the next one 429 and every later one 502 (a
-   * rate-limiting gateway whose backend went away).
+   * rate-limiting gateway whose backend went away); "throttled-forever"
+   * answers every later one 429 (a limiter whose window outlasts the retry,
+   * or one that blocks a client that sent an attack payload);
+   * "throttled-then-blocked" answers the next one 429 and every later one
+   * the "blocked" 403; "throttled-then-die" answers the next one 429 and
+   * then stops listening. "unavailable" answers every later /mcp request
+   * with HTTP 503 and a JSON-RPC -32000 error (an MCP-aware gateway whose
+   * backend went away). "token-revoked" answers every later /mcp request
+   * with a 401 carrying `Bearer error="invalid_token"` and an OAuth error
+   * body (a gateway revoking the token after an attack payload);
+   * "token-revoked-403" the same challenge on a 403.
    */
   afterDrop?:
     | "die"
@@ -1572,14 +1602,27 @@ interface InlineOptions {
     | "size-gated"
     | "hang"
     | "throttled"
-    | "throttled-then-bad-gateway";
+    | "throttled-then-bad-gateway"
+    | "throttled-forever"
+    | "throttled-then-blocked"
+    | "throttled-then-die"
+    | "unavailable"
+    | "token-revoked"
+    | "token-revoked-403";
   /**
    * The answer to every tools/call: a -32602 naming the unknown argument
    * ("rpc-error"; "rpc-error-string-code" the same error with the string
-   * code "E_ARGS"), an HTTP 500 carrying a JSON-RPC error, or a 200 envelope
-   * with neither result nor error ("no-result").
+   * code "E_ARGS"), an HTTP 500 carrying a JSON-RPC error, a 200 envelope
+   * with neither result nor error ("no-result"), or bytes written straight
+   * to the socket that are not an HTTP response at all ("not-http").
    */
-  toolsCallAnswer?: "rpc-error" | "rpc-error-string-code" | 500 | "no-result";
+  toolsCallAnswer?: "rpc-error" | "rpc-error-string-code" | 500 | "no-result" | "not-http";
+  /**
+   * Rewrite the code of every JSON-RPC error object the server sends as
+   * application/json: "string" sends it as a string ("-32601"), "missing"
+   * leaves it out.
+   */
+  errorCodes?: "string" | "missing";
   /**
    * Stop listening once this many tools/call have been answered (the
    * answer carries Connection: close so the next call opens a new
@@ -1886,9 +1929,18 @@ function sseFrame(message: unknown): string {
 
 function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
   /** Set once a tools/call was dropped under an afterDrop that keeps listening but stops serving. */
-  let backendDown: "bad-gateway" | "blocked" | "blocked-scope" | "blocked-challenge" | "size-gated" | "hang" | null =
-    null;
-  /** /mcp requests still to be answered 429 (afterDrop "throttled", "throttled-then-bad-gateway"). */
+  let backendDown:
+    | "bad-gateway"
+    | "blocked"
+    | "blocked-scope"
+    | "blocked-challenge"
+    | "size-gated"
+    | "hang"
+    | "unavailable"
+    | "token-revoked"
+    | "token-revoked-403"
+    | null = null;
+  /** /mcp requests still to be answered 429 (the "throttled" afterDrop modes; Infinity for "throttled-forever"). */
   let throttleNext = 0;
   let posts = 0;
   let unauthenticatedSeen = 0;
@@ -1968,9 +2020,24 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
       }
       if (opts.cors === "wildcard") cors["Access-Control-Allow-Origin"] = "*";
       if (opts.cors === "fixed") cors["Access-Control-Allow-Origin"] = "https://app.example.com";
+      /** `obj` with the code of its JSON-RPC error object rewritten as `errorCodes` asks. */
+      const recoded = (obj: unknown): unknown => {
+        const error = (obj as { error?: unknown } | null)?.error;
+        if (!opts.errorCodes || !error || typeof error !== "object") return obj;
+        const { code, ...rest } = error as { code?: unknown };
+        return { ...(obj as object), error: opts.errorCodes === "string" ? { code: String(code), ...rest } : rest };
+      };
       const json = (status: number, obj: unknown, extra: Record<string, string> = {}) => {
         res.writeHead(status, { "Content-Type": "application/json", ...cors, ...extra });
-        res.end(JSON.stringify(obj));
+        res.end(JSON.stringify(recoded(obj)));
+      };
+      /** The id of the JSON-RPC request in the body, or null when there is none to read. */
+      const requestId = () => {
+        try {
+          return JSON.parse(body.toString("utf8")).id ?? null;
+        } catch {
+          return null;
+        }
       };
       const html = (status: number, page: string) => {
         res.writeHead(status, { "Content-Type": "text/html; charset=utf-8", ...cors });
@@ -2013,8 +2080,28 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
       }
       if (throttleNext > 0) {
         throttleNext--;
+        const page = "<html><body>429 Too Many Requests</body></html>";
+        if (throttleNext === 0 && opts.afterDrop === "throttled-then-die") {
+          // The limiter's last answer, on a connection the client will not
+          // reuse; then the process is gone and the next request is refused.
+          res.writeHead(429, { "Content-Type": "text/html; charset=utf-8", "Retry-After": "1", Connection: "close" });
+          return res.end(page, () => {
+            server.close();
+            server.closeAllConnections?.();
+          });
+        }
         res.writeHead(429, { "Content-Type": "text/html; charset=utf-8", "Retry-After": "1" });
-        return res.end("<html><body>429 Too Many Requests</body></html>");
+        return res.end(page);
+      }
+      if (backendDown === "unavailable") {
+        return json(503, { jsonrpc: "2.0", id: requestId(), error: { code: -32000, message: "Backend unavailable" } });
+      }
+      if (backendDown === "token-revoked" || backendDown === "token-revoked-403") {
+        res.writeHead(backendDown === "token-revoked" ? 401 : 403, {
+          "Content-Type": "application/json",
+          "WWW-Authenticate": 'Bearer error="invalid_token", error_description="The access token was revoked"',
+        });
+        return res.end(JSON.stringify({ error: "invalid_token", error_description: "The access token was revoked" }));
       }
       if (backendDown === "bad-gateway") return html(502, "<html><body>502 Bad Gateway</body></html>");
       if (backendDown === "blocked") return html(403, "<html><body>Request blocked</body></html>");
@@ -2060,13 +2147,7 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         return json(401, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Missing API key" } });
       }
       if (opts.queryToken && url.searchParams.has("access_token")) {
-        const id = (() => {
-          try {
-            return JSON.parse(body.toString("utf8")).id ?? null;
-          } catch {
-            return null;
-          }
-        })();
+        const id = requestId();
         const error = { code: -32001, message: "Query-string tokens are not accepted" };
         const rpcError = { jsonrpc: "2.0", id, error };
         const rpcResult = { jsonrpc: "2.0", id, result: { resultType: "complete", supportedVersions: [] } };
@@ -2225,14 +2306,25 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
               case "blocked-challenge":
               case "size-gated":
               case "hang":
+              case "unavailable":
+              case "token-revoked":
+              case "token-revoked-403":
                 backendDown = opts.afterDrop;
                 break;
               case "throttled":
+              case "throttled-then-die":
                 throttleNext = 1;
                 break;
               case "throttled-then-bad-gateway":
                 throttleNext = 1;
                 backendDown = "bad-gateway";
+                break;
+              case "throttled-then-blocked":
+                throttleNext = 1;
+                backendDown = "blocked";
+                break;
+              case "throttled-forever":
+                throttleNext = Number.POSITIVE_INFINITY;
                 break;
             }
             if (opts.afterDrop === "die") {
@@ -2240,6 +2332,11 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
               server.closeAllConnections?.();
             }
             return req.socket.destroy();
+          }
+          if (opts.toolsCallAnswer === "not-http") {
+            // A broken proxy or a handler writing to the raw socket: undici
+            // cannot parse it as an HTTP response.
+            return req.socket.end("NOT-HTTP garbage\r\n\r\n");
           }
           if (opts.toolsCallAnswer === "rpc-error-string-code") {
             return json(200, {
@@ -2791,6 +2888,7 @@ describe("inline servers: extra-params tells a slow tool from a dead server", ()
   let droppedThenGone: DirectRun;
   let refused: DirectRun;
   let died: DirectRun;
+  let slowStdio: DirectRun;
   let dir = "";
 
   beforeAll(async () => {
@@ -2829,6 +2927,34 @@ describe("inline servers: extra-params tells a slow tool from a dead server", ()
       ].join("\n"),
     );
     died = await runDirect({ command: { command: process.execPath, args: [script] }, only: ["security-extra-params"] });
+    // A stdio server that never answers tools/call but stays up, logging
+    // words a crash diagnostic also uses; the transport appends that stderr
+    // below its timeout line.
+    const slowScript = join(dir, "slow-on-call.mjs");
+    writeFileSync(
+      slowScript,
+      [
+        'import { createInterface } from "node:readline";',
+        "const rl = createInterface({ input: process.stdin });",
+        'const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");',
+        'rl.on("line", (line) => {',
+        "  let msg;",
+        "  try { msg = JSON.parse(line); } catch { return; }",
+        "  if (msg.id === undefined) return;",
+        '  const result = (r) => send({ jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", ...r } });',
+        '  if (msg.method === "server/discover") return result({ supportedVersions: ["2026-07-28"], capabilities: { tools: {} }, ttlMs: 0, cacheScope: "public" });',
+        '  if (msg.method === "tools/list") return result({ tools: [{ name: "slow", inputSchema: { type: "object", properties: {} } }], ttlMs: 0, cacheScope: "public" });',
+        '  if (msg.method === "tools/call") return void process.stderr.write("upstream connection closed; worker terminated by signal SIGTERM, retrying\\n");',
+        '  send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });',
+        "});",
+        "",
+      ].join("\n"),
+    );
+    slowStdio = await runDirect({
+      command: { command: process.execPath, args: [slowScript] },
+      only: [EXTRA],
+      timeout: 1500,
+    });
   }, 30_000);
 
   afterAll(async () => {
@@ -2889,6 +3015,21 @@ describe("inline servers: extra-params tells a slow tool from a dead server", ()
       /^FAIL: server died on unknown tool arguments \(tools\/call boom\): .*exit code 3/,
     );
     expectAsciiDetails(died.tests, ["security-extra-params"]);
+  });
+
+  it("a stdio timeout is inconclusive even when the child's stderr says 'closed' and 'terminated': the child is still up", () => {
+    // Before baf003b: FAIL "server died on unknown tool arguments (tools/call
+    // slow): stdio transport: request timed out after 1500ms ... child
+    // stderr: upstream connection closed; worker terminated by signal
+    // SIGTERM", read from the stderr the transport appends.
+    expect(verdicts(slowStdio.tests, [EXTRA])).toEqual({ [EXTRA]: "pass" });
+    expect(detailsOf(slowStdio.tests, EXTRA)).toBe(
+      "tools/call slow did not answer within 1500ms -- extra-params verdict inconclusive (see warning)",
+    );
+    expect(slowStdio.warnings.filter((w) => w.startsWith("security-extra-params:"))).toEqual([
+      "security-extra-params: tools/call slow with unknown arguments did not answer within 1500ms; the server was still up, so the verdict is inconclusive (not a crash). Re-run with a larger --timeout or a faster first tool.",
+    ]);
+    expectAsciiDetails(slowStdio.tests, [EXTRA]);
   });
 });
 
@@ -3375,8 +3516,13 @@ describe("inline servers: injection payloads that take the server down", () => {
   let droppedThenThrottled: DirectRun;
   let throttledServer: InlineServer;
   let droppedThenThrottledGone: DirectRun;
+  let throttledForeverServer: InlineServer;
+  let droppedThenThrottledBlocked: DirectRun;
+  let droppedThenThrottledDied: DirectRun;
+  let droppedThenUnavailable: DirectRun;
   let longNameGone: DirectRun;
   let issueThenGone: DirectRun;
+  let issuesThenGone: DirectRun;
   let slow: DirectRun;
   let goneMidRun: DirectRun;
   let goneAfterIssue: DirectRun;
@@ -3406,7 +3552,19 @@ describe("inline servers: injection payloads that take the server down", () => {
       dropOnToolsCall: /whoami/,
       afterDrop: "die",
     });
+    throttledForeverServer = await startInlineServer({ dropOnToolsCall: true, afterDrop: "throttled-forever" });
+    const k = await startInlineServer({ dropOnToolsCall: true, afterDrop: "throttled-then-blocked" });
+    const l = await startInlineServer({ dropOnToolsCall: true, afterDrop: "throttled-then-die" });
+    const m = await startInlineServer({ dropOnToolsCall: true, afterDrop: "unavailable" });
+    // Answers the first two payloads with id(1) output, drops the third and stops listening.
+    const n = await startInlineServer({
+      tools: "long-param",
+      toolsCallReply: "uid=0(root) gid=0(root)",
+      dropOnToolsCall: /ls -la/,
+      afterDrop: "die",
+    });
     servers.push(a, b, goneServer, c, wafServer, d, e, blockedServer, f, g, throttledServer, h, i, j);
+    servers.push(throttledForeverServer, k, l, m, n);
     dropped = await runDirect({ url: a.url, only: [CMD] });
     waf = await runDirect({ url: wafServer.url, only: [CMD, SQL] });
     droppedThenGone = await runDirect({ url: d.url, only: [CMD] });
@@ -3416,8 +3574,12 @@ describe("inline servers: injection payloads that take the server down", () => {
     droppedThenSizeGated = await runDirect({ url: g.url, only: [CMD] });
     droppedThenThrottled = await runDirect({ url: throttledServer.url, only: [CMD] });
     droppedThenThrottledGone = await runDirect({ url: h.url, only: [CMD] });
+    droppedThenThrottledBlocked = await runDirect({ url: k.url, only: [CMD] });
+    droppedThenThrottledDied = await runDirect({ url: l.url, only: [CMD] });
+    droppedThenUnavailable = await runDirect({ url: m.url, only: [CMD] });
     longNameGone = await runDirect({ url: i.url, only: [CMD] });
     issueThenGone = await runDirect({ url: j.url, only: [CMD] });
+    issuesThenGone = await runDirect({ url: n.url, only: [CMD] });
     slow = await runDirect({ url: b.url, only: [CMD], timeout: 300 });
     goneMidRun = await runDirect({ url: goneServer.url, only: [CMD] });
     goneAfterIssue = await runDirect({ url: c.url, only: [CMD] });
@@ -3574,6 +3736,59 @@ describe("inline servers: injection payloads that take the server down", () => {
     expectAsciiDetails(droppedThenThrottledGone.tests, [CMD]);
   });
 
+  it("a retry answered 429 again counts as gone: one retry, never a loop against a limiter that keeps refusing", async () => {
+    // Run here rather than in beforeAll: a regression that retries every
+    // 429 would loop against this limiter, and the bounded test timeout
+    // turns that hang into this test's failure.
+    const run = await runDirect({ url: throttledForeverServer.url, only: [CMD] });
+    expect(verdicts(run.tests, [CMD])).toEqual({
+      [CMD]:
+        'FAIL: server may have crashed: connection dropped on payload "; cat /etc/passwd" sent to sink.data: other side closed; server/discover then answered HTTP 429, then after 1000ms answered HTTP 429, non-JSON-RPC body',
+    });
+    // The seed discover, the throttled follow-up and its one retry; nothing
+    // after the crash verdict.
+    expect(run.recorder.sent.filter((m) => m.method === "server/discover")).toHaveLength(3);
+    expect(throttledForeverServer.calls).toHaveLength(1);
+    expect(run.warnings.filter((w) => w.startsWith("security injection"))).toEqual([]);
+    expectAsciiDetails(run.tests, [CMD]);
+  }, 20_000);
+
+  it("the retry's answer decides by the same rules: a 403 gate after the wait is survived, no response after it is gone", () => {
+    expect(verdicts(droppedThenThrottledBlocked.tests, [CMD])).toEqual({ [CMD]: "pass" });
+    expect(detailsOf(droppedThenThrottledBlocked.tests, CMD)).toBe(
+      `Tested 5 payload(s) against sink.data: 0 rejected, 0 returned without evidence of execution, 5 ${UNREACHED} -- inconclusive (see warning)`,
+    );
+    expect(droppedThenThrottledBlocked.warnings.filter((w) => w.startsWith("security injection"))).toEqual([
+      dropWarning(
+        "a follow-up server/discover answered HTTP 429, then after 1000ms was still answered (HTTP 403, a gate in front of the server such as a WAF or IPS now blocking this client)",
+      ),
+      ALL_UNREACHED_WARNING,
+    ]);
+    // The seed discover, the throttled follow-up and the retry the gate answered.
+    expect(droppedThenThrottledBlocked.recorder.sent.filter((m) => m.method === "server/discover")).toHaveLength(3);
+    // The limiter's last answer, then the process was gone: the retry was
+    // refused (the 220-character limit clips the error after its code).
+    expect(verdicts(droppedThenThrottledDied.tests, [CMD])).toEqual({
+      [CMD]:
+        'FAIL: server may have crashed: connection dropped on payload "; cat /etc/passwd" sent to sink.data: other side closed; server/discover then answered HTTP 429, then after 1000ms got no response (connection failed: connect EC...',
+    });
+    expect(droppedThenThrottledDied.recorder.sent.filter((m) => m.method === "server/discover")).toHaveLength(3);
+    expect(droppedThenThrottledDied.warnings.filter((w) => w.startsWith("security injection"))).toEqual([]);
+    expectAsciiDetails(droppedThenThrottledBlocked.tests, [CMD]);
+    expectAsciiDetails(droppedThenThrottledDied.tests, [CMD]);
+  });
+
+  it("a JSON-RPC error answering the follow-up server/discover is no proof the server is up, and the failure quotes its code", () => {
+    // An MCP-aware gateway answering for a backend that went away: an
+    // error envelope, not a served discover.
+    expect(verdicts(droppedThenUnavailable.tests, [CMD])).toEqual({
+      [CMD]:
+        'FAIL: server may have crashed: connection dropped on payload "; cat /etc/passwd" sent to sink.data: other side closed; server/discover then answered HTTP 503, JSON-RPC error -32000',
+    });
+    expect(droppedThenUnavailable.warnings.filter((w) => w.startsWith("security injection"))).toEqual([]);
+    expectAsciiDetails(droppedThenUnavailable.tests, [CMD]);
+  });
+
   it("the crash conclusion survives the 220-character limit with a long tool.param name, and after an earlier issue", () => {
     // Before: the details were clipped at "...connect ECONNREFUSED
     // 127.0.0.1:NNNNN) (s...", losing "(server may have crashed)".
@@ -3591,6 +3806,20 @@ describe("inline servers: injection payloads that take the server down", () => {
     expect(both.length).toBeLessThanOrEqual(220);
     expectAsciiDetails(longNameGone.tests, [CMD]);
     expectAsciiDetails(issueThenGone.tests, [CMD]);
+  });
+
+  it("two issues before the crash are clipped to leave the crash clause its conclusion within 220 characters", () => {
+    // The joined evidence of two payloads is far past the room the crash
+    // clause leaves, so the issues are what gets clipped, and the crash
+    // clause keeps its first 60 characters. Reserving no room for it
+    // clipped the crash clause at a negative length instead and ran the
+    // details past 400 characters.
+    expect(verdicts(issuesThenGone.tests, [CMD])).toEqual({
+      [CMD]:
+        'FAIL: Payload "; cat /etc/passwd" appears to have executed in search_knowledge_base_articles.query_text (output: uid=0(root) gid=0(root)); Payload "$(whoami)" ap...; server may have crashed: connection dropped on payload "|...',
+    });
+    expect(detailsOf(issuesThenGone.tests, CMD)).toHaveLength(220);
+    expectAsciiDetails(issuesThenGone.tests, [CMD]);
   });
 
   it("a stdio child that exits on a payload fails as died; the next test finds it gone and is unreachable", () => {
@@ -3880,29 +4109,62 @@ describe("stdio servers: an oversized reply the runner drops, and a child that d
   let overflowThenExit: DirectRun;
   let earlierDrop: DirectRun;
   let spoofed: DirectRun;
+  let partialRead: DirectRun;
+  /** Uncaught exceptions raised while the partialRead run was under way. */
+  const partialReadUncaught: unknown[] = [];
 
-  /** A stdio server exposing one read-only `data` tool, with `onCall` lines deciding what tools/call does. */
-  const stdioScript = (name: string, tool: string, onCall: string[]) => {
+  /**
+   * A stdio server exposing one read-only `data` tool, with `onCall` lines
+   * deciding what tools/call does. It reads its input with readline, which
+   * takes in a whole line before handing it over -- unless `capLineBytes` is
+   * set: then it reads chunks and exits with code 3 as soon as a line grows
+   * past that many bytes without a newline, partway through reading it.
+   */
+  const stdioScript = (name: string, tool: string, onCall: string[], capLineBytes?: number) => {
     const script = join(dir, name);
-    writeFileSync(
-      script,
-      [
-        'import { createInterface } from "node:readline";',
-        "const rl = createInterface({ input: process.stdin });",
-        'const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");',
-        'rl.on("line", (line) => {',
-        "  let msg;",
-        "  try { msg = JSON.parse(line); } catch { return; }",
-        "  if (msg.id === undefined) return;",
-        '  const result = (r) => send({ jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", ...r } });',
-        '  if (msg.method === "server/discover") return result({ supportedVersions: ["2026-07-28"], capabilities: { tools: {} }, ttlMs: 0, cacheScope: "public" });',
-        `  if (msg.method === "tools/list") return result({ tools: [{ name: "${tool}", inputSchema: { type: "object", properties: { data: { type: "string" } } }, annotations: { readOnlyHint: true } }], ttlMs: 0, cacheScope: "public" });`,
-        ...onCall,
-        '  send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });',
-        "});",
-        "",
-      ].join("\n"),
-    );
+    const send = 'const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");';
+    const handler = [
+      "  let msg;",
+      "  try { msg = JSON.parse(line); } catch { return; }",
+      "  if (msg.id === undefined) return;",
+      '  const result = (r) => send({ jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", ...r } });',
+      '  if (msg.method === "server/discover") return result({ supportedVersions: ["2026-07-28"], capabilities: { tools: {} }, ttlMs: 0, cacheScope: "public" });',
+      `  if (msg.method === "tools/list") return result({ tools: [{ name: "${tool}", inputSchema: { type: "object", properties: { data: { type: "string" } } }, annotations: { readOnlyHint: true } }], ttlMs: 0, cacheScope: "public" });`,
+      ...onCall,
+      '  send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });',
+    ];
+    const lines =
+      capLineBytes === undefined
+        ? [
+            'import { createInterface } from "node:readline";',
+            "const rl = createInterface({ input: process.stdin });",
+            send,
+            'rl.on("line", (line) => {',
+            ...handler,
+            "});",
+          ]
+        : [
+            send,
+            "const handle = (line) => {",
+            ...handler,
+            "};",
+            'let buffered = "";',
+            'process.stdin.setEncoding("utf8");',
+            'process.stdin.on("data", (chunk) => {',
+            "  buffered += chunk;",
+            "  let idx;",
+            '  while ((idx = buffered.indexOf("\\n")) !== -1) {',
+            "    const line = buffered.slice(0, idx);",
+            "    buffered = buffered.slice(idx + 1);",
+            "    handle(line);",
+            "  }",
+            `  if (buffered.length > ${capLineBytes}) {`,
+            '    process.stderr.write("input line too long, exiting\\n");',
+            "    process.exit(3);",
+            "  }",
+            "});",
+          ];
+    writeFileSync(script, [...lines, ""].join("\n"));
     return { command: process.execPath, args: [script] };
   };
 
@@ -3950,6 +4212,22 @@ describe("stdio servers: an oversized reply the runner drops, and a child that d
     overflowThenExit = await runDirect({ command: echoThenExit, only: [ID] });
     earlierDrop = await runDirect({ command: staleDrop, only: [INJECTION, ID], timeout: 2000 });
     spoofed = await runDirect({ command: markerOnStderr, only: [ID], timeout: 2000 });
+    // Caps its input lines at 200 KB and exits the moment one grows past
+    // that, while the rest of the 1 MB line is still being written: the
+    // write fails (EOF on Windows, EPIPE on POSIX) a moment before the exit
+    // is reported, and the child's stdin stream emits that failure as an
+    // 'error' event on a later tick, where nothing awaited can catch it.
+    const capsLines = stdioScript("caps-lines.mjs", "cap", [], 200 * 1024);
+    const trap = (err: unknown) => {
+      partialReadUncaught.push(err);
+    };
+    process.on("uncaughtException", trap);
+    try {
+      partialRead = await runDirect({ command: capsLines, only: [ID] });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } finally {
+      process.off("uncaughtException", trap);
+    }
   }, 60_000);
 
   afterAll(() => {
@@ -3982,6 +4260,25 @@ describe("stdio servers: an oversized reply the runner drops, and a child that d
     );
     expect(overflowThenExit.warnings.filter((w) => w.startsWith("security-oversized-input:"))).toEqual([]);
     expectAsciiDetails(overflowThenExit.tests, [ID]);
+  });
+
+  it("a child that exits partway through reading the 1 MB line fails as died on every platform, and its broken pipe is not thrown uncaught", () => {
+    // Before (baf003b): on Windows PASS "Connection rejected (acceptable for
+    // oversized input): write EOF" -- EOF was not a drop and the exit had not
+    // been reported yet -- and on every platform an uncaught "write EOF" /
+    // "write EPIPE", which ends the CLI with no report at all.
+    expect(partialReadUncaught).toEqual([]);
+    expect(verdicts(partialRead.tests, [ID])[ID]).toMatch(
+      // The exit rejects the pending call; the exit wait running out first
+      // (a loaded machine) rejects it as stdin closed. Both are the server gone.
+      /^FAIL: server died on a 1 MB cap\.data: (server crashed with exit code 3 before completing the request|stdio transport: stdin is closed: the server stopped reading its input \(write (EOF|EPIPE)\))/,
+    );
+    // The 1 MB value went out, and nothing after it did.
+    const calls = partialRead.recorder.sent.filter((m) => m.method === "tools/call");
+    expect(calls).toHaveLength(1);
+    expect(String((calls[0].params as any)?.arguments?.data).length).toBeGreaterThanOrEqual(1_000_000);
+    expect(partialRead.warnings.filter((w) => w.startsWith("security-oversized-input:"))).toEqual([]);
+    expectAsciiDetails(partialRead.tests, [ID]);
   });
 
   it("a reply dropped earlier in the run does not turn a later 1 MB timeout into survived", () => {
@@ -4442,11 +4739,11 @@ describe("inline servers: an abort during an auth probe is rethrown, not graded"
   });
 
   /**
-   * Run `id` alone against `server`, abort once the server has received
-   * `requests` requests (the setup discover, then the probe it holds open),
-   * and return every result the harness emitted.
+   * Run `id` alone against `server`, abort `settleMs` after the server has
+   * received `requests` requests (the setup discover, then the probe it
+   * holds open), and return every result the harness emitted.
    */
-  const abortDuring = async (server: InlineServer, id: string, requests: number) => {
+  const abortDuring = async (server: InlineServer, id: string, requests: number, settleMs = 0) => {
     const controller = new AbortController();
     const completed: TestResult[] = [];
     const run = runDirect({
@@ -4463,6 +4760,7 @@ describe("inline servers: an abort during an auth probe is rethrown, not graded"
       timeout: 20_000,
       interval: 10,
     });
+    if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
     controller.abort(new Error("user abort"));
     await rejected;
     return completed.map((r) => [r.id, r.passed, r.details]);
@@ -4508,6 +4806,26 @@ describe("inline servers: an abort during an auth probe is rethrown, not graded"
     expect(await abortDuring(server, "security-auth-malformed", 2)).toEqual([
       ["security-auth-malformed", false, "Error: user abort"],
     ]);
+  }, 60_000);
+
+  it("security-oversized-input: an abort while the 1 MB tools/call is held is not graded as a timeout", async () => {
+    // The setup discover, tools/list, then the 1 MB call the server has
+    // read in full and holds; the abort lands ~100ms later.
+    const server = await startInlineServer({ slowToolsCall: 20_000 });
+    servers.push(server);
+    expect(await abortDuring(server, "security-oversized-input", 3, 100)).toEqual([
+      ["security-oversized-input", false, "Error: user abort"],
+    ]);
+    expect(server.calls.map((c) => String(c.args.data).length)).toEqual([1_000_000]);
+  }, 60_000);
+
+  it("security-extra-params: an abort while the unknown-arguments tools/call is held is not graded as inconclusive", async () => {
+    const server = await startInlineServer({ slowToolsCall: 20_000 });
+    servers.push(server);
+    expect(await abortDuring(server, "security-extra-params", 3, 100)).toEqual([
+      ["security-extra-params", false, "Error: user abort"],
+    ]);
+    expect(server.calls.map((c) => Object.keys(c.args))).toEqual([["__injected_param__", "__proto__"]]);
   }, 60_000);
 });
 
@@ -4580,23 +4898,50 @@ describe("inline servers: error codes and follow-up refusals read as the rest of
   const CMD = "security-command-injection";
   const OVERSIZED = "security-oversized-input";
   const EXTRA = "security-extra-params";
+  const AUTH_REQUIRED = "security-auth-required";
+  const ORIGIN = "security-origin-validation";
+  const MALFORMED = "security-auth-malformed";
+  const RUG_PULL = "security-tool-rug-pull";
+  const TOKEN_IN_URI = "security-token-in-uri";
+  const AUTH = { Authorization: "Bearer tok" };
   const servers: InlineServer[] = [];
   let noCode: DirectRun;
   let stringCode: DirectRun;
   let challengeNoAuth: DirectRun;
   let challengeWithAuth: DirectRun;
+  let revoked401: DirectRun;
+  let revoked403: DirectRun;
+  let followUpStringCode: DirectRun;
+  let discoverNoCode: DirectRun;
+  let malformedStringCode: DirectRun;
+  let secondListNoCode: DirectRun;
+  let queryTokenStringCode: DirectRun;
 
   beforeAll(async () => {
     const a = await startInlineServer({ bigBody: "rpc-error-no-code" });
     const b = await startInlineServer({ toolsCallAnswer: "rpc-error-string-code" });
     const c = await startInlineServer({ dropOnToolsCall: true, afterDrop: "blocked-challenge" });
     const d = await startInlineServer({ dropOnToolsCall: true, afterDrop: "blocked-challenge" });
-    servers.push(a, b, c, d);
+    const e = await startInlineServer({ dropOnToolsCall: true, afterDrop: "token-revoked" });
+    const f = await startInlineServer({ dropOnToolsCall: true, afterDrop: "token-revoked-403" });
+    const g = await startInlineServer({ dropOnToolsCall: true, afterDrop: "unavailable", errorCodes: "string" });
+    const h = await startInlineServer({ discover: "error", errorCodes: "missing" });
+    const i = await startInlineServer({ auth: "strict-400", errorCodes: "string" });
+    const j = await startInlineServer({ secondList: "error", errorCodes: "missing" });
+    const k = await startInlineServer({ auth: "strict", queryToken: "json-error", errorCodes: "string" });
+    servers.push(a, b, c, d, e, f, g, h, i, j, k);
     noCode = await runDirect({ url: a.url, only: [OVERSIZED] });
     stringCode = await runDirect({ url: b.url, only: [EXTRA] });
     challengeNoAuth = await runDirect({ url: c.url, only: [CMD] });
-    challengeWithAuth = await runDirect({ url: d.url, only: [CMD], headers: { Authorization: "Bearer tok" } });
-  }, 30_000);
+    challengeWithAuth = await runDirect({ url: d.url, only: [CMD], headers: AUTH });
+    revoked401 = await runDirect({ url: e.url, only: [CMD], headers: AUTH });
+    revoked403 = await runDirect({ url: f.url, only: [CMD], headers: AUTH });
+    followUpStringCode = await runDirect({ url: g.url, only: [CMD] });
+    discoverNoCode = await runDirect({ url: h.url, only: [AUTH_REQUIRED, ORIGIN] });
+    malformedStringCode = await runDirect({ url: i.url, only: [MALFORMED], headers: AUTH });
+    secondListNoCode = await runDirect({ url: j.url, only: [RUG_PULL] });
+    queryTokenStringCode = await runDirect({ url: k.url, only: [TOKEN_IN_URI], headers: AUTH });
+  }, 60_000);
 
   afterAll(async () => {
     for (const s of servers) await s.close();
@@ -4627,6 +4972,117 @@ describe("inline servers: error codes and follow-up refusals read as the rest of
     expect(followUp(challengeWithAuth)).toContain(
       "a follow-up server/discover was still answered (HTTP 403, a gate in front of the server such as a WAF or IPS now blocking this client), so",
     );
+  });
+
+  it("with --auth, a follow-up 401 or 403 whose Bearer challenge says invalid_token is an auth gate refusing the credential: the drop was survived", () => {
+    // A gateway revoking the token after an attack payload: the credential
+    // is refused, so something in front of the server is still answering.
+    const followUp = (run: DirectRun) =>
+      run.warnings.find((w) => w.startsWith("security injection tests: a tools/call to sink.data"));
+    for (const [run, status] of [
+      [revoked401, 401],
+      [revoked403, 403],
+    ] as const) {
+      expect(verdicts(run.tests, [CMD])).toEqual({ [CMD]: "pass" });
+      // Every later payload met the same refusal: nothing reached the tool.
+      expect(detailsOf(run.tests, CMD)).toBe(
+        `Tested 5 payload(s) against sink.data: 0 rejected, 0 returned without evidence of execution, 5 ${UNREACHED} -- inconclusive (see warning)`,
+      );
+      expect(followUp(run)).toContain(
+        `but a follow-up server/discover was still answered (HTTP ${status}, an auth gate), so the payload is counted as never reaching the tool rather than as a crash.`,
+      );
+      expect(run.recorder.sent.filter((m) => m.method === "server/discover")).toHaveLength(2);
+      expectAsciiDetails(run.tests, [CMD]);
+    }
+  });
+
+  // A string or missing error code is named as sent wherever a check quotes
+  // a JSON-RPC error answer. Each of these sites once read err.code, which
+  // a string or missing code turns into NaN.
+
+  it("names a string code as sent in the follow-up server/discover after a drop", () => {
+    expect(verdicts(followUpStringCode.tests, [CMD])).toEqual({
+      [CMD]:
+        'FAIL: server may have crashed: connection dropped on payload "; cat /etc/passwd" sent to sink.data: other side closed; server/discover then answered HTTP 503, JSON-RPC error with non-integer code "-32000"',
+    });
+    expectAsciiDetails(followUpStringCode.tests, [CMD]);
+  });
+
+  it("names a missing code as such in auth-required and origin-validation", () => {
+    expect(verdicts(discoverNoCode.tests, [AUTH_REQUIRED, ORIGIN])).toEqual({
+      [AUTH_REQUIRED]:
+        "FAIL: HTTP 200, JSON-RPC error with no code -- server accepted unauthenticated request (no --auth provided)",
+      [ORIGIN]:
+        "FAIL: HTTP 200, JSON-RPC error with no code -- server accepted a request with an untrusted Origin (MUST validate Origin, 403)",
+    });
+    expectAsciiDetails(discoverNoCode.tests, [AUTH_REQUIRED, ORIGIN]);
+  });
+
+  it("names a string code as sent in auth-malformed", () => {
+    expect(verdicts(malformedStringCode.tests, [MALFORMED])).toEqual({
+      [MALFORMED]:
+        'FAIL: well-formed invalid token: HTTP 400, JSON-RPC error with non-integer code "-32600" -- expected 401 (invalid tokens MUST receive 401)',
+    });
+    expectAsciiDetails(malformedStringCode.tests, [MALFORMED]);
+  });
+
+  it("names a missing code as such in tool-rug-pull's second tools/list", () => {
+    expect(verdicts(secondListNoCode.tests, [RUG_PULL])).toEqual({
+      [RUG_PULL]: "FAIL: Second tools/list call failed (JSON-RPC error with no code)",
+    });
+    expectAsciiDetails(secondListNoCode.tests, [RUG_PULL]);
+  });
+
+  it("names a string code as sent in token-in-uri, which reads its raw body itself", () => {
+    expect(verdicts(queryTokenStringCode.tests, [TOKEN_IN_URI])).toEqual({ [TOKEN_IN_URI]: "pass" });
+    expect(detailsOf(queryTokenStringCode.tests, TOKEN_IN_URI)).toBe(
+      'HTTP 200, JSON-RPC error with non-integer code "-32001" (token in query string not accepted)',
+    );
+    expectAsciiDetails(queryTokenStringCode.tests, [TOKEN_IN_URI]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A tools/call answered with bytes that are not an HTTP response at all:
+// neither an answer the checks accept as a rejection nor a dropped
+// connection, so security-oversized-input and security-extra-params both
+// fail it as no usable response.
+// ---------------------------------------------------------------------------
+
+describe("inline servers: a tools/call answered with bytes that are not HTTP", () => {
+  const OVERSIZED = "security-oversized-input";
+  const EXTRA = "security-extra-params";
+  let server: InlineServer;
+  let run: DirectRun;
+
+  beforeAll(async () => {
+    server = await startInlineServer({ toolsCallAnswer: "not-http" });
+    run = await runDirect({ url: server.url, only: [OVERSIZED, EXTRA] });
+  }, 30_000);
+
+  afterAll(async () => {
+    await server.close();
+  });
+
+  it("security-extra-params fails as no usable response, naming the parse error", () => {
+    expect(verdicts(run.tests, [EXTRA])[EXTRA]).toMatch(
+      /^FAIL: no usable response to unknown tool arguments \(tools\/call sink\): Response does not match the HTTP\/1\.1 protocol/,
+    );
+  });
+
+  it("security-oversized-input reads the same garbage the same way: not a rejection of the 1 MB value", () => {
+    // Before: PASS "Connection rejected (acceptable for oversized input):
+    // Response does not match the HTTP/1.1 protocol (Expected HTTP/, RTSP/
+    // or ICE/)", though no HTTP status, JSON-RPC error or closed connection
+    // refused anything.
+    expect(verdicts(run.tests, [OVERSIZED])[OVERSIZED]).toMatch(
+      /^FAIL: no usable response to a 1 MB sink\.data: Response does not match the HTTP\/1\.1 protocol/,
+    );
+    expect(run.warnings.filter((w) => w.startsWith("security-oversized-input:"))).toEqual([]);
+    // Both calls reached the server, and neither was followed by a server/discover: nothing was dropped.
+    expect(server.calls.map((c) => c.name)).toEqual(["sink", "sink"]);
+    expect(run.recorder.sent.filter((m) => m.method === "server/discover")).toHaveLength(1);
+    expectAsciiDetails(run.tests, [OVERSIZED, EXTRA]);
   });
 });
 

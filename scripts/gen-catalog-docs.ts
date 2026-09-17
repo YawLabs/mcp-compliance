@@ -529,12 +529,12 @@ const C: Record<string, Criteria> = {
   },
   "security-oversized-input": {
     pass: `A roughly 1 MB string in the first string argument that is not header-mirrored (a mirrored one only when no other exists, noted in the details) draws HTTP 413 or another 4xx on HTTP, or a JSON-RPC error on either transport; a completed result passes with a warning, and so does a reply to that call that overflowed the runner's stdio line buffer while the child kept running (an earlier overflow in the run, or the same marker text on the server's own stderr, does not count); on HTTP a connection closed on the 1 MB body passes only when a follow-up server/discover is then served or refused with 401/403 (a 429 retried once). Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
-    fail: `A 5xx status, a timeout, a broken stdio frame, a stdio child that dies (even after overflowing the line buffer), an HTTP connection dropped on the 1 MB body after which server/discover is neither served nor refused with 401/403, or a server already unreachable (a refused connection, a dead child). ${LIST_FAILED_FAIL("tools")}`,
+    fail: `A 5xx status, a timeout, a broken stdio frame, no usable HTTP response (bytes that are not an HTTP response), a stdio child that dies (even after overflowing the line buffer, or partway through reading the 1 MB line), an HTTP connection dropped on the 1 MB body after which server/discover is neither served nor refused with 401/403, or a server already unreachable (a refused connection, a dead child). ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-extra-params": {
     pass: `Arguments with properties the first tool's inputSchema does not define are rejected with a JSON-RPC error or ignored with a normal result; a call that times out, or an HTTP connection dropped on the call after which a follow-up server/discover is served or refused with 401/403 (a 429 retried once), passes with a warning (inconclusive). Skipped when the server declares or lists no tools. ${LIST_FAILED_SKIP("tools")}`,
-    fail: `A 5xx status, a malformed or unusable response, a stdio child that exits, an HTTP connection dropped on the call after which server/discover is neither served nor refused with 401/403, or a server already unreachable (a refused connection, a dead child). ${LIST_FAILED_FAIL("tools")}`,
+    fail: `A 5xx status, a malformed or unusable response (no result or error, or bytes that are not an HTTP response), a stdio child that exits, an HTTP connection dropped on the call after which server/discover is neither served nor refused with 401/403, or a server already unreachable (a refused connection, a dead child). ${LIST_FAILED_FAIL("tools")}`,
     gate: "tools",
   },
   "security-tool-schema-defined": {

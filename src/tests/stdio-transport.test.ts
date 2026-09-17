@@ -61,6 +61,25 @@ function recordSignals(scriptPath: string): string[] {
   return signals;
 }
 
+/**
+ * Records every uncaught exception from here until release(): an 'error'
+ * event nothing listens for is thrown on a later tick, where no await in
+ * the test can see it, and it would end the CLI's process.
+ */
+function trapUncaught(): { errors: unknown[]; release(): void } {
+  const errors: unknown[] = [];
+  const onError = (err: unknown) => {
+    errors.push(err);
+  };
+  process.on("uncaughtException", onError);
+  return { errors, release: () => process.off("uncaughtException", onError) };
+}
+
+/** The line a caller reads an error by: the transport appends the child's stderr below it. */
+function firstLineOf(err: unknown): string {
+  return (err instanceof Error ? err.message : String(err)).split("\n")[0];
+}
+
 describe("StdioTransport", () => {
   let openTransports: StdioTransport[] = [];
   let tempFiles: string[] = [];
@@ -388,6 +407,118 @@ describe("StdioTransport", () => {
     return { t, serverPath, serverPid: Number(readFileSync(readyFile, "utf8")) };
   }
 
+  const ONE_MB = 1024 * 1024;
+
+  it.each([
+    [
+      "request()",
+      (t: StdioTransport): Promise<unknown> =>
+        t.request("tools/call", { name: "echo", arguments: { data: "A".repeat(ONE_MB) } }, createIdCounter(800), {
+          timeout: 20_000,
+        }),
+      // The pending request is settled by the exit itself.
+      "server crashed with exit code 3 before completing the request",
+    ],
+    [
+      "writeRaw()",
+      (t: StdioTransport): Promise<unknown> => t.writeRaw("A".repeat(ONE_MB)),
+      // Nothing pending: the failed write waits for the exit and names it.
+      "stdio transport: server crashed with exit code 3 before completing the request",
+    ],
+  ])("a %s whose 1 MB line the child exits partway through reading rejects with the exit diagnostic, and nothing is thrown uncaught", async (_, send, expected) => {
+    // A server that caps its input: it reads chunks (not readline, which
+    // takes the whole line first) and exits once 200 KB arrived, while the
+    // rest of the line is still being written. The write fails -- EPIPE on
+    // POSIX, EOF on Windows -- a moment before the child's exit is reported,
+    // and the stdin stream emits that failure as an 'error' event too.
+    const trap = trapUncaught();
+    try {
+      const { t } = await readyServer("partial-read-exit", [
+        "let read = 0;",
+        'process.stdin.on("data", (chunk) => { read += chunk.length; if (read > 200 * 1024) process.exit(3); });',
+        "setInterval(() => {}, 1000);",
+      ]);
+      const started = Date.now();
+      const failure = await send(t).then(
+        () => new Error("the write succeeded"),
+        (err: unknown) => err,
+      );
+      // Not a bare "write EPIPE" / "write EOF": the suites read this line as
+      // the server going away (security.ts STDIO_GONE) and quote it.
+      expect(firstLineOf(failure)).toBe(expected);
+      // Settled by the exit, not by the 20s request timeout.
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(t.exited).toBe(true);
+      expect(t.exitCode).toBe(3);
+      // The stream's 'error' event is emitted on a later tick than the write callback.
+      await new Promise((r) => setTimeout(r, 100));
+      expect(trap.errors).toEqual([]);
+    } finally {
+      trap.release();
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "a write to a child that closed its stdin but keeps running rejects as stdin closed once the exit wait runs out (POSIX)",
+    async () => {
+      // On Windows the child is spawned through cmd.exe, which keeps its own
+      // handle on the pipe: a server closing its stdin does not break it.
+      const trap = trapUncaught();
+      let serverPid: number | undefined;
+      try {
+        const server = await readyServer("stdin-closed", [
+          'require("node:fs").closeSync(0);',
+          "setInterval(() => {}, 1000);",
+        ]);
+        const t = server.t;
+        serverPid = server.serverPid;
+        const started = Date.now();
+        const failure = await t.writeRaw("A".repeat(ONE_MB)).then(
+          () => new Error("the write succeeded"),
+          (err: unknown) => err,
+        );
+        const elapsed = Date.now() - started;
+        expect(firstLineOf(failure)).toBe(
+          "stdio transport: stdin is closed: the server stopped reading its input (write EPIPE)",
+        );
+        expect((failure as Error).cause).toMatchObject({ code: "EPIPE" });
+        // It gave the child the exit wait first, and no longer.
+        expect(elapsed).toBeGreaterThanOrEqual(900);
+        expect(elapsed).toBeLessThan(10_000);
+        expect(t.exited).toBe(false);
+        await new Promise((r) => setTimeout(r, 100));
+        expect(trap.errors).toEqual([]);
+      } finally {
+        trap.release();
+        // It can read nothing, so EOF would not end it: spare afterEach the EOF window.
+        if (serverPid !== undefined && isAlive(serverPid)) process.kill(serverPid, "SIGKILL");
+      }
+    },
+  );
+
+  it("a write once close() has ended stdin rejects at once as stdin closed, without an uncaught 'error' event", async () => {
+    const trap = trapUncaught();
+    try {
+      const t = spawn();
+      // Answered first, so the child has spawned and the write reaches stdin.
+      await t.request("ping", undefined, createIdCounter(900), { timeout: 5000 });
+      const closing = t.close();
+      const started = Date.now();
+      const failure = await t.writeRaw("{}").then(
+        () => new Error("the write succeeded"),
+        (err: unknown) => err,
+      );
+      expect(firstLineOf(failure)).toBe("stdio transport: stdin is closed");
+      // Not held for the exit wait: the runner closed the pipe itself.
+      expect(Date.now() - started).toBeLessThan(500);
+      await closing;
+      await new Promise((r) => setTimeout(r, 100));
+      expect(trap.errors).toEqual([]);
+    } finally {
+      trap.release();
+    }
+  });
+
   it("close() lets a server that exits on stdin EOF finish its shutdown work: no signal is sent and no killer is spawned", async () => {
     // The spec's stdio shutdown: close stdin, wait for the server to exit, and
     // terminate it only if it does not. This server takes a moment after EOF
@@ -447,6 +578,92 @@ describe("StdioTransport", () => {
       if (isAlive(serverPid)) process.kill(serverPid, "SIGKILL");
     }
   });
+
+  it.skipIf(process.platform === "win32")(
+    "close() gives a server that ignores stdin EOF but cleans up on SIGTERM the whole grace before SIGKILL (POSIX)",
+    async () => {
+      // Still busy, so EOF does not end it; on SIGTERM it spends 500ms
+      // releasing what it holds (flushing state, removing a lock file) and
+      // exits cleanly. A SIGKILL sent before that ends it mid-cleanup.
+      const stamp = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const markerFile = join(tmpdir(), `mcp-compliance-cleaned-${stamp}.txt`);
+      tempFiles.push(markerFile);
+      const { t, serverPath, serverPid } = await readyServer(
+        "sigterm-cleanup",
+        [
+          "setInterval(() => {}, 1000);",
+          "process.stdin.resume();",
+          'process.on("SIGTERM", () => setTimeout(() => { require("node:fs").writeFileSync(process.argv[3], "cleaned up"); process.exit(0); }, 500));',
+        ],
+        [markerFile],
+      );
+      const signals = recordSignals(serverPath);
+      try {
+        await t.close();
+        expect(existsSync(markerFile) ? readFileSync(markerFile, "utf8") : "no marker written").toBe("cleaned up");
+        expect(t.exited).toBe(true);
+        // Exited on its own after the cleanup, not killed (exitCode null).
+        expect(t.exitCode).toBe(0);
+        expect(signals).toEqual(["SIGTERM"]);
+      } finally {
+        if (isAlive(serverPid)) process.kill(serverPid, "SIGKILL");
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "close() survives a taskkill that cannot be spawned: it does not throw, resolves within its bound and reports exited:false (Windows)",
+    async () => {
+      // Busy, so EOF does not end it and close() goes on to the forced tree
+      // kill -- which fails to start here: no directory on PATH holds
+      // taskkill.exe (the run's own environment lacks System32), so the
+      // spawn emits ENOENT instead of running.
+      const { t, serverPid } = await readyServer("taskkill-missing", [
+        "setInterval(() => {}, 1000);",
+        "process.stdin.resume();",
+      ]);
+      const trap = trapUncaught();
+      const savedPath = process.env.PATH;
+      let bound: NodeJS.Timeout | undefined;
+      try {
+        process.env.PATH = tmpdir();
+        const started = Date.now();
+        const closing = t.close();
+        try {
+          // The PATH lookup happens inside spawn(): once taskkill was spawned
+          // (and failed), this worker gets its PATH back.
+          await vi.waitFor(() => expect(taskkillsFor(t.pid)).toHaveLength(1), { timeout: 10_000, interval: 10 });
+        } finally {
+          process.env.PATH = savedPath;
+        }
+        // Raced against a bound of its own, so a close() that hangs fails
+        // here -- and the finally below still kills the server -- instead of
+        // timing the test out.
+        const closed = await Promise.race([
+          closing.then(() => "resolved"),
+          new Promise((resolve) => {
+            bound = setTimeout(() => resolve("still pending after 15s"), 15_000);
+          }),
+        ]);
+        const elapsed = Date.now() - started;
+        expect(closed).toBe("resolved");
+        // The EOF window first, then the bounded wait for a kill that never came.
+        expect(elapsed).toBeGreaterThanOrEqual(1900);
+        expect(taskkillsFor(t.pid)).toEqual([`/pid ${t.pid} /t /f`]);
+        // Nothing killed the server, and close() does not claim otherwise.
+        expect(t.exited).toBe(false);
+        expect(isAlive(serverPid)).toBe(true);
+        expect(trap.errors).toEqual([]);
+      } finally {
+        clearTimeout(bound);
+        process.env.PATH = savedPath;
+        trap.release();
+        if (isAlive(serverPid)) process.kill(serverPid);
+      }
+      // With the server gone, cmd.exe (the transport's own child) exits too.
+      await vi.waitFor(() => expect(t.exited).toBe(true), { timeout: 5000, interval: 50 });
+    },
+  );
 
   it("close() returns at once when the child never spawned: there is no process to wait for", async () => {
     // A working directory that does not exist fails the spawn itself on every

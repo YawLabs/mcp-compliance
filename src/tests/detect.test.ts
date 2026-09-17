@@ -1082,6 +1082,13 @@ describe("auth-gated server with a rejected --auth credential", () => {
       'the 403\'s Bearer error="invalid_request" challenge means the request is malformed (an unsupported parameter, or the token sent more than one way)',
     ],
     [403, "Bearer error=token_revoked", 'the 403\'s Bearer error="token_revoked" challenge refuses the token'],
+    // An escaped quote inside an earlier quoted value (RFC 9110 quoted-pair)
+    // neither ends that value nor hides the error parameter after it.
+    [
+      403,
+      'Bearer error_description="The \\"exp\\" claim, is past", error="invalid_token"',
+      'the 403\'s Bearer error="invalid_token" challenge means the token is invalid or expired (basic/authorization requires a 401 for that)',
+    ],
   ])(
     "HTTP %i with %s: the rejected-credential warning names the challenge's error",
     async (status, challenge, reason) => {
@@ -1710,6 +1717,34 @@ describe("classifyDiscoverResponse", () => {
     );
     expect(noisy?.message).toMatch(/^Invalid \[31mHost: x+\.\.\.$/);
     expect(noisy?.message).toHaveLength(120);
+  });
+
+  it("readAuthRefusal: an escaped quote inside a quoted challenge value is part of the value, so an error parameter after it is still read", () => {
+    // RFC 9110 5.6.4: `\"` inside a quoted-string is a quoted-pair. Read as
+    // the closing quote, the rest of the value splits into bogus challenges
+    // that swallow the `error` after it, and a refused token reads as a
+    // Host/Origin 403.
+    const expired = {
+      "www-authenticate": 'Bearer error_description="The \\"exp\\" claim, is past", error="invalid_token"',
+    };
+    expect(readAuthRefusal({ statusCode: 403, headers: expired }, true)).toEqual({
+      statusCode: 403,
+      authorizationSent: true,
+      kind: "credential-rejected",
+      bearerError: "invalid_token",
+    });
+    expect(refusedCredential(403, expired)).toBe(true);
+    const quotedRealm = { "www-authenticate": 'Bearer realm="say \\"hi\\"", error="insufficient_scope"' };
+    expect(readAuthRefusal({ statusCode: 403, headers: quotedRealm }, true)).toEqual({
+      statusCode: 403,
+      authorizationSent: true,
+      kind: "credential-rejected",
+      bearerError: "insufficient_scope",
+    });
+    // Without a credential sent the same challenge only asks for one.
+    expect(readAuthRefusal({ statusCode: 403, headers: expired }, false)?.kind).toBe("auth-required");
+    // Text between escaped quotes is still inside the value, never a parameter.
+    expect(refusedCredential(403, { "www-authenticate": 'Bearer realm="a \\"error=invalid_token\\" b"' })).toBe(false);
   });
 
   const withHeaders = (body: unknown, statusCode: number, headers: Record<string, string>): TransportResponse => ({

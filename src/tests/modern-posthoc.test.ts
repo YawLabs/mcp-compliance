@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getTestDefinitionMap } from "../definitions/index.js";
 import { createHarness } from "../harness.js";
-import { createModernClient, type ModernClient } from "../modern/client.js";
+import { createModernClient, exchangeEndOf, type ModernClient } from "../modern/client.js";
+import { META } from "../modern/meta.js";
 import { createRecorder, type Recorder } from "../recorder.js";
 import { MODERN_SPEC_VERSION, specBaseFor } from "../spec.js";
 import { createModernState, type ModernState, type ModernSuiteContext } from "../suites/modern/context.js";
@@ -1256,6 +1257,93 @@ describe("2026-07-28 post-hoc tests: a request answered twice (its result plus a
     expect(echo.passed).toBe(false);
     expect(echo.details).toBe(blame(1001));
   });
+
+  /**
+   * Sends the server holds open without a byte, so the client gives up on
+   * its timer: a notification (transport-notification-202), a malformed
+   * body (the error-invalid-json raw probe), a subscriptions/listen whose
+   * headers never arrive (lifecycle-subscriptions-listen). Each one's
+   * exchange ends at its own send. If it did not, the notification or raw
+   * probe would still own the stray first frame of the next request's
+   * double answer and exempt it (a false PASS), and the listen would take
+   * the blame for it.
+   */
+  type Message = { id?: unknown; method?: string } | undefined;
+  const HOLD_TIMEOUT = 300;
+  const GAVE_UP: {
+    label: string;
+    send: (client: ModernClient) => Promise<unknown>;
+    error: RegExp;
+    holds: (message: Message) => boolean;
+    sent: unknown[];
+    blamed: number;
+  }[] = [
+    {
+      label: "a client notification",
+      send: (client) => client.notify("notifications/cancelled", { requestId: 999999 }, { timeout: HOLD_TIMEOUT }),
+      error: /aborted due to timeout/,
+      holds: (m) => m !== undefined && m.id === undefined,
+      sent: [1000, "notifications/cancelled", 1001],
+      blamed: 1001,
+    },
+    {
+      label: "a raw probe",
+      send: (client) => client.raw("{not json", { method: "server/discover", timeout: HOLD_TIMEOUT }),
+      error: /aborted due to timeout/,
+      holds: (m) => m === undefined,
+      sent: [1000, "raw probe", 1001],
+      blamed: 1001,
+    },
+    {
+      label: "a subscriptions/listen",
+      send: (client) => client.stream("subscriptions/listen", { notifications: {} }, { timeout: HOLD_TIMEOUT }),
+      error: new RegExp(`stream timed out after ${HOLD_TIMEOUT}ms`),
+      holds: (m) => m?.method === "subscriptions/listen",
+      sent: [1000, 1001, 1002],
+      blamed: 1002,
+    },
+  ];
+
+  /** twiceAnsweringHttp, except that a POST `holds` matches is held open and never answered. */
+  function holdingThenTwiceAnsweringHttp(order: Order, holds: (message: Message) => boolean) {
+    const answer = twiceAnsweringHttp(order);
+    return (req: IncomingMessage, res: ServerResponse, body: string) => {
+      let message: Message;
+      try {
+        message = JSON.parse(body) as Message;
+      } catch {
+        message = undefined;
+      }
+      if (holds(message)) return; // the client's timer ends it
+      answer(req, res, body);
+    };
+  }
+
+  it.each(
+    GAVE_UP.flatMap((row) => ORDERS.map((order) => [row.label, order, row] as const)),
+  )("over HTTP SSE after %s the server never answered (the client gave up), %s: FAILS, blamed on tools/list", async (_label, order, {
+    send,
+    error,
+    holds,
+    sent,
+    blamed,
+  }) => {
+    const { results, recorder } = await scanStub(holdingThenTwiceAnsweringHttp(order, holds), async (client) => {
+      await fire(client, "server/discover");
+      await expect(send(client)).rejects.toThrow(error);
+      await fire(client, "tools/list");
+    });
+    expect(recorder.sent.map((s) => (s.raw !== undefined ? "raw probe" : (s.id ?? s.method)))).toEqual(sent);
+    expect(recorder.received.map((r) => (r.message as { id?: unknown }).id)).toEqual(
+      order === "result first" ? [1000, blamed, null] : [1000, null, blamed],
+    );
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed, echo.details).toBe(false);
+    expect(echo.details).toBe(blame(blamed));
+    // Why: nothing came back on the send the client gave up on, so its exchange ends where it was sent.
+    const gaveUp = recorder.sent[1] as (typeof recorder.sent)[number];
+    expect(exchangeEndOf(gaveUp)).toBe(gaveUp.seq);
+  });
 });
 
 describe("2026-07-28 post-hoc tests: the cancel a stdio stream's close() writes is recorded", () => {
@@ -1573,6 +1661,68 @@ describe("2026-07-28 post-hoc tests: messages that arrive while no request is pe
       expectPassed(
         results,
         POSTHOC_IDS.filter((id) => id !== "lifecycle-log-level-gating"),
+      );
+    } finally {
+      await transport.close();
+    }
+  });
+
+  it("over real stdio: a log written after the null-id error that answered a tools/call which set logLevel is outside any request, not credited to that call", async () => {
+    // A failing handler whose error loses the id, then logs the failure
+    // before the suite sends anything else. The stray is the call's answer,
+    // so the call is no longer in flight when the log arrives.
+    const failureLog = {
+      jsonrpc: "2.0",
+      method: "notifications/message",
+      params: { level: "error", data: "handler failed" },
+    };
+    const transport = createStdioTransport({
+      command: process.execPath,
+      args: [
+        scriptedChild([
+          'if (msg.method === "server/discover") send({ jsonrpc: "2.0", id: msg.id, result: discover });',
+          'if (msg.method !== "tools/call") return;',
+          'send({ jsonrpc: "2.0", id: null, error: { code: -32603, message: "handler failed" } });',
+          `send(${JSON.stringify(failureLog)});`,
+        ]),
+      ],
+    });
+    try {
+      const ctx = makeContext(transport);
+      await fire(ctx.client, "server/discover");
+      // The null-id error never resolves the call on stdio: it times out.
+      await expect(
+        ctx.client.rpc(
+          "tools/call",
+          { name: "fail", arguments: {} },
+          { meta: { [META.logLevel]: "debug" }, timeout: SHORT_TIMEOUT },
+        ),
+      ).rejects.toThrow(/timed out/);
+      await vi.waitFor(() => expect(ctx.recorder.received).toHaveLength(3), { timeout: 5000, interval: 10 });
+      expect(ctx.recorder.sent.map((s) => [s.method, s.id, s.meta?.[META.logLevel]])).toEqual([
+        ["server/discover", 1000, undefined],
+        ["tools/call", 1001, "debug"],
+      ]);
+      expect(ctx.recorder.received.map((r) => r.message)).toEqual([
+        discoverReply,
+        { jsonrpc: "2.0", id: null, error: { code: -32603, message: "handler failed" } },
+        failureLog,
+      ]);
+      await runPostHoc(ctx);
+      const results = collect(ctx);
+      const gating = results["lifecycle-log-level-gating"] as TestResult;
+      expect(gating.passed, gating.details).toBe(false);
+      expect(gating.details).toBe(
+        '1 notifications/message (level "error") outside any request without _meta logLevel; 3 server messages scanned (1 notification)',
+      );
+      const echo = results["error-id-echo"] as TestResult;
+      expect(echo.passed).toBe(false);
+      expect(echo.details).toBe(
+        "1 of 1 error response did not echo the request id; first: tools/call sent id 1001, reply carried null",
+      );
+      expectPassed(
+        results,
+        POSTHOC_IDS.filter((id) => id !== "lifecycle-log-level-gating" && id !== "error-id-echo"),
       );
     } finally {
       await transport.close();

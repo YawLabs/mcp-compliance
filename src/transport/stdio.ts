@@ -93,6 +93,15 @@ const EOF_WINDOW_MS = 2000;
 const SIGTERM_GRACE_MS = 2000;
 /** The last, bounded wait for the forced kill to be carried out and the child reaped, in case the kill itself hangs. */
 const KILL_WAIT_MS = 5000;
+/**
+ * How long a write the child's stdin refused waits for the child's 'exit'
+ * event before it rejects. The pipe breaks because the child stopped
+ * reading, nearly always because it is exiting, and the failed write's
+ * callback lands a moment before the exit is reported (0-21ms on Windows,
+ * under 1ms on Linux, measured with a child that exits partway through
+ * reading a 1 MB line): the wait lets the rejection name the exit code.
+ */
+const WRITE_FAILURE_EXIT_WAIT_MS = 1000;
 
 /** Resolves true when `promise` settles within `ms`, false when the bound runs out first. */
 function within(promise: Promise<unknown>, ms: number): Promise<boolean> {
@@ -122,6 +131,9 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
   let protocolVersion: string | null = null;
   let exited = false;
   let exitCode: number | null = null;
+  let exitSignal: NodeJS.Signals | null = null;
+  /** Settles when the child's 'exit' event fires (never, for a spawn that failed). */
+  const childExited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
   let spawnError: Error | null = null;
   let spawned = false;
   const pending = new Map<JsonRpcId, PendingRequest>();
@@ -168,10 +180,20 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
   child.on("exit", (code, signal) => {
     exited = true;
     exitCode = code;
+    exitSignal = signal;
     if (pending.size > 0) {
       rejectAllPending(new Error(exitDiagnostic(code, signal)));
     }
   });
+
+  // A write to a child that is no longer reading -- one that exited
+  // partway through a long line, or closed its stdin -- fails with EPIPE
+  // (POSIX) or EOF (Windows), and so does end() in close() on a pipe that
+  // already broke. The failed write's callback reports it to the caller
+  // (writeLine); the stream then emits 'error' as well, and an 'error' event
+  // nothing listens for is an uncaught exception that ends the whole run
+  // with no report.
+  child.stdin?.on("error", () => {});
 
   child.stdout?.setEncoding("utf8");
   child.stdout?.on("data", (chunk: string) => {
@@ -272,7 +294,12 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     }
     if (spawnError) throw new Error(annotateWithStderr(`stdio transport: spawn failed — ${spawnError.message}`));
     const stdin = child.stdin;
-    if (!stdin || stdin.destroyed) throw new Error(annotateWithStderr("stdio transport: stdin is closed"));
+    // writableEnded: close() has ended stdin (the child may still be running
+    // out its EOF window). A write now could only fail, and after the exit
+    // wait below would read as the server going away on its own.
+    if (!stdin || stdin.destroyed || stdin.writableEnded) {
+      throw new Error(annotateWithStderr("stdio transport: stdin is closed"));
+    }
     // The write callback fires when the data is flushed to the OS pipe.
     // For sequential request() callers (await-pattern), this naturally
     // serializes — each request waits for its own write to flush before
@@ -281,8 +308,27 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     // accept slightly higher memory under burst load rather than
     // building a queue.
     return new Promise<void>((resolve, reject) => {
-      stdin.write(`${line}\n`, "utf8", (err) => (err ? reject(err) : resolve()));
+      stdin.write(`${line}\n`, "utf8", (err) => {
+        if (err) void writeFailure(err).then(reject);
+        else resolve();
+      });
     });
+  }
+
+  /**
+   * The error for a write the child's stdin refused. A bare "write EPIPE"
+   * or "write EOF" does not say the server went away, so wait (bounded) for
+   * the exit the broken pipe nearly always precedes and reject with the
+   * exit diagnostic -- the one a pending request already gets from the exit
+   * itself, which settles it first. A child still running after the wait
+   * closed its stdin: it can read nothing more either.
+   */
+  async function writeFailure(err: Error): Promise<Error> {
+    if (!exited) await within(childExited, WRITE_FAILURE_EXIT_WAIT_MS);
+    const reason = exited
+      ? exitDiagnostic(exitCode, exitSignal)
+      : `stdin is closed: the server stopped reading its input (${err.message})`;
+    return new Error(annotateWithStderr(`stdio transport: ${reason}`), { cause: err });
   }
 
   /**

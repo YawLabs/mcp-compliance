@@ -396,10 +396,13 @@ out explicitly here.
     `server unreachable` instead of "connection dropped".
   - `security-oversized-input` passed every HTTP transport error as "Connection
     rejected (acceptable for oversized input)", including a server that crashed
-    on the 1 MB body and one already unreachable. A dropped connection now
-    passes only when the server is still up afterwards (the same follow-up
-    `server/discover`); otherwise it fails as a possible crash, and a refused
-    connection is `server unreachable`.
+    on the 1 MB body, one already unreachable, and one that answered the call
+    with bytes that are not an HTTP response. A dropped connection now passes
+    only when the server is still up afterwards (the same follow-up
+    `server/discover`); otherwise it fails as a possible crash, a refused
+    connection is `server unreachable`, and an unparseable answer fails as `no
+    usable response to a 1 MB <tool>.<argument>`, as `security-extra-params`
+    already reads it.
   - `security-tls-required` passed any 3xx redirect without reading `Location`;
     a redirect must now resolve to a single https URL.
   - `security-token-in-uri` failed a server that answered the query-string
@@ -517,6 +520,20 @@ out explicitly here.
   `close()` returns as soon as it exits. Concurrent `close()` calls share one
   shutdown. A server that ignores EOF now takes about 2 s longer to close on
   POSIX (about 4 s in all if it also ignores SIGTERM).
+- **A stdio server that stopped reading its input crashed the CLI.** A write to
+  a child that had exited partway through reading a long request line (or had
+  closed its stdin) raised an unhandled `write EOF` (Windows) or `write EPIPE`
+  (POSIX) error on the child's stdin, and the run ended with a Node stack trace
+  and no report. The failed write now fails only the request that made it: a
+  request the exit interrupts gets the server's exit diagnostic (`server crashed
+  with exit code N before completing the request`, with its stderr), a write
+  with nothing pending waits up to 1 s for that exit and fails with the same
+  diagnostic (or `stdin is closed: the server stopped reading its input` when
+  the child keeps running), and a write after `close()` has ended stdin fails
+  at once. A server that exits on the 1 MB line of `security-oversized-input`
+  (2026-07-28) now fails it as `server died on a 1 MB <tool>.<argument>` on both
+  platforms, and a raw pipe-write failure reads as the server going away on
+  Windows (`EOF`) as it already did on POSIX (`EPIPE`).
 
 ## [0.18.2] — 2026-09-15
 

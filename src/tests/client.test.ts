@@ -24,14 +24,22 @@ interface StubReply {
 
 let server: Server;
 let serverUrl: string;
-let reply: (body: string) => StubReply = () => ({ status: 500, contentType: "text/plain", body: "no reply set" });
+/** The stub's answer to a POST body; HANG holds the request open without writing a byte. */
+const HANG = "hang";
+let reply: (body: string) => StubReply | typeof HANG = () => ({
+  status: 500,
+  contentType: "text/plain",
+  body: "no reply set",
+});
 
 beforeAll(async () => {
   server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
-      const { status, contentType, body } = reply(Buffer.concat(chunks).toString("utf8"));
+      const answer = reply(Buffer.concat(chunks).toString("utf8"));
+      if (answer === HANG) return; // the client's timer ends it
+      const { status, contentType, body } = answer;
       res.writeHead(status, { "content-type": contentType });
       res.end(body);
     });
@@ -46,6 +54,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  // A held request the client aborted can leave its socket open; do not wait on it.
+  server.closeAllConnections();
   await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())));
 });
 
@@ -286,6 +296,45 @@ describe("exchangeEndOf: where a finished HTTP exchange ends in the recording", 
     const { client, recorder } = clientOver(createHttpTransport({ url: "http://127.0.0.1:9/mcp" }));
     await expect(client.rpc("server/discover", {}, { timeout: 2000 })).rejects.toThrow();
     expect(exchangeEndOf(recorder.sent[0] as (typeof recorder.sent)[number])).toBe(0);
+  });
+
+  // A server that holds a POST open without a byte: a notification
+  // (transport-notification-202), a malformed body (the error-invalid-json
+  // raw probe) or a subscriptions/listen whose headers never arrive. The
+  // client gives up on its timer, and the exchange must end right there,
+  // at its own send, or it stays a candidate owner of a later stray.
+  const HANG_TIMEOUT = 300;
+  it.each<[string, (client: ModernClient) => Promise<unknown>, RegExp]>([
+    [
+      "a notify",
+      (client) => client.notify("notifications/cancelled", { requestId: 1 }, { timeout: HANG_TIMEOUT }),
+      /aborted due to timeout/,
+    ],
+    [
+      "a raw probe",
+      (client) => client.raw("{not json", { method: "server/discover", timeout: HANG_TIMEOUT }),
+      /aborted due to timeout/,
+    ],
+    [
+      "a stream",
+      (client) => client.stream("subscriptions/listen", { notifications: {} }, { timeout: HANG_TIMEOUT }),
+      new RegExp(`stream timed out after ${HANG_TIMEOUT}ms`),
+    ],
+  ])("%s the server never answers (not even headers) still ends when the client gives up: at the send itself", async (_label, send, error) => {
+    reply = (body) => {
+      // The warm-up rpc is answered; the send under test is held.
+      if (!body.includes('"id":1000')) return HANG;
+      const result = { jsonrpc: "2.0", id: 1000, result: { resultType: "complete" } };
+      return { status: 200, contentType: "application/json", body: JSON.stringify(result) };
+    };
+    const { client, recorder } = clientOver(createHttpTransport({ url: serverUrl }));
+    await client.rpc("server/discover", {});
+    await expect(send(client)).rejects.toThrow(error);
+    // Only the warm-up's reply came back.
+    expect(recorder.received.map((r) => r.seq)).toEqual([1]);
+    const gaveUp = recorder.sent[1] as (typeof recorder.sent)[number];
+    expect(gaveUp.seq).toBe(2);
+    expect(exchangeEndOf(gaveUp)).toBe(gaveUp.seq);
   });
 
   it("a stream ends when the caller closes it, not while its messages are still being read", async () => {

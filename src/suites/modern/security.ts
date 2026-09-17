@@ -126,13 +126,19 @@ const CONNECT_FAILURE_CODES = new Set([
  * the write side was already gone. undici reports the same codes whether
  * the server closed right after accepting the connection or after reading
  * the request, so the client cannot tell those two apart.
+ *
+ * EOF is that last one on a Windows pipe: a write to a stdio child that
+ * exited partway through reading a line fails with EOF there and with EPIPE
+ * on POSIX -- one event, read the same way on both.
  */
-const DROPPED_CODES = new Set(["UND_ERR_SOCKET", "ECONNRESET", "EPIPE", "ECONNABORTED"]);
+const DROPPED_CODES = new Set(["UND_ERR_SOCKET", "ECONNRESET", "EPIPE", "EOF", "ECONNABORTED"]);
 
 /**
  * The stdio transport's diagnostics for a child that is gone: its exit
  * rejection ("crashed with exit code N", "exited cleanly", "terminated by
- * signal") and the write guard's "stdin is closed" (transport/stdio.ts).
+ * signal"), the write guard's "stdin is closed", and a write the child's
+ * stdin refused -- named by the exit it waits for, or "stdin is closed: the
+ * server stopped reading its input" when no exit follows (transport/stdio.ts).
  */
 const STDIO_GONE = /crashed with exit code|exited cleanly|terminated by signal|stdin is closed/i;
 
@@ -1932,6 +1938,17 @@ async function checkOversizedInput(ctx: ModernSuiteContext, tools: any[]): Promi
     }
     if (isTimeout(err)) {
       return withNote({ passed: false, details: `Request timed out -- server may be struggling with a 1 MB ${where}` });
+    }
+    // On HTTP a rejection is an answer (a 4xx, a JSON-RPC error) or a
+    // connection closed on the body that the server outlives, all read
+    // above. What is left got no usable response at all -- bytes that are
+    // not an HTTP response, a TLS failure -- and rejects nothing: the
+    // verdict security-extra-params gives the same error.
+    if (ctx.kind === "http") {
+      return withNote({
+        passed: false,
+        details: clip(`no usable response to a 1 MB ${where}: ${clip(firstLine(message), 120)}`, 220),
+      });
     }
     return withNote({
       passed: true,
