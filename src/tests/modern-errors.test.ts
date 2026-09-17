@@ -547,6 +547,73 @@ describe("errors suite: canned bad HTTP server", () => {
     expect(warned(report, BARE_4XX_WARNING)).toBe(false);
   });
 
+  it("names an error code that is not an integer as the server sent it, and a missing one as 'no code' -- never NaN", async () => {
+    // JSON-RPC requires an integer code. The verdicts are the ones any
+    // error earns (a wrong code still fails the exact-code ids); only the
+    // rendering is under test: before, every one of these read "NaN".
+    const coded = (id: unknown, code: unknown, message: string) => ({ jsonrpc: "2.0", id, error: { code, message } });
+    const uncoded = (id: unknown, message: string) => ({ jsonrpc: "2.0", id, error: { message } });
+    bad.set(({ parseError, method, params, id }) => {
+      if (parseError) return { status: 400, body: coded(null, "PARSE", "bad json") };
+      if (method === undefined) return { status: 400, body: uncoded(id ?? null, "Invalid Request") };
+      if (method === "server/discover") return { status: 200, body: rpcResult(id, discoverResult({ tools: {} })) };
+      if (method === "tools/call") return { status: 200, body: coded(id, null, "bad call") };
+      if (method === "tools/list" && typeof params.cursor === "string") {
+        return { status: 200, body: uncoded(id, "Invalid cursor") };
+      }
+      if (method === "resources/list" || method === "prompts/list") {
+        return { status: 200, body: coded(id, -32601.5, "not here") };
+      }
+      return { status: 404, body: coded(id, "E_NOPE", "Method not found") };
+    });
+    const report = await runModern(bad.url, { only: ALL });
+    expect(Object.fromEntries(report.tests.map((t) => [t.id, { passed: t.passed, details: t.details }]))).toEqual({
+      "error-unknown-method": {
+        passed: true,
+        details: 'JSON-RPC error with non-integer code "E_NOPE" on HTTP 404, id echoed',
+      },
+      "error-method-code": {
+        passed: false,
+        details: 'Expected -32601 (Method not found), got non-integer code "E_NOPE" (Method not found)',
+      },
+      "error-invalid-jsonrpc": { passed: true, details: "JSON-RPC error with no code on HTTP 400" },
+      "error-invalid-json": { passed: true, details: 'JSON-RPC error with non-integer code "PARSE" on HTTP 400' },
+      "error-parse-code": {
+        passed: false,
+        details: 'Expected -32700 (Parse error) for invalid JSON, got non-integer code "PARSE" (bad json)',
+      },
+      "error-invalid-request-code": {
+        passed: false,
+        details: "Expected -32600 (Invalid Request) for a message with no method, got no code (Invalid Request)",
+      },
+      "error-missing-params": { passed: true, details: "JSON-RPC error with non-integer code null (bad call)" },
+      "tools-call-unknown": { passed: true, details: "JSON-RPC error with non-integer code null (bad call)" },
+      "error-capability-gated": {
+        passed: true,
+        details:
+          "Undeclared method(s) rejected: resources/list -> non-integer code -32601.5 (expected -32601), prompts/list -> non-integer code -32601.5 (expected -32601)",
+      },
+      "error-invalid-cursor": { passed: true, details: "tools/list rejected the cursor: no code (Invalid cursor)" },
+    });
+    expect(JSON.stringify(report.tests)).not.toContain("NaN");
+  });
+
+  it("names a non-integer code the same way when every probe is rejected as not evaluable", async () => {
+    bad.set(({ id }) => ({ status: 400, body: { jsonrpc: "2.0", id: id ?? null, error: { code: "E_INIT" } } }));
+    const report = await runModern(bad.url, { only: ["lifecycle-discover", ...ALL] });
+    expect(resultOf(report, "lifecycle-discover").passed).toBe(false);
+    const rpc = 'JSON-RPC error with non-integer code "E_INIT" (HTTP 400) for an unknown method; not evaluable';
+    const raw = (what: string) =>
+      `JSON-RPC error with non-integer code "E_INIT" on HTTP 400 for ${what}; not evaluable`;
+    expectFail(report, "error-unknown-method", rpc);
+    expectFail(report, "error-method-code", rpc);
+    expectFail(report, "error-invalid-jsonrpc", raw("a malformed envelope"));
+    expectFail(report, "error-invalid-json", raw("invalid JSON"));
+    expectFail(report, "error-parse-code", raw("invalid JSON"));
+    expectFail(report, "error-invalid-request-code", raw("a message with no method"));
+    expectFail(report, "error-capability-gated", 'tools/list -> non-integer code "E_INIT", resources/list');
+  });
+
   it("fails a probe answered with neither an error nor a result, and reads an SSE body with no response as no body", async () => {
     bad.set(({ parseError, method, params, id }) => {
       if (parseError) {

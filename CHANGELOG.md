@@ -215,13 +215,14 @@ out explicitly here.
     empty run's notice reads `No tests ran -- check --only/--skip` instead of
     `Grade F (0%) -- 0/0 passed`.
   - **Auth-gated server run without `--auth`.** When the probe or preflight draws
-    401/403 and no `Authorization` header was configured, the report's first
-    warning (index 0, every format) says the server requires authentication,
-    that the grade below is not meaningful, and to re-run with `--auth <token>`.
-    The 2025-11-25 `security-auth-required` now passes on that 401/403 (`HTTP 401
-    (unauthenticated preflight rejected; pass --auth ...)`) instead of claiming
-    the server "accepted unauthenticated requests" next to `transport-post`'s
-    401.
+    a 401, or a 403 carrying a `WWW-Authenticate: Bearer` challenge, and no
+    `Authorization` header was configured, the report's first warning (index 0,
+    every format) says the server requires authentication, that the grade below
+    is not meaningful, and to re-run with `--auth <token>`. The 2025-11-25
+    `security-auth-required` now passes on any 401/403 to that unauthenticated
+    preflight (`HTTP 401 (unauthenticated preflight rejected; pass --auth ...)`)
+    instead of claiming the server "accepted unauthenticated requests" next to
+    `transport-post`'s 401.
   - **Injection targets follow the spec's annotation defaults.** The 2026-07-28
     suite treated an unannotated tool as safe and could send path-traversal
     payloads into a write tool; the spec defaults `destructiveHint` to true, so a
@@ -373,9 +374,32 @@ out explicitly here.
   - The injection checks passed as inconclusive when the server died on every
     payload. A stdio child that exits on a payload, or an HTTP connection
     dropped on a payload after which the server neither serves
-    `server/discover` nor answers it with a 401/403/413/415/429 gate, now fails
-    naming the payload; a drop the server outlives (a WAF or IPS, a keep-alive
-    close) counts as never reached, with a warning.
+    `server/discover` nor answers it with a 401/403 gate (a 429 is retried once
+    after Retry-After, capped at 2 s, and counts only when the retry is served
+    or refused with 401/403; a 413 or 415 on that small discover does not
+    count), now fails naming the payload, with details that lead with
+    `server may have crashed:` so the conclusion survives the 220-character
+    limit; a drop the server outlives (a WAF or IPS, a keep-alive close, or a
+    crash of one worker of a multi-process server such as a Node cluster, PM2
+    or gunicorn, which a client cannot tell apart) counts as never reached, with
+    a warning. The warning calls the follow-up's answer an auth gate only for a
+    401, or a 403 carrying a `WWW-Authenticate: Bearer` challenge (with
+    `--auth`, one with an `error` parameter), read as the era probe reads it;
+    any other 403 is worded as a gate such as a WAF or IPS now blocking the
+    client.
+  - `security-extra-params` failed as "server may have crashed" when its
+    `__proto__` payload's connection was dropped, even when the server kept
+    serving (a WAF or IPS drops that prototype-pollution signature),
+    contradicting the injection checks in the same report. A drop now reads the
+    same way there: one the server outlives passes as inconclusive with a
+    warning, and a connection refused before anything was sent is
+    `server unreachable` instead of "connection dropped".
+  - `security-oversized-input` passed every HTTP transport error as "Connection
+    rejected (acceptable for oversized input)", including a server that crashed
+    on the 1 MB body and one already unreachable. A dropped connection now
+    passes only when the server is still up afterwards (the same follow-up
+    `server/discover`); otherwise it fails as a possible crash, and a refused
+    connection is `server unreachable`.
   - `security-tls-required` passed any 3xx redirect without reading `Location`;
     a redirect must now resolve to a single https URL.
   - `security-token-in-uri` failed a server that answered the query-string
@@ -389,25 +413,38 @@ out explicitly here.
     frame followed a notification. Only JSON-RPC responses on the stream count
     now. An SSE data frame holding an array now fails as a processed batch, as
     the same array over `application/json` does.
-  - `error-id-echo` exempted a double-answered request's stray id-less error
-    whenever any client notification had been sent earlier in the run; a
-    notification now owns a stray only while no later request was answered
-    before it.
+  - `error-id-echo` judged a server that answered a request twice -- its
+    result, then an id-less error -- by frame order and earlier traffic: it
+    exempted the stray as a reply to any client notification sent earlier in
+    the run or as `received while no request was pending`, or blamed a
+    `subscriptions/listen` stream the client had already closed. Every id-less
+    reply is now attributed by one walk back that skips requests already
+    answered, exchanges the client ended (a finished HTTP response, a closed
+    stream, a cancelled request) and notifications a later answer rules out, so
+    a notification owns a stray only while no later request was answered before
+    it. A stray no send can still own is a second answer and fails, blamed on
+    the most recent request; only a stray written before the suite sent any
+    request is still exempt.
   - `lifecycle-meta-client-info-optional` blamed clientInfo for a blanket
     rejection or a rate limiter's 429; that is now reported as not evaluable.
   - Cancelling a run during `lifecycle-subscriptions-listen` recorded "No
     acknowledgment within Nms" instead of stopping.
-- **A rejected `--auth` credential got advice to pass `--auth`.** A 401/403 on
-  the era probe or preflight with an Authorization header configured now gets a
-  first-position warning (auto and pinned runs) that the grade is not
-  meaningful. It says the credential was rejected for a 401, or a 403 with a
-  `WWW-Authenticate: Bearer error="insufficient_scope"` challenge, and the
-  auto-detection note and `transport-post` then say "credential rejected --
-  check --auth". Any other 403 (the SDK's Host validation behind a tunnel
-  hostname, Origin validation, a gateway) gets a neutral warning pointing at
-  Host/Origin validation or a gateway, and the note and `transport-post` say
-  "forbidden -- no insufficient_scope challenge". After a preflight timeout the
-  warning names the status of the re-probe that answered.
+- **A 401/403 on the era probe or preflight got the wrong auth advice.** The
+  report's first warning (auto and pinned runs), the auto-detection note and
+  `transport-post` now read the refusal from its status and `WWW-Authenticate`
+  challenge. Without an Authorization header, only a 401 or a 403 carrying a
+  Bearer challenge says authentication is required ("pass --auth"). With one,
+  a 401 or a 403 whose Bearer challenge carries any `error` parameter says the
+  credential was rejected ("credential rejected -- check --auth"), and the
+  warning names the reason from that error (`invalid_token`,
+  `insufficient_scope`, `invalid_request`). Any other 403 (the SDK's Host
+  validation behind a tunnel hostname, Origin validation, a gateway) gets a
+  neutral warning that quotes the body's JSON-RPC error message, points at
+  Host/Origin validation or a gateway first, and without a header suggests
+  `--auth` only if the server does require a credential; the note and
+  `transport-post` say "forbidden -- Host/Origin validation, a gateway, or
+  missing credentials" (or "... or token permissions" with a header). After a
+  preflight timeout the warning names the status of the re-probe that answered.
 - **False verdicts and misleading details found by a final coverage pass over
   the 2026-07-28 suite:**
   - `lifecycle-removed-methods` credited any bare HTTP 4xx and any
@@ -431,7 +468,11 @@ out explicitly here.
   - `security-oversized-input` (stdio) passed a timed-out 1 MB call as
     "survived" when an earlier reply in the run had overflowed the runner's
     stdio line buffer, or when the server printed the runner's drop marker on
-    its own stderr. Only an overflow during that call counts now.
+    its own stderr. Only an overflow during that call counts now, and only
+    while the child is still running: a child that wrote more than 1 MiB and
+    then exited passed as "server survived" and now fails as died. It and
+    `security-extra-params` no longer fail as "server died" when an earlier test
+    had already killed the child; that is now `server unreachable`.
   - The reply to a raw-body probe (invalid JSON, invalid JSON-RPC, a batch)
     sent as SSE with its JSON split across several `data:` lines was dropped
     from the recording, so `error-retired-codes` could miss a retired code in
@@ -440,9 +481,13 @@ out explicitly here.
   - `stdio-unicode` reported a crash or hang on the CJK/emoji probe as a harness
     `Error:` carrying the server's multi-line stderr tail; it now fails with a
     one-line reason (`server exited (code N)`, or the timeout). `error-id-echo`
-    notes a stray error reply that arrives while no request is pending as
+    notes a stray error reply that arrives before the suite sent any request as
     `received while no request was pending` instead of counting it as a reply
     to a raw probe or client notification.
+  - A JSON-RPC error whose `code` was not an integer, or was missing, was
+    reported as `JSON-RPC error NaN`. Details now name what the server sent:
+    `JSON-RPC error with non-integer code "E_LIST"`, `JSON-RPC error with no
+    code`, `rejected with no code`.
   - The "non-JSON-RPC body" detail printed the HTTP status twice
     (`server/discover answered HTTP 404, non-JSON-RPC body (HTTP 404)`) and
     claimed `HTTP 200` on stdio; it now reads `server/discover answered
@@ -461,6 +506,17 @@ out explicitly here.
   took `taskkill` down with it and left a busy server that ignores stdin
   closing running. `close()` now waits up to 5 s for the kill to finish and the
   child to exit, and a transport whose spawn failed closes at once.
+- **stdio `close()` killed servers before they could shut down on stdin EOF.**
+  On POSIX it sent SIGTERM in the same tick it closed stdin, so a server that
+  exits cleanly on EOF was killed before its cleanup ran. On Windows every close
+  started a non-forced `taskkill /t` that cannot end a console process and could
+  still be running after `close()` returned. `close()` now follows the spec's
+  stdio shutdown order: close stdin, wait up to 2 s for the server to exit, then
+  terminate it (POSIX: SIGTERM, then SIGKILL after 2 s more; Windows: a forced
+  `taskkill /t /f` only). A server that exits on EOF is never signalled and
+  `close()` returns as soon as it exits. Concurrent `close()` calls share one
+  shutdown. A server that ignores EOF now takes about 2 s longer to close on
+  POSIX (about 4 s in all if it also ignores SIGTERM).
 
 ## [0.18.2] — 2026-09-15
 

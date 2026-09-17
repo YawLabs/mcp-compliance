@@ -188,8 +188,8 @@ interface FakeScript {
   answer: (method: string, id: JsonRpcId, n: number, params?: unknown) => Answer;
   /** The `result` object for an answer of "result"; default: a minimal DiscoverResult. */
   result?: (method: string, params: unknown) => Record<string, unknown>;
-  /** The JSON-RPC error code for an answer of "error"; default -32601. */
-  errorCode?: (method: string) => number;
+  /** The JSON-RPC error code for an answer of "error"; default -32601. Any value is sent as is (a string code, say). */
+  errorCode?: (method: string) => unknown;
   onNotify?: (method: string, fake: FakeStdio) => void;
 }
 
@@ -588,6 +588,46 @@ describe("2026-07-28 stdio tests: scripted misbehaviour (no fixture knob exists 
     ]);
   });
 
+  it("stdio-unknown-method-recovers names an error code that is not an integer as sent, never NaN", async () => {
+    // Before: "unknown method -> JSON-RPC error NaN" for the string code, and
+    // "... -> JSON-RPC error 1.5" passed off as a code for the fractional one.
+    const recovers = fakeStdio({
+      ...conformant,
+      errorCode: (method) => (method === BOGUS_METHOD ? "E_UNKNOWN" : -32601),
+    });
+    const ctx = makeContext(recovers);
+    await runStdio(ctx);
+    const r = outcome(ctx, "stdio-unknown-method-recovers");
+    expect(r.passed, r.details).toBe(true);
+    expect(r.details).toBe(
+      'unknown method -> JSON-RPC error with non-integer code "E_UNKNOWN"; server/discover answered afterwards on the same process',
+    );
+    expect(ctx.harness.warnings).toEqual([
+      'stdio-unknown-method-recovers: unknown method drew JSON-RPC error with non-integer code "E_UNKNOWN"; -32601 Method not found is the expected code.',
+    ]);
+
+    let desynced = false;
+    const desync = fakeStdio({
+      answer: (method) => {
+        if (method === BOGUS_METHOD) {
+          desynced = true;
+          return "error";
+        }
+        if (desynced) {
+          desynced = false;
+          return "error";
+        }
+        return "result";
+      },
+      errorCode: (method) => (method === "server/discover" ? 1.5 : -32601),
+    });
+    const ctx2 = makeContext(desync);
+    await runStdio(ctx2);
+    expect(outcome(ctx2, "stdio-unknown-method-recovers").details).toBe(
+      "unknown method -> JSON-RPC error -32601, but server/discover afterwards -> JSON-RPC error with non-integer code 1.5 (server may have desynced)",
+    );
+  });
+
   it("stdio-unknown-method-recovers warns about nothing when the unknown method draws -32601 (control)", async () => {
     const ctx = makeContext(fakeStdio(conformant));
     await runStdio(ctx);
@@ -710,6 +750,8 @@ describe("2026-07-28 stdio-unicode: a JSON-RPC error on the tools/call probe, ov
       `  if (msg.method === "tools/call") return send({ jsonrpc: "2.0", id: msg.id, error: { code: ${toolsCallCode}, message: ${JSON.stringify(toolsCallMessage)} } });`,
       '  send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });',
       "});",
+      // Exits on stdin EOF, as a real server does, so close() need not wait out its EOF window.
+      'rl.on("close", () => process.exit(0));',
       "setTimeout(() => {}, 30000);",
     ].join("\n");
     const path = join(tmpdir(), `mcp-compliance-stdio-child-${process.pid}-${Date.now()}-${Math.random()}.cjs`);
@@ -800,6 +842,8 @@ describe("2026-07-28 stdio-unicode: a JSON-RPC error on the tools/call probe, ov
       '  if (msg.method === "server/discover") return send({ jsonrpc: "2.0", id: msg.id, result: discover });',
       '  send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });',
       "});",
+      // Exits on stdin EOF, as a real server does, so close() need not wait out its EOF window.
+      'rl.on("close", () => process.exit(0));',
       "setTimeout(() => {}, 30000);",
     ].join("\n");
     const path = join(tmpdir(), `mcp-compliance-stdio-crash-child-${process.pid}-${Date.now()}-${Math.random()}.cjs`);

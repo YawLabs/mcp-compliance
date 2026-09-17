@@ -215,7 +215,12 @@ async function stubHttp(
   const port = typeof address === "object" && address ? address.port : 0;
   return {
     url: `http://127.0.0.1:${port}/mcp`,
-    stop: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    stop: () =>
+      new Promise<void>((resolve) => {
+        // A stream the client aborted can leave its socket open for seconds; do not wait on it.
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
   };
 }
 
@@ -775,8 +780,8 @@ describe("2026-07-28 post-hoc tests: timeline attribution of a reply to a client
         ["server/discover", 1000],
         ["tools/list", 1001],
       ]);
-      // The stray arrived after discover went out (so the pop lands it on
-      // discover and re-attribution runs), ahead of discover's own reply.
+      // The stray arrived after discover went out (so discover is the most
+      // recent send and must be ruled out), ahead of discover's own reply.
       expect(ctx.recorder.received.map((r) => (r.message as { id?: unknown }).id)).toEqual([null, 1000]);
       expect(ctx.recorder.received[0]?.seq).toBeGreaterThan(ctx.recorder.sent[1]?.seq as number);
       await runPostHoc(ctx);
@@ -797,8 +802,8 @@ describe("2026-07-28 post-hoc tests: timeline attribution when id-bearing reques
 
   it("blames the unanswered request the stray overlapped, not the later one that got its own reply (scripted)", async () => {
     // Three requests in flight; the server answers the second with
-    // id: null. The stray arrives before the third's reply, so the pop
-    // lands it on 1003, which is then answered by id: 1002 is the one
+    // id: null. The stray arrives before the third's reply, so the most
+    // recent send is 1003, which is then answered by id: 1002 is the one
     // request that never was.
     const { results } = await scanRecording("stdio", (recorder) => {
       recorder.recordSent({ id: 1001, method: "server/discover", params: {}, meta: undefined });
@@ -995,7 +1000,7 @@ describe("2026-07-28 post-hoc tests: a stray id-less error PLUS the request's ow
     }
   }
 
-  it("with no earlier candidate the popped request stands: the stray FAILS error-id-echo, rendered 'reply carried no id'", async () => {
+  it("with no earlier candidate the request itself is blamed: the stray FAILS error-id-echo, rendered 'reply carried no id'", async () => {
     const { results, recorder } = await runDoubleAnswer(1, (client) => fire(client, "server/discover"));
     // The recording this scan sees: the stray (no id member at all) lands between the send and the reply.
     expect(
@@ -1059,7 +1064,7 @@ describe("2026-07-28 post-hoc tests: a stray id-less error PLUS the request's ow
     // then arrives while 1002 is in flight and 1002 is answered too. The
     // answered 1001 rules the notification out, but the unanswered 1000
     // behind it remains the request the stray most plausibly answers (a
-    // late reply), not the popped 1002.
+    // late reply), not the most recent 1002.
     const { results } = await scanRecording("stdio", (recorder) => {
       recorder.recordSent({ id: 1000, method: "tools/list", params: {}, meta: undefined });
       recorder.recordSent({ id: undefined, method: "notifications/cancelled", params: {}, meta: undefined });
@@ -1074,6 +1079,182 @@ describe("2026-07-28 post-hoc tests: a stray id-less error PLUS the request's ow
     expect(echo.details).toBe(
       "1 of 1 error response did not echo the request id; first: tools/list sent id 1000, reply carried no id",
     );
+  });
+});
+
+describe("2026-07-28 post-hoc tests: a request answered twice (its result plus an id-less error) fails in either frame order", () => {
+  /**
+   * The server answers tools/list with its result AND a null-id error, in
+   * the order under test, on one stdio write or one SSE response. The
+   * verdict must not depend on which line the server writes first, nor on
+   * a closed listen stream or a notification sent earlier. Before, the
+   * result-first order PASSED ("received while no request was pending"),
+   * a closed listen took the blame, and an earlier notification exempted
+   * the stray.
+   */
+  type Order = "result first" | "stray first";
+  const ORDERS: Order[] = ["result first", "stray first"];
+  const STRAY = { jsonrpc: "2.0", id: null, error: { code: -32603, message: "internal error" } };
+  const toolsResult = (id: unknown) => ({
+    jsonrpc: "2.0",
+    id,
+    result: { resultType: "complete", tools: [], ttlMs: 0, cacheScope: "public" },
+  });
+  const blame = (id: number) =>
+    `1 of 1 error response did not echo the request id; first: tools/list sent id ${id}, reply carried null`;
+  const LISTEN_TIMEOUT = 300;
+
+  /** A stdio child: discover answered, subscriptions/listen never acknowledged, notifications ignored, tools/list answered twice. */
+  function twiceAnsweringChild(order: Order): string {
+    return scriptedChild([
+      'if (msg.method === "server/discover") send({ jsonrpc: "2.0", id: msg.id, result: discover });',
+      'if (msg.method !== "tools/list") return;',
+      `const result = ${JSON.stringify(toolsResult(0))};`,
+      "result.id = msg.id;",
+      `const stray = ${JSON.stringify(STRAY)};`,
+      order === "result first" ? "send(result); send(stray);" : "send(stray); send(result);",
+    ]);
+  }
+
+  async function overStdio(order: Order, trigger: (client: ModernClient) => Promise<void>) {
+    const transport = createStdioTransport({ command: process.execPath, args: [twiceAnsweringChild(order)] });
+    try {
+      const ctx = makeContext(transport);
+      await trigger(ctx.client);
+      // tools/list resolves on its own line; the stray can be read just after it.
+      await vi.waitFor(() => expect(ctx.recorder.errors()).toHaveLength(1), { timeout: 5000, interval: 10 });
+      await runPostHoc(ctx);
+      return { echo: collect(ctx)["error-id-echo"] as TestResult, recorder: ctx.recorder };
+    } finally {
+      await transport.close();
+    }
+  }
+
+  /** Close a subscriptions/listen the server never acknowledges (stdio: the timer ends it, close() records the cancel). */
+  async function openAndCloseListen(client: ModernClient) {
+    const stream = await client.stream("subscriptions/listen", { notifications: {} }, { timeout: LISTEN_TIMEOUT });
+    for await (const _ of stream.messages) break;
+    await stream.close();
+  }
+
+  const frames = (order: Order, id: unknown) =>
+    (order === "result first" ? [toolsResult(id), STRAY] : [STRAY, toolsResult(id)])
+      .map((m) => `event: message\ndata: ${JSON.stringify(m)}\n\n`)
+      .join("");
+
+  /** An HTTP stub: notifications 202, discover JSON, listen an acknowledged SSE stream held open, tools/list twice on one SSE body. */
+  function twiceAnsweringHttp(order: Order) {
+    return (_req: IncomingMessage, res: ServerResponse, body: string) => {
+      const m = JSON.parse(body) as { id?: number; method?: string };
+      if (m.id === undefined) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      if (m.method === "server/discover") {
+        sendJson(res, 200, { jsonrpc: "2.0", id: m.id, result: DISCOVER_RESULT });
+        return;
+      }
+      if (m.method === "subscriptions/listen") {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        const ack = {
+          jsonrpc: "2.0",
+          method: "notifications/subscriptions/acknowledged",
+          params: { notifications: {} },
+        };
+        res.write(`event: message\ndata: ${JSON.stringify(ack)}\n\n`);
+        return; // held open until the client closes it
+      }
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end(frames(order, m.id));
+    };
+  }
+
+  it.each(ORDERS)("over a scripted stdio child, %s: FAILS, blamed on tools/list", async (order) => {
+    const { echo, recorder } = await overStdio(order, async (client) => {
+      await fire(client, "server/discover");
+      await fire(client, "tools/list");
+    });
+    expect(recorder.sent.map((s) => s.id ?? s.method)).toEqual([1000, 1001]);
+    const ids = recorder.received.map((r) => (r.message as { id?: unknown }).id);
+    expect(ids).toEqual(order === "result first" ? [1000, 1001, null] : [1000, null, 1001]);
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(blame(1001));
+  });
+
+  it.each(
+    ORDERS,
+  )("over a scripted stdio child after a closed listen stream and a request answered since, %s: FAILS, blamed on tools/list", async (order) => {
+    const { echo, recorder } = await overStdio(order, async (client) => {
+      await fire(client, "server/discover");
+      await openAndCloseListen(client);
+      await fire(client, "server/discover");
+      await fire(client, "tools/list");
+    });
+    // The close wrote notifications/cancelled for the listen, which ends it.
+    expect(recorder.sent.map((s) => s.id ?? s.method)).toEqual([1000, 1001, "notifications/cancelled", 1002, 1003]);
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(blame(1003));
+  });
+
+  it("over a scripted stdio child, result first right after a closed listen: the cancel is ruled out by tools/list's own answer and the listen by its cancel", async () => {
+    // A real stdio run's shape (lifecycle-subscriptions-listen, then a
+    // feature test). Stray first right after a notification stays the
+    // exempt flush race (see 'a request answered only AFTER the stray').
+    const { echo, recorder } = await overStdio("result first", async (client) => {
+      await fire(client, "server/discover");
+      await openAndCloseListen(client);
+      await fire(client, "tools/list");
+    });
+    expect(recorder.sent.map((s) => s.id ?? s.method)).toEqual([1000, 1001, "notifications/cancelled", 1002]);
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(blame(1002));
+  });
+
+  it.each(ORDERS)("over HTTP SSE, %s: FAILS, blamed on tools/list", async (order) => {
+    const { results, recorder } = await scanStub(twiceAnsweringHttp(order), async (client) => {
+      await fire(client, "server/discover");
+      await fire(client, "tools/list");
+    });
+    expect(recorder.sent.map((s) => s.id ?? s.method)).toEqual([1000, 1001]);
+    expect(recorder.received.map((r) => (r.message as { id?: unknown }).id)).toEqual(
+      order === "result first" ? [1000, 1001, null] : [1000, null, 1001],
+    );
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(blame(1001));
+  });
+
+  it.each(
+    ORDERS,
+  )("over HTTP SSE after a listen stream the client closed, %s: FAILS, blamed on tools/list, not the listen", async (order) => {
+    const { results, recorder } = await scanStub(twiceAnsweringHttp(order), async (client) => {
+      await fire(client, "server/discover");
+      await openAndCloseListen(client);
+      await fire(client, "tools/list");
+    });
+    // The listen was acknowledged, never answered by id, and closed before tools/list went out.
+    expect(recorder.sent.map((s) => s.id ?? s.method)).toEqual([1000, 1001, 1002]);
+    expect(recorder.received.map((r) => (r.message as { method?: string }).method)).toContain(
+      "notifications/subscriptions/acknowledged",
+    );
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(blame(1002));
+  });
+
+  it.each(
+    ORDERS,
+  )("over HTTP SSE right after a client notification, %s: FAILS (an HTTP notification's body is never a recorded reply)", async (order) => {
+    const { results, recorder } = await scanStub(twiceAnsweringHttp(order), async (client) => {
+      await fire(client, "server/discover");
+      await client.notify("notifications/cancelled", { requestId: 999999 });
+      await fire(client, "tools/list");
+    });
+    expect(recorder.sent.map((s) => s.id ?? s.method)).toEqual([1000, "notifications/cancelled", 1001]);
+    const echo = results["error-id-echo"] as TestResult;
+    expect(echo.passed).toBe(false);
+    expect(echo.details).toBe(blame(1001));
   });
 });
 

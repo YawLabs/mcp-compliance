@@ -1449,6 +1449,72 @@ describe("a server that rejects everything (SDK v1 'Server not initialized') ove
   });
 });
 
+describe("a JSON-RPC error code that is not an integer is named as sent, never NaN (HTTP)", () => {
+  it.each([
+    ["a string code", "E_UNINIT", 'non-integer code "E_UNINIT"'],
+    ["no code at all", undefined, "no code"],
+  ] as const)("a server that rejects everything with %s", async (_label, code, text) => {
+    // Before: "rejected with NaN" for the string code; for an error object
+    // with no code the listen said NaN and the not-evaluable reason
+    // "no JSON-RPC error code", as if there had been no error body.
+    const stub = await startModernStub((_method, msg) => ({
+      status: 400,
+      body: {
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { ...(code === undefined ? {} : { code }), message: "Bad Request: Server not initialized" },
+      },
+    }));
+    try {
+      const report = await runModern(stub.url, {
+        only: ["lifecycle-discover", "lifecycle-removed-methods", "lifecycle-subscriptions-listen"],
+      });
+      const reason = `not evaluable: the conformant server/discover was itself rejected with ${text} (HTTP 400), so this rejection proves nothing about the injected defect`;
+      expect(expectFailed(report, "lifecycle-removed-methods").details).toBe(
+        `ping ${text}, logging/setLevel ${text}, resources/subscribe ${text} rejected; ${reason}`,
+      );
+      expect(expectFailed(report, "lifecycle-subscriptions-listen").details).toBe(
+        `subscriptions/listen rejected with ${text} (HTTP 400); ${reason}`,
+      );
+      expect(lifecycleWarnings(report)).toEqual([]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("a probe rejected with a string code is credited with a warning that names the code", async () => {
+    const stub = await startModernStub(
+      conformantRoute((method, msg) => {
+        if (method === "ping") {
+          return { status: 404, body: { jsonrpc: "2.0", id: msg.id, error: { code: "E_PING", message: "no ping" } } };
+        }
+        if (method === "server/discover" && !hasProtocolVersionClaim(msg)) {
+          return { status: 400, body: { jsonrpc: "2.0", id: msg.id, error: { code: "E_META", message: "bad _meta" } } };
+        }
+        return undefined;
+      }),
+    );
+    try {
+      const report = await runModern(stub.url, {
+        only: ["lifecycle-discover", "lifecycle-removed-methods", "lifecycle-meta-protocol-version-required"],
+      });
+      expectPassed(report, "lifecycle-discover");
+      expect(expectPassed(report, "lifecycle-removed-methods").details).toBe(
+        'ping non-integer code "E_PING"/404, logging/setLevel -32601/404, resources/subscribe -32601/404 (see warnings)',
+      );
+      expect(expectPassed(report, "lifecycle-meta-protocol-version-required").details).toBe(
+        'server/discover without _meta protocolVersion: rejected with non-integer code "E_META" (HTTP 400), expected -32602 (see warning)',
+      );
+      expect(lifecycleWarnings(report)).toEqual([
+        'lifecycle-removed-methods: ping rejected with non-integer code "E_PING" (expected -32601 Method not found)',
+        'lifecycle-meta-protocol-version-required: server/discover without _meta protocolVersion was rejected with non-integer code "E_META" (bad _meta) (expected -32602)',
+      ]);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
 describe("lifecycle-removed-methods: removed methods answered without a -32601 body (HTTP)", () => {
   const REMOVED_ID = "lifecycle-removed-methods";
   const EXPECTED = "no JSON-RPC error body (expected HTTP 404 with JSON-RPC error -32601)";
@@ -2395,6 +2461,15 @@ describe("listFailureReason (why a list response yields no list)", () => {
     expect(listFailureReason("prompts", result({ prompts: [["greet"]] }))).toBe("prompts array has non-object entries");
     expect(listFailureReason("tools", result({ tools: [] }))).toBeNull();
     expect(listFailureReason("tools", result({ tools: [{ name: "a" }] }))).toBeNull();
+  });
+
+  it("names an error code that is not an integer as sent, never NaN", () => {
+    expect(
+      listFailureReason("tools", response({ jsonrpc: "2.0", id: 1, error: { code: "E_LIST", message: "boom" } })),
+    ).toBe('JSON-RPC error with non-integer code "E_LIST" (boom)');
+    expect(listFailureReason("tools", response({ jsonrpc: "2.0", id: 1, error: { message: "boom" } }))).toBe(
+      "JSON-RPC error with no code (boom)",
+    );
   });
 });
 

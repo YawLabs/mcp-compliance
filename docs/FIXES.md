@@ -14,7 +14,7 @@ The tool grades one spec revision per run (`report.specVersion`; see [the spec v
 
 **Failure:** `HTTP 401 (auth required — pass --auth)` or `HTTP 404`.
 
-**Fix:** Your server is reachable but rejecting the probe. If auth is required, pass `--auth 'Bearer <token>'` to the CLI. If the URL is wrong, check the path — most MCP servers serve at `/mcp` or `/` specifically.
+**Fix:** Your server is reachable but rejecting the probe. If auth is required, pass `--auth 'Bearer <token>'` to the CLI. If the URL is wrong, check the path — most MCP servers serve at `/mcp` or `/` specifically. A 403 annotated `forbidden` (`Host/Origin validation, a gateway, or ...`) carried no `WWW-Authenticate: Bearer` challenge (with `--auth`, none with an `error` parameter), so it is most likely not about credentials: the SDK's Host validation refuses a tunnel or proxy hostname it was not configured to allow, and Origin validation or a gateway answers 403 too. The report's first warning quotes the server's error message when the body has one.
 
 ### `transport-content-type` — Responds with JSON or SSE
 

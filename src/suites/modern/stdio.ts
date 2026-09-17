@@ -1,3 +1,4 @@
+import { errorWithCode } from "../../checks/validators.js";
 import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
 import { JSONRPC_ERROR_CODES, META } from "../../modern/meta.js";
 import type { StdioTransport } from "../../transport/stdio.js";
@@ -278,7 +279,7 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
       // reflecting its arguments: nothing to compare, so the envelope
       // probe decides.
       note = err
-        ? `tools/call ${tool.name} rejected the probe (JSON-RPC error ${err.code}); `
+        ? `tools/call ${tool.name} rejected the probe (${errorWithCode(err.rawCode)}); `
         : `tools/call ${tool.name} did not echo the probe; `;
     }
 
@@ -297,7 +298,7 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
     if (err) {
       return {
         passed: false,
-        details: `${note}server/discover with a CJK/emoji clientInfo name -> JSON-RPC error ${err.code}`,
+        details: `${note}server/discover with a CJK/emoji clientInfo name -> ${errorWithCode(err.rawCode)}`,
       };
     }
     if (!resultOf(res.body)) {
@@ -338,7 +339,7 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
     }
     if (err.code !== JSONRPC_ERROR_CODES.METHOD_NOT_FOUND) {
       harness.warnings.push(
-        `stdio-unknown-method-recovers: unknown method drew JSON-RPC error ${err.code}; -32601 Method not found is the expected code.`,
+        `stdio-unknown-method-recovers: unknown method drew ${errorWithCode(err.rawCode)}; -32601 Method not found is the expected code.`,
       );
     }
     let second: RpcResponse;
@@ -347,25 +348,25 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
     } catch (e: unknown) {
       return {
         passed: false,
-        details: `unknown method -> JSON-RPC error ${err.code}, but server/discover afterwards got no reply (${explainFailure(ctx, e)})`,
+        details: `unknown method -> ${errorWithCode(err.rawCode)}, but server/discover afterwards got no reply (${explainFailure(ctx, e)})`,
       };
     }
     const err2 = errorOf(second.body);
     if (err2) {
       return {
         passed: false,
-        details: `unknown method -> JSON-RPC error ${err.code}, but server/discover afterwards -> JSON-RPC error ${err2.code} (server may have desynced)`,
+        details: `unknown method -> ${errorWithCode(err.rawCode)}, but server/discover afterwards -> ${errorWithCode(err2.rawCode)} (server may have desynced)`,
       };
     }
     if (!resultOf(second.body)) {
       return {
         passed: false,
-        details: `unknown method -> JSON-RPC error ${err.code}, but server/discover afterwards -> non-JSON-RPC reply`,
+        details: `unknown method -> ${errorWithCode(err.rawCode)}, but server/discover afterwards -> non-JSON-RPC reply`,
       };
     }
     return {
       passed: true,
-      details: `unknown method -> JSON-RPC error ${err.code}; server/discover answered afterwards on the same process`,
+      details: `unknown method -> ${errorWithCode(err.rawCode)}; server/discover answered afterwards on the same process`,
     };
   });
 
@@ -396,7 +397,7 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
     if (err) {
       return {
         passed: false,
-        details: `server/discover after notifications/cancelled (unknown id) -> JSON-RPC error ${err.code}`,
+        details: `server/discover after notifications/cancelled (unknown id) -> ${errorWithCode(err.rawCode)}`,
       };
     }
     if (!resultOf(res.body)) {
@@ -411,7 +412,7 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
       .filter((m) => isResponse(m) && m.id !== res.requestId);
     if (stray.length > 0) {
       const m = stray[0] as Record<string, unknown>;
-      const what = errorOf(m) ? `JSON-RPC error ${errorOf(m)?.code}` : "a result";
+      const what = errorOf(m) ? errorWithCode(errorOf(m)?.rawCode) : "a result";
       return {
         passed: false,
         details: `server replied to notifications/cancelled with ${what} (id ${brief(m.id)}); notifications must not be answered`,

@@ -15,6 +15,7 @@ import {
   probeAnswerShowsEra,
   probeExitWarning,
   REASON_PREFIX,
+  readAuthRefusal,
   refusedCredential,
   STDIO_PROBE_STATUS_DELAY_MS,
 } from "../detect.js";
@@ -1019,7 +1020,7 @@ describe("auth-gated server with a rejected --auth credential", () => {
     try {
       const auto = await runComplianceSuite(stub.url, { timeout: 5000, headers: WRONG, only: ["transport-post"] });
       expect(auto.warnings[0]).toBe(
-        `Server at ${stub.url} rejected the configured credential (the server/discover probe carried an Authorization header and got HTTP 403), so the era could not be determined and the 2025-11-25 grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): a 403 means the token lacks a required scope or permission.`,
+        `Server at ${stub.url} rejected the configured credential (the server/discover probe carried an Authorization header and got HTTP 403), so the era could not be determined and the 2025-11-25 grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): the 403's Bearer error="insufficient_scope" challenge means the token lacks a required scope or permission.`,
       );
       expect(resultOf(auto, "transport-post").details).toBe("HTTP 403 (credential rejected — check --auth)");
       const pinned = await runComplianceSuite(stub.url, {
@@ -1029,7 +1030,7 @@ describe("auth-gated server with a rejected --auth credential", () => {
         only: ["transport-post"],
       });
       expect(pinned.warnings[0]).toBe(
-        `Server at ${stub.url} rejected the configured credential (the preflight carried an Authorization header and got HTTP 403), so the 2026-07-28 grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): a 403 means the token lacks a required scope or permission.`,
+        `Server at ${stub.url} rejected the configured credential (the preflight carried an Authorization header and got HTTP 403), so the 2026-07-28 grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): the 403's Bearer error="insufficient_scope" challenge means the token lacks a required scope or permission.`,
       );
       expect(resultOf(pinned, "transport-post").details).toBe("HTTP 403 (credential rejected -- check --auth)");
     } finally {
@@ -1037,7 +1038,73 @@ describe("auth-gated server with a rejected --auth credential", () => {
     }
   }, 20_000);
 
-  it("a 403 with no insufficient_scope challenge (the SDK's Host validation behind a tunnel) is not called a rejected credential", async () => {
+  it("a 403 whose Bearer challenge says invalid_token is a rejected credential, worded from the error value", async () => {
+    // A gateway that answers an expired token with 403 instead of the 401
+    // basic/authorization requires. Before: the neutral "no
+    // insufficient_scope challenge" wording sent the user to Host/Origin
+    // validation although the challenge names the token.
+    const stub = await startFixedServer(403, JSON.stringify({ error: "invalid_token" }), "application/json", {
+      "WWW-Authenticate": 'Bearer error="invalid_token", error_description="The access token expired"',
+    });
+    const rejected = (probe: string, era: string, spec: string) =>
+      `Server at ${stub.url} rejected the configured credential (${probe} carried an Authorization header and got HTTP 403), so ${era}the ${spec} grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): the 403's Bearer error="invalid_token" challenge means the token is invalid or expired (basic/authorization requires a 401 for that).`;
+    try {
+      const auto = await runComplianceSuite(stub.url, { timeout: 5000, headers: WRONG, only: ["transport-post"] });
+      expect(auto.warnings[0]).toBe(
+        rejected("the server/discover probe", "the era could not be determined and ", LEGACY_SPEC_VERSION),
+      );
+      expect(autoNote(auto)).toContain("server/discover -> HTTP 403 (credential rejected -- check --auth)");
+      expect(resultOf(auto, "transport-post").details).toBe("HTTP 403 (credential rejected — check --auth)");
+      const pinned = await runComplianceSuite(stub.url, {
+        timeout: 5000,
+        headers: WRONG,
+        specVersion: MODERN_SPEC_VERSION,
+        only: ["transport-post"],
+      });
+      expect(pinned.warnings[0]).toBe(rejected("the preflight", "", MODERN_SPEC_VERSION));
+      expect(resultOf(pinned, "transport-post").details).toBe("HTTP 403 (credential rejected -- check --auth)");
+      expect([...auto.warnings, ...pinned.warnings].some((w) => w.includes("Host and Origin"))).toBe(false);
+    } finally {
+      await stub.stop();
+    }
+  }, 20_000);
+
+  it.each([
+    // The SDK's requireBearerAuth answer to a wrong token.
+    [
+      401,
+      'Bearer error="invalid_token", error_description="Invalid token"',
+      'the 401\'s Bearer error="invalid_token" challenge means the token is invalid or expired',
+    ],
+    [
+      403,
+      'Bearer realm="mcp", error="invalid_request"',
+      'the 403\'s Bearer error="invalid_request" challenge means the request is malformed (an unsupported parameter, or the token sent more than one way)',
+    ],
+    [403, "Bearer error=token_revoked", 'the 403\'s Bearer error="token_revoked" challenge refuses the token'],
+  ])(
+    "HTTP %i with %s: the rejected-credential warning names the challenge's error",
+    async (status, challenge, reason) => {
+      const stub = await startFixedServer(status, "", "text/plain", { "WWW-Authenticate": challenge });
+      try {
+        const pinned = await runComplianceSuite(stub.url, {
+          timeout: 5000,
+          headers: WRONG,
+          specVersion: MODERN_SPEC_VERSION,
+          only: ["transport-post"],
+        });
+        expect(pinned.warnings[0]).toBe(
+          `Server at ${stub.url} rejected the configured credential (the preflight carried an Authorization header and got HTTP ${status}), so the 2026-07-28 grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): ${reason}.`,
+        );
+        expect(resultOf(pinned, "transport-post").details).toBe(`HTTP ${status} (credential rejected -- check --auth)`);
+      } finally {
+        await stub.stop();
+      }
+    },
+    20_000,
+  );
+
+  it("a 403 with no Bearer error challenge (the SDK's Host validation behind a tunnel) is not called a rejected credential", async () => {
     // The official SDK's Host guard answering a request forwarded with a
     // tunnel hostname: 403, a JSON-RPC -32000 body, no WWW-Authenticate.
     // Before: "rejected the configured credential ... a 403 means the token
@@ -1052,7 +1119,7 @@ describe("auth-gated server with a rejected --auth credential", () => {
       "application/json",
     );
     const neutral = (probe: string, era: string, spec: string) =>
-      `Server at ${stub.url} refused ${probe} with HTTP 403, so ${era}the ${spec} grade below is not meaningful. The request carried an Authorization header, but the 403 has no WWW-Authenticate: Bearer error="insufficient_scope" challenge, so it need not be about the credential: check the server's Host and Origin validation (a tunnel or proxy hostname it does not allow), any gateway in front of it, and the permissions of the --auth token.`;
+      `Server at ${stub.url} refused ${probe} with HTTP 403 ("Invalid Host: abc.ngrok-free.app"), so ${era}the ${spec} grade below is not meaningful. The request carried an Authorization header, but the 403 has no WWW-Authenticate: Bearer challenge with an error parameter, so it need not be about the credential: check the server's Host and Origin validation (a tunnel or proxy hostname it does not allow), any gateway in front of it, and the permissions of the --auth token.`;
     try {
       const auto = await runComplianceSuite(stub.url, { timeout: 5000, headers: WRONG, only: ["transport-post"] });
       expect(auto.specVersion).toBe(LEGACY_SPEC_VERSION);
@@ -1060,9 +1127,11 @@ describe("auth-gated server with a rejected --auth credential", () => {
         neutral("the server/discover probe", "the era could not be determined and ", LEGACY_SPEC_VERSION),
       );
       expect(autoNote(auto)).toBe(
-        "Spec version auto-detected as 2025-11-25 (server/discover -> HTTP 403 (forbidden -- no insufficient_scope challenge); era not determinable, using 2025-11-25). Pin with --spec-version to override.",
+        "Spec version auto-detected as 2025-11-25 (server/discover -> HTTP 403 (forbidden -- Host/Origin validation, a gateway, or token permissions); era not determinable, using 2025-11-25). Pin with --spec-version to override.",
       );
-      expect(resultOf(auto, "transport-post").details).toBe("HTTP 403 (forbidden — no insufficient_scope challenge)");
+      expect(resultOf(auto, "transport-post").details).toBe(
+        "HTTP 403 (forbidden — Host/Origin validation, a gateway, or token permissions)",
+      );
       for (const specVersion of [LEGACY_SPEC_VERSION, MODERN_SPEC_VERSION] as const) {
         const pinned = await runComplianceSuite(stub.url, {
           timeout: 5000,
@@ -1073,23 +1142,88 @@ describe("auth-gated server with a rejected --auth credential", () => {
         expect(pinned.warnings[0]).toBe(neutral("the preflight", "", specVersion));
         expect(resultOf(pinned, "transport-post").details).toBe(
           specVersion === MODERN_SPEC_VERSION
-            ? "HTTP 403 (forbidden -- no insufficient_scope challenge)"
-            : "HTTP 403 (forbidden — no insufficient_scope challenge)",
+            ? "HTTP 403 (forbidden -- Host/Origin validation, a gateway, or token permissions)"
+            : "HTTP 403 (forbidden — Host/Origin validation, a gateway, or token permissions)",
         );
       }
       expect(auto.warnings.some((w) => w.includes("rejected the configured credential"))).toBe(false);
       expect(auto.warnings.some((w) => w.includes("lacks a required scope"))).toBe(false);
-      // Without --auth the advice is unchanged: a bare 403 to a request with
-      // no credential still reads as authentication required.
-      const noAuth = await runComplianceSuite(stub.url, { timeout: 5000, only: ["transport-post"] });
-      expect(noAuth.warnings[0]).toBe(
-        `Server at ${stub.url} requires authentication (the server/discover probe got HTTP 403) and no Authorization header was sent, so the era could not be determined and the 2025-11-25 grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`,
-      );
-      expect(resultOf(noAuth, "transport-post").details).toBe("HTTP 403 (auth required — pass --auth)");
     } finally {
       await stub.stop();
     }
   }, 30_000);
+
+  it("without --auth, the same bare 403 is not called authentication required: the advice names Host/Origin, a gateway, then --auth", async () => {
+    // A server with no auth at all behind a tunnel, tested without --auth:
+    // the SDK Host guard's 403 carries no Bearer challenge, and a server
+    // that wants a token answers 401 (basic/authorization "Authorization
+    // required"). Before: "requires authentication ... Re-run with --auth".
+    const stub = await startFixedServer(
+      403,
+      JSON.stringify({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Invalid Host: abc.ngrok-free.app" },
+        id: null,
+      }),
+      "application/json",
+    );
+    const neutral = (probe: string, era: string, spec: string) =>
+      `Server at ${stub.url} refused ${probe} with HTTP 403 ("Invalid Host: abc.ngrok-free.app") and no Authorization header was sent, so ${era}the ${spec} grade below is not meaningful. The 403 has no WWW-Authenticate: Bearer challenge, and a server that requires a token answers 401, so it need not be about authentication: check the server's Host and Origin validation (a tunnel or proxy hostname it does not allow) and any gateway in front of it; re-run with --auth <token> (or -H "Authorization: ...") only if the server does require a credential.`;
+    try {
+      const auto = await runComplianceSuite(stub.url, { timeout: 5000, only: ["transport-post"] });
+      expect(auto.specVersion).toBe(LEGACY_SPEC_VERSION);
+      expect(auto.warnings[0]).toBe(
+        neutral("the server/discover probe", "the era could not be determined and ", LEGACY_SPEC_VERSION),
+      );
+      expect(autoNote(auto)).toBe(
+        "Spec version auto-detected as 2025-11-25 (server/discover -> HTTP 403 (forbidden -- Host/Origin validation, a gateway, or missing credentials); era not determinable, using 2025-11-25). Pin with --spec-version to override.",
+      );
+      expect(resultOf(auto, "transport-post").details).toBe(
+        "HTTP 403 (forbidden — Host/Origin validation, a gateway, or missing credentials)",
+      );
+      for (const specVersion of [LEGACY_SPEC_VERSION, MODERN_SPEC_VERSION] as const) {
+        const pinned = await runComplianceSuite(stub.url, { timeout: 5000, specVersion, only: ["transport-post"] });
+        expect(pinned.warnings[0]).toBe(neutral("the preflight", "", specVersion));
+        expect(resultOf(pinned, "transport-post").details).toBe(
+          specVersion === MODERN_SPEC_VERSION
+            ? "HTTP 403 (forbidden -- Host/Origin validation, a gateway, or missing credentials)"
+            : "HTTP 403 (forbidden — Host/Origin validation, a gateway, or missing credentials)",
+        );
+        expect(pinned.warnings.some((w) => w.includes("requires authentication"))).toBe(false);
+      }
+      expect(auto.warnings.some((w) => w.includes("requires authentication") || w.includes("pass --auth"))).toBe(false);
+    } finally {
+      await stub.stop();
+    }
+  }, 30_000);
+
+  it("without --auth, a 403 carrying a Bearer challenge still reads as authentication required", async () => {
+    // A server that wants a token but answers 403 (not the 401 the spec
+    // asks for): the Bearer challenge says what it wants, so --auth stays
+    // the advice in the warning, the note and transport-post.
+    const stub = await startFixedServer(403, "", "text/plain", {
+      "WWW-Authenticate": 'Bearer realm="mcp", resource_metadata="https://x/.well-known/oauth-protected-resource"',
+    });
+    try {
+      const auto = await runComplianceSuite(stub.url, { timeout: 5000, only: ["transport-post"] });
+      expect(auto.warnings[0]).toBe(
+        `Server at ${stub.url} requires authentication (the server/discover probe got HTTP 403) and no Authorization header was sent, so the era could not be determined and the 2025-11-25 grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`,
+      );
+      expect(autoNote(auto)).toContain("server/discover -> HTTP 403 (authentication required -- pass --auth)");
+      expect(resultOf(auto, "transport-post").details).toBe("HTTP 403 (auth required — pass --auth)");
+      const pinned = await runComplianceSuite(stub.url, {
+        timeout: 5000,
+        specVersion: MODERN_SPEC_VERSION,
+        only: ["transport-post"],
+      });
+      expect(pinned.warnings[0]).toBe(
+        `Server at ${stub.url} requires authentication (the preflight got HTTP 403) and no Authorization header was sent, so the 2026-07-28 grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`,
+      );
+      expect(resultOf(pinned, "transport-post").details).toBe("HTTP 403 (auth required -- pass --auth)");
+    } finally {
+      await stub.stop();
+    }
+  }, 20_000);
 
   it("auto re-probe after a preflight timeout: a bare 403 on the re-probe is read from the re-probe, not defaulted to 401", async () => {
     let first = true;
@@ -1119,7 +1253,9 @@ describe("auth-gated server with a rejected --auth credential", () => {
         headers: WRONG,
         only: ["transport-post"],
       });
-      expect(autoNote(report)).toContain("server/discover -> HTTP 403 (forbidden -- no insufficient_scope challenge)");
+      expect(autoNote(report)).toContain(
+        "server/discover -> HTTP 403 (forbidden -- Host/Origin validation, a gateway, or token permissions)",
+      );
       // Before: the preflight timed out, so the warning fell back to "HTTP 401 ... invalid or expired".
       expect(report.warnings[0]).toMatch(
         new RegExp(`^Server at ${url.replace(/[.]/g, "\\.")} refused the server/discover probe with HTTP 403, so `),
@@ -1495,29 +1631,85 @@ describe("classifyDiscoverResponse", () => {
   });
 
   it.each([
-    401, 403,
-  ])("HTTP %i is refused before the era shows: legacy default, reason names auth, era undetermined", (status) => {
+    [401, "authentication required -- pass --auth"],
+    // No Bearer challenge on the 403: it may be Host/Origin validation.
+    [403, "forbidden -- Host/Origin validation, a gateway, or missing credentials"],
+  ])("HTTP %i is refused before the era shows: legacy default, era undetermined, reason %s", (status, hint) => {
     // The SDK's requireBearerAuth shape: a non-JSON-RPC body on the status.
     const d = classifyDiscoverResponse(res({ error: "invalid_token", error_description: "x" }, status));
     expect(d.version).toBe(LEGACY_SPEC_VERSION);
     expect(d.era).toBe("legacy");
     expect(d.responded).toBe(true);
     expect(d.eraUndetermined).toBe(true);
-    expect(d.reason).toBe(
-      `server/discover -> HTTP ${status} (authentication required -- pass --auth); era not determinable, using 2025-11-25`,
-    );
+    expect(d.reason).toBe(`server/discover -> HTTP ${status} (${hint}); era not determinable, using 2025-11-25`);
   });
 
-  it("refusedCredential: a 401 always, a 403 only with a Bearer insufficient_scope challenge, read from a repeated header too", () => {
+  it("refusedCredential: a 401 always, a 403 only when a Bearer challenge carries an error parameter, read from a repeated header too", () => {
     // undici hands a repeated header to the legacy transport-post as string[].
     const scopeAmongOthers = { "www-authenticate": ['Basic realm="proxy"', 'Bearer error="insufficient_scope"'] };
     expect(refusedCredential(403, scopeAmongOthers)).toBe(true);
     expect(refusedCredential(403, { "www-authenticate": ['Basic realm="proxy"', 'Bearer realm="mcp"'] })).toBe(false);
     expect(refusedCredential(403, undefined)).toBe(false);
     expect(refusedCredential(401, undefined)).toBe(true);
+    // Any error value names the credential, not only insufficient_scope.
+    expect(refusedCredential(403, { "www-authenticate": 'Bearer error="invalid_token"' })).toBe(true);
+    expect(refusedCredential(403, { "www-authenticate": 'Bearer realm="mcp", error="invalid_request"' })).toBe(true);
+    expect(refusedCredential(403, { "www-authenticate": "bearer error=invalid_token" })).toBe(true);
+    // The error must belong to a Bearer challenge: not another scheme's
+    // parameter after a comma, not text inside a quoted value, not empty.
+    expect(refusedCredential(403, { "www-authenticate": 'Bearer realm="mcp", DPoP error="insufficient_scope"' })).toBe(
+      false,
+    );
+    expect(refusedCredential(403, { "www-authenticate": 'Bearer realm="error=insufficient_scope"' })).toBe(false);
+    expect(refusedCredential(403, { "www-authenticate": 'Bearer error=""' })).toBe(false);
+    expect(refusedCredential(403, { "www-authenticate": 'Bearer error_description="insufficient_scope"' })).toBe(false);
+    // A token68 scheme ahead of the Bearer challenge does not swallow it.
+    expect(refusedCredential(403, { "www-authenticate": 'Negotiate ab/cd==, Bearer error="invalid_token"' })).toBe(
+      true,
+    );
     // Neither status: no refusal to read, whatever the headers say.
     expect(refusedCredential(400, scopeAmongOthers)).toBe(false);
     expect(refusedCredential(undefined, scopeAmongOthers)).toBe(false);
+  });
+
+  it("readAuthRefusal: the kind follows the status, the Bearer challenge and whether a credential was sent", () => {
+    const bare = {};
+    const realm = { "www-authenticate": 'Bearer realm="mcp"' };
+    const invalid = { "www-authenticate": 'Bearer error="invalid_token"' };
+    const kind = (status: number, headers: Record<string, string>, sent: boolean) =>
+      readAuthRefusal({ statusCode: status, headers }, sent)?.kind;
+    // No credential sent: a 401, or a 403 carrying any Bearer challenge, asks for one.
+    expect(kind(401, bare, false)).toBe("auth-required");
+    expect(kind(403, realm, false)).toBe("auth-required");
+    expect(kind(403, invalid, false)).toBe("auth-required");
+    expect(kind(403, bare, false)).toBe("forbidden");
+    expect(kind(403, { "www-authenticate": 'Basic realm="proxy"' }, false)).toBe("forbidden");
+    // A credential sent: a 401, or a 403 whose Bearer challenge carries an error, refused it.
+    expect(kind(401, bare, true)).toBe("credential-rejected");
+    expect(kind(403, invalid, true)).toBe("credential-rejected");
+    expect(kind(403, realm, true)).toBe("forbidden");
+    expect(kind(403, bare, true)).toBe("forbidden");
+    // Any other status is not an auth refusal.
+    expect(readAuthRefusal({ statusCode: 400, headers: invalid }, true)).toBeUndefined();
+    expect(readAuthRefusal({ statusCode: undefined }, false)).toBeUndefined();
+    expect(readAuthRefusal({ statusCode: 403, headers: invalid, body: { error: "invalid_token" } }, true)).toEqual({
+      statusCode: 403,
+      authorizationSent: true,
+      kind: "credential-rejected",
+      bearerError: "invalid_token",
+    });
+    // A JSON-RPC error message is kept on one line, stripped of control
+    // characters (an ESC here) and capped.
+    const esc = String.fromCharCode(27);
+    const noisy = readAuthRefusal(
+      {
+        statusCode: 403,
+        body: { jsonrpc: "2.0", error: { code: -32000, message: `Invalid\n${esc}[31mHost: ${"x".repeat(200)}` } },
+      },
+      false,
+    );
+    expect(noisy?.message).toMatch(/^Invalid \[31mHost: x+\.\.\.$/);
+    expect(noisy?.message).toHaveLength(120);
   });
 
   const withHeaders = (body: unknown, statusCode: number, headers: Record<string, string>): TransportResponse => ({
@@ -1540,6 +1732,18 @@ describe("classifyDiscoverResponse", () => {
     ],
     // Header names are matched case-insensitively (a hand-built response map).
     ["the same 403, header name capitalised", withHeaders({}, 403, { "WWW-Authenticate": SCOPE_CHALLENGE })],
+    // Any Bearer error names the credential; the spec wants 401 for these,
+    // but a gateway answering 403 is still refusing the token.
+    [
+      "a 403 with a Bearer invalid_token challenge",
+      withHeaders({ error: "invalid_token" }, 403, {
+        "www-authenticate": 'Bearer error="invalid_token", error_description="The access token expired"',
+      }),
+    ],
+    [
+      "a 403 with a Bearer invalid_request challenge",
+      withHeaders({}, 403, { "www-authenticate": 'Bearer realm="mcp", error="invalid_request"' }),
+    ],
   ])("%s with an Authorization header on the probe: the credential was rejected, and the reason does not say to pass --auth", (_name, response) => {
     const d = classifyDiscoverResponse(response, { authorizationSent: true });
     expect(d.version).toBe(LEGACY_SPEC_VERSION);
@@ -1547,7 +1751,9 @@ describe("classifyDiscoverResponse", () => {
     expect(d.reason).toBe(
       `server/discover -> HTTP ${response.statusCode} (credential rejected -- check --auth); era not determinable, using 2025-11-25`,
     );
-    expect(d.refusal).toEqual({ statusCode: response.statusCode, credentialRefused: true });
+    expect(d.refusal?.kind).toBe("credential-rejected");
+    expect(d.refusal?.statusCode).toBe(response.statusCode);
+    expect(d.refusal?.authorizationSent).toBe(true);
   });
 
   it.each([
@@ -1563,29 +1769,40 @@ describe("classifyDiscoverResponse", () => {
           "content-type": "application/json",
         },
       ),
+      "forbidden -- Host/Origin validation, a gateway, or missing credentials",
     ],
-    ["a 403 with a JSON body naming a scope but no challenge", res({ error: "insufficient_scope" }, 403)],
     [
-      "a 403 whose Bearer challenge is not insufficient_scope",
+      "a 403 with a JSON body naming a scope but no challenge",
+      res({ error: "insufficient_scope" }, 403),
+      "forbidden -- Host/Origin validation, a gateway, or missing credentials",
+    ],
+    // A Bearer challenge with no error asks for a token without refusing one:
+    // neutral when a token was sent, authentication required when none was.
+    [
+      "a 403 whose Bearer challenge carries no error",
       withHeaders({}, 403, { "www-authenticate": 'Bearer realm="mcp"' }),
+      "authentication required -- pass --auth",
     ],
     [
       "a 403 whose insufficient_scope is not a Bearer challenge",
       withHeaders({}, 403, { "www-authenticate": 'DPoP error="insufficient_scope"' }),
+      "forbidden -- Host/Origin validation, a gateway, or missing credentials",
     ],
-  ])("%s with an Authorization header on the probe: not called a credential rejection", (_name, response) => {
+  ])("%s with an Authorization header on the probe: not called a credential rejection", (_name, response, noCredentialHint) => {
     const d = classifyDiscoverResponse(response, { authorizationSent: true });
     expect(d.version).toBe(LEGACY_SPEC_VERSION);
     expect(d.eraUndetermined).toBe(true);
     // Before: "(credential rejected -- check --auth)" for every 403.
     expect(d.reason).toBe(
-      "server/discover -> HTTP 403 (forbidden -- no insufficient_scope challenge); era not determinable, using 2025-11-25",
+      "server/discover -> HTTP 403 (forbidden -- Host/Origin validation, a gateway, or token permissions); era not determinable, using 2025-11-25",
     );
-    expect(d.refusal).toEqual({ statusCode: 403, credentialRefused: false });
-    // Without the header the no-credential advice is unchanged.
-    expect(classifyDiscoverResponse(response).reason).toBe(
-      "server/discover -> HTTP 403 (authentication required -- pass --auth); era not determinable, using 2025-11-25",
+    expect(d.refusal?.kind).toBe("forbidden");
+    // Without the header, only a Bearer challenge keeps the --auth advice.
+    const noHeader = classifyDiscoverResponse(response);
+    expect(noHeader.reason).toBe(
+      `server/discover -> HTTP 403 (${noCredentialHint}); era not determinable, using 2025-11-25`,
     );
+    expect(noHeader.refusal?.authorizationSent).toBe(false);
   });
 
   it("authorizationSent changes only the auth reason: other shapes classify exactly as without it", () => {

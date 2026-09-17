@@ -452,6 +452,70 @@ const PROMPTS = [
   { name: "simple", description: "no arguments" },
 ];
 
+describe("transport-post: the 401/403 hint reads the Bearer challenge", () => {
+  /** A server that answers every request with 403, the given WWW-Authenticate (if any) and body. */
+  async function forbiddenStub(challenge: string | undefined, body = "") {
+    return startStub((_req, res) => {
+      res.writeHead(403, {
+        "Content-Type": body ? "application/json" : "text/plain",
+        ...(challenge ? { "WWW-Authenticate": challenge } : {}),
+      });
+      res.end(body);
+    });
+  }
+  const HOST_GUARD = JSON.stringify({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Invalid Host: abc.ngrok-free.app" },
+    id: null,
+  });
+
+  it.each([
+    // The SDK's Host guard behind a tunnel, on a server with no auth at all.
+    // Before: "auth required -- pass --auth".
+    [
+      "no --auth, a bare 403",
+      undefined,
+      HOST_GUARD,
+      false,
+      "HTTP 403 (forbidden -- Host/Origin validation, a gateway, or missing credentials)",
+    ],
+    [
+      "no --auth, a 403 with a Bearer challenge",
+      'Bearer realm="mcp"',
+      "",
+      false,
+      "HTTP 403 (auth required -- pass --auth)",
+    ],
+    // A gateway answering an expired token with 403. Before: "forbidden --
+    // no insufficient_scope challenge".
+    [
+      "--auth, a 403 with a Bearer invalid_token challenge",
+      'Bearer error="invalid_token"',
+      "",
+      true,
+      "HTTP 403 (credential rejected -- check --auth)",
+    ],
+    [
+      "--auth, a 403 with a Bearer challenge that carries no error",
+      'Bearer realm="mcp"',
+      "",
+      true,
+      "HTTP 403 (forbidden -- Host/Origin validation, a gateway, or token permissions)",
+    ],
+  ] as const)("%s", async (_name, challenge, body, withAuth, details) => {
+    const stub = await forbiddenStub(challenge, body);
+    try {
+      const report = await runModern(
+        { type: "http", url: stub.url, headers: withAuth ? { Authorization: "Bearer WRONG" } : undefined },
+        { only: ["transport-post"] },
+      );
+      expect(failed(report, "transport-post")).toBe(details);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
 describe("transport-header-name-mismatch: direct context", () => {
   let clean: HttpFixture;
 
@@ -663,6 +727,80 @@ describe("modern transport suite: stub servers for knob-less branches", () => {
       expect(report.warnings.filter((w) => /^(lifecycle|transport)-/.test(w))).toEqual([]);
     } finally {
       await stub.close();
+    }
+  });
+
+  it("a JSON-RPC error code that is not an integer is named as sent, never NaN", async () => {
+    // Before: "JSON-RPC error NaN" in transport-post and transport-batch-reject,
+    // "error code NaN" in the header tests, and "rejected with NaN" in the
+    // not-evaluable reason.
+    const everything = await startStub((_req, res, body) => {
+      let id: unknown = null;
+      try {
+        id = JSON.parse(body).id ?? null;
+      } catch {}
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          error: { code: "E_UNINIT", message: "Bad Request: Server not initialized" },
+        }),
+      );
+    });
+    // Serves the conformant discover; a batch draws an error with a string
+    // code, and a header defect a 400 whose error object has no code.
+    const probes = await startStub((req, res, body) => {
+      const answer = (status: number, obj: unknown) => {
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(obj));
+      };
+      if (body.trimStart().startsWith("[")) {
+        return answer(200, { jsonrpc: "2.0", id: null, error: { code: "E_BATCH", message: "no batches" } });
+      }
+      if (req.headers["mcp-protocol-version"] === undefined || body.includes("1999-01-01")) {
+        return answer(400, { jsonrpc: "2.0", id: null, error: { message: "header mismatch" } });
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(discoverResult(body));
+    });
+    try {
+      const report = await runModern(everything.url, { only: ["transport-post", "transport-header-version-required"] });
+      expect(failed(report, "transport-post")).toBe(
+        'HTTP 400, JSON-RPC error with non-integer code "E_UNINIT" (Bad Request: Server not initialized)',
+      );
+      expect(failed(report, "transport-header-version-required")).toBe(
+        'not evaluable: the conformant server/discover was itself rejected with non-integer code "E_UNINIT" (HTTP 400), so this rejection proves nothing about the injected defect',
+      );
+
+      const batch = await directContext(probes.url, {}, { only: ["transport-batch-reject"] }).run();
+      expect(batch).toMatchObject({
+        passed: true,
+        details: 'HTTP 200, JSON-RPC error with non-integer code "E_BATCH" (batch rejected)',
+      });
+      const headers = directContext(
+        probes.url,
+        {},
+        {
+          only: ["transport-header-version-required", "transport-header-version-mismatch"],
+        },
+      );
+      expect(await headers.all()).toEqual({
+        "transport-header-version-required": {
+          passed: true,
+          details: "HTTP 400 with a JSON-RPC error with no code (expected -32020; reported as a warning)",
+        },
+        "transport-header-version-mismatch": {
+          passed: false,
+          details: "HTTP 400 but a JSON-RPC error with no code (expected -32020 HeaderMismatch)",
+        },
+      });
+      expect(headers.warnings()).toEqual([
+        "transport-header-version-required: server rejected the request with HTTP 400 but a JSON-RPC error with no code instead of -32020 HeaderMismatch (SHOULD).",
+      ]);
+    } finally {
+      await everything.close();
+      await probes.close();
     }
   });
 

@@ -600,6 +600,17 @@ describe("a list answered with the wrong shape", () => {
       caching: "tools/list returned JSON-RPC error -32603 (boom); no complete result to check caching hints on",
     },
     {
+      // JSON-RPC requires an integer code: the detail names what was sent, not "NaN".
+      name: "a JSON-RPC error whose code is a string",
+      reply: (msg) => ({
+        status: 200,
+        body: { jsonrpc: "2.0", id: msg.id, error: { code: "E_LIST", message: "boom" } },
+      }),
+      list: 'tools/list returned JSON-RPC error with non-integer code "E_LIST" (boom)',
+      caching:
+        'tools/list returned JSON-RPC error with non-integer code "E_LIST" (boom); no complete result to check caching hints on',
+    },
+    {
       // An interim MRTR result is not a list (and schema-no-input-required-on-lists
       // fails it), but it carries no caching hints to judge either.
       name: "an input_required interim result",
@@ -732,6 +743,23 @@ describe("tools/call answered against a stub", () => {
       callDetails: "t: protocol error: JSON-RPC error -32603 (handler crashed)",
       typesPassed: true,
       typesDetails: "t: tool returned error (content types not applicable): code -32603",
+    },
+    {
+      // An error with no code member at all is still an error; the details say so instead of "NaN".
+      name: "an error with no code: passes as a protocol error, named 'no code'",
+      call: (msg) => ({ status: 200, body: { jsonrpc: "2.0", id: msg.id, error: { message: "handler crashed" } } }),
+      callPassed: true,
+      callDetails: "t: protocol error: JSON-RPC error with no code (handler crashed)",
+      typesPassed: true,
+      typesDetails: "t: tool returned error (content types not applicable): no code",
+    },
+    {
+      name: "an error whose code is a numeric string: never read as -32602",
+      call: (msg) => ({ status: 200, body: { jsonrpc: "2.0", id: msg.id, error: { code: "-32602", message: "x" } } }),
+      callPassed: true,
+      callDetails: 't: protocol error: JSON-RPC error with non-integer code "-32602" (x)',
+      typesPassed: true,
+      typesDetails: 't: tool returned error (content types not applicable): non-integer code "-32602"',
     },
     {
       // tools-call only asks that every item HAS a type; which types are

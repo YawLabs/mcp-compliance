@@ -75,6 +75,36 @@ function exitDiagnostic(code: number | null, signal: NodeJS.Signals | null): str
   return `server crashed with exit code ${code} before completing the request`;
 }
 
+/**
+ * How long close() waits, after closing the child's stdin, for the server to
+ * exit on its own before it terminates it. The spec's stdio shutdown
+ * (basic/transports/stdio, "Shutdown") is: close the input stream, wait for
+ * the server to exit, and only "if the server does not exit within a
+ * reasonable time" terminate it forcibly; servers SHOULD exit "promptly" on
+ * EOF, "the primary graceful-shutdown signal and the only portable one". The
+ * spec puts no number on either, so this is the reference TypeScript SDK
+ * client's wait (StdioClientTransport.close()): time for a server to flush
+ * and release what it holds, short enough that a run against a server that
+ * ignores EOF does not stall noticeably. A server that does exit on EOF ends
+ * the wait the moment it goes.
+ */
+const EOF_WINDOW_MS = 2000;
+/** POSIX: how long a server that ignored EOF gets to exit on SIGTERM before SIGKILL (the SDK client's second wait). */
+const SIGTERM_GRACE_MS = 2000;
+/** The last, bounded wait for the forced kill to be carried out and the child reaped, in case the kill itself hangs. */
+const KILL_WAIT_MS = 5000;
+
+/** Resolves true when `promise` settles within `ms`, false when the bound runs out first. */
+function within(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    void promise.then(() => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
 export function createStdioTransport(opts: StdioTransportOptions): StdioTransport {
   const { command, args = [], env, cwd, verbose = false } = opts;
   const stderrBufferSize = opts.stderrBufferSize ?? 64 * 1024;
@@ -99,6 +129,8 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
   let stdoutBuffer = "";
   let stderrBuffer = "";
   let stdoutOverflows = 0;
+  /** The shutdown close() started, so a second close() joins it. */
+  let closing: Promise<void> | null = null;
 
   function emit(message: unknown) {
     for (const l of listeners) {
@@ -251,6 +283,70 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     return new Promise<void>((resolve, reject) => {
       stdin.write(`${line}\n`, "utf8", (err) => (err ? reject(err) : resolve()));
     });
+  }
+
+  /**
+   * The spec's stdio shutdown order: close stdin, wait EOF_WINDOW_MS for the
+   * server to exit, and only then terminate it. Nothing is signalled or
+   * spawned at EOF time: a SIGTERM sent along with EOF ends a server that
+   * would have exited cleanly before its shutdown work runs.
+   */
+  async function shutDown(): Promise<void> {
+    const childExit = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    try {
+      child.stdin?.end();
+    } catch {}
+    // No pid: the spawn itself failed (ENOENT, EACCES), so there is no
+    // process to wait for or kill.
+    if (child.pid === undefined) {
+      rejectAllPending(new Error("stdio transport: closed"));
+      return;
+    }
+    const pid = String(child.pid);
+    if (!(await within(childExit, EOF_WINDOW_MS))) {
+      if (isWindows) {
+        // Windows has no SIGTERM step: a non-forced taskkill asks a process to
+        // close its windows, which a console process has none of (taskkill
+        // exits 128, "can only be terminated forcefully"), so it could never
+        // end the server -- only leave a taskkill running. Go straight to the
+        // forced kill of the whole tree: the child is spawned via a shell
+        // (shell:true, for .cmd/.bat shims like npx), so child.kill() would
+        // only reach cmd.exe and orphan the real server (the node/npx
+        // grandchild); `taskkill /t` walks the tree.
+        //
+        // Wait for the forced kill to be carried out and the child to be
+        // reaped, not merely for taskkill to be spawned. Node puts its direct
+        // children (cmd.exe, taskkill) in a kill-on-close job object that the
+        // shell's own children are outside of, so a caller that exits right
+        // after close() resolves -- a test worker torn down after its last
+        // test -- takes taskkill and cmd.exe down with it before the kill is
+        // carried out, and the real server (the grandchild), still busy and
+        // so not gone on EOF, is left running as an orphan.
+        const forcedTreeKill = new Promise<void>((resolve) => {
+          try {
+            const killer = spawn("taskkill", ["/pid", pid, "/t", "/f"], { stdio: "ignore" });
+            killer.once("exit", () => resolve());
+            killer.once("error", () => resolve());
+          } catch {
+            resolve();
+          }
+        });
+        await within(Promise.all([forcedTreeKill, childExit]), KILL_WAIT_MS);
+      } else {
+        // POSIX spawns with shell:false, so the child is the server itself:
+        // SIGTERM, then SIGKILL for one that ignores that too.
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+        if (!(await within(childExit, SIGTERM_GRACE_MS))) {
+          try {
+            child.kill("SIGKILL");
+          } catch {}
+          await within(childExit, KILL_WAIT_MS);
+        }
+      }
+    }
+    rejectAllPending(new Error("stdio transport: closed"));
   }
 
   const transport: StdioTransport = {
@@ -428,71 +524,12 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     writeRaw(line) {
       return writeLine(line);
     },
-    async close() {
-      if (exited) return;
-      const childExit = new Promise<void>((resolve) => child.once("exit", () => resolve()));
-      // Signal EOF via stdin close; many stdio servers exit cleanly on this.
-      try {
-        child.stdin?.end();
-      } catch {}
-      // No pid: the spawn itself failed (ENOENT, EACCES), so there is no
-      // process to wait for or kill.
-      if (child.pid === undefined) {
-        rejectAllPending(new Error("stdio transport: closed"));
-        return;
-      }
-      const pid = String(child.pid);
-      // Kill the whole process tree, not just the direct child. On Windows
-      // the child is spawned via a shell (shell:true, for .cmd/.bat shims
-      // like npx), so child.kill() would only reach cmd.exe and orphan the
-      // real server (the node/npx grandchild); `taskkill /t` walks the tree.
-      // On POSIX we spawn with shell:false, so signalling the child directly
-      // is sufficient. Settles once the kill has been carried out: on
-      // Windows when taskkill exits, on POSIX as soon as the signal is sent.
-      const treeKill = (force: boolean): Promise<void> => {
-        if (!isWindows) {
-          try {
-            child.kill(force ? "SIGKILL" : "SIGTERM");
-          } catch {}
-          return Promise.resolve();
-        }
-        return new Promise<void>((resolve) => {
-          try {
-            const killer = spawn("taskkill", ["/pid", pid, "/t", ...(force ? ["/f"] : [])], { stdio: "ignore" });
-            killer.once("exit", () => resolve());
-            killer.once("error", () => resolve());
-          } catch {
-            resolve();
-          }
-        });
-      };
-      /** Resolves true when `promise` settles within `ms`, false when the bound runs out first. */
-      const within = (promise: Promise<unknown>, ms: number) =>
-        new Promise<boolean>((resolve) => {
-          const timer = setTimeout(() => resolve(false), ms);
-          void promise.then(() => {
-            clearTimeout(timer);
-            resolve(true);
-          });
-        });
-      // Grace period for a clean exit on EOF (or SIGTERM), then force-kill
-      // the tree. A non-forced taskkill cannot end a console process, so on
-      // Windows the grace period is really the EOF window.
-      const gracePeriodMs = 2000;
-      void treeKill(false);
-      if (!(await within(childExit, gracePeriodMs))) {
-        // Wait for the forced kill to be carried out and the child to be
-        // reaped, not merely for taskkill to be spawned. Node puts its direct
-        // children (cmd.exe, taskkill) in a kill-on-close job object that the
-        // shell's own children are outside of, so a caller that exits right
-        // after close() resolves -- a test worker torn down after its last
-        // test -- takes taskkill and cmd.exe down with it before the kill is
-        // carried out, and the real server (the grandchild), still busy and
-        // so not gone on EOF, is left running as an orphan. Bounded, in case
-        // taskkill itself hangs.
-        await within(Promise.all([treeKill(true), childExit]), 5000);
-      }
-      rejectAllPending(new Error("stdio transport: closed"));
+    close() {
+      if (exited) return Promise.resolve();
+      // A close() while one is under way joins it: one EOF window, one
+      // termination.
+      closing ??= shutDown();
+      return closing;
     },
     setSessionId(_id) {
       // stdio has no session concept; no-op.

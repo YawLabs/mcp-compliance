@@ -3,6 +3,8 @@ import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   checkPagination,
+  errorCodeText,
+  errorWithCode,
   type RpcBodyCall,
   validateInputRequired,
   validatePromptMessages,
@@ -86,20 +88,50 @@ describe("checkPagination: a first page that is not a list result", () => {
     expect(calls).toBe(1);
   });
 
-  it("an error whose code is not a number is still an error on either page, reported as NaN", async () => {
+  it("an error whose code is not an integer is still an error on either page, named as the server sent it", async () => {
     const stringCode = { jsonrpc: "2.0", id: 1, error: { code: "E_LIST", message: "boom" } };
     expect(await checkPagination(async () => stringCode, "tools/list", "tools")).toEqual({
       passed: false,
-      details: "No result from tools/list (JSON-RPC error NaN)",
+      details: 'No result from tools/list (JSON-RPC error with non-integer code "E_LIST")',
       warnings: [],
     });
     const secondPageFails: RpcBodyCall = async (_m, params) =>
       params?.cursor === undefined ? { result: { tools: [1], nextCursor: "c1" } } : stringCode;
     expect(await checkPagination(secondPageFails, "tools/list", "tools")).toEqual({
       passed: false,
-      details: "Next page failed: tools/list with cursor returned error NaN",
+      details: 'Next page failed: tools/list with cursor returned error with non-integer code "E_LIST"',
       warnings: [],
     });
+  });
+
+  it("an error with no code at all is 'no code', never NaN; a long non-integer code is clipped", async () => {
+    const noCode = { jsonrpc: "2.0", id: 1, error: { message: "boom" } };
+    expect((await checkPagination(async () => noCode, "prompts/list", "prompts")).details).toBe(
+      "No result from prompts/list (JSON-RPC error with no code)",
+    );
+    const secondPageFails: RpcBodyCall = async (_m, params) =>
+      params?.cursor === undefined ? { result: { prompts: [], nextCursor: "c1" } } : noCode;
+    expect((await checkPagination(secondPageFails, "prompts/list", "prompts")).details).toBe(
+      "Next page failed: prompts/list with cursor returned error with no code",
+    );
+    const longCode = { error: { code: `E_${"X".repeat(60)}` } };
+    expect((await checkPagination(async () => longCode, "tools/list", "tools")).details).toBe(
+      `No result from tools/list (JSON-RPC error with non-integer code "E_${"X".repeat(34)}...)`,
+    );
+  });
+});
+
+describe("errorCodeText / errorWithCode: one rendering of a JSON-RPC error code for every detail", () => {
+  it("an integer as is; anything else as sent, clipped; a missing member as 'no code'", () => {
+    expect(errorCodeText(-32601)).toBe("-32601");
+    expect(errorCodeText("E_LIST")).toBe('non-integer code "E_LIST"');
+    expect(errorCodeText("-32601")).toBe('non-integer code "-32601"');
+    expect(errorCodeText(1.5)).toBe("non-integer code 1.5");
+    expect(errorCodeText(null)).toBe("non-integer code null");
+    expect(errorCodeText(undefined)).toBe("no code");
+    expect(errorWithCode(-32601)).toBe("JSON-RPC error -32601");
+    expect(errorWithCode(undefined)).toBe("JSON-RPC error with no code");
+    expect(errorWithCode("E_LIST", "error")).toBe('error with non-integer code "E_LIST"');
   });
 });
 

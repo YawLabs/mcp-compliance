@@ -1,4 +1,5 @@
-import { authRefusalHint, refusedCredential } from "../../detect.js";
+import { errorCodeText, errorWithCode } from "../../checks/validators.js";
+import { authRefusalHint, readAuthRefusal } from "../../detect.js";
 import type { TestOutcome } from "../../harness.js";
 import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
 import { HEADER_METHOD, HEADER_NAME, HEADER_PROTOCOL_VERSION } from "../../modern/headers.js";
@@ -75,7 +76,7 @@ function summarize(res: RpcResponse, withMessage = false): string {
   const err = errorOf(res.body);
   if (err) {
     const msg = withMessage && err.message ? ` (${clip(err.message, 80)})` : "";
-    return `JSON-RPC error ${err.code}${msg}`;
+    return `${errorWithCode(err.rawCode)}${msg}`;
   }
   return resultOf(res.body) ? "result" : "non-JSON-RPC body";
 }
@@ -119,7 +120,11 @@ function evaluateHeaderRejection(
   if (err && err.code === HEADER_MISMATCH) {
     return { passed: true, details: `HTTP 400, JSON-RPC error -32020 HeaderMismatch` };
   }
-  const codeText = err ? `error code ${err.code}` : "no JSON-RPC error body";
+  const codeText = !err
+    ? "no JSON-RPC error body"
+    : Number.isInteger(err.rawCode)
+      ? `error code ${err.rawCode}`
+      : `a JSON-RPC error with ${errorCodeText(err.rawCode)}`;
   if (opts.codeRequired) {
     return { passed: false, details: `HTTP 400 but ${codeText} (expected -32020 HeaderMismatch)` };
   }
@@ -135,15 +140,15 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
   await harness.check("transport-post", async () => {
     const res = await client.rpc(DISCOVER, {});
     if (is2xx(res.statusCode)) return { passed: true, details: `HTTP ${res.statusCode}` };
-    if (res.statusCode === 401 || res.statusCode === 403) {
-      // "credential rejected" only when the status says so: a 403 without a
-      // Bearer insufficient_scope challenge may be Host/Origin validation.
-      const hint = authRefusalHint(
-        ctx.hasAuth,
-        refusedCredential(res.statusCode, res.headers),
-        "auth required -- pass --auth",
-      );
-      return { passed: false, details: `HTTP ${res.statusCode} (${hint})` };
+    // "pass --auth" only when the status asks for a credential none was
+    // sent for; "credential rejected" only when it refused the one sent;
+    // any other 403 may be Host/Origin validation (readAuthRefusal).
+    const refusal = readAuthRefusal(res, ctx.hasAuth);
+    if (refusal) {
+      return {
+        passed: false,
+        details: `HTTP ${res.statusCode} (${authRefusalHint(refusal, "auth required -- pass --auth")})`,
+      };
     }
     return { passed: false, details: `HTTP ${res.statusCode}, ${summarize(res, true)}` };
   });
@@ -219,7 +224,7 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
       };
     }
     const err = errorOf(parsed);
-    if (err) return { passed: true, details: `HTTP ${res.statusCode}, JSON-RPC error ${err.code} (batch rejected)` };
+    if (err) return { passed: true, details: `HTTP ${res.statusCode}, ${errorWithCode(err.rawCode)} (batch rejected)` };
     return { passed: false, details: `HTTP ${res.statusCode} without a JSON-RPC error (expected 4xx or error)` };
   });
 

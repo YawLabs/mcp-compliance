@@ -1,3 +1,4 @@
+import { errorWithCode } from "../../checks/validators.js";
 import type { DetectionResult } from "../../detect.js";
 import type { Harness, TestOutcome } from "../../harness.js";
 import { errorOf, type ModernClient, type RpcResponse, resultOf } from "../../modern/client.js";
@@ -21,7 +22,7 @@ export interface ModernState {
    * Negative probes compare against it: a rejection identical to the one
    * the CONFORMANT request drew proves nothing about the injected defect.
    */
-  discoverRejection: { code: number | null; statusCode: number } | null;
+  discoverRejection: { code: number | null; rawCode: unknown; statusCode: number } | null;
   /**
    * How long the setup `server/discover` took to answer (ms), null when
    * it never did. On a pinned stdio run it is the first exchange with the
@@ -188,7 +189,7 @@ function clip(text: string, max = 80): string {
  */
 export function listFailureReason(key: ListKey, res: RpcResponse): string | null {
   const err = errorOf(res.body);
-  if (err) return `JSON-RPC error ${err.code}${err.message ? ` (${clip(err.message, 60)})` : ""}`;
+  if (err) return `${errorWithCode(err.rawCode)}${err.message ? ` (${clip(err.message, 60)})` : ""}`;
   const result = resultOf(res.body);
   if (!result) return `no result object (HTTP ${res.statusCode})`;
   const list = result[LIST_RESULT_KEY[key]];

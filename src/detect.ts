@@ -43,9 +43,13 @@ export interface DetectOptions {
 
 export interface ClassifyOptions {
   /**
-   * Whether the probe carried a user-configured Authorization header. A
-   * 401/403 then means the credential was rejected, not that one is
-   * missing, and the reason must not tell the user to pass --auth.
+   * Whether the probe carried a user-configured Authorization header. It
+   * decides how a 401/403 reads (see `readAuthRefusal`). With a header, a
+   * 401, or a 403 whose Bearer challenge carries an `error` parameter,
+   * means the credential was rejected, any other 403 is worded as
+   * forbidden, and the reason never tells the user to pass --auth. Without
+   * one, a 401, or a 403 carrying a Bearer challenge, means a credential is
+   * required (pass --auth), and any other 403 is worded as forbidden.
    */
   authorizationSent?: boolean;
 }
@@ -78,12 +82,11 @@ export interface DetectionResult {
    */
   eraUndetermined?: boolean;
   /**
-   * With `eraUndetermined`: the refusing status, and whether it refused a
-   * credential rather than something else (see `refusedCredential`).
+   * With `eraUndetermined`: how the refusal reads (see `readAuthRefusal`).
    * Callers word their warning from this, not from the preflight, which a
    * re-probe after a preflight timeout never saw.
    */
-  refusal?: { statusCode: number; credentialRefused: boolean };
+  refusal?: AuthRefusal;
   /**
    * The probe response when the server answered with a DiscoverResult.
    * Seeds serverInfo/capabilities so the modern suite does not repeat
@@ -103,51 +106,192 @@ export function isModernErrorCode(code: unknown): boolean {
   return typeof code === "number" && MODERN_CODES.has(code);
 }
 
+type HeaderMap = Record<string, string | string[] | undefined>;
+
+/** One challenge of a WWW-Authenticate header: its scheme and auth-params, both names lower-cased. */
+interface AuthChallenge {
+  scheme: string;
+  params: Map<string, string>;
+}
+
+const TCHAR = /[!#$%&'*+.^_`|~0-9A-Za-z-]/;
+
 /**
- * Whether a 401/403 refused the credential a request carried, read the
- * way basic/authorization splits the two statuses:
- *
- * - a 401 always does ("Authorization required or token invalid");
- * - a 403 does only with a `WWW-Authenticate: Bearer
- *   error="insufficient_scope"` challenge ("Runtime Insufficient Scope
- *   Errors"). A bare 403 is also what streamable-http requires for an
- *   invalid Origin and what the SDK's Host validation answers a tunnel or
- *   proxy hostname with, so on its own it says nothing about the token.
- *
- * Header names are matched case-insensitively; the challenge is found by
- * a Bearer scheme followed anywhere by that error parameter.
+ * Split one WWW-Authenticate value into its challenges (RFC 9110 11.6.1).
+ * Commas separate both the challenges and the auth-params inside one, so a
+ * bare token after a comma starts a challenge, a `name=value` pair belongs
+ * to the challenge before it, and a token68 (`Negotiate ab/cd==`) is
+ * skipped. Quoted values are unescaped, so text inside one (`realm="error=x"`)
+ * is never read as a parameter. Lenient: malformed input yields whatever
+ * challenges parse, never an exception.
  */
-export function refusedCredential(
-  statusCode: number | undefined,
-  headers: Record<string, string | string[] | undefined> | undefined,
-): boolean {
-  if (statusCode === 401) return true;
-  if (statusCode !== 403 || !headers) return false;
-  return Object.entries(headers).some(
-    ([name, value]) =>
-      name.toLowerCase() === "www-authenticate" &&
-      value !== undefined &&
-      /\bBearer\b[\s\S]*\berror\s*=\s*"?insufficient_scope\b/i.test(Array.isArray(value) ? value.join(", ") : value),
-  );
+function parseChallenges(value: string): AuthChallenge[] {
+  const challenges: AuthChallenge[] = [];
+  const n = value.length;
+  let i = 0;
+  // A bare token right after a scheme (no comma between) is its token68.
+  let afterScheme = false;
+  const skipBlanks = () => {
+    while (i < n && (value[i] === " " || value[i] === "\t")) i++;
+  };
+  while (i < n) {
+    if (value[i] === ",") {
+      afterScheme = false;
+      i++;
+      continue;
+    }
+    if (!TCHAR.test(value[i])) {
+      i++;
+      continue;
+    }
+    const start = i;
+    while (i < n && TCHAR.test(value[i])) i++;
+    const token = value.slice(start, i);
+    skipBlanks();
+    if (value[i] !== "=") {
+      if (!afterScheme) {
+        challenges.push({ scheme: token.toLowerCase(), params: new Map() });
+        afterScheme = true;
+      }
+      continue;
+    }
+    i++;
+    skipBlanks();
+    if (i >= n || value[i] === "=" || value[i] === ",") {
+      // token68 padding (`abc==`), not a parameter.
+      while (i < n && value[i] !== ",") i++;
+      continue;
+    }
+    let paramValue = "";
+    if (value[i] === '"') {
+      i++;
+      while (i < n && value[i] !== '"') {
+        if (value[i] === "\\" && i + 1 < n) i++;
+        paramValue += value[i++];
+      }
+      i++;
+    } else {
+      const valueStart = i;
+      while (i < n && value[i] !== "," && value[i] !== " " && value[i] !== "\t") i++;
+      paramValue = value.slice(valueStart, i);
+    }
+    const current = challenges[challenges.length - 1];
+    const name = token.toLowerCase();
+    if (current && !current.params.has(name)) current.params.set(name, paramValue);
+    afterScheme = false;
+  }
+  return challenges;
+}
+
+/** Every Bearer challenge across a response's WWW-Authenticate headers (names matched case-insensitively, repeated headers included). */
+function bearerChallenges(headers: HeaderMap | undefined): AuthChallenge[] {
+  if (!headers) return [];
+  const out: AuthChallenge[] = [];
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() !== "www-authenticate" || value === undefined) continue;
+    for (const v of Array.isArray(value) ? value : [value]) {
+      out.push(...parseChallenges(v).filter((c) => c.scheme === "bearer"));
+    }
+  }
+  return out;
+}
+
+/** Collapse whitespace, drop control characters and cap the length of server-supplied text quoted in a warning. */
+function snippet(text: string, max: number): string {
+  const flat = text
+    .replace(/\p{Cc}+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return flat.length > max ? `${flat.slice(0, max - 3)}...` : flat;
+}
+
+/**
+ * How a 401/403 reads (see `readAuthRefusal`):
+ * - `auth-required`: no Authorization header was sent, and the status asks
+ *   for one (a 401, or a 403 carrying a Bearer challenge); pass --auth.
+ * - `credential-rejected`: an Authorization header was sent and the status
+ *   refused it (a 401, or a 403 whose Bearer challenge carries `error`).
+ * - `forbidden`: any other 403. streamable-http requires a bare 403 for an
+ *   invalid Origin and the SDK's Host validation answers a tunnel or proxy
+ *   hostname with one, so it says nothing about the credential on its own.
+ */
+export type AuthRefusalKind = "auth-required" | "credential-rejected" | "forbidden";
+
+export interface AuthRefusal {
+  statusCode: number;
+  /** Whether the refused request carried a user-configured Authorization header. */
+  authorizationSent: boolean;
+  kind: AuthRefusalKind;
+  /** The `error` parameter of the response's first Bearer challenge that carries one ("invalid_token", "insufficient_scope", ...). */
+  bearerError?: string;
+  /** A JSON-RPC `error.message` in the body (e.g. "Invalid Host: abc.ngrok-free.app"), one line, capped at 120 chars. */
+  message?: string;
+}
+
+/**
+ * Read a 401/403 the way basic/authorization splits the two statuses
+ * ("Authorization required or token invalid" is 401, "Invalid or expired
+ * tokens MUST receive a HTTP 401"; 403 is "Invalid scopes or insufficient
+ * permissions", signalled by a `WWW-Authenticate: Bearer
+ * error="insufficient_scope"` challenge), and RFC 6750 3.1 (a request that
+ * carried no token gets a Bearer challenge without an error code). Returns
+ * undefined for any other status. Exported so every place that words a
+ * 401/403 (the era-probe note and warning, transport-post in both suites,
+ * the security suite) reads it the same way.
+ */
+export function readAuthRefusal(
+  res: { statusCode?: number; headers?: HeaderMap; body?: unknown },
+  authorizationSent: boolean,
+): AuthRefusal | undefined {
+  const { statusCode } = res;
+  if (statusCode !== 401 && statusCode !== 403) return undefined;
+  const bearer = bearerChallenges(res.headers);
+  // RFC 6750 error values never contain `"` or `\`; drop them so the value quotes cleanly.
+  const bearerError = bearer
+    .map((c) => snippet((c.params.get("error") ?? "").replace(/["\\]/g, ""), 40))
+    .find((e) => e !== "");
+  let kind: AuthRefusalKind;
+  if (authorizationSent) {
+    kind = statusCode === 401 || bearerError !== undefined ? "credential-rejected" : "forbidden";
+  } else {
+    kind = statusCode === 401 || bearer.length > 0 ? "auth-required" : "forbidden";
+  }
+  const refusal: AuthRefusal = { statusCode, authorizationSent, kind };
+  if (bearerError !== undefined) refusal.bearerError = bearerError;
+  const rawMessage = (res.body as { error?: { message?: unknown } } | null | undefined)?.error?.message;
+  const message = typeof rawMessage === "string" ? snippet(rawMessage, 120) : "";
+  if (message) refusal.message = message;
+  return refusal;
+}
+
+/**
+ * Whether a 401/403 refused the credential a request carried: a 401
+ * always, a 403 only when a Bearer challenge carries an `error` parameter
+ * (a bare 403, or `Bearer realm=...` with no error, may be Host/Origin
+ * validation or a gateway). `readAuthRefusal(res, true).kind ===
+ * "credential-rejected"`, for callers that hold only a status and headers.
+ */
+export function refusedCredential(statusCode: number | undefined, headers: HeaderMap | undefined): boolean {
+  return readAuthRefusal({ statusCode, headers }, true)?.kind === "credential-rejected";
 }
 
 /**
  * The parenthesised hint for a 401/403 in a note or a transport-post
- * detail: "pass --auth" without a credential, "credential rejected" when
- * the status refused the one sent (refusedCredential), and a neutral
- * "forbidden" for a 403 that does not say it is about the credential.
+ * detail: `noCredential` (the caller's "pass --auth" wording) when a
+ * credential is required, "credential rejected" when the one sent was
+ * refused, and a neutral "forbidden" naming Host/Origin validation, a
+ * gateway, and missing credentials or the token's permissions otherwise.
  * `dash` is the separator the caller's wording uses.
  */
-export function authRefusalHint(
-  authorizationSent: boolean,
-  credentialRefused: boolean,
-  noCredential: string,
-  dash = "--",
-): string {
-  if (!authorizationSent) return noCredential;
-  return credentialRefused
-    ? `credential rejected ${dash} check --auth`
-    : `forbidden ${dash} no insufficient_scope challenge`;
+export function authRefusalHint(refusal: AuthRefusal, noCredential: string, dash = "--"): string {
+  switch (refusal.kind) {
+    case "auth-required":
+      return noCredential;
+    case "credential-rejected":
+      return `credential rejected ${dash} check --auth`;
+    default:
+      return `forbidden ${dash} Host/Origin validation, a gateway, or ${refusal.authorizationSent ? "token permissions" : "missing credentials"}`;
+  }
 }
 
 /**
@@ -191,27 +335,22 @@ export function classifyDiscoverResponse(res: TransportResponse | null, opts: Cl
       reason: `${REASON_PREFIX}modern error ${code}`,
     };
   }
-  if (res.statusCode === 401 || res.statusCode === 403) {
+  const refusal = readAuthRefusal(res, opts.authorizationSent === true);
+  if (refusal) {
     // Refused before the era could show (whatever the body says):
-    // neither modern nor legacy is observable without credentials. The
-    // legacy default still applies (spec: a 4xx without a modern error
-    // body falls back to initialize). With an Authorization header on the
-    // probe, "pass --auth" would send the user to do what they already
-    // did; the reason says the credential was rejected only when the
-    // status says so (a bare 403 may be Host/Origin validation).
-    const credentialRefused = refusedCredential(res.statusCode, res.headers);
-    const why = authRefusalHint(
-      opts.authorizationSent === true,
-      credentialRefused,
-      "authentication required -- pass --auth",
-    );
+    // neither modern nor legacy is observable. The legacy default still
+    // applies (spec: a 4xx without a modern error body falls back to
+    // initialize). "pass --auth" only when the status asks for a
+    // credential none was sent for; "credential rejected" only when it
+    // refused the one sent; a bare 403 may be Host/Origin validation.
+    const why = authRefusalHint(refusal, "authentication required -- pass --auth");
     return {
       version: LEGACY_SPEC_VERSION,
       era: "legacy",
       responded: true,
       eraUndetermined: true,
-      refusal: { statusCode: res.statusCode, credentialRefused },
-      reason: `${REASON_PREFIX}HTTP ${res.statusCode} (${why}); era not determinable, using ${LEGACY_SPEC_VERSION}`,
+      refusal,
+      reason: `${REASON_PREFIX}HTTP ${refusal.statusCode} (${why}); era not determinable, using ${LEGACY_SPEC_VERSION}`,
     };
   }
   const detail =

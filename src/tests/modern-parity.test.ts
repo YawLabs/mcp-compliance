@@ -63,6 +63,17 @@ describe("modern suite modules ↔ MODERN_TEST_DEFINITIONS parity", () => {
     ]);
   });
 
+  it("no module interpolates a raw JSON-RPC error code into a string (errorCodeText / errorWithCode render it)", () => {
+    // errorOf() turns a code that is not a number into NaN so comparisons
+    // fail safe; printed raw it read "JSON-RPC error NaN". rawCode carries
+    // what the server sent.
+    const RAW_CODE_RE = /\$\{(?:err\w*|error\w*|errorOf\([^)]*\)\??)\.code\}/g;
+    const offenders = [...MODULES, "context.ts"].flatMap((f) =>
+      [...readFileSync(join(SUITE_DIR, f), "utf8").matchAll(RAW_CODE_RE)].map((m) => `${f}: ${m[0]}`),
+    );
+    expect(offenders).toEqual([]);
+  });
+
   it("security.ts's injection() wrapper still forwards to check(id, ...)", () => {
     const src = readFileSync(join(SUITE_DIR, "security.ts"), "utf8");
     expect(src).toMatch(/const injection = \([^)]*\) =>\s*check\(id,/);

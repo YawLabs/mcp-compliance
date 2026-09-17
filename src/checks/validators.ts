@@ -53,6 +53,27 @@ export function brief(value: unknown, max = 40): string {
 }
 
 /**
+ * A JSON-RPC error code as details render it. JSON-RPC 2.0 requires an
+ * integer; anything else is shown as the server sent it, clipped, never as
+ * "NaN": `-32601`, `non-integer code "E_LIST"`, or `no code` when the
+ * member is missing.
+ */
+export function errorCodeText(code: unknown): string {
+  if (Number.isInteger(code)) return String(code);
+  if (code === undefined) return "no code";
+  return `non-integer code ${brief(code)}`;
+}
+
+/**
+ * `<label> <code>` for an integer code, `<label> with <errorCodeText>`
+ * otherwise: "JSON-RPC error -32601", "JSON-RPC error with no code",
+ * "error with non-integer code "E_LIST"".
+ */
+export function errorWithCode(code: unknown, label = "JSON-RPC error"): string {
+  return Number.isInteger(code) ? `${label} ${code}` : `${label} with ${errorCodeText(code)}`;
+}
+
+/**
  * Join issues for a details string without flooding it: the first `max`
  * issues, a count of the rest, and a hard character cap so a server with
  * fifty broken tools still produces a readable line.
@@ -390,10 +411,10 @@ export interface PaginationOutcome {
   warnings: string[];
 }
 
-function errorCodeOf(body: unknown): number | undefined {
+/** The error object of a JSON-RPC error body, its `code` member as sent; undefined for anything else. */
+function jsonRpcErrorOf(body: unknown): { code: unknown } | undefined {
   if (!isPlainObject(body) || !isPlainObject(body.error)) return undefined;
-  const code = body.error.code;
-  return typeof code === "number" ? code : Number.NaN;
+  return { code: body.error.code };
 }
 
 function resultListOf(body: unknown, key: string): { result?: Record<string, unknown>; list?: unknown[] } {
@@ -413,9 +434,9 @@ function resultListOf(body: unknown, key: string): { result?: Record<string, unk
 export async function checkPagination(rpc: RpcBodyCall, method: string, key: string): Promise<PaginationOutcome> {
   const warnings: string[] = [];
   const first = await rpc(method);
-  const firstCode = errorCodeOf(first);
-  if (firstCode !== undefined) {
-    return { passed: false, details: `No result from ${method} (JSON-RPC error ${firstCode})`, warnings };
+  const firstError = jsonRpcErrorOf(first);
+  if (firstError) {
+    return { passed: false, details: `No result from ${method} (${errorWithCode(firstError.code)})`, warnings };
   }
   const page1 = resultListOf(first, key);
   if (!page1.result) return { passed: false, details: `No result from ${method}`, warnings };
@@ -428,9 +449,13 @@ export async function checkPagination(rpc: RpcBodyCall, method: string, key: str
     return { passed: false, details: `nextCursor should be string, got ${typeof cursor}`, warnings };
   }
   const second = await rpc(method, { cursor });
-  const secondCode = errorCodeOf(second);
-  if (secondCode !== undefined) {
-    return { passed: false, details: `Next page failed: ${method} with cursor returned error ${secondCode}`, warnings };
+  const secondError = jsonRpcErrorOf(second);
+  if (secondError) {
+    return {
+      passed: false,
+      details: `Next page failed: ${method} with cursor returned ${errorWithCode(secondError.code, "error")}`,
+      warnings,
+    };
   }
   const page2 = resultListOf(second, key);
   if (!page2.list) return { passed: false, details: `Next page failed to return ${key} array`, warnings };

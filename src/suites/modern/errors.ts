@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
+import { errorCodeText, errorWithCode } from "../../checks/validators.js";
+import { errorOf, type JsonRpcErrorInfo, type RpcResponse, resultOf } from "../../modern/client.js";
 import { JSONRPC_ERROR_CODES } from "../../modern/meta.js";
 import type { JsonRpcId } from "../../transport/index.js";
 import { hasPrompts, hasResources, hasTools, type ModernSuiteContext } from "./context.js";
@@ -73,19 +74,19 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
     if (!sameId(echoed, res.requestId)) {
       return {
         passed: false,
-        details: `JSON-RPC error ${err.code} did not echo the request id (sent ${show(res.requestId)}, got ${show(echoed)})`,
+        details: `${errorWithCode(err.rawCode)} did not echo the request id (sent ${show(res.requestId)}, got ${show(echoed)})`,
       };
     }
     if (http && res.statusCode !== 404) {
       harness.warnings.push(
-        `Unknown method answered HTTP ${res.statusCode} with JSON-RPC error ${err.code}; the spec requires 404 Not Found alongside the error body.`,
+        `Unknown method answered HTTP ${res.statusCode} with ${errorWithCode(err.rawCode)}; the spec requires 404 Not Found alongside the error body.`,
       );
       return {
         passed: true,
-        details: `JSON-RPC error ${err.code} on HTTP ${res.statusCode} (spec requires 404), id echoed`,
+        details: `${errorWithCode(err.rawCode)} on HTTP ${res.statusCode} (spec requires 404), id echoed`,
       };
     }
-    return { passed: true, details: `JSON-RPC error ${err.code}${http ? " on HTTP 404" : ""}, id echoed` };
+    return { passed: true, details: `${errorWithCode(err.rawCode)}${http ? " on HTTP 404" : ""}, id echoed` };
   });
 
   await harness.check("error-method-code", async () => {
@@ -98,7 +99,10 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
       return { passed: false, details: `No JSON-RPC error returned for unknown method${status(ctx, probe.res)}` };
     }
     if (err.code !== JSONRPC_ERROR_CODES.METHOD_NOT_FOUND) {
-      return { passed: false, details: `Expected -32601 (Method not found), got ${err.code}${message(err.message)}` };
+      return {
+        passed: false,
+        details: `Expected -32601 (Method not found), got ${errorCodeText(err.rawCode)}${message(err.message)}`,
+      };
     }
     return { passed: true, details: "-32601 (Method not found)" };
   });
@@ -117,7 +121,7 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
       };
     if (error) {
       const correct = error.code === JSONRPC_ERROR_CODES.INVALID_REQUEST ? " (correct: Invalid Request)" : "";
-      return { passed: true, details: `JSON-RPC error ${error.code}${correct} on HTTP ${statusCode}` };
+      return { passed: true, details: `${errorWithCode(error.rawCode)}${correct} on HTTP ${statusCode}` };
     }
     if (result) return { passed: false, details: `Malformed envelope produced a result on HTTP ${statusCode}` };
     if (statusCode >= 400) return { passed: true, details: `HTTP ${statusCode} without a JSON-RPC body (acceptable)` };
@@ -135,7 +139,7 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
       return { passed: false, details: `HTTP ${statusCode} for invalid JSON; expected -32700 or a 4xx` };
     if (error) {
       const correct = error.code === JSONRPC_ERROR_CODES.PARSE_ERROR ? " (correct: Parse error)" : "";
-      return { passed: true, details: `JSON-RPC error ${error.code}${correct} on HTTP ${statusCode}` };
+      return { passed: true, details: `${errorWithCode(error.rawCode)}${correct} on HTTP ${statusCode}` };
     }
     if (result) return { passed: false, details: `Invalid JSON produced a result on HTTP ${statusCode}` };
     if (statusCode >= 400) return { passed: true, details: `HTTP ${statusCode} without a JSON-RPC body (acceptable)` };
@@ -163,7 +167,7 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
       const err = errorOf(probe.res.body);
       if (err) {
         const correct = err.code === JSONRPC_ERROR_CODES.INVALID_PARAMS ? " (correct: Invalid params)" : "";
-        return { passed: true, details: `JSON-RPC error ${err.code}${correct}${message(err.message)}` };
+        return { passed: true, details: `${errorWithCode(err.rawCode)}${correct}${message(err.message)}` };
       }
       const result = resultOf(probe.res.body);
       if (result) {
@@ -182,7 +186,7 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
       const err = errorOf(probe.res.body);
       if (err) {
         const correct = err.code === JSONRPC_ERROR_CODES.INVALID_PARAMS ? " (correct: Invalid params)" : "";
-        return { passed: true, details: `JSON-RPC error ${err.code}${correct}${message(err.message)}` };
+        return { passed: true, details: `${errorWithCode(err.rawCode)}${correct}${message(err.message)}` };
       }
       const result = resultOf(probe.res.body);
       if (result?.isError === true) return { passed: true, details: "Tool execution error with isError: true (valid)" };
@@ -217,7 +221,11 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
       const err = errorOf(probe.res.body);
       const result = resultOf(probe.res.body);
       if (unattributable) {
-        const answer = err ? String(err.code) : result ? "result" : `no JSON-RPC body${status(ctx, probe.res)}`;
+        const answer = err
+          ? errorCodeText(err.rawCode)
+          : result
+            ? "result"
+            : `no JSON-RPC body${status(ctx, probe.res)}`;
         seen.push(`${method} -> ${answer}`);
         continue;
       }
@@ -227,7 +235,7 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
       }
       if (err) {
         const note = err.code === JSONRPC_ERROR_CODES.METHOD_NOT_FOUND ? "" : " (expected -32601)";
-        seen.push(`${method} -> ${err.code}${note}`);
+        seen.push(`${method} -> ${errorCodeText(err.rawCode)}${note}`);
       } else {
         seen.push(`${method} -> rejected${status(ctx, probe.res)}`);
       }
@@ -252,7 +260,7 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
       const correct = err.code === JSONRPC_ERROR_CODES.INVALID_PARAMS ? " (correct: Invalid params)" : "";
       return {
         passed: true,
-        details: `${target.method} rejected the cursor: ${err.code}${correct}${message(err.message)}`,
+        details: `${target.method} rejected the cursor: ${errorCodeText(err.rawCode)}${correct}${message(err.message)}`,
       };
     }
     const result = resultOf(res.body);
@@ -312,13 +320,13 @@ function blanketRejection(
   if (!err && res.statusCode < 400) return null;
   const reason = notEvaluable(ctx);
   if (!reason) return null;
-  const answer = err ? `JSON-RPC error ${err.code}` : "no JSON-RPC error body";
+  const answer = err ? errorWithCode(err.rawCode) : "no JSON-RPC error body";
   return { passed: false, details: `${answer}${status(ctx, res)} for ${what}; ${reason}` };
 }
 
 interface RawProbe {
   statusCode: number;
-  error?: { code: number; message: string };
+  error?: JsonRpcErrorInfo;
   result?: Record<string, unknown>;
 }
 
@@ -332,7 +340,7 @@ function blanketRawRejection(
   if (!probe.error && probe.statusCode < 400) return null;
   const reason = notEvaluable(ctx);
   if (!reason) return null;
-  const answer = probe.error ? `JSON-RPC error ${probe.error.code}` : "no JSON-RPC error body";
+  const answer = probe.error ? errorWithCode(probe.error.rawCode) : "no JSON-RPC error body";
   return { passed: false, details: `${answer} on HTTP ${probe.statusCode} for ${what}; ${reason}` };
 }
 
@@ -351,7 +359,7 @@ async function rawOrFailure(ctx: ModernSuiteContext, body: string): Promise<RawP
   const error = errorOf(parsed);
   return {
     statusCode: res.statusCode,
-    error: error ? { code: error.code, message: error.message } : undefined,
+    error,
     result: resultOf(parsed),
   };
 }
@@ -371,7 +379,7 @@ function exactCode(
     if (error.code === code) return { passed: true, details: `${code} (${name}) on HTTP ${statusCode}` };
     return {
       passed: false,
-      details: `Expected ${code} (${name}) for ${what}, got ${error.code}${message(error.message)}`,
+      details: `Expected ${code} (${name}) for ${what}, got ${errorCodeText(error.rawCode)}${message(error.message)}`,
     };
   }
   if (result)

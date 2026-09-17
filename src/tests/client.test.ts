@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { createModernClient, describeResponse, errorOf, type ModernClient } from "../modern/client.js";
+import { createModernClient, describeResponse, errorOf, exchangeEndOf, type ModernClient } from "../modern/client.js";
 import { createRecorder, type Recorder } from "../recorder.js";
 import { createHttpTransport } from "../transport/http.js";
 import type { Transport } from "../transport/index.js";
@@ -201,16 +201,33 @@ describe("errorOf: a malformed error object never passes for a well-formed one",
     expect(err?.code).toBeNaN();
     expect(err?.code).not.toBe(-32601);
     expect(err?.message).toBe("");
-    expect(describeResponse(res)).toBe("JSON-RPC error NaN");
+    // The detail names what the server sent, never "NaN".
+    expect(err?.rawCode).toBe("-32601");
+    expect(describeResponse(res)).toBe('JSON-RPC error with non-integer code "-32601"');
   });
 
-  it("an empty error object is still an error, with code NaN and an empty message", () => {
-    expect(errorOf({ jsonrpc: "2.0", id: 1, error: {} })).toEqual({ code: Number.NaN, message: "", data: undefined });
+  it("an empty error object is still an error, with code NaN, no raw code and an empty message", () => {
+    const err = errorOf({ jsonrpc: "2.0", id: 1, error: {} });
+    expect(err).toEqual({ code: Number.NaN, rawCode: undefined, message: "", data: undefined });
+    expect(err && "rawCode" in err).toBe(true);
+  });
+
+  it("describeResponse renders a code that is not an integer as sent, clipped, and a missing one as 'no code'", () => {
+    const base = { requestId: 1, statusCode: 200, headers: {}, messages: [] };
+    const described = (error: unknown) => describeResponse({ ...base, body: { jsonrpc: "2.0", id: 1, error } });
+    expect(described({ code: "E_LIST", message: "boom" })).toBe('JSON-RPC error with non-integer code "E_LIST" (boom)');
+    expect(described({ message: "boom" })).toBe("JSON-RPC error with no code (boom)");
+    expect(described({ code: null, message: "" })).toBe("JSON-RPC error with non-integer code null");
+    expect(described({ code: -32600.5, message: "" })).toBe("JSON-RPC error with non-integer code -32600.5");
+    expect(described({ code: { nested: "x".repeat(80) }, message: "" })).toBe(
+      'JSON-RPC error with non-integer code {"nested":"xxxxxxxxxxxxxxxxxxxxxxxxxx...',
+    );
   });
 
   it("a well-formed error passes through with its data; a missing or non-object error is no error", () => {
     expect(errorOf({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "bad", data: { field: "x" } } })).toEqual({
       code: -32602,
+      rawCode: -32602,
       message: "bad",
       data: { field: "x" },
     });
@@ -218,5 +235,93 @@ describe("errorOf: a malformed error object never passes for a well-formed one",
     expect(errorOf({ jsonrpc: "2.0", id: 1, result: {} })).toBeUndefined();
     expect(errorOf(null)).toBeUndefined();
     expect(errorOf("error")).toBeUndefined();
+  });
+});
+
+describe("exchangeEndOf: where a finished HTTP exchange ends in the recording", () => {
+  // The post-hoc timeline rules out an exchange that had ended before a
+  // stray id-less reply arrived; over HTTP nothing can arrive on a
+  // response the client stopped reading, so the client marks that point.
+
+  const sseOf = (...messages: unknown[]) =>
+    messages.map((m) => `event: message\ndata: ${JSON.stringify(m)}\n\n`).join("");
+
+  it("rpc, notify and raw end once their response is read: at their last recorded message, or at the send itself", async () => {
+    reply = (body) => {
+      let id: unknown;
+      try {
+        id = (JSON.parse(body) as { id?: unknown }).id;
+      } catch {
+        return {
+          status: 400,
+          contentType: "application/json",
+          body: '{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}',
+        };
+      }
+      if (id === undefined) return { status: 202, contentType: "text/plain", body: "" };
+      return {
+        status: 200,
+        contentType: "text/event-stream",
+        body: sseOf(
+          { jsonrpc: "2.0", id, result: { resultType: "complete" } },
+          { jsonrpc: "2.0", id: null, error: { code: -32603, message: "again" } },
+        ),
+      };
+    };
+    const { client, recorder } = clientOver(createHttpTransport({ url: serverUrl }));
+    await client.rpc("tools/list", {});
+    await client.notify("notifications/cancelled", { requestId: 1 });
+    await client.raw("{not json", { method: "server/discover" });
+    const [rpc, notify, raw] = recorder.sent;
+    // Both frames of the rpc's body are its own, so its end is the second one.
+    expect(recorder.received.map((r) => r.seq)).toEqual([1, 2, 5]);
+    expect(exchangeEndOf(rpc as (typeof recorder.sent)[number])).toBe(2);
+    // A notification's HTTP body is never recorded: it ends where it was sent.
+    expect(exchangeEndOf(notify as (typeof recorder.sent)[number])).toBe(3);
+    expect(exchangeEndOf(raw as (typeof recorder.sent)[number])).toBe(5);
+  });
+
+  it("an rpc that fails still ends: nothing it could draw is recorded after it gave up", async () => {
+    reply = () => ({ status: 200, contentType: "application/json", body: "" });
+    const { client, recorder } = clientOver(createHttpTransport({ url: "http://127.0.0.1:9/mcp" }));
+    await expect(client.rpc("server/discover", {}, { timeout: 2000 })).rejects.toThrow();
+    expect(exchangeEndOf(recorder.sent[0] as (typeof recorder.sent)[number])).toBe(0);
+  });
+
+  it("a stream ends when the caller closes it, not while its messages are still being read", async () => {
+    const ack = { jsonrpc: "2.0", method: "notifications/subscriptions/acknowledged", params: {} };
+    reply = () => ({ status: 200, contentType: "text/event-stream", body: sseOf(ack, ack) });
+    const { client, recorder } = clientOver(createHttpTransport({ url: serverUrl }));
+    const stream = await client.stream("subscriptions/listen", { notifications: {} });
+    const listen = recorder.sent[0] as (typeof recorder.sent)[number];
+    for await (const _ of stream.messages) {
+      expect(exchangeEndOf(listen)).toBeUndefined();
+      break;
+    }
+    // Breaking out of the loop ends the iterator: that is the end too.
+    expect(exchangeEndOf(listen)).toBe(1);
+    await stream.close();
+    expect(exchangeEndOf(listen)).toBe(1);
+  });
+
+  it("a stream closed before it was read ends at close()", async () => {
+    const ack = { jsonrpc: "2.0", method: "notifications/subscriptions/acknowledged", params: {} };
+    reply = () => ({ status: 200, contentType: "text/event-stream", body: sseOf(ack) });
+    const { client, recorder } = clientOver(createHttpTransport({ url: serverUrl }));
+    const stream = await client.stream("subscriptions/listen", { notifications: {} });
+    const listen = recorder.sent[0] as (typeof recorder.sent)[number];
+    expect(exchangeEndOf(listen)).toBeUndefined();
+    await stream.close();
+    expect(exchangeEndOf(listen)).toBe(0);
+  });
+
+  it("stdio exchanges never end this way: a stdio reply can arrive at any time", async () => {
+    const t = scriptedChild(
+      '  if (msg.method === "server/discover") send({ jsonrpc: "2.0", id: msg.id, result: {} });',
+    );
+    const { client, recorder } = clientOver(t);
+    await client.rpc("server/discover", {});
+    await client.notify("notifications/cancelled", { requestId: 1 });
+    expect(recorder.sent.map((s) => exchangeEndOf(s))).toEqual([undefined, undefined]);
   });
 });

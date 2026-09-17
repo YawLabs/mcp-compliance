@@ -1,5 +1,5 @@
 import type { TestOutcome } from "../../harness.js";
-import { errorOf } from "../../modern/client.js";
+import { errorOf, exchangeEndOf } from "../../modern/client.js";
 import { INPUT_REQUEST_METHODS, META, MRTR_METHODS, RETIRED_ERROR_CODES } from "../../modern/meta.js";
 import { formatViolation, getWireValidator } from "../../modern/schema-validator.js";
 import type { ReceivedMessage, Recorder, SentRequest } from "../../recorder.js";
@@ -151,103 +151,178 @@ function plural(n: number, noun: string): string {
  * Correlation the Recorder cannot do on its own. It links a response to
  * its request by the id the response carries -- which is exactly what a
  * server that drops or retypes the id breaks, leaving those responses
- * with `request: undefined`. The timeline replays sent and received
- * entries in sequence order and keeps the requests still awaiting an
- * answer; an unmatched response is attributed to the most recently sent
- * unanswered entry (the suite is sequential apart from a few
- * parallel-safe rpc calls, so this is the request whose connection or
- * turn it arrived on), and a notification is attributed to the request
- * in flight when it arrived. A raw probe or a client notification is a
- * legitimate owner of an id-less reply; an id-bearing request is not.
+ * with `request: undefined`. The timeline attributes each such unmatched
+ * response, and each received message to the request in flight when it
+ * arrived.
  *
- * One correction after the replay. Replies overlap the next send in two
- * ways: on stdio a notification's write resolves on flush, so the
- * suite's next request is often SENT before the server's (illegitimate)
- * reply to the notification arrives; and the few parallel-safe tests
- * have several id-bearing requests in flight at once, so a null-id
- * reply to one of them can arrive after a later one was answered. In
- * both cases the pop lands the stray on a request that ALSO received
- * its own id-matched response, which the stray therefore cannot have
- * answered. It is re-attributed to the most recent id-bearing request
- * sent before it that never got an id-matched reply -- the request it
- * most plausibly answers -- unless an id-less sent entry (a client
- * notification or raw probe) lies between that request and the stray,
- * in which case the id-less entry, being the more recent send, wins.
- * An id-less entry is a candidate only while no request sent after it
- * was fully answered by id before the stray arrived: its reply would
- * have come before that answer, so an old notification or raw probe
- * several answered requests back cannot capture (and exempt) a stray.
- * With no such candidate at all the popped owner stands: the stray is
- * then a second answer to the only request that could have drawn it.
+ * An unmatched response is attributed by one walk back through the sends
+ * before it (see `candidateOwner`), the same for every one. Replies
+ * overlap later sends in two ways: on stdio a notification's write
+ * resolves on flush, so the suite's next request is often SENT before
+ * the server's (illegitimate) reply to the notification arrives; and the
+ * few parallel-safe tests have several id-bearing requests in flight at
+ * once. So the most recent send is not simply the owner. Walking back
+ * from the stray, the first entry that could still draw a reply owns it:
+ *
+ *  - an id-bearing request that received its own id-matched reply
+ *    (before or after the stray) did not draw it, and neither did one an
+ *    earlier stray was already attributed to;
+ *  - an exchange that had ENDED before the stray arrived did not draw it:
+ *    an HTTP exchange the client finished reading (a closed
+ *    `subscriptions/listen` above all; see exchangeEndOf), or a request
+ *    the client cancelled with notifications/cancelled;
+ *  - an id-less entry (a client notification or raw probe) is a
+ *    candidate only while no request sent after it was answered before
+ *    the stray arrived: its reply would have come before that answer, so
+ *    an old notification several answered requests back cannot capture
+ *    (and exempt) a stray.
+ *
+ * A raw probe or a client notification is a legitimate owner of an
+ * id-less reply; an id-bearing request is not. When no send before the
+ * stray is still a candidate, every request the stray could answer had
+ * already been answered: the stray is a SECOND answer (a result then an
+ * id-less error, in either frame order). The timeline then names the
+ * most recent id-bearing request sent before it (`repeated`), which
+ * error-id-echo blames; the result scans leave such a reply
+ * unattributed. Only a reply that arrives before anything was sent (a
+ * stray written at boot) has neither.
  */
 interface Timeline {
-  /** Unmatched responses -> the sent entry they most plausibly answer (null = nothing was pending). */
+  /** Unmatched responses -> the sent entry still able to draw a reply that they most plausibly answer (null = none). */
   unmatched: Map<ReceivedMessage, SentRequest | null>;
+  /** Unmatched responses with no such owner -> the most recent id-bearing request sent before them (a second answer). */
+  repeated: Map<ReceivedMessage, SentRequest>;
   /** Every received entry -> the request in flight when it arrived (null = none). */
   inFlight: Map<ReceivedMessage, SentRequest | null>;
 }
 
 function buildTimeline(recorder: Recorder): Timeline {
-  type Event = { seq: number; sent?: SentRequest; received?: ReceivedMessage };
+  const { sent, received } = recorder;
+  /**
+   * When each request stopped being able to draw a reply: the seq of its
+   * first id-matched response, or of an earlier stray attributed to it.
+   * Pre-filled with every id-matched response, including those that
+   * arrive after a stray; strays add theirs in seq order during the replay.
+   */
+  const answered = new Map<SentRequest, number>();
+  for (const entry of received) {
+    if (entry.request && isResponse(entry.message) && !answered.has(entry.request)) {
+      answered.set(entry.request, entry.seq);
+    }
+  }
+  const ends = exchangeEnds(sent);
+
+  type Event = { seq: number; sent?: SentRequest; received?: ReceivedMessage; ended?: SentRequest };
   const events: Event[] = [
-    ...recorder.sent.map((sent) => ({ seq: sent.seq, sent })),
-    ...recorder.received.map((received) => ({ seq: received.seq, received })),
+    ...sent.map((s) => ({ seq: s.seq, sent: s })),
+    ...received.map((r) => ({ seq: r.seq, received: r })),
+    // An end falls after the last entry it covers and before the next one.
+    ...[...ends].map(([s, end]) => ({ seq: end + 0.5, ended: s })),
   ].sort((a, b) => a.seq - b.seq);
-  const unanswered: SentRequest[] = [];
+  /** Sent entries still open, in send order: the top is the request in flight. */
+  const open: SentRequest[] = [];
+  const close = (s: SentRequest) => {
+    const idx = open.lastIndexOf(s);
+    if (idx !== -1) open.splice(idx, 1);
+  };
   const unmatched = new Map<ReceivedMessage, SentRequest | null>();
+  const repeated = new Map<ReceivedMessage, SentRequest>();
   const inFlight = new Map<ReceivedMessage, SentRequest | null>();
-  /** Requests that received a response carrying their own id -> the seq of the first such response. */
-  const answeredById = new Map<SentRequest, number>();
   for (const ev of events) {
     if (ev.sent) {
-      unanswered.push(ev.sent);
+      open.push(ev.sent);
+      continue;
+    }
+    if (ev.ended) {
+      close(ev.ended);
       continue;
     }
     const entry = ev.received as ReceivedMessage;
-    inFlight.set(entry, unanswered[unanswered.length - 1] ?? null);
+    inFlight.set(entry, open[open.length - 1] ?? null);
     if (!isResponse(entry.message)) continue; // notifications and server requests answer nothing
     if (entry.request) {
-      if (!answeredById.has(entry.request)) answeredById.set(entry.request, entry.seq);
-      const idx = unanswered.lastIndexOf(entry.request);
-      if (idx !== -1) unanswered.splice(idx, 1);
+      close(entry.request);
       continue;
     }
-    unmatched.set(entry, unanswered.pop() ?? null);
+    const owner = candidateOwner(sent, entry.seq, answered, ends);
+    unmatched.set(entry, owner ?? null);
+    if (owner) {
+      close(owner);
+      if (owner.id !== undefined && !answered.has(owner)) answered.set(owner, entry.seq);
+      continue;
+    }
+    const latest = latestRequestBefore(sent, entry.seq);
+    if (latest) repeated.set(entry, latest);
   }
-  for (const [entry, owner] of unmatched) {
-    if (!owner || owner.id === undefined || !answeredById.has(owner)) continue;
-    const reattributed = reattribute(recorder.sent, entry.seq, answeredById);
-    if (reattributed) unmatched.set(entry, reattributed);
-  }
-  return { unmatched, inFlight };
+  return { unmatched, repeated, inFlight };
 }
 
 /**
- * The sent entry a stray reply at `seq` most plausibly answers once its
- * popped owner is ruled out: walking back from the stray, the first
- * id-less entry wins if it comes before the first id-bearing request
- * that never received an id-matched reply; otherwise that request does.
- * Once the walk passes a request whose id-matched reply arrived before
- * `seq`, id-less entries older than it are no longer candidates (see
- * Timeline); an unanswered id-bearing request still is.
- * Undefined when no candidate exists before `seq`.
+ * The last seq each ended exchange can own (see Timeline): the client's
+ * mark for a finished HTTP exchange, or the seq of a notifications/cancelled
+ * the client sent naming an earlier request's id, whichever is first.
  */
-function reattribute(
+function exchangeEnds(sent: SentRequest[]): Map<SentRequest, number> {
+  const ends = new Map<SentRequest, number>();
+  /** The latest id-bearing request per id ("<type>:<value>"), for resolving a cancel's requestId. */
+  const byId = new Map<string, SentRequest>();
+  for (const s of sent) {
+    const marked = exchangeEndOf(s);
+    if (marked !== undefined) ends.set(s, marked);
+    if (s.id !== undefined) {
+      byId.set(`${typeof s.id}:${s.id}`, s);
+      continue;
+    }
+    if (s.raw !== undefined || s.method !== "notifications/cancelled" || !isObject(s.params)) continue;
+    const target = s.params.requestId;
+    if (typeof target !== "number" && typeof target !== "string") continue;
+    const cancelled = byId.get(`${typeof target}:${target}`);
+    if (!cancelled) continue;
+    const end = ends.get(cancelled);
+    if (end === undefined || s.seq < end) ends.set(cancelled, s.seq);
+  }
+  return ends;
+}
+
+/**
+ * The sent entry a stray reply at `seq` most plausibly answers (see
+ * Timeline): walking back from the stray, the first id-less entry not
+ * ruled out by a request answered after it, or the first id-bearing
+ * request neither answered nor ended, whichever is more recent.
+ * Undefined when no send before `seq` is still a candidate.
+ */
+function candidateOwner(
   sent: SentRequest[],
   seq: number,
-  answeredById: Map<SentRequest, number>,
+  answered: Map<SentRequest, number>,
+  ends: Map<SentRequest, number>,
 ): SentRequest | undefined {
   let answeredInBetween = false;
   for (let i = sent.length - 1; i >= 0; i--) {
     const s = sent[i] as SentRequest;
     if (s.seq >= seq) continue;
+    const end = ends.get(s);
+    const ended = end !== undefined && end < seq;
     if (s.id === undefined) {
-      if (!answeredInBetween) return s;
+      if (!ended && !answeredInBetween) return s;
       continue;
     }
-    const answeredAt = answeredById.get(s);
-    if (answeredAt === undefined) return s;
-    if (answeredAt < seq) answeredInBetween = true;
+    // Answered comes first: a finished HTTP request is ended too, and is still a barrier.
+    const answeredAt = answered.get(s);
+    if (answeredAt !== undefined) {
+      if (answeredAt < seq) answeredInBetween = true;
+      continue;
+    }
+    if (!ended) return s;
+  }
+  return undefined;
+}
+
+/** The most recent id-bearing request sent before `seq`, if any. */
+function latestRequestBefore(sent: SentRequest[], seq: number): SentRequest | undefined {
+  for (let i = sent.length - 1; i >= 0; i--) {
+    const s = sent[i] as SentRequest;
+    if (s.seq < seq && s.id !== undefined) return s;
   }
   return undefined;
 }
@@ -436,10 +511,13 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
   // scopes the id MUST to those): an auth gate's `{"error":"..."}` body
   // or a GCP-style `{"error":{"code":400,...}}` is not one. A null or
   // missing id is exempt only when no id-bearing request owns the reply
-  // (a raw probe, a client notification, or nothing pending at all -- a
+  // (a raw probe, a client notification, or nothing sent yet at all -- a
   // stray at boot, noted as such) or the reply is a
   // transport-level rejection (HTTP 401/403/413/415/429, answered before
-  // the JSON-RPC layer read the id). A PRESENT but wrong id is an
+  // the JSON-RPC layer read the id). A reply no open send can own is a
+  // second answer and is blamed on the most recent request sent before
+  // it (see Timeline), so a server that answers a request twice fails
+  // in either frame order. A PRESENT but wrong id is an
   // offender whatever the status: the id was read and then retyped or
   // replaced. The error CODE does not exempt anything: every body the
   // client sent through rpc() is well-formed with a readable id, so a
@@ -450,7 +528,7 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
     const nonJsonRpc = recorder.errors().length - errors.length;
     let scanned = 0;
     let ownerless = 0;
-    /** Unmatched replies that arrived while nothing at all was pending (a stray at boot, or after every request was answered). */
+    /** Unmatched replies that arrived before anything was sent (a stray written at boot). */
     let unowned = 0;
     let rejected = 0;
     const offenders: { method: string; expected: unknown; got: unknown }[] = [];
@@ -463,7 +541,7 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
         }
         continue;
       }
-      const owner = timeline.unmatched.get(entry) ?? null;
+      const owner = timeline.unmatched.get(entry) ?? timeline.repeated.get(entry) ?? null;
       if (!owner) {
         unowned++;
         continue;

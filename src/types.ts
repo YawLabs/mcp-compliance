@@ -124,7 +124,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     description:
       "Verifies the server accepts HTTP POST requests and returns a 2xx status code. This is the fundamental transport requirement for Streamable HTTP MCP servers.",
     recommendation:
-      "Ensure your server listens for POST requests on the MCP endpoint. If you see 401/403, pass --auth with a valid token. Check that the URL is correct and the server is running.",
+      "Ensure your server listens for POST requests on the MCP endpoint. If you see 401 (or a 403 with a WWW-Authenticate: Bearer challenge), pass --auth with a valid token; any other 403 may be Host/Origin validation (e.g. a tunnel hostname) or a gateway. Check that the URL is correct and the server is running.",
   },
   {
     id: "transport-content-type",

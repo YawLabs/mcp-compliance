@@ -6,12 +6,13 @@ import {
   POISONING_PATTERNS,
   STACK_TRACE_PATTERNS,
 } from "../../checks/patterns.js";
+import { errorCodeText, errorWithCode } from "../../checks/validators.js";
+import { readAuthRefusal } from "../../detect.js";
 import type { TestOutcome } from "../../harness.js";
 import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
 import { parseSSEMessages } from "../../sse.js";
 import type { StdioTransport } from "../../transport/stdio.js";
 import { ensureTools, hasTools, listUnavailable, type ModernSuiteContext } from "./context.js";
-import { TRANSPORT_LEVEL_STATUS } from "./lifecycle.js";
 
 /**
  * Security tests of the 2026-07-28 suite (21 in the catalog). Ported from
@@ -300,7 +301,7 @@ function discoverProbe(ctx: ModernSuiteContext, id: number): { body: string; hea
 
 function summarize(res: RpcResponse): string {
   const err = errorOf(res.body);
-  if (err) return `JSON-RPC error ${err.code}`;
+  if (err) return errorWithCode(err.rawCode);
   return resultOf(res.body) ? "result" : "non-JSON-RPC body";
 }
 
@@ -1011,7 +1012,7 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
         if (err) {
           return {
             passed: true,
-            details: `HTTP ${status}, JSON-RPC error ${err.code} (token in query string not accepted)`,
+            details: `HTTP ${status}, ${errorWithCode(err.rawCode)} (token in query string not accepted)`,
           };
         }
         const shape = resultOf(body) ? "result" : "non-error body";
@@ -1571,9 +1572,10 @@ function noteInjectionScope(ctx: ModernSuiteContext, target: InjectionTarget): v
  * error or a timeout means the payload never reached a verdict. A server
  * that goes away on a payload fails naming that payload: the stdio child
  * exits, or an accepted HTTP connection is closed or reset and a follow-up
- * server/discover is neither served nor refused by a transport-level gate
- * (discoverAfterDrop). A drop the server outlives (a WAF or IPS, a
- * keep-alive close) never reached the tool, with a warning. One
+ * server/discover is neither served nor refused by a gate still in front of
+ * the server (discoverAfterDrop). A drop the server outlives (a WAF or IPS,
+ * a keep-alive close, one crashed worker of several) never reached the
+ * tool, with a warning. One
  * that was already gone when a payload was sent (a dead child, a refused
  * connection) stops the probe with an unreachable() verdict.
  * `toolInputSchema` keeps `x-mcp-header` arguments callable: their values
@@ -1628,7 +1630,7 @@ async function runInjectionTest(
       // exit event makes that conclusive.
       if (failure === "dropped" && !alreadyGone && ctx.kind === "stdio") {
         const died = `server died on payload "${clip(payload, 30)}" sent to ${where}: ${reason}`;
-        return { passed: false, details: clip([...issues, died].join("; "), 220) };
+        return { passed: false, details: issuesThenCrash(issues, died) };
       }
       // An HTTP connection closed or reset instead of answered says nothing
       // on its own about whether the server is still up: a WAF or IPS drops
@@ -1640,12 +1642,12 @@ async function runInjectionTest(
       if (failure === "dropped" && ctx.kind === "http") {
         const after = await discoverAfterDrop(ctx);
         if ("gone" in after) {
-          const died = `connection dropped on payload "${clip(payload, 30)}" sent to ${where}: ${clip(reason, 40)}; server/discover then ${after.gone} (server may have crashed)`;
-          return { passed: false, details: clip([...issues, died].join("; "), 220) };
+          const died = `server may have crashed: connection dropped on payload "${clip(payload, 30)}" sent to ${where}: ${clip(reason, 40)}; server/discover then ${after.gone}`;
+          return { passed: false, details: issuesThenCrash(issues, died) };
         }
         warnOnce(
           ctx,
-          `security injection tests: a tools/call to ${where} carrying a payload had its connection closed without a response, but ${after.alive}, so the payload is counted as never reaching the tool, not as a crash (a WAF or IPS dropping the request, or a keep-alive connection closed as it was sent). Refuse a payload with HTTP 4xx or a JSON-RPC error so a client can tell a refusal from a crash.`,
+          `security injection tests: a tools/call to ${where} carrying a payload had its connection closed without a response, but ${after.alive}, so the payload is counted as never reaching the tool rather than as a crash. ${DROP_CAUSES} Refuse a payload with HTTP 4xx or a JSON-RPC error so a client can tell a refusal from a crash.`,
         );
         unreached++;
         continue;
@@ -1683,31 +1685,139 @@ async function runInjectionTest(
 }
 
 /**
- * After an HTTP connection was dropped on an injection payload, one
- * conformant server/discover tells a connection-level refusal from a crash:
+ * What a drop the server outlived may have been. A black-box client sees
+ * the same thing for each: one connection closed, the next request answered.
+ */
+const DROP_CAUSES =
+  "The drop may be a WAF or IPS dropping the request, a keep-alive connection closed as it was sent, or a crash of one worker of a multi-process server (Node cluster, PM2, gunicorn) while the others still answer -- a black-box client cannot tell these apart.";
+
+/**
+ * Failure details for a crash found after `issues` (execution evidence)
+ * were recorded, within the 220-character limit: the issues come first,
+ * clipped only as far as needed to leave the crash clause its first 60
+ * characters, which state the conclusion ("server died ...", "server may
+ * have crashed ..."); the crash clause gets whatever room remains.
+ */
+function issuesThenCrash(issues: string[], crash: string): string {
+  if (issues.length === 0) return clip(crash, 220);
+  const head = clip(issues.join("; "), 220 - 2 - Math.min(crash.length, 60));
+  return `${head}; ${clip(crash, 220 - 2 - head.length)}`;
+}
+
+/** The longest a follow-up server/discover waits on a 429's Retry-After before its one retry. */
+const RETRY_AFTER_CAP_MS = 2000;
+/** The wait before that retry when the 429 carries no usable Retry-After. */
+const RETRY_AFTER_DEFAULT_MS = 1000;
+
+/**
+ * The wait a 429's Retry-After asks for (delay-seconds or an HTTP-date,
+ * RFC 9110 section 10.2.3), capped at RETRY_AFTER_CAP_MS;
+ * RETRY_AFTER_DEFAULT_MS when the header is missing or unparseable.
+ *
+ * @internal Exported for testing.
+ */
+export function retryAfterMs(headers: Record<string, string>): number {
+  const value = headerOf(headers, "retry-after")?.trim() ?? "";
+  let ms: number;
+  if (/^\d+$/.test(value)) ms = Number(value) * 1000;
+  else {
+    // Every HTTP-date form (IMF-fixdate, RFC 850, asctime) opens with a day
+    // name; Date.parse alone would read "-5" or "1.5" as a date in 2001.
+    const at = /^[A-Za-z]{3}/.test(value) ? Date.parse(value) : Number.NaN;
+    if (Number.isNaN(at)) return RETRY_AFTER_DEFAULT_MS;
+    ms = at - Date.now();
+  }
+  return Math.min(Math.max(ms, 0), RETRY_AFTER_CAP_MS);
+}
+
+/** Resolve after `ms`, or reject with the abort reason as soon as `signal` aborts. */
+function pause(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * The gate a 401 or 403 answering the follow-up server/discover shows is
+ * still standing in front of the server, or undefined for any other answer.
+ * Read the way the era probe and transport-post read a 401/403
+ * (readAuthRefusal): one that asks for a credential (no Authorization
+ * header; a 401, or a 403 with a Bearer challenge) or refuses the one sent
+ * (a 401, or a 403 whose Bearer challenge carries an error) is an auth
+ * gate. Any other 403 says nothing about the credential -- it is also what
+ * an Origin or Host check answers -- and after a dropped attack payload is
+ * most likely a WAF or IPS now blocking this client.
+ */
+function gateAnswering(ctx: ModernSuiteContext, res: RpcResponse): string | undefined {
+  const refusal = readAuthRefusal(res, ctx.hasAuth);
+  if (!refusal) return undefined;
+  return refusal.kind === "forbidden"
+    ? "a gate in front of the server such as a WAF or IPS now blocking this client"
+    : "an auth gate";
+}
+
+/**
+ * After an HTTP connection was dropped (an injection payload, a 1 MB
+ * argument, unknown arguments), one conformant server/discover tells a
+ * connection-level refusal from a crash:
  *
  * - served (a DiscoverResult, as the setup discover that unlocked the tool
  *   tests was): the server is up;
- * - refused with a transport-level status (401, 403, 413, 415, 429;
- *   TRANSPORT_LEVEL_STATUS): a gate in front of the server -- a WAF or IPS
- *   now blocking this client, an auth gate, a rate limiter -- answered, so
+ * - refused with 401 or 403 (gateAnswering): a gate in front of the server
+ *   -- a WAF or IPS now blocking this client, an auth gate -- answered, so
  *   this is no crash either;
+ * - refused with 429: a rate limiter answers before the server reads the
+ *   request, and one running as a separate gateway answers for a backend
+ *   that is gone, so the 429 alone proves nothing. The discover is retried
+ *   once after Retry-After (at most RETRY_AFTER_CAP_MS) and the retry's
+ *   answer decides by the rules above; a second 429 counts as gone;
  * - anything else (no response, a proxy's 502 for a backend that went away,
- *   a JSON-RPC error): the server may have crashed.
+ *   a JSON-RPC error, a 413 or 415 -- which no size limit or media-type gate
+ *   in front of a live server answers a small conformant discover with):
+ *   the server may have crashed.
  *
  * `alive` / `gone` is the clause the warning / failure quotes. A run the
- * caller aborted is rethrown.
+ * caller aborted (during the discover or the wait before its retry) is
+ * rethrown.
  */
 async function discoverAfterDrop(ctx: ModernSuiteContext): Promise<{ alive: string } | { gone: string }> {
-  try {
-    const res = await ctx.client.rpc(DISCOVER, {});
-    if (resultOf(res.body)) return { alive: "the server still served a follow-up server/discover" };
-    const gate = res.statusCode === undefined ? undefined : TRANSPORT_LEVEL_STATUS[res.statusCode];
-    if (gate) return { alive: `a follow-up server/discover was still answered (HTTP ${res.statusCode}, ${gate})` };
-    return { gone: `answered HTTP ${res.statusCode}, ${summarize(res)}` };
-  } catch (err) {
-    if (ctx.signal?.aborted) throw err;
-    return { gone: `got ${noResponse(err, ctx.timeout)}` };
+  /** "answered HTTP 429, then after Nms " once the discover has been retried. */
+  let retried = "";
+  for (;;) {
+    let res: RpcResponse;
+    try {
+      res = await ctx.client.rpc(DISCOVER, {});
+    } catch (err) {
+      if (ctx.signal?.aborted) throw err;
+      return { gone: `${retried}got ${noResponse(err, ctx.timeout)}` };
+    }
+    if (resultOf(res.body)) {
+      return {
+        alive: retried
+          ? `a follow-up server/discover ${retried}was served`
+          : "the server still served a follow-up server/discover",
+      };
+    }
+    const gate = gateAnswering(ctx, res);
+    if (gate) {
+      return { alive: `a follow-up server/discover ${retried}was still answered (HTTP ${res.statusCode}, ${gate})` };
+    }
+    if (res.statusCode !== 429 || retried) {
+      return { gone: `${retried}answered HTTP ${res.statusCode}, ${summarize(res)}` };
+    }
+    // One retry, after the wait the limiter asked for (capped).
+    const wait = retryAfterMs(res.headers);
+    await pause(wait, ctx.signal);
+    retried = `answered HTTP 429, then after ${wait}ms `;
   }
 }
 
@@ -1729,11 +1839,16 @@ async function checkOversizedInput(ctx: ModernSuiteContext, tools: any[]): Promi
     !plain && strings.length > 0 ? ` [${target.param} is x-mcp-header: measured the header limit, not the body]` : "";
   const withNote = (o: TestOutcome): TestOutcome => (note ? { ...o, details: `${o.details}${note}` } : o);
   const largeValue = "A".repeat(OVERSIZED_BYTES);
+  const what = `tools/call ${where} with a 1 MB value`;
+  const stdio = ctx.transport as Partial<StdioTransport>;
   // Scopes the "reply dropped by the runner" verdict to output produced
   // during THIS call: the stdio transport counts every overflow of its
   // line buffer for its whole life (see transport/stdio.ts).
-  const overflows = () => (ctx.transport as Partial<StdioTransport>).stdoutOverflows ?? 0;
+  const overflows = () => stdio.stdoutOverflows ?? 0;
   const overflowsBefore = overflows();
+  // A child already gone was not killed by the 1 MB value (see runInjectionTest).
+  const exited = () => ctx.kind === "stdio" && stdio.exited === true;
+  const alreadyGone = exited();
   try {
     const res = await ctx.client.rpc(
       TOOLS_CALL,
@@ -1753,7 +1868,7 @@ async function checkOversizedInput(ctx: ModernSuiteContext, tools: any[]): Promi
       }
     }
     const err = errorOf(res.body);
-    if (err) return withNote({ passed: true, details: `JSON-RPC error ${err.code} (oversized input rejected)` });
+    if (err) return withNote({ passed: true, details: `${errorWithCode(err.rawCode)} (oversized input rejected)` });
     if (resultOf(res.body)) {
       ctx.harness.warnings.push(
         `security-oversized-input: the server completed a tools/call carrying a 1 MB string argument (${where}) instead of rejecting it; enforce a request body limit (413) or maxLength in inputSchema.`,
@@ -1767,14 +1882,23 @@ async function checkOversizedInput(ctx: ModernSuiteContext, tools: any[]): Promi
     const frame = ctx.kind === "http" ? `HTTP ${status}, non-JSON-RPC body` : "broken stdio frame";
     return withNote({ passed: false, details: `${frame} -- no result or error for a 1 MB ${where}` });
   } catch (err) {
+    if (ctx.signal?.aborted) throw err;
     const message = errorMessage(err);
+    const failure = classifyTransportError(err);
     if (ctx.kind === "stdio") {
+      // The exit decides before the overflow does: a child that wrote an
+      // over-long line and then exited was rejected by its exit, however
+      // much it wrote first.
+      if (failure === "dropped" || exited()) {
+        if (alreadyGone) return withNote(unreachable(ctx, what, err));
+        return withNote({ passed: false, details: `server died on a 1 MB ${where}: ${clip(message, 120)}` });
+      }
       if (overflows() > overflowsBefore) {
         // The server answered, but with a single line longer than the
-        // runner's 1 MiB stdio buffer: a runner limit, not a server fault.
-        // An overflow from before this call (an earlier over-long reply,
-        // a startup banner) says nothing about this one, and neither does
-        // the same text on the child's own stderr.
+        // runner's 1 MiB stdio buffer, and is still running: a runner
+        // limit, not a server fault. An overflow from before this call (an
+        // earlier over-long reply, a startup banner) says nothing about
+        // this one, and neither does the same text on the child's own stderr.
         ctx.harness.warnings.push(
           `security-oversized-input: the server's reply to a 1 MB ${where} exceeded the runner's 1 MiB stdio line buffer and was dropped; treated as survived. Prefer rejecting oversized arguments with a JSON-RPC error.`,
         );
@@ -1783,8 +1907,27 @@ async function checkOversizedInput(ctx: ModernSuiteContext, tools: any[]): Promi
           details: `response to a 1 MB ${where} exceeded the runner's stdio line buffer (server survived)`,
         });
       }
-      if (/exit|crash|terminated|closed/i.test(message)) {
-        return withNote({ passed: false, details: `server died on a 1 MB ${where}: ${clip(message, 120)}` });
+    } else {
+      // Refused before anything was sent: nothing about the 1 MB value was measured.
+      if (failure === "connect") return withNote(unreachable(ctx, what, err));
+      // Closing the connection on a 1 MB body is an acceptable refusal only
+      // when the server is still there afterwards (discoverAfterDrop).
+      if (failure === "dropped") {
+        const reason = clip(firstLine(message), 40);
+        const after = await discoverAfterDrop(ctx);
+        if ("gone" in after) {
+          return withNote({
+            passed: false,
+            details: clip(
+              `server may have crashed: connection dropped on a 1 MB ${where}: ${reason}; server/discover then ${after.gone}`,
+              220,
+            ),
+          });
+        }
+        return withNote({
+          passed: true,
+          details: clip(`Connection rejected (acceptable for oversized input): ${reason}; ${after.alive}`, 220),
+        });
       }
     }
     if (isTimeout(err)) {
@@ -1801,7 +1944,11 @@ async function checkOversizedInput(ctx: ModernSuiteContext, tools: any[]): Promi
  * Unknown arguments on the first tool. Rejected (-32602) or ignored both
  * pass; a 5xx or a dead server fails. A request that merely times out is
  * neither (the tool may simply be slow with placeholder-free arguments):
- * it passes with a warning that the verdict is inconclusive.
+ * it passes with a warning that the verdict is inconclusive, and so does an
+ * HTTP connection dropped on the call that the server outlives
+ * (discoverAfterDrop) -- the same reading the injection checks give a drop.
+ * A server already gone before the call (a refused connection, a child an
+ * earlier test killed) is unreachable, not a crash on these arguments.
  */
 async function checkExtraParams(ctx: ModernSuiteContext, tool: any): Promise<TestOutcome> {
   // Build the arguments via JSON.parse so "__proto__" lands as a real own
@@ -1809,6 +1956,9 @@ async function checkExtraParams(ctx: ModernSuiteContext, tool: any): Promise<Tes
   // instead and JSON.stringify would drop it before it reached the wire.
   const maliciousArgs = JSON.parse('{"__injected_param__":"malicious_value","__proto__":{"admin":true}}');
   const name = String(tool?.name);
+  const what = `tools/call ${name} with unknown arguments`;
+  const exited = () => ctx.kind === "stdio" && (ctx.transport as Partial<StdioTransport>).exited === true;
+  const alreadyGone = exited();
   try {
     const res = await ctx.client.rpc(
       TOOLS_CALL,
@@ -1820,7 +1970,10 @@ async function checkExtraParams(ctx: ModernSuiteContext, tool: any): Promise<Tes
     }
     const err = errorOf(res.body);
     if (err) {
-      return { passed: true, details: `Extra params rejected with error: ${err.code} -- ${clip(err.message, 100)}` };
+      return {
+        passed: true,
+        details: `Extra params rejected with error: ${errorCodeText(err.rawCode)} -- ${clip(err.message, 100)}`,
+      };
     }
     if (resultOf(res.body)) {
       return { passed: true, details: "Server processed request (extra params likely ignored)" };
@@ -1830,15 +1983,41 @@ async function checkExtraParams(ctx: ModernSuiteContext, tool: any): Promise<Tes
       details: `malformed response to unknown tool arguments (HTTP ${res.statusCode}, no result or error)`,
     };
   } catch (err) {
+    if (ctx.signal?.aborted) throw err;
     const message = errorMessage(err);
+    const failure = classifyTransportError(err);
     // The stdio transport rejects every pending request with its exit
     // diagnostic ("crashed with exit code N", "exited cleanly",
     // "terminated by signal") the moment the child goes away.
-    if (ctx.kind === "stdio" && /exit|crash|terminated|closed/i.test(message)) {
+    if (ctx.kind === "stdio" && (failure === "dropped" || exited())) {
+      if (alreadyGone) return unreachable(ctx, what, err);
       return {
         passed: false,
         details: `server died on unknown tool arguments (tools/call ${name}): ${clip(message, 120)}`,
       };
+    }
+    if (ctx.kind === "http") {
+      // Refused before anything was sent: an earlier test took the server down.
+      if (failure === "connect") return unreachable(ctx, what, err);
+      if (failure === "dropped") {
+        const after = await discoverAfterDrop(ctx);
+        if ("gone" in after) {
+          return {
+            passed: false,
+            details: clip(
+              `server may have crashed: connection dropped on unknown tool arguments (tools/call ${name}): ${clip(firstLine(message), 40)}; server/discover then ${after.gone}`,
+              220,
+            ),
+          };
+        }
+        ctx.harness.warnings.push(
+          `security-extra-params: tools/call ${name} with unknown arguments had its connection closed without a response, but ${after.alive}, so the verdict is inconclusive rather than a crash. ${DROP_CAUSES} Reject unknown arguments with a JSON-RPC error or ignore them so a client can tell a refusal from a crash.`,
+        );
+        return {
+          passed: true,
+          details: `tools/call ${name} had its connection closed without a response -- extra-params verdict inconclusive (see warning)`,
+        };
+      }
     }
     if (isTimeout(err)) {
       ctx.harness.warnings.push(
@@ -1849,9 +2028,11 @@ async function checkExtraParams(ctx: ModernSuiteContext, tool: any): Promise<Tes
         details: `tools/call ${name} did not answer within ${ctx.timeout}ms -- extra-params verdict inconclusive (see warning)`,
       };
     }
+    // Neither an answer nor a transport failure the server can be judged
+    // by (an unparseable HTTP response, a spawn failure).
     return {
       passed: false,
-      details: `connection dropped on unknown tool arguments (tools/call ${name}): ${clip(message, 120)} (server may have crashed)`,
+      details: `no usable response to unknown tool arguments (tools/call ${name}): ${clip(firstLine(message), 120)}`,
     };
   }
 }

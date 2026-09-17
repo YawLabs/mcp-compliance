@@ -1,3 +1,4 @@
+import { errorCodeText, errorWithCode } from "../../checks/validators.js";
 import type { TestOutcome } from "../../harness.js";
 import {
   createModernClient,
@@ -70,8 +71,6 @@ const LEGACY_INITIALIZE_ID = 1;
  * limiter answers BEFORE the JSON-RPC layer reads the request. None of
  * them is the server's verdict on the request body, so a negative probe
  * that draws one measured nothing (the same list error-id-echo exempts).
- * The security injection checks read it the other way round: a follow-up
- * that draws one after a dropped payload shows something is still up.
  */
 export const TRANSPORT_LEVEL_STATUS: Record<number, string> = {
   401: "an auth gate",
@@ -185,7 +184,7 @@ export function notEvaluable(ctx: ModernSuiteContext, about = "the injected defe
   if (!rejection) {
     return `not evaluable: the conformant server/discover got no response, so this rejection proves nothing about ${about}`;
   }
-  const code = rejection.code === null ? "no JSON-RPC error code" : String(rejection.code);
+  const code = rejection.code === null ? "no JSON-RPC error code" : errorCodeText(rejection.rawCode);
   const status = ctx.kind === "http" ? ` (HTTP ${rejection.statusCode})` : "";
   return `not evaluable: the conformant server/discover was itself rejected with ${code}${status}, so this rejection proves nothing about ${about}`;
 }
@@ -274,15 +273,17 @@ async function expectRejection(
     return fail(`${what}: neither result nor JSON-RPC error in the response${status}`);
   }
   if (ctx.kind === "http" && res.statusCode !== 400) {
-    return fail(`${what}: JSON-RPC error ${err.code} with HTTP ${res.statusCode} (expected 400)`);
+    return fail(`${what}: ${errorWithCode(err.rawCode)} with HTTP ${res.statusCode} (expected 400)`);
   }
   if (err.code !== expectedCode) {
     ctx.harness.warnings.push(
-      `${id}: ${what} was rejected with ${err.code}${err.message ? ` (${short(err.message, 60)})` : ""} (expected ${expectedCode})`,
+      `${id}: ${what} was rejected with ${errorCodeText(err.rawCode)}${err.message ? ` (${short(err.message, 60)})` : ""} (expected ${expectedCode})`,
     );
-    return pass(`${what}: rejected with ${err.code}${status}, expected ${expectedCode} (see warning)`);
+    return pass(
+      `${what}: rejected with ${errorCodeText(err.rawCode)}${status}, expected ${expectedCode} (see warning)`,
+    );
   }
-  return pass(`${what}: rejected with ${err.code}${status}`);
+  return pass(`${what}: rejected with ${errorCodeText(err.rawCode)}${status}`);
 }
 
 /**
@@ -354,9 +355,13 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
   } else if (probe.res) {
     // The conformant request was rejected: remember how, so the negative
     // probes can tell "rejected the defect" from "rejects everything".
-    const code = errorOf(probe.res.body)?.code;
+    // `code` is null only when the body is no JSON-RPC error at all; an
+    // error whose code is missing or not a number keeps NaN there, and
+    // `rawCode` what was sent (rendered by errorCodeText).
+    const err = errorOf(probe.res.body);
     ctx.state.discoverRejection = {
-      code: typeof code === "number" && !Number.isNaN(code) ? code : null,
+      code: err ? err.code : null,
+      rawCode: err?.rawCode,
       statusCode: probe.res.statusCode,
     };
   }
@@ -531,7 +536,7 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
     const served = resultOf(res.body);
     if (err || !served) {
       const refusal = err
-        ? `server/discover without clientInfo rejected with ${err.code}${status}`
+        ? `server/discover without clientInfo rejected with ${errorCodeText(err.rawCode)}${status}`
         : `server/discover without clientInfo: no result${status}`;
       // Blame clientInfo only when the conformant discover (clientInfo
       // included) was served and no gate answered before the JSON-RPC
@@ -562,7 +567,9 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
     const err = errorOf(res.body);
     if (!err) return fail(`${what}: no JSON-RPC error in the response${status} (expected -32022)`);
     if (err.code !== MODERN_ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION) {
-      return fail(`${what}: rejected with ${err.code}${status}, expected -32022 UnsupportedProtocolVersionError`);
+      return fail(
+        `${what}: rejected with ${errorCodeText(err.rawCode)}${status}, expected -32022 UnsupportedProtocolVersionError`,
+      );
     }
     const problems: string[] = [];
     if (ctx.kind === "http" && res.statusCode !== 400) problems.push(`HTTP ${res.statusCode} (expected 400)`);
@@ -594,7 +601,7 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
       }
       const err = errorOf(res.body);
       if (unattributable) {
-        summary.push(`${method} ${err ? `${err.code}` : `HTTP ${res.statusCode}`}`);
+        summary.push(`${method} ${err ? errorCodeText(err.rawCode) : `HTTP ${res.statusCode}`}`);
         continue;
       }
       // A gate that answered before the JSON-RPC layer (401/403/413/415/429,
@@ -628,7 +635,7 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
       }
       if (err.code !== JSONRPC_ERROR_CODES.METHOD_NOT_FOUND) {
         harness.warnings.push(
-          `lifecycle-removed-methods: ${method} rejected with ${err.code} (expected -32601 Method not found)`,
+          `lifecycle-removed-methods: ${method} rejected with ${errorCodeText(err.rawCode)} (expected -32601 Method not found)`,
         );
         warned = true;
       } else if (ctx.kind === "http" && res.statusCode !== 404) {
@@ -637,7 +644,7 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
         );
         warned = true;
       }
-      summary.push(`${method} ${err.code}${ctx.kind === "http" ? `/${res.statusCode}` : ""}`);
+      summary.push(`${method} ${errorCodeText(err.rawCode)}${ctx.kind === "http" ? `/${res.statusCode}` : ""}`);
     }
     if (failures.length > 0) return fail(failures.join("; "));
     if (unattributable) return fail(`${summary.join(", ")} rejected; ${unattributable}`);
@@ -683,10 +690,10 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
       }
       if (err.code !== JSONRPC_ERROR_CODES.METHOD_NOT_FOUND) {
         harness.warnings.push(
-          `lifecycle-capability-handlers-match: undeclared ${method} rejected with ${err.code} (expected -32601)`,
+          `lifecycle-capability-handlers-match: undeclared ${method} rejected with ${errorCodeText(err.rawCode)} (expected -32601)`,
         );
       }
-      summary.push(`${cap}: undeclared, ${method} -> ${err.code}`);
+      summary.push(`${cap}: undeclared, ${method} -> ${errorCodeText(err.rawCode)}`);
     }
     if (failures.length > 0) return fail(failures.join("; "));
     return pass(summary.join("; "));
@@ -706,7 +713,7 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
     const served = resultOf(res.body);
     if (err || !served) {
       const refusal = err
-        ? `server/discover with unknown _meta key "${VENDOR_META_KEY}" rejected with ${err.code}${status}`
+        ? `server/discover with unknown _meta key "${VENDOR_META_KEY}" rejected with ${errorCodeText(err.rawCode)}${status}`
         : `server/discover with an extra _meta key: no result${status}`;
       // Blame the key only when the conformant discover (the same envelope
       // without it) was served and no gate answered before the JSON-RPC
@@ -804,15 +811,19 @@ async function checkSubscriptionsListen(ctx: ModernSuiteContext): Promise<TestOu
   const unattributable = notEvaluable(ctx);
   if (err) {
     if (isAdvertised) {
-      return fail(`subscriptions/listen rejected with ${err.code}${httpStatus} although ${advertisedNote}`);
-    }
-    if (unattributable) return fail(`subscriptions/listen rejected with ${err.code}${httpStatus}; ${unattributable}`);
-    if (err.code !== JSONRPC_ERROR_CODES.METHOD_NOT_FOUND) {
-      ctx.harness.warnings.push(
-        `lifecycle-subscriptions-listen: rejected with ${err.code} (expected -32601 when unsupported)`,
+      return fail(
+        `subscriptions/listen rejected with ${errorCodeText(err.rawCode)}${httpStatus} although ${advertisedNote}`,
       );
     }
-    return pass(`${advertisedNote}; subscriptions/listen rejected with ${err.code}${httpStatus}`);
+    if (unattributable) {
+      return fail(`subscriptions/listen rejected with ${errorCodeText(err.rawCode)}${httpStatus}; ${unattributable}`);
+    }
+    if (err.code !== JSONRPC_ERROR_CODES.METHOD_NOT_FOUND) {
+      ctx.harness.warnings.push(
+        `lifecycle-subscriptions-listen: rejected with ${errorCodeText(err.rawCode)} (expected -32601 when unsupported)`,
+      );
+    }
+    return pass(`${advertisedNote}; subscriptions/listen rejected with ${errorCodeText(err.rawCode)}${httpStatus}`);
   }
   if (response) return fail(`subscriptions/listen ended with a result before any acknowledgment${httpStatus}`);
   if (!first) {
@@ -1413,11 +1424,11 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
       const named = supportedVersionsNamedIn(err);
       if (!named) {
         harness.warnings.push(
-          `lifecycle-dual-era: initialize rejected with ${err.code} but neither the message nor data.supported names a supported protocol version (spec SHOULD): "${short(err.message, 80)}"`,
+          `lifecycle-dual-era: initialize rejected with ${errorCodeText(err.rawCode)} but neither the message nor data.supported names a supported protocol version (spec SHOULD): "${short(err.message, 80)}"`,
         );
       }
       return pass(
-        `modern-only: initialize rejected with ${err.code}${status}${where}${named ? `; ${named}` : " (see warning)"}`,
+        `modern-only: initialize rejected with ${errorCodeText(err.rawCode)}${status}${where}${named ? `; ${named}` : " (see warning)"}`,
       );
     }
     if (ctx.kind === "http" && res.statusCode >= 400) {

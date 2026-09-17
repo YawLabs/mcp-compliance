@@ -22,6 +22,7 @@ import {
   parseResourceMetadata,
   pickInjectionTarget,
   placeholderFor,
+  retryAfterMs,
   runSecurity,
   toolSafety,
 } from "../suites/modern/security.js";
@@ -806,6 +807,27 @@ describe("classifyTransportError: reads what the error is, from real transport f
   });
 });
 
+describe("retryAfterMs: the wait before the one retry of a server/discover a 429 answered after a drop", () => {
+  it("reads delay-seconds and an HTTP-date, whatever case the header name is in, and caps the wait at 2 s", () => {
+    expect(retryAfterMs({ "retry-after": "1" })).toBe(1000);
+    expect(retryAfterMs({ "Retry-After": " 0 " })).toBe(0);
+    // A limiter asking for two minutes is not waited out: the retry goes at the cap.
+    expect(retryAfterMs({ "retry-after": "120" })).toBe(2000);
+    expect(retryAfterMs({ "retry-after": new Date(Date.now() + 60_000).toUTCString() })).toBe(2000);
+    // A date already past asks for no wait at all.
+    expect(retryAfterMs({ "retry-after": "Wed, 21 Oct 2015 07:28:00 GMT" })).toBe(0);
+  });
+
+  it("falls back to 1 s without a usable header", () => {
+    expect(retryAfterMs({})).toBe(1000);
+    expect(retryAfterMs({ "retry-after": "" })).toBe(1000);
+    expect(retryAfterMs({ "retry-after": "soon" })).toBe(1000);
+    // Not delay-seconds and not an HTTP-date, though Date.parse would read both as a day in 2001.
+    expect(retryAfterMs({ "retry-after": "-5" })).toBe(1000);
+    expect(retryAfterMs({ "retry-after": "1.5" })).toBe(1000);
+  });
+});
+
 describe("mentionsName: distinctive names match as whole identifiers, plain words only in code-like context", () => {
   it("a name with punctuation, digits or an internal capital counts wherever it stands as a whole identifier", () => {
     expect(mentionsName("call fs.read first", "fs.read")).toBe(true);
@@ -1473,10 +1495,11 @@ interface InlineOptions {
   rateLimitStatus?: 503;
   /**
    * The answer to a body over 500 KB: an HTTP status, a 200 carrying a
-   * JSON-RPC error ("rpc-error"), or a 200 carrying neither result nor
-   * error ("no-result").
+   * JSON-RPC error ("rpc-error"; "rpc-error-no-code" the same error object
+   * without its code), or a 200 carrying neither result nor error
+   * ("no-result").
    */
-  bigBody?: 413 | 500 | 400 | "rpc-error" | "no-result";
+  bigBody?: 413 | 500 | 400 | "rpc-error" | "rpc-error-no-code" | "no-result";
   /** Answer `server/discover` with a JSON-RPC error: capabilities stay unknown. */
   discover?: "error";
   /**
@@ -1508,11 +1531,14 @@ interface InlineOptions {
     | "structured"
     | "unannotated-only"
     | "destructive-only"
+    | "long-param"
     | "empty"
     | "list-error"
     | "none";
   /** Delay every tools/call answer by this many ms. */
   slowToolsCall?: number;
+  /** The text of every tools/call a plain (sink-like) tool answers (default "ok"). */
+  toolsCallReply?: string;
   /**
    * Destroy the socket on tools/call instead of answering: every call
    * (true), or only a call whose raw body matches (a WAF or IPS dropping
@@ -1525,16 +1551,35 @@ interface InlineOptions {
    * "bad-gateway" answers every later /mcp request with an HTML 502 (a
    * proxy whose backend went away); "blocked" answers every later /mcp
    * request with an HTML 403 (a WAF or IPS that blocks a client after an
-   * attack payload, the server behind it still up); "hang" never answers a
-   * later /mcp request.
+   * attack payload, the server behind it still up); "blocked-scope" the
+   * same 403 carrying a Bearer insufficient_scope challenge (an auth gate
+   * refusing the credential); "blocked-challenge" the same 403 carrying a
+   * Bearer challenge with no error parameter (read as auth-required without
+   * --auth, as forbidden with it); "size-gated" an HTML 413 (a body-size limit
+   * answering even a small request, the backend behind it gone); "hang"
+   * never answers a later /mcp request. "throttled" answers the next /mcp
+   * request with an HTML 429 (Retry-After: 1) and serves the rest (a rate
+   * limiter in front of a server that is still up); "throttled-then-bad-
+   * gateway" answers the next one 429 and every later one 502 (a
+   * rate-limiting gateway whose backend went away).
    */
-  afterDrop?: "die" | "bad-gateway" | "blocked" | "hang";
+  afterDrop?:
+    | "die"
+    | "bad-gateway"
+    | "blocked"
+    | "blocked-scope"
+    | "blocked-challenge"
+    | "size-gated"
+    | "hang"
+    | "throttled"
+    | "throttled-then-bad-gateway";
   /**
    * The answer to every tools/call: a -32602 naming the unknown argument
-   * ("rpc-error"), an HTTP 500 carrying a JSON-RPC error, or a 200 envelope
+   * ("rpc-error"; "rpc-error-string-code" the same error with the string
+   * code "E_ARGS"), an HTTP 500 carrying a JSON-RPC error, or a 200 envelope
    * with neither result nor error ("no-result").
    */
-  toolsCallAnswer?: "rpc-error" | 500 | "no-result";
+  toolsCallAnswer?: "rpc-error" | "rpc-error-string-code" | 500 | "no-result";
   /**
    * Stop listening once this many tools/call have been answered (the
    * answer carries Connection: close so the next call opens a new
@@ -1816,6 +1861,14 @@ const DESTRUCTIVE_ONLY_TOOL = {
   annotations: { destructiveHint: true },
 };
 
+/** A read-only tool whose tool.param name is 41 characters: long enough to crowd a 220-character details string. */
+const LONG_PARAM_TOOL = {
+  name: "search_knowledge_base_articles",
+  description: "Searches the knowledge base",
+  inputSchema: { type: "object", properties: { query_text: { type: "string" } } },
+  annotations: { readOnlyHint: true },
+};
+
 /** An Express-style 500 page: a stack frame and an internal host, in HTML rather than JSON-RPC. */
 function errorPageHtml(where: string, withStack: boolean): string {
   const body = withStack
@@ -1832,8 +1885,11 @@ function sseFrame(message: unknown): string {
 }
 
 function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
-  /** Set once a tools/call was dropped under afterDrop "bad-gateway", "blocked" or "hang". */
-  let backendDown: "bad-gateway" | "blocked" | "hang" | null = null;
+  /** Set once a tools/call was dropped under an afterDrop that keeps listening but stops serving. */
+  let backendDown: "bad-gateway" | "blocked" | "blocked-scope" | "blocked-challenge" | "size-gated" | "hang" | null =
+    null;
+  /** /mcp requests still to be answered 429 (afterDrop "throttled", "throttled-then-bad-gateway"). */
+  let throttleNext = 0;
   let posts = 0;
   let unauthenticatedSeen = 0;
   let toolCalls = 0;
@@ -1873,6 +1929,8 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         return [UNANNOTATED_ONLY_TOOL];
       case "destructive-only":
         return [DESTRUCTIVE_ONLY_TOOL];
+      case "long-param":
+        return [LONG_PARAM_TOOL];
       case "empty":
       case "list-error":
       case "none":
@@ -1953,8 +2011,25 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         res.writeHead(404);
         return res.end();
       }
+      if (throttleNext > 0) {
+        throttleNext--;
+        res.writeHead(429, { "Content-Type": "text/html; charset=utf-8", "Retry-After": "1" });
+        return res.end("<html><body>429 Too Many Requests</body></html>");
+      }
       if (backendDown === "bad-gateway") return html(502, "<html><body>502 Bad Gateway</body></html>");
       if (backendDown === "blocked") return html(403, "<html><body>Request blocked</body></html>");
+      if (backendDown === "blocked-scope") {
+        res.writeHead(403, {
+          "Content-Type": "text/html; charset=utf-8",
+          "WWW-Authenticate": 'Bearer error="insufficient_scope", scope="tools:call"',
+        });
+        return res.end("<html><body>Forbidden</body></html>");
+      }
+      if (backendDown === "blocked-challenge") {
+        res.writeHead(403, { "Content-Type": "text/html; charset=utf-8", "WWW-Authenticate": 'Bearer realm="mcp"' });
+        return res.end("<html><body>Forbidden</body></html>");
+      }
+      if (backendDown === "size-gated") return html(413, "<html><body>413 Request Entity Too Large</body></html>");
       if (backendDown === "hang") return;
       // "hang" leaves the request pending until close() destroys the
       // connection; "drop" closes the accepted connection without a byte
@@ -2085,6 +2160,9 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
         );
       }
       if (opts.bigBody && body.length > 500_000) {
+        if (opts.bigBody === "rpc-error-no-code") {
+          return json(200, { jsonrpc: "2.0", id: msg?.id ?? null, error: { message: "data exceeds maxLength" } });
+        }
         if (opts.bigBody === "rpc-error") {
           return json(200, {
             jsonrpc: "2.0",
@@ -2140,14 +2218,35 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
             opts.dropOnToolsCall === true ||
             (opts.dropOnToolsCall instanceof RegExp && opts.dropOnToolsCall.test(body.toString("utf8")))
           ) {
-            if (opts.afterDrop === "bad-gateway" || opts.afterDrop === "blocked" || opts.afterDrop === "hang") {
-              backendDown = opts.afterDrop;
+            switch (opts.afterDrop) {
+              case "bad-gateway":
+              case "blocked":
+              case "blocked-scope":
+              case "blocked-challenge":
+              case "size-gated":
+              case "hang":
+                backendDown = opts.afterDrop;
+                break;
+              case "throttled":
+                throttleNext = 1;
+                break;
+              case "throttled-then-bad-gateway":
+                throttleNext = 1;
+                backendDown = "bad-gateway";
+                break;
             }
             if (opts.afterDrop === "die") {
               server.close();
               server.closeAllConnections?.();
             }
             return req.socket.destroy();
+          }
+          if (opts.toolsCallAnswer === "rpc-error-string-code") {
+            return json(200, {
+              jsonrpc: "2.0",
+              id: msg?.id ?? null,
+              error: { code: "E_ARGS", message: "unknown argument __injected_param__" },
+            });
           }
           if (opts.toolsCallAnswer === "rpc-error") {
             return error(-32602, "Invalid params: unknown argument __injected_param__");
@@ -2207,7 +2306,9 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
                 structuredContent: { out: "uid=0(root) gid=0(root)" },
               });
             }
-            if (opts.tools !== "injection-set") return result({ content: [{ type: "text", text: "ok" }] });
+            if (opts.tools !== "injection-set") {
+              return result({ content: [{ type: "text", text: opts.toolsCallReply ?? "ok" }] });
+            }
             switch (name) {
               case "lookup":
                 if (typeof args.q !== "string" || args.limit !== 1 || args.verbose !== false) {
@@ -2682,18 +2783,29 @@ describe("inline servers: rate limiting on tools/call only, and the discover fal
 });
 
 describe("inline servers: extra-params tells a slow tool from a dead server", () => {
+  const EXTRA = "security-extra-params";
+  const CMD = "security-command-injection";
   const servers: InlineServer[] = [];
   let slow: DirectRun;
   let dropped: DirectRun;
+  let droppedThenGone: DirectRun;
+  let refused: DirectRun;
   let died: DirectRun;
   let dir = "";
 
   beforeAll(async () => {
     const a = await startInlineServer({ slowToolsCall: 1500 });
-    const b = await startInlineServer({ dropOnToolsCall: true });
-    servers.push(a, b);
-    slow = await runDirect({ url: a.url, only: ["security-extra-params"], timeout: 500 });
-    dropped = await runDirect({ url: b.url, only: ["security-extra-params"] });
+    // A WAF or IPS dropping the prototype-pollution signature ("__proto__")
+    // while the server behind it keeps serving everything else.
+    const b = await startInlineServer({ dropOnToolsCall: /__proto__/ });
+    const c = await startInlineServer({ dropOnToolsCall: true, afterDrop: "die" });
+    const d = await startInlineServer({ dropOnToolsCall: true, afterDrop: "die" });
+    servers.push(a, b, c, d);
+    slow = await runDirect({ url: a.url, only: [EXTRA], timeout: 500 });
+    dropped = await runDirect({ url: b.url, only: [CMD, EXTRA] });
+    droppedThenGone = await runDirect({ url: c.url, only: [EXTRA] });
+    // The first injection payload takes the server down: extra-params finds the connection refused.
+    refused = await runDirect({ url: d.url, only: [CMD, EXTRA] });
     // A stdio server that exits on tools/call.
     dir = mkdtempSync(join(tmpdir(), "mcp-compliance-sec-"));
     const script = join(dir, "exit-on-call.mjs");
@@ -2735,10 +2847,41 @@ describe("inline servers: extra-params tells a slow tool from a dead server", ()
     expect(warnings[0]).toContain("not a crash");
   });
 
-  it("a dropped connection fails as a possible crash", () => {
-    expect(verdicts(dropped.tests, ["security-extra-params"])["security-extra-params"]).toMatch(
-      /^FAIL: connection dropped on unknown tool arguments \(tools\/call sink\): .+ \(server may have crashed\)$/,
+  it("a dropped connection the server outlives is inconclusive, with a warning -- the same rule the injection checks apply", () => {
+    // Before: FAIL "connection dropped on unknown tool arguments (tools/call
+    // sink): other side closed (server may have crashed)" against a server
+    // that served the follow-up discover and every injection payload.
+    expect(verdicts(dropped.tests, [CMD, EXTRA])).toEqual({ [CMD]: "pass", [EXTRA]: "pass" });
+    expect(detailsOf(dropped.tests, EXTRA)).toBe(
+      "tools/call sink had its connection closed without a response -- extra-params verdict inconclusive (see warning)",
     );
+    expect(dropped.warnings.filter((w) => w.startsWith("security-extra-params:"))).toEqual([
+      "security-extra-params: tools/call sink with unknown arguments had its connection closed without a response, but the server still served a follow-up server/discover, so the verdict is inconclusive rather than a crash. The drop may be a WAF or IPS dropping the request, a keep-alive connection closed as it was sent, or a crash of one worker of a multi-process server (Node cluster, PM2, gunicorn) while the others still answer -- a black-box client cannot tell these apart. Reject unknown arguments with a JSON-RPC error or ignore them so a client can tell a refusal from a crash.",
+    ]);
+    // One follow-up discover, after the seed discover.
+    expect(dropped.recorder.sent.filter((m) => m.method === "server/discover")).toHaveLength(2);
+    expectAsciiDetails(dropped.tests, [EXTRA]);
+  });
+
+  it("a dropped connection fails as a possible crash when server/discover then gets no answer", () => {
+    expect(verdicts(droppedThenGone.tests, [EXTRA])[EXTRA]).toMatch(
+      /^FAIL: server may have crashed: connection dropped on unknown tool arguments \(tools\/call sink\): other side closed; server\/discover then got no response \(connection failed: connect ECONNREFUSED 127\.0\.0\.1:\d+\)$/,
+    );
+    expect(droppedThenGone.warnings.filter((w) => w.startsWith("security-extra-params:"))).toEqual([]);
+    expectAsciiDetails(droppedThenGone.tests, [EXTRA]);
+  });
+
+  it("a server already gone (the connection refused) is unreachable, not a drop on unknown arguments", () => {
+    // Before: FAIL "connection dropped on unknown tool arguments (tools/call
+    // sink): connect ECONNREFUSED ... (server may have crashed)", though
+    // nothing was sent and the injection check had already failed the crash.
+    expect(verdicts(refused.tests, [CMD])[CMD]).toMatch(
+      /^FAIL: server may have crashed: connection dropped on payload/,
+    );
+    expect(verdicts(refused.tests, [EXTRA])[EXTRA]).toMatch(
+      /^FAIL: server unreachable: tools\/call sink with unknown arguments got no response \(connection failed: connect ECONNREFUSED 127\.0\.0\.1:\d+\)$/,
+    );
+    expectAsciiDetails(refused.tests, [EXTRA]);
   });
 
   it("a stdio child that exits on the call fails as died", () => {
@@ -3209,8 +3352,16 @@ describe("security-tls-required over an https URL: the plaintext probe", () => {
 describe("inline servers: injection payloads that take the server down", () => {
   const CMD = "security-command-injection";
   const SQL = "security-sql-injection";
-  const DROP_WARNING =
-    "security injection tests: a tools/call to sink.data carrying a payload had its connection closed without a response, but the server still served a follow-up server/discover, so the payload is counted as never reaching the tool, not as a crash (a WAF or IPS dropping the request, or a keep-alive connection closed as it was sent). Refuse a payload with HTTP 4xx or a JSON-RPC error so a client can tell a refusal from a crash.";
+  const OVERSIZED = "security-oversized-input";
+  const EXTRA = "security-extra-params";
+  /** Why a drop the server outlives is not called a crash, and what a black-box client cannot rule out. */
+  const DROP_CAUSES =
+    "The drop may be a WAF or IPS dropping the request, a keep-alive connection closed as it was sent, or a crash of one worker of a multi-process server (Node cluster, PM2, gunicorn) while the others still answer -- a black-box client cannot tell these apart.";
+  const dropWarning = (after: string) =>
+    `security injection tests: a tools/call to sink.data carrying a payload had its connection closed without a response, but ${after}, so the payload is counted as never reaching the tool rather than as a crash. ${DROP_CAUSES} Refuse a payload with HTTP 4xx or a JSON-RPC error so a client can tell a refusal from a crash.`;
+  const DROP_WARNING = dropWarning("the server still served a follow-up server/discover");
+  const ALL_UNREACHED_WARNING =
+    "security injection tests: no payload sent to sink.data reached the tool (every tools/call drew a JSON-RPC or transport error), so the verdict is inconclusive; check that the placeholder arguments satisfy the tool's schema, or expose a read-only tool with a free-form string argument.";
   const servers: InlineServer[] = [];
   let dropped: DirectRun;
   let waf: DirectRun;
@@ -3219,6 +3370,13 @@ describe("inline servers: injection payloads that take the server down", () => {
   let droppedThenBadGateway: DirectRun;
   let droppedThenBlocked: DirectRun;
   let blockedServer: InlineServer;
+  let droppedThenScopeRefused: DirectRun;
+  let droppedThenSizeGated: DirectRun;
+  let droppedThenThrottled: DirectRun;
+  let throttledServer: InlineServer;
+  let droppedThenThrottledGone: DirectRun;
+  let longNameGone: DirectRun;
+  let issueThenGone: DirectRun;
   let slow: DirectRun;
   let goneMidRun: DirectRun;
   let goneAfterIssue: DirectRun;
@@ -3236,12 +3394,30 @@ describe("inline servers: injection payloads that take the server down", () => {
     const d = await startInlineServer({ dropOnToolsCall: true, afterDrop: "die" });
     const e = await startInlineServer({ dropOnToolsCall: true, afterDrop: "bad-gateway" });
     blockedServer = await startInlineServer({ dropOnToolsCall: true, afterDrop: "blocked" });
-    servers.push(a, b, goneServer, c, wafServer, d, e, blockedServer);
+    const f = await startInlineServer({ dropOnToolsCall: true, afterDrop: "blocked-scope" });
+    const g = await startInlineServer({ dropOnToolsCall: true, afterDrop: "size-gated" });
+    throttledServer = await startInlineServer({ dropOnToolsCall: /etc\/passwd/, afterDrop: "throttled" });
+    const h = await startInlineServer({ dropOnToolsCall: true, afterDrop: "throttled-then-bad-gateway" });
+    const i = await startInlineServer({ tools: "long-param", dropOnToolsCall: true, afterDrop: "die" });
+    // Answers the first payload with id(1) output, drops the second and stops listening.
+    const j = await startInlineServer({
+      tools: "long-param",
+      toolsCallReply: "uid=0(root) gid=0(root)",
+      dropOnToolsCall: /whoami/,
+      afterDrop: "die",
+    });
+    servers.push(a, b, goneServer, c, wafServer, d, e, blockedServer, f, g, throttledServer, h, i, j);
     dropped = await runDirect({ url: a.url, only: [CMD] });
     waf = await runDirect({ url: wafServer.url, only: [CMD, SQL] });
     droppedThenGone = await runDirect({ url: d.url, only: [CMD] });
     droppedThenBadGateway = await runDirect({ url: e.url, only: [CMD] });
     droppedThenBlocked = await runDirect({ url: blockedServer.url, only: [CMD] });
+    droppedThenScopeRefused = await runDirect({ url: f.url, only: [CMD] });
+    droppedThenSizeGated = await runDirect({ url: g.url, only: [CMD] });
+    droppedThenThrottled = await runDirect({ url: throttledServer.url, only: [CMD] });
+    droppedThenThrottledGone = await runDirect({ url: h.url, only: [CMD] });
+    longNameGone = await runDirect({ url: i.url, only: [CMD] });
+    issueThenGone = await runDirect({ url: j.url, only: [CMD] });
     slow = await runDirect({ url: b.url, only: [CMD], timeout: 300 });
     goneMidRun = await runDirect({ url: goneServer.url, only: [CMD] });
     goneAfterIssue = await runDirect({ url: c.url, only: [CMD] });
@@ -3267,8 +3443,11 @@ describe("inline servers: injection payloads that take the server down", () => {
         "",
       ].join("\n"),
     );
-    died = await runDirect({ command: { command: process.execPath, args: [script] }, only: [CMD, SQL] });
-  }, 30_000);
+    died = await runDirect({
+      command: { command: process.execPath, args: [script] },
+      only: [CMD, SQL, OVERSIZED, EXTRA],
+    });
+  }, 60_000);
 
   afterAll(async () => {
     for (const s of servers) await s.close();
@@ -3303,7 +3482,7 @@ describe("inline servers: injection payloads that take the server down", () => {
     );
     expect(dropped.warnings.filter((w) => w.startsWith("security injection"))).toEqual([
       DROP_WARNING,
-      "security injection tests: no payload sent to sink.data reached the tool (every tools/call drew a JSON-RPC or transport error), so the verdict is inconclusive; check that the placeholder arguments satisfy the tool's schema, or expose a read-only tool with a free-form string argument.",
+      ALL_UNREACHED_WARNING,
     ]);
     expectAsciiDetails(dropped.tests, [CMD]);
   });
@@ -3311,12 +3490,12 @@ describe("inline servers: injection payloads that take the server down", () => {
   it("an HTTP connection dropped on a payload fails as a possible crash when server/discover is not served after it", () => {
     // Stopped listening: the follow-up connection is refused.
     expect(verdicts(droppedThenGone.tests, [CMD])[CMD]).toMatch(
-      /^FAIL: connection dropped on payload "; cat \/etc\/passwd" sent to sink\.data: other side closed; server\/discover then got no response \(connection failed: connect ECONNREFUSED 127\.0\.0\.1:\d+\) \(server may have crashed\)$/,
+      /^FAIL: server may have crashed: connection dropped on payload "; cat \/etc\/passwd" sent to sink\.data: other side closed; server\/discover then got no response \(connection failed: connect ECONNREFUSED 127\.0\.0\.1:\d+\)$/,
     );
     // A proxy whose backend went away: an answer, but not a served discover.
     expect(verdicts(droppedThenBadGateway.tests, [CMD])).toEqual({
       [CMD]:
-        'FAIL: connection dropped on payload "; cat /etc/passwd" sent to sink.data: other side closed; server/discover then answered HTTP 502, non-JSON-RPC body (server may have crashed)',
+        'FAIL: server may have crashed: connection dropped on payload "; cat /etc/passwd" sent to sink.data: other side closed; server/discover then answered HTTP 502, non-JSON-RPC body',
     });
     for (const run of [droppedThenGone, droppedThenBadGateway]) {
       expect(run.warnings.filter((w) => w.startsWith("security injection"))).toEqual([]);
@@ -3324,7 +3503,7 @@ describe("inline servers: injection payloads that take the server down", () => {
     }
   });
 
-  it("a drop followed by a gate refusing server/discover (a WAF blocking the client with 403) is not a crash", () => {
+  it("a drop followed by a gate refusing server/discover (a WAF blocking the client with 403) is not a crash, and a bare 403 is not called an auth gate", () => {
     // Before: FAIL 'connection dropped on payload "; cat /etc/passwd" sent to
     // sink.data: other side closed; server/discover then answered HTTP 403,
     // non-JSON-RPC body (server may have crashed)'. A 403 is an answer from
@@ -3334,15 +3513,84 @@ describe("inline servers: injection payloads that take the server down", () => {
     expect(detailsOf(droppedThenBlocked.tests, CMD)).toBe(
       `Tested 5 payload(s) against sink.data: 0 rejected, 0 returned without evidence of execution, 5 ${UNREACHED} -- inconclusive (see warning)`,
     );
+    // Before: "(HTTP 403, an auth gate)" for a 403 with no challenge, which
+    // says nothing about the credential.
     expect(droppedThenBlocked.warnings.filter((w) => w.startsWith("security injection"))).toEqual([
-      "security injection tests: a tools/call to sink.data carrying a payload had its connection closed without a response, but a follow-up server/discover was still answered (HTTP 403, an auth gate), so the payload is counted as never reaching the tool, not as a crash (a WAF or IPS dropping the request, or a keep-alive connection closed as it was sent). Refuse a payload with HTTP 4xx or a JSON-RPC error so a client can tell a refusal from a crash.",
-      "security injection tests: no payload sent to sink.data reached the tool (every tools/call drew a JSON-RPC or transport error), so the verdict is inconclusive; check that the placeholder arguments satisfy the tool's schema, or expose a read-only tool with a free-form string argument.",
+      dropWarning(
+        "a follow-up server/discover was still answered (HTTP 403, a gate in front of the server such as a WAF or IPS now blocking this client)",
+      ),
+      ALL_UNREACHED_WARNING,
     ]);
     // Only the first payload reached the server's tools/call handler, and
     // only it was followed by a discover: the rest were answered 403.
     expect(blockedServer.calls).toHaveLength(1);
     expect(droppedThenBlocked.recorder.sent.filter((m) => m.method === "server/discover")).toHaveLength(2);
     expectAsciiDetails(droppedThenBlocked.tests, [CMD]);
+  });
+
+  it("a 403 that refuses the credential with a Bearer challenge is still read as an auth gate", () => {
+    expect(verdicts(droppedThenScopeRefused.tests, [CMD])).toEqual({ [CMD]: "pass" });
+    expect(droppedThenScopeRefused.warnings.filter((w) => w.startsWith("security injection"))).toEqual([
+      dropWarning("a follow-up server/discover was still answered (HTTP 403, an auth gate)"),
+      ALL_UNREACHED_WARNING,
+    ]);
+  });
+
+  it("a 413 on the small follow-up server/discover is no proof the server is up", () => {
+    // Before: PASS as inconclusive ("HTTP 413, a body-size limit" counted
+    // as a gate still standing) though no size limit refuses a conformant
+    // server/discover of a few hundred bytes.
+    expect(verdicts(droppedThenSizeGated.tests, [CMD])).toEqual({
+      [CMD]:
+        'FAIL: server may have crashed: connection dropped on payload "; cat /etc/passwd" sent to sink.data: other side closed; server/discover then answered HTTP 413, non-JSON-RPC body',
+    });
+    expect(droppedThenSizeGated.warnings.filter((w) => w.startsWith("security injection"))).toEqual([]);
+  });
+
+  it("a 429 on the follow-up server/discover is retried once after Retry-After: served, the drop was survived", () => {
+    // Only the /etc/passwd payload is dropped; the 429 answers the first
+    // follow-up discover and the retry a second later is served.
+    expect(verdicts(droppedThenThrottled.tests, [CMD])).toEqual({ [CMD]: "pass" });
+    expect(detailsOf(droppedThenThrottled.tests, CMD)).toBe(
+      `Tested 5 payload(s) against sink.data: 0 rejected, 4 returned without evidence of execution, 1 ${UNREACHED}`,
+    );
+    expect(droppedThenThrottled.warnings.filter((w) => w.startsWith("security injection"))).toEqual([
+      dropWarning("a follow-up server/discover answered HTTP 429, then after 1000ms was served"),
+    ]);
+    // The seed discover, the throttled follow-up and its retry.
+    expect(droppedThenThrottled.recorder.sent.filter((m) => m.method === "server/discover")).toHaveLength(3);
+    expect(throttledServer.calls).toHaveLength(5);
+  });
+
+  it("a 429 on the follow-up server/discover followed by a 502 on the retry is a possible crash, not a gate", () => {
+    // Before: PASS as inconclusive, the warning reading "(HTTP 429, rate
+    // limiting) ... not as a crash", for a rate-limiting gateway whose
+    // backend had gone away (every later request drew 502).
+    expect(verdicts(droppedThenThrottledGone.tests, [CMD])).toEqual({
+      [CMD]:
+        'FAIL: server may have crashed: connection dropped on payload "; cat /etc/passwd" sent to sink.data: other side closed; server/discover then answered HTTP 429, then after 1000ms answered HTTP 502, non-JSON-RPC body',
+    });
+    expect(droppedThenThrottledGone.warnings.filter((w) => w.startsWith("security injection"))).toEqual([]);
+    expectAsciiDetails(droppedThenThrottledGone.tests, [CMD]);
+  });
+
+  it("the crash conclusion survives the 220-character limit with a long tool.param name, and after an earlier issue", () => {
+    // Before: the details were clipped at "...connect ECONNREFUSED
+    // 127.0.0.1:NNNNN) (s...", losing "(server may have crashed)".
+    const gone = detailsOf(longNameGone.tests, CMD);
+    expect(verdicts(longNameGone.tests, [CMD])[CMD]).toMatch(
+      /^FAIL: server may have crashed: connection dropped on payload "; cat \/etc\/passwd" sent to search_knowledge_base_articles\.query_text: other side closed; server\/discover then got no response/,
+    );
+    expect(gone.length).toBeLessThanOrEqual(220);
+    // Before: the execution evidence filled the 220 characters and the
+    // crash on the second payload was clipped away entirely.
+    const both = detailsOf(issueThenGone.tests, CMD);
+    expect(verdicts(issueThenGone.tests, [CMD])[CMD]).toMatch(
+      /^FAIL: Payload "; cat \/etc\/passwd" appears to have executed in search_knowledge_base_articles\.query_text \(output: uid=0\(root\) gid=0\(root\)\); server may have crashed: connection dropped on payload "\$\(whoami\)"/,
+    );
+    expect(both.length).toBeLessThanOrEqual(220);
+    expectAsciiDetails(longNameGone.tests, [CMD]);
+    expectAsciiDetails(issueThenGone.tests, [CMD]);
   });
 
   it("a stdio child that exits on a payload fails as died; the next test finds it gone and is unreachable", () => {
@@ -3354,6 +3602,19 @@ describe("inline servers: injection payloads that take the server down", () => {
     });
     expect(died.warnings.filter((w) => w.startsWith("security injection"))).toEqual([]);
     expectAsciiDetails(died.tests, [CMD, SQL]);
+  });
+
+  it("oversized-input and extra-params do not blame themselves for a stdio child an earlier payload killed", () => {
+    // Before: "server died on a 1 MB boom.data: ..." and "server died on
+    // unknown tool arguments (tools/call boom): ...", though the child
+    // exited on the command-injection payload and nothing reached it after.
+    expect(verdicts(died.tests, [OVERSIZED, EXTRA])).toEqual({
+      [OVERSIZED]:
+        "FAIL: server unreachable: tools/call boom.data with a 1 MB value got no response (connection closed: stdio transport: server crashed with exit code 3 before completing the request)",
+      [EXTRA]:
+        "FAIL: server unreachable: tools/call boom with unknown arguments got no response (connection closed: stdio transport: server crashed with exit code 3 before completing the request)",
+    });
+    expectAsciiDetails(died.tests, [OVERSIZED, EXTRA]);
   });
 
   it("a server that stops listening mid-probe is unreachable from that payload on, counting what was answered", () => {
@@ -3616,6 +3877,7 @@ describe("stdio servers: an oversized reply the runner drops, and a child that d
   let dir = "";
   let dropped: DirectRun;
   let died: DirectRun;
+  let overflowThenExit: DirectRun;
   let earlierDrop: DirectRun;
   let spoofed: DirectRun;
 
@@ -3655,6 +3917,15 @@ describe("stdio servers: an oversized reply the runner drops, and a child that d
       "  }",
     ]);
     const exitOnCall = stdioScript("exit-on-call.mjs", "boom", ['  if (msg.method === "tools/call") process.exit(3);']);
+    // Writes the same ~2 MB reply, then exits once it is flushed: the
+    // overflow is counted during the call, but the child is gone.
+    const echoThenExit = stdioScript("echo-then-exit.mjs", "echo", [
+      '  if (msg.method === "tools/call") {',
+      '    const data = String(msg.params?.arguments?.data ?? "");',
+      '    const reply = { jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", content: [{ type: "text", text: data }], structuredContent: { echo: data } } };',
+      '    return process.stdout.write(JSON.stringify(reply) + "\\n", () => process.exit(3));',
+      "  }",
+    ]);
     // Answers the FIRST tools/call (a command-injection payload) with a
     // ~2 MB reply the runner drops, the other payloads with a short
     // result, and never answers the 1 MB call at all.
@@ -3676,6 +3947,7 @@ describe("stdio servers: an oversized reply the runner drops, and a child that d
     ]);
     dropped = await runDirect({ command: echoTwice, only: [ID] });
     died = await runDirect({ command: exitOnCall, only: [ID] });
+    overflowThenExit = await runDirect({ command: echoThenExit, only: [ID] });
     earlierDrop = await runDirect({ command: staleDrop, only: [INJECTION, ID], timeout: 2000 });
     spoofed = await runDirect({ command: markerOnStderr, only: [ID], timeout: 2000 });
   }, 60_000);
@@ -3699,6 +3971,17 @@ describe("stdio servers: an oversized reply the runner drops, and a child that d
     expect(verdicts(died.tests, [ID])[ID]).toMatch(/^FAIL: server died on a 1 MB boom\.data: .*exit code 3/);
     expect(died.warnings.filter((w) => w.startsWith("security-oversized-input:"))).toEqual([]);
     expectAsciiDetails(died.tests, [ID]);
+  });
+
+  it("a child that overflows the line buffer and then exits fails as died, not survived", () => {
+    // Before: PASS "response to a 1 MB echo.data exceeded the runner's stdio
+    // line buffer (server survived)" with the "treated as survived" warning,
+    // though the request was rejected by the exit well inside the timeout.
+    expect(verdicts(overflowThenExit.tests, [ID])[ID]).toMatch(
+      /^FAIL: server died on a 1 MB echo\.data: .*exit code 3/,
+    );
+    expect(overflowThenExit.warnings.filter((w) => w.startsWith("security-oversized-input:"))).toEqual([]);
+    expectAsciiDetails(overflowThenExit.tests, [ID]);
   });
 
   it("a reply dropped earlier in the run does not turn a later 1 MB timeout into survived", () => {
@@ -3789,19 +4072,23 @@ describe("inline servers: the leak scans read non-JSON error bodies", () => {
 // ---------------------------------------------------------------------------
 // security-oversized-input, one verdict per answer shape: a 4xx that is not
 // 413, a JSON-RPC error, an envelope with neither result nor error, a
-// timeout, and a dropped connection (which security-extra-params, on the
-// same drop, fails).
+// timeout, and a dropped connection -- acceptable when the server outlives
+// it, a possible crash when server/discover then goes unanswered, and
+// unreachable when the connection was refused before anything was sent.
 // ---------------------------------------------------------------------------
 
 describe("inline servers: oversized-input verdicts per answer shape", () => {
   const ID = "security-oversized-input";
   const EXTRA = "security-extra-params";
+  const CMD = "security-command-injection";
   const servers: InlineServer[] = [];
   let rejected4xx: DirectRun;
   let rpcError: DirectRun;
   let noResult: DirectRun;
   let slow: DirectRun;
   let dropped: DirectRun;
+  let droppedThenGone: DirectRun;
+  let alreadyGone: DirectRun;
 
   beforeAll(async () => {
     const a = await startInlineServer({ bigBody: 400 });
@@ -3809,12 +4096,18 @@ describe("inline servers: oversized-input verdicts per answer shape", () => {
     const c = await startInlineServer({ bigBody: "no-result" });
     const d = await startInlineServer({ slowToolsCall: 1500 });
     const e = await startInlineServer({ dropOnToolsCall: true });
-    servers.push(a, b, c, d, e);
+    // Crashes on the 1 MB body alone: reads it, drops the connection, stops listening.
+    const f = await startInlineServer({ dropOnToolsCall: /A{100000}/, afterDrop: "die" });
+    const g = await startInlineServer({ dropOnToolsCall: true, afterDrop: "die" });
+    servers.push(a, b, c, d, e, f, g);
     rejected4xx = await runDirect({ url: a.url, only: [ID] });
     rpcError = await runDirect({ url: b.url, only: [ID] });
     noResult = await runDirect({ url: c.url, only: [ID] });
     slow = await runDirect({ url: d.url, only: [ID], timeout: 500 });
     dropped = await runDirect({ url: e.url, only: [ID, EXTRA] });
+    droppedThenGone = await runDirect({ url: f.url, only: [ID, EXTRA] });
+    // The first injection payload takes the server down before the 1 MB call.
+    alreadyGone = await runDirect({ url: g.url, only: [CMD, ID] });
   }, 30_000);
 
   afterAll(async () => {
@@ -3841,14 +4134,40 @@ describe("inline servers: oversized-input verdicts per answer shape", () => {
     for (const run of [noResult, slow]) expectAsciiDetails(run.tests, [ID]);
   });
 
-  it("a dropped connection is acceptable for oversized input, though extra-params fails the same drop", () => {
-    expect(verdicts(dropped.tests, [ID])).toEqual({ [ID]: "pass" });
+  it("a dropped connection the server outlives is acceptable for oversized input, and extra-params reads the same drop the same way", () => {
+    expect(verdicts(dropped.tests, [ID, EXTRA])).toEqual({ [ID]: "pass", [EXTRA]: "pass" });
     expect(detailsOf(dropped.tests, ID)).toBe(
-      "Connection rejected (acceptable for oversized input): other side closed",
+      "Connection rejected (acceptable for oversized input): other side closed; the server still served a follow-up server/discover",
     );
-    expect(verdicts(dropped.tests, [EXTRA])[EXTRA]).toMatch(
-      /^FAIL: connection dropped on unknown tool arguments \(tools\/call sink\): other side closed \(server may have crashed\)$/,
+    expect(detailsOf(dropped.tests, EXTRA)).toBe(
+      "tools/call sink had its connection closed without a response -- extra-params verdict inconclusive (see warning)",
     );
+    // One follow-up discover per drop, after the seed discover.
+    expect(dropped.recorder.sent.filter((m) => m.method === "server/discover")).toHaveLength(3);
+    expectAsciiDetails(dropped.tests, [ID, EXTRA]);
+  });
+
+  it("a server that crashes on the 1 MB body fails oversized-input, and extra-params finds it unreachable", () => {
+    // Before: oversized-input PASSED "Connection rejected (acceptable for
+    // oversized input): other side closed" and extra-params took the blame
+    // ("connection dropped on unknown tool arguments ... connect
+    // ECONNREFUSED ... (server may have crashed)").
+    expect(verdicts(droppedThenGone.tests, [ID])[ID]).toMatch(
+      /^FAIL: server may have crashed: connection dropped on a 1 MB sink\.data: other side closed; server\/discover then got no response \(connection failed: connect ECONNREFUSED 127\.0\.0\.1:\d+\)$/,
+    );
+    expect(verdicts(droppedThenGone.tests, [EXTRA])[EXTRA]).toMatch(
+      /^FAIL: server unreachable: tools\/call sink with unknown arguments got no response \(connection failed: connect ECONNREFUSED 127\.0\.0\.1:\d+\)$/,
+    );
+    expectAsciiDetails(droppedThenGone.tests, [ID, EXTRA]);
+  });
+
+  it("a server already gone before the 1 MB call is unreachable, not a connection rejected", () => {
+    // Before: PASS "Connection rejected (acceptable for oversized input):
+    // connect ECONNREFUSED 127.0.0.1:NNNNN", though nothing was sent.
+    expect(verdicts(alreadyGone.tests, [ID])[ID]).toMatch(
+      /^FAIL: server unreachable: tools\/call sink\.data with a 1 MB value got no response \(connection failed: connect ECONNREFUSED 127\.0\.0\.1:\d+\)$/,
+    );
+    expectAsciiDetails(alreadyGone.tests, [ID]);
   });
 });
 
@@ -4167,6 +4486,19 @@ describe("inline servers: an abort during an auth probe is rethrown, not graded"
     ]);
   }, 60_000);
 
+  it("security-command-injection: an abort while waiting out a 429's Retry-After before the discover retry is not graded", async () => {
+    // The setup discover, tools/list, the dropped payload, then the
+    // follow-up discover answered 429: the abort lands in the one-second
+    // wait before the retry.
+    const server = await startInlineServer({ dropOnToolsCall: true, afterDrop: "throttled-then-bad-gateway" });
+    servers.push(server);
+    expect(await abortDuring(server, "security-command-injection", 4)).toEqual([
+      ["security-command-injection", false, "Error: user abort"],
+    ]);
+    // Aborted in the wait: the retry was never sent.
+    expect(server.urls).toHaveLength(4);
+  }, 60_000);
+
   it("security-auth-malformed: the held invalid-token probe is not graded as 'connection rejected'", async () => {
     // Before: both probes came back null and the check emitted a PASS
     // ("well-formed invalid token: connection rejected; ...") before the
@@ -4234,6 +4566,67 @@ describe("inline servers: extra-params on a 5xx, a JSON-RPC error and an empty e
       expect(args.__injected_param__).toBe("malicious_value");
       expect(Object.getOwnPropertyDescriptor(args, "__proto__")?.value).toEqual({ admin: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Two readings the security suite shares with the rest of the modern suite:
+// an error code that is not an integer is named as sent (never NaN), and a
+// 401/403 answering the follow-up server/discover after a dropped payload is
+// read the way the era probe and transport-post read it (readAuthRefusal).
+// ---------------------------------------------------------------------------
+
+describe("inline servers: error codes and follow-up refusals read as the rest of the suite reads them", () => {
+  const CMD = "security-command-injection";
+  const OVERSIZED = "security-oversized-input";
+  const EXTRA = "security-extra-params";
+  const servers: InlineServer[] = [];
+  let noCode: DirectRun;
+  let stringCode: DirectRun;
+  let challengeNoAuth: DirectRun;
+  let challengeWithAuth: DirectRun;
+
+  beforeAll(async () => {
+    const a = await startInlineServer({ bigBody: "rpc-error-no-code" });
+    const b = await startInlineServer({ toolsCallAnswer: "rpc-error-string-code" });
+    const c = await startInlineServer({ dropOnToolsCall: true, afterDrop: "blocked-challenge" });
+    const d = await startInlineServer({ dropOnToolsCall: true, afterDrop: "blocked-challenge" });
+    servers.push(a, b, c, d);
+    noCode = await runDirect({ url: a.url, only: [OVERSIZED] });
+    stringCode = await runDirect({ url: b.url, only: [EXTRA] });
+    challengeNoAuth = await runDirect({ url: c.url, only: [CMD] });
+    challengeWithAuth = await runDirect({ url: d.url, only: [CMD], headers: { Authorization: "Bearer tok" } });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("names an error code that is not an integer as sent, never NaN", () => {
+    // Before: "JSON-RPC error NaN (oversized input rejected)" and
+    // "Extra params rejected with error: NaN -- unknown argument ...".
+    expect(verdicts(noCode.tests, [OVERSIZED])).toEqual({ [OVERSIZED]: "pass" });
+    expect(detailsOf(noCode.tests, OVERSIZED)).toBe("JSON-RPC error with no code (oversized input rejected)");
+    expect(verdicts(stringCode.tests, [EXTRA])).toEqual({ [EXTRA]: "pass" });
+    expect(detailsOf(stringCode.tests, EXTRA)).toBe(
+      'Extra params rejected with error: non-integer code "E_ARGS" -- unknown argument __injected_param__',
+    );
+  });
+
+  it("a follow-up 403 with a Bearer challenge but no error is an auth gate without --auth, and a WAF-like gate with it", () => {
+    const followUp = (run: DirectRun) =>
+      run.warnings.find((w) => w.startsWith("security injection tests: a tools/call to sink.data"));
+    expect(verdicts(challengeNoAuth.tests, [CMD])).toEqual({ [CMD]: "pass" });
+    expect(verdicts(challengeWithAuth.tests, [CMD])).toEqual({ [CMD]: "pass" });
+    // Before: both called it "a gate in front of the server such as a WAF
+    // or IPS", though without a credential the era probe and transport-post
+    // read the same 403 as authentication required.
+    expect(followUp(challengeNoAuth)).toContain(
+      "a follow-up server/discover was still answered (HTTP 403, an auth gate), so",
+    );
+    expect(followUp(challengeWithAuth)).toContain(
+      "a follow-up server/discover was still answered (HTTP 403, a gate in front of the server such as a WAF or IPS now blocking this client), so",
+    );
   });
 });
 

@@ -1,17 +1,64 @@
-import { spawn as spawnProcess } from "node:child_process";
+import { type ChildProcess, type SpawnOptions, spawn as spawnProcess } from "node:child_process";
 import { getEventListeners } from "node:events";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createStdioTransport, type StdioTransport } from "../transport/stdio.js";
 
+/**
+ * Every process spawned through node:child_process in this file -- the
+ * transport's own child and any killer (taskkill) close() starts -- so a
+ * test can see what close() sent and spawned. Pass-through: each spawn
+ * still happens exactly as the transport asked.
+ */
+const spawned = vi.hoisted(() => [] as { command: string; args: readonly string[]; child: ChildProcess }[]);
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  const spawn = (command: string, args: readonly string[] = [], options: SpawnOptions = {}) => {
+    const child = actual.spawn(command, args, options);
+    spawned.push({ command, args, child });
+    return child;
+  };
+  return { ...actual, spawn };
+});
+
 const fixturePath = fileURLToPath(new URL("./fixtures/echo-server.mjs", import.meta.url));
 
 function createIdCounter(start = 0): () => number {
   let n = start;
   return () => ++n;
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The taskkill invocations started against `pid`, as their argument lists. */
+function taskkillsFor(pid: number | undefined): string[] {
+  return spawned.filter((s) => s.command === "taskkill" && s.args.includes(String(pid))).map((s) => s.args.join(" "));
+}
+
+/**
+ * The signals close() sends the child spawned for `scriptPath`: its kill()
+ * is wrapped to record each call (the signal is still delivered).
+ */
+function recordSignals(scriptPath: string): string[] {
+  const entry = spawned.find((s) => s.args[0] === scriptPath);
+  if (!entry) throw new Error(`no spawn recorded for ${scriptPath}`);
+  const signals: string[] = [];
+  const kill = entry.child.kill.bind(entry.child);
+  entry.child.kill = (signal?: NodeJS.Signals | number) => {
+    signals.push(String(signal ?? "SIGTERM"));
+    return kill(signal);
+  };
+  return signals;
 }
 
 describe("StdioTransport", () => {
@@ -132,8 +179,10 @@ describe("StdioTransport", () => {
       'const big = "X".repeat(200 * 1024);',
       "for (let i = 0; i < 4; i++) process.stdout.write(big);",
       // Outlive the request below so it settles by timeout, not by exit;
-      // afterEach close() tears the child down.
+      // afterEach close() ends the child through its stdin, which it honors.
       "setTimeout(() => {}, 30000);",
+      'process.stdin.on("end", () => process.exit(0));',
+      "process.stdin.resume();",
     ].join("\n");
     const scriptPath = join(tmpdir(), `mcp-compliance-overflow-${process.pid}-${Date.now()}.mjs`);
     writeFileSync(scriptPath, script, "utf8");
@@ -174,6 +223,8 @@ describe("StdioTransport", () => {
    * (a multi-line `-e` script through cmd.exe is unreliable on Windows).
    * It reads JSON lines; `onLine` is the body of the per-line handler and
    * sees `msg` (the parsed line) and `send(obj)` (writes one JSON line).
+   * It exits when its stdin closes, as the spec asks of a stdio server, so
+   * afterEach close() does not wait out the EOF window.
    */
   function scriptedChild(onLine: string): StdioTransport {
     const script = [
@@ -184,6 +235,7 @@ describe("StdioTransport", () => {
       "  try { msg = JSON.parse(line); } catch { return; }",
       onLine,
       "});",
+      'rl.on("close", () => process.exit(0));',
       "setTimeout(() => {}, 30000);",
     ].join("\n");
     const scriptPath = join(tmpdir(), `mcp-compliance-stream-${process.pid}-${Date.now()}-${Math.random()}.cjs`);
@@ -306,8 +358,94 @@ describe("StdioTransport", () => {
     await t.close();
     const elapsed = Date.now() - started;
     expect(t.exited).toBe(true);
-    // The forced kill comes 2000ms after EOF; the echo fixture exits on EOF in tens of ms.
+    // Termination starts only 2000ms after EOF; the echo fixture exits on EOF in tens of ms.
     expect(elapsed).toBeLessThan(1500);
+  });
+
+  /**
+   * A server script written to a temp file (a multi-line `-e` script through
+   * cmd.exe is unreliable on Windows), spawned with a ready file it writes
+   * its pid to once its stdin handling is in place, plus `extraArgs`.
+   */
+  async function readyServer(
+    name: string,
+    body: string[],
+    extraArgs: string[] = [],
+  ): Promise<{ t: StdioTransport; serverPath: string; serverPid: number }> {
+    const stamp = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const readyFile = join(tmpdir(), `mcp-compliance-${name}-${stamp}.pid`);
+    const serverPath = join(tmpdir(), `mcp-compliance-${name}-${stamp}.cjs`);
+    tempFiles.push(readyFile, serverPath);
+    writeFileSync(
+      serverPath,
+      [...body, 'require("node:fs").writeFileSync(process.argv[2], String(process.pid));'].join("\n"),
+      "utf8",
+    );
+    const t = createStdioTransport({ command: process.execPath, args: [serverPath, readyFile, ...extraArgs] });
+    openTransports.push(t);
+    // A slow spawn on a loaded machine takes seconds; wait on the file, not a fixed delay.
+    await vi.waitFor(() => expect(readFileSync(readyFile, "utf8")).toMatch(/^\d+$/), { timeout: 20000, interval: 20 });
+    return { t, serverPath, serverPid: Number(readFileSync(readyFile, "utf8")) };
+  }
+
+  it("close() lets a server that exits on stdin EOF finish its shutdown work: no signal is sent and no killer is spawned", async () => {
+    // The spec's stdio shutdown: close stdin, wait for the server to exit, and
+    // terminate it only if it does not. This server takes a moment after EOF
+    // (flushing state, say) and then exits cleanly.
+    const stamp = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const markerFile = join(tmpdir(), `mcp-compliance-flushed-${stamp}.txt`);
+    tempFiles.push(markerFile);
+    const { t, serverPath } = await readyServer(
+      "eof-exit",
+      [
+        "setInterval(() => {}, 1000);",
+        'process.stdin.on("end", () => setTimeout(() => { require("node:fs").writeFileSync(process.argv[3], "flushed"); process.exit(0); }, 300));',
+        "process.stdin.resume();",
+      ],
+      [markerFile],
+    );
+    const signals = recordSignals(serverPath);
+    await t.close();
+    // A SIGTERM sent along with EOF ends the server before its cleanup runs:
+    // no marker, and no exit code (it died of the signal).
+    expect(existsSync(markerFile) ? readFileSync(markerFile, "utf8") : "no marker written").toBe("flushed");
+    expect(t.exitCode).toBe(0);
+    expect(signals).toEqual([]);
+    // Nothing is spawned to kill a server that went on its own -- nor a
+    // non-forced taskkill, which cannot end a console process anyway.
+    expect(taskkillsFor(t.pid)).toEqual([]);
+  });
+
+  it("close() terminates a server that ignores stdin EOF only after the EOF window, once, and resolves after it is gone", async () => {
+    // Still busy (a live timer), so EOF does not end it; the first termination
+    // does (SIGTERM on POSIX, the forced tree kill on Windows).
+    const { t, serverPath, serverPid } = await readyServer("eof-ignore", [
+      "setInterval(() => {}, 1000);",
+      "process.stdin.resume();",
+    ]);
+    const signals = recordSignals(serverPath);
+    const started = Date.now();
+    try {
+      // A second close() while the first is under way joins it instead of
+      // sending a termination of its own.
+      await Promise.all([t.close(), t.close()]);
+      const elapsed = Date.now() - started;
+      expect(t.exited).toBe(true);
+      // The server had the whole 2000ms EOF window to exit before anything was sent.
+      expect(elapsed).toBeGreaterThanOrEqual(1900);
+      if (process.platform === "win32") {
+        expect(signals).toEqual([]);
+        // Only the forced tree kill: a non-forced one cannot end a console process.
+        expect(taskkillsFor(t.pid)).toEqual([`/pid ${t.pid} /t /f`]);
+      } else {
+        expect(signals).toEqual(["SIGTERM"]);
+        expect(taskkillsFor(t.pid)).toEqual([]);
+      }
+      // Process teardown is asynchronous in the OS, so allow it a moment.
+      await vi.waitFor(() => expect(isAlive(serverPid)).toBe(false), { timeout: 3000, interval: 50 });
+    } finally {
+      if (isAlive(serverPid)) process.kill(serverPid, "SIGKILL");
+    }
   });
 
   it("close() returns at once when the child never spawned: there is no process to wait for", async () => {

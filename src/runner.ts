@@ -16,6 +16,7 @@ import {
 } from "./checks/patterns.js";
 import { getTestDefinitionMap } from "./definitions/index.js";
 import {
+  type AuthRefusal,
   authRefusalHint,
   buildDiscoverProbe,
   classifyDiscoverResponse,
@@ -26,7 +27,7 @@ import {
   probeExitOf,
   probeExitWarning,
   REASON_PREFIX,
-  refusedCredential,
+  readAuthRefusal,
   settledStderr,
   summarizeStderr,
 } from "./detect.js";
@@ -117,40 +118,73 @@ function describeProbeAnswer(d: DetectionResult): string {
 }
 
 /**
+ * Why a credential-rejected 401/403 refused the token, from its Bearer
+ * challenge's `error` when it names one (RFC 6750 3.1), else from the
+ * status (basic/authorization: "Invalid or expired tokens MUST receive a
+ * HTTP 401"; 403 is "Invalid scopes or insufficient permissions").
+ */
+function credentialRejectionReason(refusal: AuthRefusal): string {
+  const { statusCode: status, bearerError: error } = refusal;
+  if (error === undefined) {
+    return status === 403
+      ? "a 403 means the token lacks a required scope or permission"
+      : "a 401 means the token is invalid or expired";
+  }
+  const challenge = `the ${status}'s Bearer error="${error}" challenge`;
+  switch (error) {
+    case "invalid_token":
+      return `${challenge} means the token is invalid or expired${status === 403 ? " (basic/authorization requires a 401 for that)" : ""}`;
+    case "insufficient_scope":
+      return `${challenge} means the token lacks a required scope or permission`;
+    case "invalid_request":
+      return `${challenge} means the request is malformed (an unsupported parameter, or the token sent more than one way)`;
+    default:
+      return `${challenge} refuses the token`;
+  }
+}
+
+/**
  * The first-position warning for a preflight / era probe that drew
- * 401/403. Without an Authorization header the server wants one; with
- * one, re-running with --auth is the wrong advice. The hint follows the
- * spec's status split (basic/authorization: "Invalid or expired tokens
- * MUST receive a HTTP 401"; 403 is "Invalid scopes or insufficient
- * permissions", signalled by a Bearer error="insufficient_scope"
- * challenge). A 403 without that challenge (`credentialRefused` false,
- * see refusedCredential) is not called a rejected credential: it is as
- * likely Host/Origin validation (streamable-http requires 403 for an
- * invalid Origin; the SDK's Host guard answers a tunnel hostname with it)
- * or a gateway.
+ * 401/403, worded from how the refusal reads (see readAuthRefusal):
+ * - `auth-required` (no Authorization header; a 401, or a 403 with a
+ *   Bearer challenge): re-run with --auth.
+ * - `credential-rejected` (a header was sent; a 401, or a 403 whose Bearer
+ *   challenge carries an error): check the --auth value, with the reason
+ *   named from the challenge's error.
+ * - `forbidden` (any other 403): neutral. It is as likely Host/Origin
+ *   validation (streamable-http requires 403 for an invalid Origin; the
+ *   SDK's Host guard answers a tunnel hostname with it) or a gateway, so
+ *   it names those first, then the token's permissions or, with no header
+ *   sent, --auth only if the server does require a credential (a server
+ *   that wants a token answers 401). A JSON-RPC error message in the body
+ *   ("Invalid Host: ...") is quoted.
  */
 function authRejectionWarning(opts: {
   displayUrl: string;
-  status: number;
-  authSent: boolean;
-  credentialRefused: boolean;
+  refusal: AuthRefusal;
   spec: SpecVersion;
   auto: boolean;
 }): string {
-  const { displayUrl, status, spec } = opts;
+  const { displayUrl, refusal, spec } = opts;
+  const status = refusal.statusCode;
   const probe = opts.auto ? "the server/discover probe" : "the preflight";
   const era = opts.auto ? "the era could not be determined and " : "";
-  if (!opts.authSent) {
-    return `Server at ${displayUrl} requires authentication (${probe} got HTTP ${status}) and no Authorization header was sent, so ${era}the ${spec} grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`;
+  switch (refusal.kind) {
+    case "auth-required":
+      return `Server at ${displayUrl} requires authentication (${probe} got HTTP ${status}) and no Authorization header was sent, so ${era}the ${spec} grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`;
+    case "credential-rejected":
+      return `Server at ${displayUrl} rejected the configured credential (${probe} carried an Authorization header and got HTTP ${status}), so ${era}the ${spec} grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): ${credentialRejectionReason(refusal)}.`;
   }
-  if (!opts.credentialRefused) {
-    return `Server at ${displayUrl} refused ${probe} with HTTP ${status}, so ${era}the ${spec} grade below is not meaningful. The request carried an Authorization header, but the ${status} has no WWW-Authenticate: Bearer error="insufficient_scope" challenge, so it need not be about the credential: check the server's Host and Origin validation (a tunnel or proxy hostname it does not allow), any gateway in front of it, and the permissions of the --auth token.`;
+  const said = refusal.message ? ` (${JSON.stringify(refusal.message)})` : "";
+  if (refusal.authorizationSent) {
+    return `Server at ${displayUrl} refused ${probe} with HTTP ${status}${said}, so ${era}the ${spec} grade below is not meaningful. The request carried an Authorization header, but the ${status} has no WWW-Authenticate: Bearer challenge with an error parameter, so it need not be about the credential: check the server's Host and Origin validation (a tunnel or proxy hostname it does not allow), any gateway in front of it, and the permissions of the --auth token.`;
   }
-  const why =
-    status === 403
-      ? "a 403 means the token lacks a required scope or permission"
-      : "a 401 means the token is invalid or expired";
-  return `Server at ${displayUrl} rejected the configured credential (${probe} carried an Authorization header and got HTTP ${status}), so ${era}the ${spec} grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): ${why}.`;
+  return `Server at ${displayUrl} refused ${probe} with HTTP ${status}${said} and no Authorization header was sent, so ${era}the ${spec} grade below is not meaningful. The ${status} has no WWW-Authenticate: Bearer challenge, and a server that requires a token answers 401, so it need not be about authentication: check the server's Host and Origin validation (a tunnel or proxy hostname it does not allow) and any gateway in front of it; re-run with --auth <token> (or -H "Authorization: ...") only if the server does require a credential.`;
+}
+
+/** The refusal to word a warning from when an undetermined era carries none (classifyDiscoverResponse always sets one). */
+function assumedRefusal(authorizationSent: boolean): AuthRefusal {
+  return { statusCode: 401, authorizationSent, kind: authorizationSent ? "credential-rejected" : "auth-required" };
 }
 
 /** Propagate a caller's abort between phases that no test() gate covers (preflight, detection, handshake). */
@@ -536,8 +570,8 @@ export async function runComplianceSuite(
             body = { _raw: text };
           }
         }
-        // The headers are kept: a 403's WWW-Authenticate challenge decides
-        // whether it refused the credential (refusedCredential).
+        // The headers are kept: a 401/403's WWW-Authenticate challenge
+        // decides how the refusal reads (readAuthRefusal).
         const headers: Record<string, string> = {};
         for (const [name, value] of Object.entries(preflight.headers)) {
           if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(", ") : value;
@@ -652,13 +686,10 @@ export async function runComplianceSuite(
       if (detection.eraUndetermined) {
         // Read from the classified answer: after a preflight timeout the
         // re-probe answered, and the preflight holds nothing.
-        const refusal = detection.refusal ?? { statusCode: 401, credentialRefused: true };
         preWarnings.unshift(
           authRejectionWarning({
             displayUrl,
-            status: refusal.statusCode,
-            authSent: hasAuthHeader,
-            credentialRefused: refusal.credentialRefused,
+            refusal: detection.refusal ?? assumedRefusal(hasAuthHeader),
             spec: resolvedSpec,
             auto: true,
           }),
@@ -673,15 +704,12 @@ export async function runComplianceSuite(
       // 2026-07-28. A dual-era server pinned to its legacy side is not a
       // mismatch, and a 5xx or an intermediary's page is not an era.
       if (requested !== "auto" && preflightResponse) {
-        const seen = classifyDiscoverResponse(preflightResponse);
+        const seen = classifyDiscoverResponse(preflightResponse, { authorizationSent: hasAuthHeader });
         if (seen.eraUndetermined) {
-          const refusal = seen.refusal ?? { statusCode: 401, credentialRefused: true };
           preWarnings.unshift(
             authRejectionWarning({
               displayUrl,
-              status: refusal.statusCode,
-              authSent: hasAuthHeader,
-              credentialRefused: refusal.credentialRefused,
+              refusal: seen.refusal ?? assumedRefusal(hasAuthHeader),
               spec: resolvedSpec,
               auto: false,
             }),
@@ -836,16 +864,12 @@ export async function runComplianceSuite(
         if (res.statusCode >= 200 && res.statusCode < 300) {
           return { passed: true, details: `HTTP ${res.statusCode}` };
         }
-        if (res.statusCode === 401 || res.statusCode === 403) {
-          // With an Authorization header configured, "pass --auth" would be
-          // the wrong advice; "credential rejected" only when the status
-          // says so (a bare 403 may be Host/Origin validation).
-          const hint = authRefusalHint(
-            hasAuthHeader,
-            refusedCredential(res.statusCode, res.headers),
-            "auth required — pass --auth",
-            "—",
-          );
+        // "pass --auth" only when the status asks for a credential none was
+        // sent for; "credential rejected" only when it refused the one sent;
+        // any other 403 may be Host/Origin validation (readAuthRefusal).
+        const refusal = readAuthRefusal({ statusCode: res.statusCode, headers: res.headers }, hasAuthHeader);
+        if (refusal) {
+          const hint = authRefusalHint(refusal, "auth required — pass --auth", "—");
           return { passed: false, details: `HTTP ${res.statusCode} (${hint})` };
         }
         // 400 with a JSON-RPC error body is acceptable — server processed the POST
@@ -2700,8 +2724,7 @@ export async function runComplianceSuite(
           // The preflight was itself an unauthenticated request; when it
           // drew a 401/403 the server does reject unauthenticated
           // requests, and saying it "accepted" them would contradict
-          // transport-post's "auth required -- pass --auth" on the same
-          // report.
+          // transport-post's HTTP 401/403 failure on the same report.
           const status = preflightResponse?.statusCode;
           if (status === 401 || status === 403) {
             return {

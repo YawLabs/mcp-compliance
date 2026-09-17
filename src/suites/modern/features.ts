@@ -1,6 +1,8 @@
 import {
   brief,
   checkPagination,
+  errorCodeText,
+  errorWithCode,
   isInputRequired,
   isPlainObject,
   type RpcBodyCall,
@@ -12,7 +14,7 @@ import {
   validateResourceContents,
   validateResourceTemplates,
 } from "../../checks/validators.js";
-import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
+import { errorOf, type JsonRpcErrorInfo, type RpcResponse, resultOf } from "../../modern/client.js";
 import {
   ensureList,
   hasPrompts,
@@ -65,13 +67,18 @@ interface ResponseCache {
 const pass = (details: string): Outcome => ({ passed: true, details });
 const fail = (details: string): Outcome => ({ passed: false, details });
 
-function errDetail(err: { code: number; message: string }): string {
+function errDetail(err: JsonRpcErrorInfo): string {
   const msg = err.message
     .replace(/\s+/g, " ")
     .replace(/[^\x20-\x7e]/g, "?")
     .trim()
     .slice(0, 80);
-  return `JSON-RPC error ${err.code}${msg ? ` (${msg})` : ""}`;
+  return `${errorWithCode(err.rawCode)}${msg ? ` (${msg})` : ""}`;
+}
+
+/** "code -32603", or the code as sent when it is not an integer: "no code", 'non-integer code "E_CALL"'. */
+function codeDetail(err: JsonRpcErrorInfo): string {
+  return Number.isInteger(err.rawCode) ? `code ${err.rawCode}` : errorCodeText(err.rawCode);
 }
 
 function namesOf(items: unknown[], key = "name"): string[] {
@@ -269,7 +276,7 @@ async function runTools(ctx: ModernSuiteContext, cache: ResponseCache): Promise<
       const err = errorOf(res.body);
       if (err) {
         if (err.code === -32602 || err.code === -32600) {
-          return pass(`${tool.name}: invalid params error (acceptable): code ${err.code}`);
+          return pass(`${tool.name}: invalid params error (acceptable): ${codeDetail(err)}`);
         }
         return pass(`${tool.name}: protocol error: ${errDetail(err)}`);
       }
@@ -293,7 +300,7 @@ async function runTools(ctx: ModernSuiteContext, cache: ResponseCache): Promise<
       if ("passed" in called) return called;
       const { tool, res } = called;
       const err = errorOf(res.body);
-      if (err) return pass(`${tool.name}: tool returned error (content types not applicable): code ${err.code}`);
+      if (err) return pass(`${tool.name}: tool returned error (content types not applicable): ${codeDetail(err)}`);
       const result = resultOf(res.body);
       if (!result) return fail(`${tool.name}: no result object (HTTP ${res.statusCode})`);
       if (isInputRequired(result)) return pass(`${tool.name}: input_required result (content types not applicable)`);
@@ -504,7 +511,7 @@ async function runPrompts(ctx: ModernSuiteContext, cache: ResponseCache): Promis
       const err = errorOf(res.body);
       if (err) {
         if (err.code === -32602 || err.code === -32600) {
-          return pass(`${prompt.name}: invalid params error (acceptable): code ${err.code}`);
+          return pass(`${prompt.name}: invalid params error (acceptable): ${codeDetail(err)}`);
         }
         return fail(`${prompt.name}: ${errDetail(err)} (expected messages, input_required or -32602)`);
       }
