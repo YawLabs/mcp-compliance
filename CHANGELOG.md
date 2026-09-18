@@ -9,6 +9,8 @@ out explicitly here.
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-09-18
+
 ### Added
 - **MCP 2026-07-28 support (#63).** A second test catalog, `MODERN_TEST_DEFINITIONS`
   (103 tests in the same 8 categories: 20 transport, 22 lifecycle, 6 tools, 8
