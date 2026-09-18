@@ -361,12 +361,16 @@ function ownRejectionCode(body: unknown, codes: readonly number[]): number | und
 }
 
 /**
- * The warning for a negative probe the server rejected with its own
- * JSON-RPC error (see ownRejectionCode) on a 5xx: credited, but the status
- * tells clients and gateways that the server failed.
+ * The warning for a negative probe the server answered with its own
+ * JSON-RPC error (see ownRejectionCode) on a 5xx: the status tells clients
+ * and gateways that the server failed. It describes the status only and
+ * says nothing about the verdict, because it is pushed before the check has
+ * decided: the check may still fail on something else (another undeclared
+ * method in error-capability-gated). Worded as the 2026-07-28 suite's
+ * (suites/modern/gate.ts).
  */
 function rejectionOn5xxWarning(check: string, statusCode: number, code: number, defect: string): string {
-  return `${check}: the server rejected ${defect} with JSON-RPC error ${code} on HTTP ${statusCode}; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).`;
+  return `${check}: the server answered ${defect} with its own JSON-RPC error ${code} on HTTP ${statusCode}; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).`;
 }
 
 /**
@@ -717,6 +721,42 @@ const ECHO_ARGUMENT_NAMES = ["message", "text", "input", "query"] as const;
  * any prefixed key).
  */
 const UNICODE_META_KEY = "com.example.compliance/unicode-probe";
+/**
+ * How long stdio-unicode waits, once its last probe is answered, for the
+ * child to exit before the liveness ping after it (LIVENESS_PING_MS). A
+ * child that answers and crashes a moment later (an async logger or
+ * callback throwing on the non-ASCII input) is caught here, not by the
+ * check after it. Paid once per run by a healthy stdio server.
+ */
+const UNICODE_EXIT_GRACE_MS = 250;
+/** How often that wait looks at the child: the transport reports the exit as a flag. */
+const EXIT_POLL_MS = 10;
+/**
+ * The budget, capped by --timeout, of the plain ping stdio-unicode sends to
+ * tell a live child from one its probe killed: between its two probes, and
+ * after the bounded wait that follows the last one. A child that has exited
+ * but whose exit is not reported yet (a loaded machine is slow to reap it)
+ * never answers it, and the transport fails it the moment the exit is
+ * reported, so a longer wait could tell nothing more; a ping still
+ * unanswered when it runs out means a live child.
+ */
+const LIVENESS_PING_MS = 2000;
+
+/**
+ * Whether a stdio child exits within `ms`: true as soon as it has (at once
+ * when it already had), false when the time runs out first. Polled, since
+ * the transport reports the exit as a flag. A caller's abort rejects at once
+ * with its reason (pause).
+ */
+async function exitsWithin(stdio: StdioTransport, ms: number, signal: AbortSignal | undefined): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (!stdio.exited) {
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    await pause(Math.min(EXIT_POLL_MS, left), signal);
+  }
+  return true;
+}
 
 /** The string-typed properties of a tool's inputSchema whose names suggest an echo path. */
 function echoArguments(inputSchema: unknown): string[] {
@@ -6334,12 +6374,28 @@ export async function runComplianceSuite(
       // is the round-trip verified. With no tool to call -- none declared,
       // none listed, or a tools/list that failed -- the envelope decides
       // alone. A request that gets no reply fails, and so does one answered
-      // by a child that exits right after (a plain ping sent after each
-      // answered probe finds it gone); a child that exited on it is
-      // restarted (restartStdioServer) so the tests after it measure the
-      // server, and one already gone before it is "server unreachable".
-      // A caller's abort is rethrown.
+      // by a child that exits right after it: a plain ping between the two
+      // probes finds a child the tools/call killed, and after the last
+      // answered probe one bounded wait (UNICODE_EXIT_GRACE_MS) and then a
+      // plain ping find one that crashes a moment after answering, the ping
+      // also one whose exit a loaded machine reports late (each ping's
+      // budget capped at LIVENESS_PING_MS). A child that exited on the
+      // check's probes is restarted (restartStdioServer) so the tests after
+      // it measure the server, and one already gone before them is "server
+      // unreachable". A caller's abort is rethrown.
       const stdio = transport as StdioTransport;
+      /** The probe the child answered last, until a verdict that needs no liveness reading is reached. */
+      let answered = null as { what: string; cause: string } | null;
+      /** The verdict for a child gone after answering `probe`, which is restarted. */
+      const exitedAfter = async (probe: { what: string; cause: string }): Promise<LegacyOutcome> => {
+        answered = null;
+        const verdict = {
+          passed: false,
+          details: `${probe.what} was answered, but the server exited right after (server exited (code ${stdio.exitCode ?? "unknown"}))`,
+        };
+        await restartStdioServer("stdio-unicode", probe.cause);
+        return verdict;
+      };
       /**
        * Send one request carrying the probe: its answer, or the verdict for
        * none. `what` opens the details; `cause` names the request in the
@@ -6351,30 +6407,16 @@ export async function runComplianceSuite(
         method: string,
         params: unknown,
       ): Promise<{ body: any } | { verdict: LegacyOutcome }> => {
+        // Gone after answering an earlier probe of this check: that probe killed it.
+        if (stdio.exited && answered) return { verdict: await exitedAfter(answered) };
         const alreadyGone = stdio.exited === true;
         try {
           const body = (await rpc(method, params)).body;
-          if (alreadyGone) return { body };
-          // A child can answer the probe and exit right after writing the
-          // reply: one plain ping tells a live process from one the probe
-          // killed (the 2026-07-28 check sends a server/discover). An answer,
-          // or anything short of the child being gone, is a live process.
-          try {
-            await rpc("ping");
-          } catch (err: unknown) {
-            if (options.signal?.aborted) throw err;
-            if (stdio.exited) {
-              const verdict = {
-                passed: false,
-                details: `${what} was answered, but the server exited right after (server exited (code ${stdio.exitCode ?? "unknown"}))`,
-              };
-              await restartStdioServer("stdio-unicode", cause);
-              return { verdict };
-            }
-          }
+          answered = { what, cause };
           return { body };
         } catch (err: unknown) {
           if (options.signal?.aborted) throw err;
+          answered = null;
           if (alreadyGone) return { verdict: unreachable(what, err, timeout) };
           if (!stdio.exited) {
             return {
@@ -6389,74 +6431,105 @@ export async function runComplianceSuite(
           return { verdict };
         }
       };
-      let tools: unknown[] | null = cachedToolsList;
-      if (tools === null && hasTools) {
-        // tools-list did not run (a filtered run): ask for the list now.
+      /**
+       * Whether the child is gone after answering a probe: one plain ping
+       * (the 2026-07-28 check sends a server/discover). An answer, an
+       * error, or no answer within its capped budget is a live child; the
+       * transport fails the ping the moment the child's exit is reported.
+       */
+      const goneAfterPing = async (): Promise<boolean> => {
         try {
-          const listed = (await rpc("tools/list")).body?.result?.tools;
-          if (Array.isArray(listed)) tools = listed;
+          await mcpRequest(backendUrl, "ping", undefined, nextId, buildHeaders(), Math.min(timeout, LIVENESS_PING_MS));
         } catch (err: unknown) {
           if (options.signal?.aborted) throw err;
         }
-      }
-      let note = "";
-      const tool = hasTools && tools ? pickUnicodeTool(tools) : null;
-      if (tool) {
-        const name = clipAscii(tool.name, 60);
-        const what = `tools/call ${name} with a CJK/emoji argument`;
-        const sent = await send(what, what, "tools/call", {
-          name: tool.name,
-          arguments: Object.fromEntries(tool.args.map((arg) => [arg, UNICODE_PROBE])),
+        return stdio.exited;
+      };
+      const judge = async (): Promise<LegacyOutcome> => {
+        let tools: unknown[] | null = cachedToolsList;
+        if (tools === null && hasTools) {
+          // tools-list did not run (a filtered run): ask for the list now.
+          try {
+            const listed = (await rpc("tools/list")).body?.result?.tools;
+            if (Array.isArray(listed)) tools = listed;
+          } catch (err: unknown) {
+            if (options.signal?.aborted) throw err;
+          }
+        }
+        let note = "";
+        const tool = hasTools && tools ? pickUnicodeTool(tools) : null;
+        if (tool) {
+          const name = clipAscii(tool.name, 60);
+          const what = `tools/call ${name} with a CJK/emoji argument`;
+          const sent = await send(what, what, "tools/call", {
+            name: tool.name,
+            arguments: Object.fromEntries(tool.args.map((arg) => [arg, UNICODE_PROBE])),
+          });
+          if ("verdict" in sent) return sent.verdict;
+          const serialized = JSON.stringify(sent.body) ?? "";
+          if (serialized.includes(UNICODE_PROBE)) {
+            return { passed: true, details: `tools/call ${name} reproduced the CJK/emoji probe byte-for-byte` };
+          }
+          if (reproducesEveryUnicodePiece(serialized)) {
+            return {
+              passed: true,
+              details: `tools/call ${name} reproduced every non-ASCII piece of the CJK/emoji probe (split across the reply, not byte-for-byte)`,
+            };
+          }
+          const error = sent.body?.error;
+          if (error?.code === -32700) {
+            return { passed: false, details: `tools/call ${name} with a CJK/emoji argument -> -32700 parse error` };
+          }
+          const mangled = unicodeManglingEvidence(serialized);
+          if (mangled) {
+            return {
+              passed: false,
+              details: `tools/call ${name} mangled the CJK/emoji probe: ${mangled} (got ${firstTextOf(sent.body)})`,
+            };
+          }
+          // Rejected (unknown arguments, a schema mismatch) or answered
+          // without reflecting its arguments: nothing to compare, so the
+          // envelope probe decides -- sent to a child the tools/call did
+          // not kill.
+          if (await goneAfterPing()) return exitedAfter({ what, cause: what });
+          note = error
+            ? `tools/call ${name} rejected the probe (${errorWithCode(error.code)}); `
+            : `tools/call ${name} did not echo the probe; `;
+        }
+        const envelope = "ping with a CJK/emoji _meta value";
+        const sent = await send(`${note}${envelope}`, envelope, "ping", {
+          _meta: { [UNICODE_META_KEY]: UNICODE_PROBE },
         });
         if ("verdict" in sent) return sent.verdict;
+        const error = sent.body?.error;
+        if (error) return { passed: false, details: `${note}${envelope} -> ${errorWithCode(error.code)}` };
+        if (sent.body?.result === undefined) {
+          return { passed: false, details: `${note}${envelope} -> non-JSON-RPC reply` };
+        }
         const serialized = JSON.stringify(sent.body) ?? "";
         if (serialized.includes(UNICODE_PROBE)) {
-          return { passed: true, details: `tools/call ${name} reproduced the CJK/emoji probe byte-for-byte` };
-        }
-        if (reproducesEveryUnicodePiece(serialized)) {
-          return {
-            passed: true,
-            details: `tools/call ${name} reproduced every non-ASCII piece of the CJK/emoji probe (split across the reply, not byte-for-byte)`,
-          };
-        }
-        const error = sent.body?.error;
-        if (error?.code === -32700) {
-          return { passed: false, details: `tools/call ${name} with a CJK/emoji argument -> -32700 parse error` };
+          return { passed: true, details: `${note}ping reproduced the CJK/emoji _meta value byte-for-byte` };
         }
         const mangled = unicodeManglingEvidence(serialized);
-        if (mangled) {
-          return {
-            passed: false,
-            details: `tools/call ${name} mangled the CJK/emoji probe: ${mangled} (got ${firstTextOf(sent.body)})`,
-          };
-        }
-        // Rejected (unknown arguments, a schema mismatch) or answered
-        // without reflecting its arguments: nothing to compare, so the
-        // envelope probe decides.
-        note = error
-          ? `tools/call ${name} rejected the probe (${errorWithCode(error.code)}); `
-          : `tools/call ${name} did not echo the probe; `;
-      }
-      const envelope = "ping with a CJK/emoji _meta value";
-      const sent = await send(`${note}${envelope}`, envelope, "ping", {
-        _meta: { [UNICODE_META_KEY]: UNICODE_PROBE },
-      });
-      if ("verdict" in sent) return sent.verdict;
-      const error = sent.body?.error;
-      if (error) return { passed: false, details: `${note}${envelope} -> ${errorWithCode(error.code)}` };
-      if (sent.body?.result === undefined) {
-        return { passed: false, details: `${note}${envelope} -> non-JSON-RPC reply` };
-      }
-      const serialized = JSON.stringify(sent.body) ?? "";
-      if (serialized.includes(UNICODE_PROBE)) {
-        return { passed: true, details: `${note}ping reproduced the CJK/emoji _meta value byte-for-byte` };
-      }
-      const mangled = unicodeManglingEvidence(serialized);
-      if (mangled) return { passed: false, details: `${note}ping mangled the CJK/emoji _meta value: ${mangled}` };
-      return {
-        passed: true,
-        details: `${note}envelope round-trip verified: ping answered a request whose _meta carries CJK/emoji (no echo path to compare byte-for-byte)`,
+        if (mangled) return { passed: false, details: `${note}ping mangled the CJK/emoji _meta value: ${mangled}` };
+        return {
+          passed: true,
+          details: `${note}envelope round-trip verified: ping answered a request whose _meta carries CJK/emoji (no echo path to compare byte-for-byte)`,
+        };
       };
+      const verdict = await judge();
+      if (answered === null) return verdict;
+      // The verdict read an answer. A child that answered and exited a
+      // moment later is the verdict instead, so the check after this one is
+      // not blamed for the crash: one bounded wait finds the exit, and a
+      // plain ping after it an exit the child made in that window but a
+      // loaded machine has not reported yet (the ping is never answered,
+      // and fails once it is).
+      const probe = answered;
+      if ((await exitsWithin(stdio, UNICODE_EXIT_GRACE_MS, options.signal)) || (await goneAfterPing())) {
+        return exitedAfter(probe);
+      }
+      return verdict;
     });
 
     await test(

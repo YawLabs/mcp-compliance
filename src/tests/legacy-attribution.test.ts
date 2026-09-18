@@ -492,7 +492,7 @@ describe("legacy negative probes: the answer to the probe alone, next to a serve
         "FAIL: HTTP 500, JSON-RPC error -32000 on nonexistent/method -- the server failed on the request rather than refusing it (a broken server, or a gateway with no backend), which is no rejection of the unknown method",
     });
     for (const w of [...internal.warnings, ...custom.warnings])
-      expect(w).not.toMatch(/credited, but a rejected request/);
+      expect(w).not.toMatch(/a rejected request is a client error/);
   }, 30_000);
 
   it("a 5xx carrying the server's own rejection of the defect keeps its PASS, with a warning about the status", async () => {
@@ -519,9 +519,9 @@ describe("legacy negative probes: the answer to the probe alone, next to a serve
     expect(
       warnings.filter((w) => /^(transport-batch-reject|lifecycle-version-negotiate|error-unknown-method):/.test(w)),
     ).toEqual([
-      "transport-batch-reject: the server rejected the batch with JSON-RPC error -32600 on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
-      "lifecycle-version-negotiate: the server rejected the unknown version with JSON-RPC error -32602 on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
-      "error-unknown-method: the server rejected the unknown method with JSON-RPC error -32601 on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
+      "transport-batch-reject: the server answered the batch with its own JSON-RPC error -32600 on HTTP 500; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
+      "lifecycle-version-negotiate: the server answered the unknown version with its own JSON-RPC error -32602 on HTTP 500; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
+      "error-unknown-method: the server answered the unknown method with its own JSON-RPC error -32601 on HTTP 500; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
     ]);
   }, 30_000);
 

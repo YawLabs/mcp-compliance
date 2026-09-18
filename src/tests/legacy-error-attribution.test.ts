@@ -516,16 +516,39 @@ describe("legacy error checks: the answer to the probe alone, next to a served h
       [PARAMS]: "PASS: Error code: -32602 (correct: Invalid params) — Invalid params: name is required",
       [GATED]: CONFORMANT[GATED],
     });
-    const credited = (check: string, code: number, what: string) =>
-      `${check}: the server rejected ${what} with JSON-RPC error ${code} on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).`;
+    const on5xx = (check: string, code: number, what: string) =>
+      `${check}: the server answered ${what} with its own JSON-RPC error ${code} on HTTP 500; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).`;
     expect(warnings.filter((w) => /^error-/.test(w))).toEqual([
-      credited(ENVELOPE, -32600, "the malformed JSON-RPC message"),
-      credited(PARSE, -32700, "the invalid JSON body"),
-      credited(PARAMS, -32602, "the missing tool name"),
-      credited(GATED, -32601, "a method of the undeclared tools capability"),
-      credited(GATED, -32601, "a method of the undeclared resources capability"),
-      credited(GATED, -32601, "a method of the undeclared prompts capability"),
+      on5xx(ENVELOPE, -32600, "the malformed JSON-RPC message"),
+      on5xx(PARSE, -32700, "the invalid JSON body"),
+      on5xx(PARAMS, -32602, "the missing tool name"),
+      on5xx(GATED, -32601, "a method of the undeclared tools capability"),
+      on5xx(GATED, -32601, "a method of the undeclared resources capability"),
+      on5xx(GATED, -32601, "a method of the undeclared prompts capability"),
     ]);
+  }, 30_000);
+
+  it("the status warning makes no claim about the verdict, so it reads right next to a check that fails on something else", async () => {
+    // tools/list gets the server's own -32601 on HTTP 500 (a gate-shaped
+    // knob, exempting everything else), resources/list and prompts/list are
+    // served. The warning is pushed when tools/list is read, before the
+    // check sees the served methods. Before: FAIL with a warning that the
+    // same check's answer was "credited".
+    const { byId, warnings } = await verdicts(
+      {
+        gate: "own-500",
+        exempt: ["initialize", "notifications/initialized", "ping", "resources/list", "prompts/list"],
+        lists: "serve",
+      },
+      { only: [GATED] },
+    );
+    expect(byId[GATED]).toBe(
+      "FAIL: resources/list returned success despite missing resources capability; prompts/list returned success despite missing prompts capability",
+    );
+    expect(warnings.filter((w) => w.startsWith(GATED))).toEqual([
+      "error-capability-gated: the server answered a method of the undeclared tools capability with its own JSON-RPC error -32601 on HTTP 500; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
+    ]);
+    for (const w of warnings) expect(w).not.toMatch(/credited/);
   }, 30_000);
 
   it("a 403 on the probe alone, next to a served ping, is credited as the rejection it is, whatever its message names", async () => {
@@ -629,7 +652,7 @@ describe("legacy lifecycle-jsonrpc: whose envelope an initialize answered withou
     const own = await verdicts({ init: "own-500" }, { only: [JSONRPC] });
     expect(own.byId[JSONRPC]).toBe("PASS: Valid JSON-RPC 2.0 response");
     expect(own.warnings.filter((w) => w.startsWith(JSONRPC))).toEqual([
-      "lifecycle-jsonrpc: the server rejected the initialize request with JSON-RPC error -32602 on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
+      "lifecycle-jsonrpc: the server answered the initialize request with its own JSON-RPC error -32602 on HTTP 500; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
     ]);
   }, 30_000);
 
