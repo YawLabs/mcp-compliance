@@ -256,7 +256,7 @@ describe("transport-batch-reject / -content-type-reject: a conformant server kee
     );
     expect(byId[BATCH]).toBe("PASS: HTTP 500, JSON-RPC error -32600 (batch rejected)");
     expect(warnings).toEqual([
-      "transport-batch-reject: the server rejected a batch with JSON-RPC error -32600 on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
+      "transport-batch-reject: the server answered a batch with its own JSON-RPC error -32600 on HTTP 500; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed)",
     ]);
   }, 30_000);
 });
@@ -279,11 +279,11 @@ describe("transport-batch-reject / -content-type-reject: the twin a bare 403 is 
   it("a bare 403 on every request: not evaluable, and no further server/discover is sent", async () => {
     const { byId, hits } = await verdicts({ all: rpcError(403, -32000, "Forbidden") });
     const twin = (about: string) =>
-      `not evaluable: a conformant server/discover sent next to it was refused (HTTP 403, JSON-RPC error -32000) too, so the 403 proves nothing about ${about} (see security-auth-required)`;
+      `not evaluable: a conformant server/discover was refused (HTTP 403, JSON-RPC error -32000) too, so the 403 proves nothing about ${about} (see security-auth-required)`;
     expect(byId).toEqual({
-      [BATCH]: `FAIL: HTTP 403 on the batch; ${twin("the batch")}`,
-      // The reason names the Content-Type; the probe's name gives way to it.
-      [CT]: `FAIL: HTTP 403; ${twin("the Content-Type")}`,
+      [BATCH]: `FAIL: HTTP 403, JSON-RPC error -32000 on the batch; ${twin("the batch")}`,
+      // Within 220 characters the probe's JSON-RPC code gives way to the reason.
+      [CT]: `FAIL: HTTP 403 on the text/plain POST; ${twin("the Content-Type")}`,
     });
     expect(count(hits, "discover")).toBe(2);
   }, 30_000);

@@ -684,27 +684,30 @@ describe("r82 lifecycle-subscriptions-listen: an advertised listen refused with 
     );
   }, 30_000);
 
-  it("pins: a 5xx without -32601 stays not evaluable when advertised; a -32601 on a 5xx is credited with a warning when nothing is", async () => {
+  it("pins: a 5xx without -32601 fails as the server failing when advertised; a -32601 on a 5xx is credited with a warning when nothing is", async () => {
+    // The gate reads a 5xx without the check's own code as the server failing
+    // on the request (no "not evaluable"); with something advertised the
+    // check has no own code, so the reason names none.
+    const failed =
+      "the server failed on the request rather than rejecting it (a broken server, or a gateway with no backend)";
     const internal = await runStub(
       { capabilities: advertised, route: listenAnswer(rpc(503, -32603, "Backend unavailable")) },
       [LISTEN],
     );
     expect(verdictOf(internal.report, LISTEN)).toBe(
-      "FAIL: subscriptions/listen rejected with -32603 (HTTP 503); not evaluable: a 5xx is a server failure or a gateway with no backend, so it proves nothing about subscriptions/listen",
+      `FAIL: subscriptions/listen rejected with -32603 (HTTP 503); ${failed}`,
     );
     const bare = await runStub(
       { capabilities: advertised, route: listenAnswer(() => ({ status: 502, text: "Bad Gateway" })) },
       [LISTEN],
     );
-    expect(verdictOf(bare.report, LISTEN)).toBe(
-      "FAIL: subscriptions/listen rejected (HTTP 502); not evaluable: a 5xx is a server failure or a gateway with no backend, so it proves nothing about subscriptions/listen",
-    );
+    expect(verdictOf(bare.report, LISTEN)).toBe(`FAIL: subscriptions/listen rejected (HTTP 502); ${failed}`);
     const unadvertised = await runStub({ route: listenAnswer(rpc(500, -32601, "Method not found")) }, [LISTEN]);
     expect(verdictOf(unadvertised.report, LISTEN)).toBe(
       "PASS: nothing subscription-related advertised; subscriptions/listen rejected with -32601 (HTTP 500)",
     );
     expect(listenWarnings(unadvertised.report)).toEqual([
-      `${LISTEN}: the server rejected subscriptions/listen with JSON-RPC error -32601 on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).`,
+      `${LISTEN}: the server answered subscriptions/listen with its own JSON-RPC error -32601 on HTTP 500; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed)`,
     ]);
   }, 40_000);
 });

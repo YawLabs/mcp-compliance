@@ -913,11 +913,12 @@ async function checkSubscriptionsListen(ctx: ModernSuiteContext): Promise<TestOu
   // conformant discover was served (see notEvaluable): a server that
   // rejects everything proves nothing by rejecting the listen too.
   const unattributable = notEvaluable(ctx);
-  // Nor when something in front of the server answered in its place
-  // (gateVerdict, as for the error checks): an auth gate (a gateway's 401
-  // with a -32001 body that echoes the id), a 429 still a 429 after one
-  // resend, a 5xx without -32601, or a 403 the conformant twin could not get
-  // past either. Read for a JSON-RPC error and for a bare status >= 400
+  // Nor when something in front of the server answered in its place, or the
+  // server failed on the request (gateVerdict, as for the error checks): an
+  // auth gate (a gateway's 401 with a -32001 body that echoes the id), a 429
+  // still a 429 after one resend, a 403 the conformant twin could not get
+  // past either, or a 5xx without -32601 (a server failure, or a gateway
+  // with no backend). Read for a JSON-RPC error and for a bare status >= 400
   // alike. With something advertised no rejection is the server's right
   // answer, so no 5xx is credited there -- but a -32601 on a 5xx is still
   // the server's own answer (a gateway with no backend has not read the

@@ -170,6 +170,7 @@ function twinFor(ctx: ModernSuiteContext, statusCode: number): Twin {
   const refused = statusCode === 401 || statusCode === 403;
   const code = setup.code === null ? "" : `, ${errorWithCode(setup.rawCode)}`;
   return async () => ({
+    request: DISCOVER,
     served: false,
     outcome: `${refused ? "was refused" : "was not served"} (HTTP ${statusCode}${code})`,
     statusCode,
@@ -199,8 +200,9 @@ function gatedDetails(seen: string, rpcSuffix: string, on: string, reason: strin
  * - Something in front of the server answered in its place: the 2025-11-25
  *   checks' gateRefusal / bare403Verdict reading (gateVerdict). A 401, a
  *   403 carrying a Bearer challenge, a 429 still a 429 after its one
- *   resend, a 5xx without the probe's own code, or a 403 the conformant
- *   server/discover (the twin) could not get past either.
+ *   resend, or a 403 the conformant server/discover (the twin) could not
+ *   get past either. A 5xx without the probe's own code fails too, as the
+ *   server failing on the probe rather than rejecting it (gateVerdict).
  * - The conformant setup server/discover was itself rejected or never
  *   answered (notEvaluable): a server that rejects everything proves
  *   nothing by rejecting the probe too. The gate's reason is preferred when
@@ -313,9 +315,10 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
     // A rejection is the server's only when nothing in front of it answered
     // in its place and the conformant setup discover was served
     // (rawProbeGate): a 429 is resent once, and an auth gate, a 429 again, a
-    // 5xx, a 403 the conformant discover drew too, or any rejection of a
-    // server that rejected the conformant discover as well is not evaluable.
-    // A 415 (or any other 4xx the server chose) is credited.
+    // 403 the conformant discover drew too, or any rejection of a server
+    // that rejected the conformant discover as well is not evaluable; a 5xx
+    // fails as the server failing on the POST. A 415 (or any other 4xx the
+    // server chose) is credited.
     const params = client.paramsFor({});
     const body = JSON.stringify({ jsonrpc: "2.0", id: 99905, method: DISCOVER, params });
     const send = () => client.raw(body, { method: DISCOVER, params, headers: { "Content-Type": "text/plain" } });
@@ -341,11 +344,11 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
     // A rejection -- a status >= 400, or a JSON-RPC error on a 2xx -- is the
     // server's only when nothing in front of it answered in its place and
     // the conformant setup discover was served (rawProbeGate): a 429 is
-    // resent once, and an auth gate, a 429 again, a 5xx without the
-    // server's own -32600, a 403 the conformant discover drew too, or any
-    // rejection of a server that rejected the conformant discover as well is
-    // not evaluable. A -32600 on a 5xx is credited, with a warning about the
-    // status.
+    // resent once, and an auth gate, a 429 again, a 403 the conformant
+    // discover drew too, or any rejection of a server that rejected the
+    // conformant discover as well is not evaluable; a 5xx without the
+    // server's own -32600 fails as the server failing on the batch. A -32600
+    // on a 5xx is credited, with a warning about the status.
     const send = () => client.raw(body, { method: DISCOVER, params });
     const sent = await sendRawProbe(ctx, "the batch", send);
     if ("outcome" in sent) return sent.outcome;

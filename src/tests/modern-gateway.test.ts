@@ -1036,10 +1036,11 @@ describe("modern transport-batch-reject and transport-content-type-reject: whose
     const twin = (about: string) =>
       twinFailed("server/discover", "was refused (HTTP 403, JSON-RPC error -32000)", about);
     // Within the 220-character details budget the reason is kept whole: the
-    // probe's JSON-RPC code gives way first, then the probe's name.
+    // probe's JSON-RPC code gives way first, then the probe's name. The
+    // batch's details fit with the code; the text/plain POST's without it.
     expect(refused.byId).toEqual({
-      [BATCH]: `FAIL: HTTP 403 on the batch; ${twin("the batch")}`,
-      [CT]: `FAIL: HTTP 403; ${twin("the Content-Type")}`,
+      [BATCH]: `FAIL: HTTP 403, JSON-RPC error -32000 on the batch; ${twin("the batch")}`,
+      [CT]: `FAIL: HTTP 403 on the text/plain POST; ${twin("the Content-Type")}`,
     });
     for (const verdict of Object.values(refused.byId)) {
       expect(verdict.replace(/^FAIL: /, "").length).toBeLessThanOrEqual(220);
