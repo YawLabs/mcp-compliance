@@ -31,6 +31,7 @@ import {
   publishList,
 } from "./context.js";
 import { discoverTwin, gateVerdict, httpStatusText, resendOn429 } from "./gate.js";
+import { checkLiveness, warnUnresponsive } from "./liveness.js";
 import { classifyTransportError, restartStdioServer } from "./security.js";
 
 /**
@@ -1140,9 +1141,10 @@ interface ProgressCall {
   alreadyGone: boolean;
   /**
    * stdio: the child exited on this call, not before it -- "exit code 3:
-   * <stderr summary>" (describeExit). It has been replaced since
-   * (restartStdioServer), so the calls and checks after it reach a live
-   * process.
+   * <stderr summary>" (describeExit), prefixed "after answering it, " when
+   * it answered the call first (`res` is null either way). It has been
+   * replaced since (restartStdioServer), so the calls and checks after it
+   * reach a live process.
    */
   exit?: string;
 }
@@ -1162,9 +1164,15 @@ interface ProgressCall {
  * call as `call` carrying or without the token), as the security checks and
  * stdio-unicode replace one their own request killed, so the next call and
  * the checks after this one reach a live process; with no way to spawn one,
- * a warning says the rest ran against the exited process. A child already
- * gone before the call is left as it is. A caller's abort is rethrown; any
- * other transport error comes back as `err`.
+ * a warning says the rest ran against the exited process. That includes a
+ * child that answers the call and exits right after: an answered call is
+ * followed by one short server/discover (checkLiveness, as stdio-unicode
+ * does after its probe), and a child found gone makes the call a dropped
+ * one (`res` null, `exit` "after answering it, ..."), so the exit is
+ * charged to this call, never to the next one. A child that answers and
+ * then stops answering is named in a warning and left running. A child
+ * already gone before the call is left as it is. A caller's abort is
+ * rethrown; any other transport error comes back as `err`.
  */
 async function sendProgressCall(
   ctx: ModernSuiteContext,
@@ -1204,17 +1212,32 @@ async function sendProgressCall(
   for (const r of ctx.recorder.received.slice(seqStart)) consider(r.message);
   const sent: ProgressCall = { res, notifications, throttledMs, resendLost, alreadyGone };
   if (!res) sent.err = err;
-  if (!res && child && !alreadyGone && child.exited) {
-    // Read before the restart replaces ctx.transport.
-    sent.exit = await describeExit(child);
-    const cause = `${call} ${withToken ? "carrying" : "without"} _meta.progressToken`;
-    if (ctx.replaceStdioProcess) {
-      await restartStdioServer(ctx, "lifecycle-progress-token", cause);
-    } else {
-      ctx.harness.warnings.push(
-        `lifecycle-progress-token: the server exited on ${cause} (${sent.exit}); the tests after it ran against the exited process.`,
-      );
-    }
+  if (!child || alreadyGone) return sent;
+  const cause = `${call} ${withToken ? "carrying" : "without"} _meta.progressToken`;
+  // An answered call: make sure the child that answered it is still
+  // serving before the next call, or the next check, is written to it and
+  // takes the blame for its exit (checkLiveness, one short server/discover).
+  // One that stopped answering is still running: a warning names this call,
+  // and the answer stands.
+  if (res && !child.exited) {
+    const live = await checkLiveness(ctx);
+    if (live.state === "unresponsive") warnUnresponsive(ctx, "lifecycle-progress-token", cause, live);
+    if (live.state === "exited") sent.err = live.err;
+  }
+  if (!child.exited) return sent;
+  // The child exited on this call -- before answering it, or right after:
+  // either way the call counts as dropped (an answer is cleared; the
+  // notifications it drew are kept), and the child is replaced.
+  // Read before the restart replaces ctx.transport.
+  const exit = await describeExit(child);
+  sent.exit = res ? `after answering it, ${exit}` : exit;
+  sent.res = null;
+  if (ctx.replaceStdioProcess) {
+    await restartStdioServer(ctx, "lifecycle-progress-token", cause);
+  } else {
+    ctx.harness.warnings.push(
+      `lifecycle-progress-token: the server exited on ${cause} (${sent.exit}); the tests after it ran against the exited process.`,
+    );
   }
   return sent;
 }

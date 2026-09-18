@@ -19,10 +19,11 @@ import { MODERN_TEST_DEFINITIONS } from "../definitions/index.js";
 const SUITE_DIR = fileURLToPath(new URL("../suites/modern/", import.meta.url));
 
 /**
- * The helper modules that register no test: the shared context, and the
- * gate reader (whose answer a rejection is) that several modules share.
+ * The helper modules that register no test: the shared context, the gate
+ * reader (whose answer a rejection is) that several modules share, and the
+ * stdio liveness probe stdio-unicode and lifecycle-progress-token share.
  */
-const HELPERS = ["context.ts", "gate.ts"];
+const HELPERS = ["context.ts", "gate.ts", "liveness.ts"];
 
 /** Every module in src/suites/modern except the orchestrator itself and the helpers. */
 const MODULES = readdirSync(SUITE_DIR)
