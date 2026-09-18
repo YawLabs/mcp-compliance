@@ -540,8 +540,14 @@ if gh release view "v${VERSION}" >/dev/null 2>&1; then
   info "GitHub release v${VERSION} already exists -- skipping"
 else
   PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^v${VERSION}$" | tail -1)
-  NOTES=$(release_notes "$PREV_TAG")
-  gh release create "v${VERSION}" --title "v${VERSION}" --notes "$NOTES"
+  # Hand the notes over as a file, not an argument: v0.19.0's changelog
+  # section was ~62 KB, and passing it as `--notes "$NOTES"` failed on
+  # Windows with "Argument list too long" (a command line there is capped
+  # near 32K characters) -- after npm had already published.
+  NOTES_FILE=$(mktemp)
+  release_notes "$PREV_TAG" > "$NOTES_FILE"
+  gh release create "v${VERSION}" --title "v${VERSION}" --notes-file "$NOTES_FILE"
+  rm -f "$NOTES_FILE"
   info "GitHub release created (notes from CHANGELOG.md [${VERSION}])"
 fi
 
