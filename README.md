@@ -156,6 +156,7 @@ Two things to know when you rely on `auto` in CI:
 | `-E, --env <var>` | stdio | Set env var for stdio command, format `"KEY=VALUE"` (repeatable) |
 | `--env-file <path>` | stdio | Load env vars from a file (one `KEY=VALUE` per line) |
 | `--cwd <dir>` | stdio | Working directory for the stdio command |
+| `--watch` | stdio | Re-run the suite whenever a file under the current directory changes (500 ms debounce; ignores `node_modules`, `.git`, `dist`, `coverage`, build caches and log/swap/temp files) until Ctrl+C. stdio targets only, and only with `--format` `terminal`, `markdown` or `html`; `--strict` and `--min-grade` do not apply |
 | `--timeout <ms>` | both | Per-request timeout in milliseconds after the initial exchange (default: `15000`) |
 | `--startup-timeout <ms>` | both | Budget for the server's first reply: the stdio era probe under `auto`, the 2025-11-25 `initialize` handshake on either transport, and on HTTP the second era probe sent when the preflight times out (default: `max(--timeout, 60000)`; covers cold `npx` cache fetches before a stdio server starts) |
 | `--preflight-timeout <ms>` | HTTP | Deadline for the preflight `server/discover` request, which under `auto` is also the era probe; a timeout here re-probes once within `--startup-timeout` before the run defaults to 2025-11-25 (default: `min(--timeout, 10000)`) |
@@ -164,6 +165,7 @@ Two things to know when you rely on `auto` in CI:
 | `--skip <items>` | both | Skip tests matching these categories or test IDs (comma-separated) |
 | `--concurrency <n>` | both | Max parallel-safe tests in flight (default: `1`; raising reduces wall time but can perturb timing-sensitive servers) |
 | `--verbose` | both | Print each test result as it runs, as PASS, FAIL or SKIP (also forwards stdio stderr) |
+| `--no-color` | both | Disable colored output (the `NO_COLOR` environment variable does the same) |
 
 ### CI integration
 
