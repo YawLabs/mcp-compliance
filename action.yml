@@ -14,9 +14,13 @@ inputs:
     required: false
     default: 'latest'
   format:
-    description: 'Output format: terminal, json, sarif, github, markdown'
+    description: 'Output format: terminal, json, sarif, github, markdown, html'
     required: false
     default: 'github'
+  spec-version:
+    description: 'MCP spec revision to grade against: "auto" (default) probes the server and picks the newest revision it speaks (2026-07-28 when it answers server/discover, else 2025-11-25); pin "2025-11-25" or "2026-07-28" to keep the suite, test ids and grade stable across server upgrades. The resolved revision is exposed as the spec-version output. Requires mcp-compliance 0.19.0 or newer (the `version` input); older CLIs reject the flag.'
+    required: false
+    default: 'auto'
   strict:
     description: 'Exit non-zero on any required-test failure'
     required: false
@@ -56,11 +60,17 @@ outputs:
     description: 'Numeric score 0-100'
     value: ${{ steps.run.outputs.score }}
   passed:
-    description: 'Number of passing tests'
+    description: 'Number of passing tests (includes skipped checks, which measured nothing -- see skipped)'
     value: ${{ steps.run.outputs.passed }}
   failed:
     description: 'Number of failing tests'
     value: ${{ steps.run.outputs.failed }}
+  skipped:
+    description: 'How many of the passing tests were skipped (measured nothing); 0 for a report without skip data'
+    value: ${{ steps.run.outputs.skipped }}
+  spec-version:
+    description: 'MCP spec revision the suite actually graded against (2025-11-25 or 2026-07-28), resolved from the spec-version input'
+    value: ${{ steps.run.outputs.spec-version }}
 
 runs:
   using: 'composite'
@@ -77,6 +87,7 @@ runs:
         MCP_TARGET: ${{ inputs.target }}
         MCP_VERSION: ${{ inputs.version }}
         MCP_FORMAT: ${{ inputs.format }}
+        MCP_SPEC_VERSION: ${{ inputs.spec-version }}
         MCP_STRICT: ${{ inputs.strict }}
         MCP_MIN_GRADE: ${{ inputs.min-grade }}
         MCP_OUTPUT: ${{ inputs.output }}
@@ -102,11 +113,12 @@ runs:
           args+=("${parts[@]}")
         fi
 
-        # Common flags shared by every invocation. NOTE: --format is NOT
-        # in here — each run chooses its own format. Previously --format
-        # lived in cmd_flags and the SARIF path did a fragile bash param
-        # substitution to rename it, which produced an unknown flag and
-        # (depending on commander version) failed silently.
+        # Common flags shared by every invocation. NOTE: --format and
+        # --spec-version are NOT in here — each run chooses its own
+        # format, and the spec version is pinned per pass (see below).
+        # Previously --format lived in cmd_flags and the SARIF path did a
+        # fragile bash param substitution to rename it, which produced an
+        # unknown flag and (depending on commander version) failed silently.
         cmd_common=()
         cmd_common+=("--timeout" "$MCP_TIMEOUT")
         [[ "$MCP_STRICT" == "true" ]] && cmd_common+=("--strict")
@@ -122,12 +134,16 @@ runs:
         # Pin to the requested version
         pkg="@yawlabs/mcp-compliance@$MCP_VERSION"
 
+        # The spec version requested by the user: "auto" or a pinned
+        # revision. Empty (older callers) means auto.
+        requested_spec="${MCP_SPEC_VERSION:-auto}"
+
         # Echo a redacted command line for the workflow log. GitHub's
         # automatic secret masking only covers repo/org secrets — tokens
         # piped in from `with: auth:` on a called workflow (or from a
         # plain workflow input) are NOT masked, so the token value
         # passed via `--auth` must be stripped here before echo.
-        safe_cmd=("npx" "-y" "$pkg" "$subcommand" "--format" "$MCP_FORMAT")
+        safe_cmd=("npx" "-y" "$pkg" "$subcommand" "--format" "$MCP_FORMAT" "--spec-version" "$requested_spec")
         redact_next=0
         for arg in "${cmd_common[@]}"; do
           if [[ "$redact_next" == "1" ]]; then
@@ -142,27 +158,52 @@ runs:
         done
         echo "Running: ${safe_cmd[*]} ${args[*]}"
 
-        # Optional SARIF pass for Code Scanning upload. Runs with the
-        # full common flag set so auth / only / skip / strict all apply.
-        if [[ "$MCP_UPLOAD_SARIF" == "true" ]]; then
-          npx -y "$pkg" "$subcommand" --format sarif "${cmd_common[@]}" "${args[@]}" > compliance.sarif || true
-        fi
-
-        # JSON pass to extract grade/score for workflow outputs. Must use
-        # the same flags as the user-visible run so the numbers match.
-        json_out=$(npx -y "$pkg" "$subcommand" --format json "${cmd_common[@]}" "${args[@]}" || true)
+        # JSON pass FIRST. It extracts grade/score for the workflow
+        # outputs and, under "auto", is the ONE place the server's spec
+        # revision is detected: the report always stamps the resolved
+        # version, and every later pass is pinned to it so a flaky
+        # server/discover probe cannot make the SARIF upload or the
+        # visible annotations grade a different suite than the outputs.
+        json_out=$(npx -y "$pkg" "$subcommand" --format json --spec-version "$requested_spec" "${cmd_common[@]}" "${args[@]}" || true)
         echo "$json_out" > compliance.json
         grade=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).grade)}catch(e){console.log('?')}")
         score=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).score)}catch(e){console.log(0)}")
         passed=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).summary.passed)}catch(e){console.log(0)}")
         failed=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).summary.failed)}catch(e){console.log(0)}")
+        skipped=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).summary.skipped||0)}catch(e){console.log(0)}")
+        reported_spec=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).specVersion||'')}catch(e){console.log('')}")
+
+        # Resolve the spec version the remaining passes are pinned to:
+        # a user pin is used as-is; under "auto" take what the JSON pass
+        # reported; if that pass produced no report (crash, bad flags)
+        # fall back to the request so the visible pass still surfaces
+        # the real error instead of a bogus --spec-version value.
+        if [[ "$requested_spec" != "auto" ]]; then
+          resolved_spec="$requested_spec"
+        elif [[ -n "$reported_spec" ]]; then
+          resolved_spec="$reported_spec"
+        else
+          resolved_spec="$requested_spec"
+        fi
+        echo "Spec version: requested=$requested_spec resolved=$resolved_spec"
 
         {
           echo "grade=$grade"
           echo "score=$score"
           echo "passed=$passed"
           echo "failed=$failed"
+          echo "skipped=$skipped"
+          echo "spec-version=$reported_spec"
         } >> "$GITHUB_OUTPUT"
 
-        # User-visible run in the requested format.
-        npx -y "$pkg" "$subcommand" --format "$MCP_FORMAT" "${cmd_common[@]}" "${args[@]}"
+        # Optional SARIF pass for Code Scanning upload. Runs with the
+        # full common flag set so auth / only / skip / strict all apply,
+        # pinned to the spec version the JSON pass resolved.
+        if [[ "$MCP_UPLOAD_SARIF" == "true" ]]; then
+          npx -y "$pkg" "$subcommand" --format sarif --spec-version "$resolved_spec" "${cmd_common[@]}" "${args[@]}" > compliance.sarif || true
+        fi
+
+        # User-visible run in the requested format, pinned the same way.
+        # This is the pass whose exit code fails the step (--strict /
+        # --min-grade), so it runs last.
+        npx -y "$pkg" "$subcommand" --format "$MCP_FORMAT" --spec-version "$resolved_spec" "${cmd_common[@]}" "${args[@]}"

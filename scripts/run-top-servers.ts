@@ -142,6 +142,8 @@ interface Result {
   score?: number;
   passed?: number;
   failed?: number;
+  /** How many of `passed` measured nothing (see TestResult.skipped). */
+  skipped?: number;
   total?: number;
   requiredPassed?: number;
   requiredTotal?: number;
@@ -169,6 +171,7 @@ async function runOne(server: ServerEntry): Promise<Result> {
       score: report.score,
       passed: report.summary.passed,
       failed: report.summary.failed,
+      skipped: report.summary.skipped ?? 0,
       total: report.summary.total,
       requiredPassed: report.summary.requiredPassed,
       requiredTotal: report.summary.required,
@@ -208,7 +211,7 @@ function toMarkdown(results: Result[]): string {
             ? "ERROR"
             : r.status;
     const required = r.requiredPassed != null ? `${r.requiredPassed}/${r.requiredTotal}` : "—";
-    const passfail = r.passed != null ? `${r.passed}/${r.total}` : "—";
+    const passfail = r.passed != null ? `${r.passed}/${r.total}${r.skipped ? ` (${r.skipped} skipped)` : ""}` : "—";
     lines.push(
       `| ${r.name} | \`${r.package}\` | ${status.split(" ")[0]} | ${r.score ?? ""} | ${passfail} | ${r.failed ?? ""} | ${required} | ${r.notes ?? ""} |`,
     );
@@ -237,7 +240,7 @@ async function main() {
     const r = await runOne(srv);
     const status =
       r.status === "ok"
-        ? `${r.grade} ${r.score}% ${r.passed}/${r.total}`
+        ? `${r.grade} ${r.score}% ${r.passed}/${r.total}${r.skipped ? ` (${r.skipped} skipped)` : ""}`
         : r.status === "skipped-missing-env"
           ? "skipped"
           : r.status;

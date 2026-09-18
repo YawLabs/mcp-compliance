@@ -1,5 +1,12 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import type { Transport, TransportNotifyResult, TransportResponse } from "./index.js";
+import type {
+  JsonRpcId,
+  MessageListener,
+  Transport,
+  TransportNotifyResult,
+  TransportResponse,
+  TransportStream,
+} from "./index.js";
 
 export interface StdioTransportOptions {
   command: string;
@@ -26,16 +33,32 @@ export interface StdioTransport extends Transport {
   readonly pid: number | undefined;
   /** Last N bytes of stderr as a string, for debugging failures. */
   stderrTail(): string;
+  /**
+   * How many times stdout outgrew `stdoutBufferSize` without a newline and
+   * the buffered line was discarded (each time also leaves a "stdout buffer
+   * exceeded" line in stderrTail()). Monotonic for the transport's life:
+   * compare the value before and after a request to learn whether output
+   * produced during THAT request was dropped. stderrTail() cannot say --
+   * it is a rolling buffer that still holds the marker of an earlier drop,
+   * and the child can write the same text to its own stderr.
+   */
+  readonly stdoutOverflows: number;
   /** Whether the child has exited. */
   readonly exited: boolean;
   /** Exit code once the child has exited, null otherwise. */
   readonly exitCode: number | null;
+  /**
+   * Write one raw line to the child's stdin, bypassing JSON-RPC framing.
+   * Lets the malformed-message error tests (invalid JSON, invalid
+   * JSON-RPC) run over stdio the way they run over HTTP.
+   */
+  writeRaw(line: string): Promise<void>;
 }
 
 interface PendingRequest {
   resolve: (res: TransportResponse) => void;
   reject: (err: Error) => void;
-  id: number;
+  id: JsonRpcId;
   timer: NodeJS.Timeout;
 }
 
@@ -50,6 +73,45 @@ function exitDiagnostic(code: number | null, signal: NodeJS.Signals | null): str
     return "server exited cleanly (code 0) before completing the request. This usually means the command is a one-shot CLI, not a long-running MCP stdio server. If the server needs a subcommand to start (e.g. `serve`, `mcp`, `start`), include it in the command.";
   }
   return `server crashed with exit code ${code} before completing the request`;
+}
+
+/**
+ * How long close() waits, after closing the child's stdin, for the server to
+ * exit on its own before it terminates it. The spec's stdio shutdown
+ * (basic/transports/stdio, "Shutdown") is: close the input stream, wait for
+ * the server to exit, and only "if the server does not exit within a
+ * reasonable time" terminate it forcibly; servers SHOULD exit "promptly" on
+ * EOF, "the primary graceful-shutdown signal and the only portable one". The
+ * spec puts no number on either, so this is the reference TypeScript SDK
+ * client's wait (StdioClientTransport.close()): time for a server to flush
+ * and release what it holds, short enough that a run against a server that
+ * ignores EOF does not stall noticeably. A server that does exit on EOF ends
+ * the wait the moment it goes.
+ */
+const EOF_WINDOW_MS = 2000;
+/** POSIX: how long a server that ignored EOF gets to exit on SIGTERM before SIGKILL (the SDK client's second wait). */
+const SIGTERM_GRACE_MS = 2000;
+/** The last, bounded wait for the forced kill to be carried out and the child reaped, in case the kill itself hangs. */
+const KILL_WAIT_MS = 5000;
+/**
+ * How long a write the child's stdin refused waits for the child's 'exit'
+ * event before it rejects. The pipe breaks because the child stopped
+ * reading, nearly always because it is exiting, and the failed write's
+ * callback lands a moment before the exit is reported (0-21ms on Windows,
+ * under 1ms on Linux, measured with a child that exits partway through
+ * reading a 1 MB line): the wait lets the rejection name the exit code.
+ */
+const WRITE_FAILURE_EXIT_WAIT_MS = 1000;
+
+/** Resolves true when `promise` settles within `ms`, false when the bound runs out first. */
+function within(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    void promise.then(() => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
 }
 
 export function createStdioTransport(opts: StdioTransportOptions): StdioTransport {
@@ -69,11 +131,28 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
   let protocolVersion: string | null = null;
   let exited = false;
   let exitCode: number | null = null;
+  let exitSignal: NodeJS.Signals | null = null;
+  /** Settles when the child's 'exit' event fires (never, for a spawn that failed). */
+  const childExited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
   let spawnError: Error | null = null;
   let spawned = false;
-  const pending = new Map<number, PendingRequest>();
+  const pending = new Map<JsonRpcId, PendingRequest>();
+  const listeners = new Set<MessageListener>();
   let stdoutBuffer = "";
   let stderrBuffer = "";
+  let stdoutOverflows = 0;
+  /** The shutdown close() started, so a second close() joins it. */
+  let closing: Promise<void> | null = null;
+
+  function emit(message: unknown) {
+    for (const l of listeners) {
+      try {
+        l(message, {});
+      } catch {
+        // A listener must never break the transport.
+      }
+    }
+  }
 
   // Wait for the 'spawn' event before accepting writes. Without this,
   // request() called immediately after createStdioTransport() would
@@ -101,10 +180,20 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
   child.on("exit", (code, signal) => {
     exited = true;
     exitCode = code;
+    exitSignal = signal;
     if (pending.size > 0) {
       rejectAllPending(new Error(exitDiagnostic(code, signal)));
     }
   });
+
+  // A write to a child that is no longer reading -- one that exited
+  // partway through a long line, or closed its stdin -- fails with EPIPE
+  // (POSIX) or EOF (Windows), and so does end() in close() on a pipe that
+  // already broke. The failed write's callback reports it to the caller
+  // (writeLine); the stream then emits 'error' as well, and an 'error' event
+  // nothing listens for is an uncaught exception that ends the whole run
+  // with no report.
+  child.stdin?.on("error", () => {});
 
   child.stdout?.setEncoding("utf8");
   child.stdout?.on("data", (chunk: string) => {
@@ -123,6 +212,7 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     // un-newlined output before the real JSON reply) is diagnosable
     // rather than manifesting only as a request timeout.
     if (stdoutBuffer.length > stdoutBufferSize) {
+      stdoutOverflows++;
       stderrBuffer += `[mcp-compliance] stdout buffer exceeded ${stdoutBufferSize} bytes without a newline; discarding buffered data\n`;
       if (stderrBuffer.length > stderrBufferSize) {
         stderrBuffer = stderrBuffer.slice(stderrBuffer.length - stderrBufferSize);
@@ -152,20 +242,21 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
       return;
     }
     if (!parsed || typeof parsed !== "object") return;
+    // Every parsed message — notifications included — is fanned out to
+    // onMessage listeners, so held-open streams and the modern suite's
+    // recorder see them. Only responses are matched to pending requests.
+    emit(parsed);
     const msg = parsed as { id?: number | string; jsonrpc?: string };
-    if (typeof msg.id === "number" && pending.has(msg.id)) {
+    if ((typeof msg.id === "number" || typeof msg.id === "string") && pending.has(msg.id)) {
       const p = pending.get(msg.id);
       if (!p) return;
       clearTimeout(p.timer);
       pending.delete(msg.id);
       p.resolve({ body: parsed, requestId: msg.id });
     }
-    // Only numeric ids are matched: the runner and benchmark allocate ids
-    // via numeric counters for stdio and `pending` is keyed by number. A
-    // server echoing a string id would time out here rather than resolve —
-    // but the suite never sends string ids over stdio (lifecycle-string-id
-    // is HTTP-only via STDIO_INCOMPATIBLE_IDS in runner.ts).
-    // Notifications (no id) and unmatched ids are dropped.
+    // Ids are matched by value AND type (a Map key): a server that
+    // answers a numeric id with the same digits as a string is not
+    // echoing the id, and its reply times out here as it should.
   }
 
   function rejectAllPending(err: Error) {
@@ -203,7 +294,12 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     }
     if (spawnError) throw new Error(annotateWithStderr(`stdio transport: spawn failed — ${spawnError.message}`));
     const stdin = child.stdin;
-    if (!stdin || stdin.destroyed) throw new Error(annotateWithStderr("stdio transport: stdin is closed"));
+    // writableEnded: close() has ended stdin (the child may still be running
+    // out its EOF window). A write now could only fail, and after the exit
+    // wait below would read as the server going away on its own.
+    if (!stdin || stdin.destroyed || stdin.writableEnded) {
+      throw new Error(annotateWithStderr("stdio transport: stdin is closed"));
+    }
     // The write callback fires when the data is flushed to the OS pipe.
     // For sequential request() callers (await-pattern), this naturally
     // serializes — each request waits for its own write to flush before
@@ -212,8 +308,91 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     // accept slightly higher memory under burst load rather than
     // building a queue.
     return new Promise<void>((resolve, reject) => {
-      stdin.write(`${line}\n`, "utf8", (err) => (err ? reject(err) : resolve()));
+      stdin.write(`${line}\n`, "utf8", (err) => {
+        if (err) void writeFailure(err).then(reject);
+        else resolve();
+      });
     });
+  }
+
+  /**
+   * The error for a write the child's stdin refused. A bare "write EPIPE"
+   * or "write EOF" does not say the server went away, so wait (bounded) for
+   * the exit the broken pipe nearly always precedes and reject with the
+   * exit diagnostic -- the one a pending request already gets from the exit
+   * itself, which settles it first. A child still running after the wait
+   * closed its stdin: it can read nothing more either.
+   */
+  async function writeFailure(err: Error): Promise<Error> {
+    if (!exited) await within(childExited, WRITE_FAILURE_EXIT_WAIT_MS);
+    const reason = exited
+      ? exitDiagnostic(exitCode, exitSignal)
+      : `stdin is closed: the server stopped reading its input (${err.message})`;
+    return new Error(annotateWithStderr(`stdio transport: ${reason}`), { cause: err });
+  }
+
+  /**
+   * The spec's stdio shutdown order: close stdin, wait EOF_WINDOW_MS for the
+   * server to exit, and only then terminate it. Nothing is signalled or
+   * spawned at EOF time: a SIGTERM sent along with EOF ends a server that
+   * would have exited cleanly before its shutdown work runs.
+   */
+  async function shutDown(): Promise<void> {
+    const childExit = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    try {
+      child.stdin?.end();
+    } catch {}
+    // No pid: the spawn itself failed (ENOENT, EACCES), so there is no
+    // process to wait for or kill.
+    if (child.pid === undefined) {
+      rejectAllPending(new Error("stdio transport: closed"));
+      return;
+    }
+    const pid = String(child.pid);
+    if (!(await within(childExit, EOF_WINDOW_MS))) {
+      if (isWindows) {
+        // Windows has no SIGTERM step: a non-forced taskkill asks a process to
+        // close its windows, which a console process has none of (taskkill
+        // exits 128, "can only be terminated forcefully"), so it could never
+        // end the server -- only leave a taskkill running. Go straight to the
+        // forced kill of the whole tree: the child is spawned via a shell
+        // (shell:true, for .cmd/.bat shims like npx), so child.kill() would
+        // only reach cmd.exe and orphan the real server (the node/npx
+        // grandchild); `taskkill /t` walks the tree.
+        //
+        // Wait for the forced kill to be carried out and the child to be
+        // reaped, not merely for taskkill to be spawned. Node puts its direct
+        // children (cmd.exe, taskkill) in a kill-on-close job object that the
+        // shell's own children are outside of, so a caller that exits right
+        // after close() resolves -- a test worker torn down after its last
+        // test -- takes taskkill and cmd.exe down with it before the kill is
+        // carried out, and the real server (the grandchild), still busy and
+        // so not gone on EOF, is left running as an orphan.
+        const forcedTreeKill = new Promise<void>((resolve) => {
+          try {
+            const killer = spawn("taskkill", ["/pid", pid, "/t", "/f"], { stdio: "ignore" });
+            killer.once("exit", () => resolve());
+            killer.once("error", () => resolve());
+          } catch {
+            resolve();
+          }
+        });
+        await within(Promise.all([forcedTreeKill, childExit]), KILL_WAIT_MS);
+      } else {
+        // POSIX spawns with shell:false, so the child is the server itself:
+        // SIGTERM, then SIGKILL for one that ignores that too.
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+        if (!(await within(childExit, SIGTERM_GRACE_MS))) {
+          try {
+            child.kill("SIGKILL");
+          } catch {}
+          await within(childExit, KILL_WAIT_MS);
+        }
+      }
+    }
+    rejectAllPending(new Error("stdio transport: closed"));
   }
 
   const transport: StdioTransport = {
@@ -232,22 +411,52 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     stderrTail() {
       return stderrBuffer;
     },
+    get stdoutOverflows() {
+      return stdoutOverflows;
+    },
     async request(method, params, nextId, init): Promise<TransportResponse> {
       const id = nextId();
       const body = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} });
       return new Promise<TransportResponse>((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
+          detach();
           reject(
             new Error(
               annotateWithStderr(`stdio transport: request timed out after ${init.timeout}ms (method=${method})`),
             ),
           );
         }, init.timeout);
-        pending.set(id, { resolve, reject, id, timer });
+        const onAbort = () => {
+          clearTimeout(timer);
+          pending.delete(id);
+          const reason = init.signal?.reason;
+          reject(reason instanceof Error ? reason : new Error("stdio transport: request aborted"));
+        };
+        const detach = () => init.signal?.removeEventListener("abort", onAbort);
+        if (init.signal) {
+          if (init.signal.aborted) {
+            onAbort();
+            return;
+          }
+          init.signal.addEventListener("abort", onAbort, { once: true });
+        }
+        pending.set(id, {
+          resolve: (res) => {
+            detach();
+            resolve(res);
+          },
+          reject: (err) => {
+            detach();
+            reject(err);
+          },
+          id,
+          timer,
+        });
         writeLine(body).catch((err: Error) => {
           clearTimeout(timer);
           pending.delete(id);
+          detach();
           reject(err);
         });
       });
@@ -257,43 +466,116 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
       await writeLine(body);
       return {};
     },
-    async close() {
-      if (exited) return;
-      // Signal EOF via stdin close; many stdio servers exit cleanly on this.
-      try {
-        child.stdin?.end();
-      } catch {}
-      // Kill the whole process tree, not just the direct child. On Windows
-      // the child is spawned via a shell (shell:true, for .cmd/.bat shims
-      // like npx), so child.kill() would only reach cmd.exe and orphan the
-      // real server (the node/npx grandchild); `taskkill /t` walks the tree.
-      // On POSIX we spawn with shell:false, so signalling the child directly
-      // is sufficient.
-      const treeKill = (force: boolean) => {
-        if (isWindows && child.pid !== undefined) {
-          try {
-            spawn("taskkill", ["/pid", String(child.pid), "/t", ...(force ? ["/f"] : [])], { stdio: "ignore" });
-          } catch {}
-        } else {
-          try {
-            child.kill(force ? "SIGKILL" : "SIGTERM");
-          } catch {}
-        }
+    async stream(method, params, nextId, init): Promise<TransportStream> {
+      const id: JsonRpcId = nextId();
+      const body = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} });
+      // Every message the child writes while the stream is open is
+      // delivered; the caller filters by subscriptionId / progressToken.
+      // The stream ends when the response carrying `id` arrives, when the
+      // timeout elapses, when the child exits, or on close().
+      const queue: unknown[] = [];
+      let done = false;
+      /** The response carrying `id` arrived: the server considers the request finished. */
+      let answered = false;
+      let exit: { code: number | null; signal: string | null } | undefined;
+      let cancelSent = false;
+      let wake: (() => void) | null = null;
+      let timer: NodeJS.Timeout | null = null;
+      let unsubscribe: () => void = () => {};
+      const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+        exit = { code, signal };
+        finish();
       };
-      // Grace period, then force-kill the tree.
-      const gracePeriodMs = 2000;
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          treeKill(true);
-          resolve();
-        }, gracePeriodMs);
-        child.once("exit", () => {
-          clearTimeout(timer);
-          resolve();
-        });
-        treeKill(false);
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        unsubscribe();
+        child.removeListener("exit", onExit);
+        init.signal?.removeEventListener("abort", finish);
+        wake?.();
+      };
+      unsubscribe = transport.onMessage((msg) => {
+        if (done) return;
+        queue.push(msg);
+        const m = msg as { id?: unknown };
+        const isResponse = m && typeof m === "object" && m.id === id;
+        if (isResponse) answered = true;
+        wake?.();
+        if (isResponse) finish();
       });
-      rejectAllPending(new Error("stdio transport: closed"));
+      timer = setTimeout(finish, init.timeout);
+      // A child that dies mid-stream ends the stream now, not at the
+      // timeout; `exit` tells the caller why the iterator completed.
+      child.once("exit", onExit);
+      if (init.signal?.aborted) finish();
+      else init.signal?.addEventListener("abort", finish, { once: true });
+      try {
+        await writeLine(body);
+      } catch (err) {
+        finish();
+        throw err;
+      }
+      async function* iterate(): AsyncGenerator<unknown> {
+        while (true) {
+          if (queue.length > 0) {
+            yield queue.shift();
+            continue;
+          }
+          if (done) return;
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+          wake = null;
+        }
+      }
+      return {
+        requestId: id,
+        messages: iterate(),
+        get exit() {
+          return exit;
+        },
+        async close() {
+          finish();
+          // The spec's stdio teardown for a held-open request is a
+          // client-side notifications/cancelled naming the request id.
+          // The request is still live on the server whenever its response
+          // has not arrived -- after the timer fired or an abort as much as
+          // on an early close -- so the cancel keys on `answered`, not on
+          // `done`. Nothing to cancel once the child is gone.
+          if (cancelSent || answered || exited) return;
+          cancelSent = true;
+          const cancel = { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } };
+          // Reported before the write so a recorder logs it ahead of any
+          // reply the server (wrongly) sends to it.
+          try {
+            init.onSent?.(cancel);
+          } catch {
+            // A hook must never break the transport.
+          }
+          try {
+            await writeLine(JSON.stringify(cancel));
+          } catch {
+            // child already gone
+          }
+        },
+      };
+    },
+    onMessage(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    writeRaw(line) {
+      return writeLine(line);
+    },
+    close() {
+      if (exited) return Promise.resolve();
+      // A close() while one is under way joins it: one EOF window, one
+      // termination.
+      closing ??= shutDown();
+      return closing;
     },
     setSessionId(_id) {
       // stdio has no session concept; no-op.

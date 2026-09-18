@@ -25,7 +25,7 @@ npm test
 
 1. **One PR per change.** Keep PRs focused — a bug fix, a new feature, or a refactor, not all three.
 2. **Branch from `main`** (or `master` if that's the default branch).
-3. **Run `npm run lint:fix`** before committing — CI will reject formatting issues.
+3. **Run `npm run lint:fix`** before committing — this repo has no hosted CI, so the local lint/typecheck/test gate in `release.sh` is the only one and reviewers will ask for a clean run.
 4. **Run `npm test`** and confirm all tests pass.
 5. **Write a clear PR title and description** — explain *what* changed and *why*.
 6. **All PRs require approval** from a maintainer before merging.
@@ -52,17 +52,21 @@ npm test
 
 The JSON output of `runComplianceSuite()` is a **stable, versioned contract** consumed by downstream renderers (Yaw MCP, third-party dashboards). Every report carries a top-level `schemaVersion` field, defined by `REPORT_SCHEMA_VERSION` in `src/types.ts`, and is described by `schemas/report.v1.json`.
 
-When changing the `ComplianceReport` type:
+The schema is **strict**: every object in `report.v1.json` (the report, `summary`, `serverInfo`, `badge`, each `TestResult`) is `additionalProperties: false`, and `category` is a closed enum. So there is no "additive, non-breaking" change to the report shape — a consumer validating against the shipped schema rejects a report that carries a field the schema does not list. When changing the `ComplianceReport` type:
 
-- **Adding a field** (non-breaking): update both `src/types.ts` and `schemas/report.v1.json` in the same PR. No version bump needed.
-- **Renaming, removing, or changing the type of an existing field** (breaking): bump `REPORT_SCHEMA_VERSION` to `"2"`, create `schemas/report.v2.json`, and keep `schemas/report.v1.json` for downstream consumers still on v1.
+- **Adding a field, adding a category, renaming, removing, or changing the type of an existing field** (all breaking under a strict schema): bump `REPORT_SCHEMA_VERSION` to `"2"`, create `schemas/report.v2.json`, and keep `schemas/report.v1.json` for downstream consumers still on v1. Emit v1 or v2 for every run — never pick the schema version per run based on something the server controls (such as the detected spec revision).
+- **Changing the *value* of an existing free-form field** (a new `specVersion` string, a new warning text) is fine within v1. That is how 2026-07-28 support shipped without a schema bump: `specVersion` is a free string and both catalogs use the same 8 categories.
 - **Anything that affects determinism** (new non-deterministic field, new warning that includes a timestamp/duration/random ID): the integration test `produces deterministic output` will catch this. Don't bypass it — fix the root cause.
 
-The CI suite enforces this:
+The test suite enforces this:
 
 - `src/tests/schema.test.ts` validates a hand-crafted sample against the schema.
 - `src/tests/integration.test.ts` validates a real CLI run against the schema.
-- Drift between `ComplianceReport` and `report.v1.json` will fail CI.
+- Drift between `ComplianceReport` and `report.v1.json` fails the suite.
+
+## Test catalog discipline
+
+Each spec revision has one catalog (`TEST_DEFINITIONS` in `src/types.ts` for 2025-11-25, `MODERN_TEST_DEFINITIONS` in `src/definitions/2026-07-28.ts` for 2026-07-28) and three hand-maintained mirrors: the README's "What the N tests check (<revision>)" section, `COMPLIANCE_RUBRIC.md` (section 3 / 3b), and `mcp-compliance-rules.json` (rules tagged by `specVersion`). When you add, rename, re-categorise, or flip the `required` default of a test, update all three in the same PR — `src/tests/types.test.ts` and `src/tests/catalog-parity.test.ts` are red until you do. For 2026-07-28, `npx tsx scripts/gen-catalog-docs.ts` regenerates the rules entries and rubric section 3b from the catalog; its pass/fail criteria table is the one thing you write by hand. Reuse an id across revisions when the check covers the same feature and the same server behaviour keeps the same verdict (its wording, exact criteria and required flag may still differ, and the docs say so); a check whose verdict on the same behaviour flipped gets a new id, because `diff`, SARIF, `--only`/`--skip` and `explain` all key on ids within a revision.
 
 ## For AI Coding Agents
 

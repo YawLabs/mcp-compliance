@@ -8,6 +8,19 @@ export function computeGrade(score: number): Grade {
   return "F";
 }
 
+/**
+ * A check that measured nothing. Skips are `passed: true` (they are not
+ * failures) and are counted in `summary.passed` and in the score's
+ * denominator exactly as before -- excluding them would move every
+ * server's existing grade, which is a product decision, not a reporting
+ * one. What `summary.skipped` and the per-category `skipped` counts add
+ * is visibility: a reader can now see how much of a pass total was
+ * "nothing was measured" instead of "the server did the right thing".
+ */
+function isSkip(t: TestResult): boolean {
+  return t.passed && t.skipped === true;
+}
+
 export function computeScore(tests: TestResult[]): {
   score: number;
   grade: Grade;
@@ -18,12 +31,14 @@ export function computeScore(tests: TestResult[]): {
     failed: number;
     required: number;
     requiredPassed: number;
+    skipped: number;
   };
-  categories: Record<string, { passed: number; total: number }>;
+  categories: Record<string, { passed: number; total: number; skipped: number }>;
 } {
   const total = tests.length;
   const passed = tests.filter((t) => t.passed).length;
   const failed = total - passed;
+  const skipped = tests.filter(isSkip).length;
 
   const requiredTests = tests.filter((t) => t.required);
   const requiredPassed = requiredTests.filter((t) => t.passed).length;
@@ -58,18 +73,19 @@ export function computeScore(tests: TestResult[]): {
     overall = "partial";
   }
 
-  const categories: Record<string, { passed: number; total: number }> = {};
+  const categories: Record<string, { passed: number; total: number; skipped: number }> = {};
   for (const t of tests) {
-    if (!categories[t.category]) categories[t.category] = { passed: 0, total: 0 };
+    if (!categories[t.category]) categories[t.category] = { passed: 0, total: 0, skipped: 0 };
     categories[t.category].total++;
     if (t.passed) categories[t.category].passed++;
+    if (isSkip(t)) categories[t.category].skipped++;
   }
 
   return {
     score,
     grade: computeGrade(score),
     overall,
-    summary: { total, passed, failed, required: requiredTests.length, requiredPassed },
+    summary: { total, passed, failed, required: requiredTests.length, requiredPassed, skipped },
     categories,
   };
 }

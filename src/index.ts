@@ -5,13 +5,30 @@ import chalk from "chalk";
 import { Command, Option } from "commander";
 import { renderBadgeSvg } from "./badge-svg.js";
 import { formatBenchmark, runBenchmark } from "./benchmark.js";
-import { type ComplianceConfig, loadConfig } from "./config.js";
+import { type ComplianceConfig, loadConfig, OUTPUT_FORMATS } from "./config.js";
 import { diffReports, formatDiff, hasRegressions } from "./diff.js";
 import { startServer } from "./mcp/server.js";
-import { formatGithub, formatHtml, formatJson, formatMarkdown, formatSarif, formatTerminal } from "./reporter.js";
-import { previewTests, runComplianceSuite } from "./runner.js";
+import {
+  formatGithub,
+  formatHtml,
+  formatJson,
+  formatMarkdown,
+  formatProgressLine,
+  formatSarif,
+  formatTerminal,
+} from "./reporter.js";
+import { filterWarnings, previewTests, runComplianceSuite } from "./runner.js";
+import { type SpecVersion, type SpecVersionOption, SUPPORTED_SPEC_VERSIONS } from "./spec.js";
 import { splitStdioTarget } from "./stdio-split.js";
-import type { TransportTarget } from "./types.js";
+import type { TestDefinition, TransportTarget } from "./types.js";
+
+/** `--spec-version` choices: `auto` plus every catalog the tool ships. */
+const SPEC_VERSION_CHOICES: string[] = ["auto", ...SUPPORTED_SPEC_VERSIONS];
+
+const SPEC_VERSION_HELP =
+  "MCP spec revision to test against (default: auto, or `specVersion` in config). " +
+  "auto probes the server with a 2026-07-28 server/discover request and grades the newest revision it speaks; " +
+  "pin a date to force one suite. With --list (no connection is made) auto prints every catalog.";
 
 // `__VERSION__` is injected by esbuild's `--define` at single-binary (SEA)
 // build time; esbuild dead-code-eliminates the else branch under the define.
@@ -201,17 +218,16 @@ program
   .argument("[extraArgs...]", "Additional args passed to the stdio command")
   .addOption(
     new Option("--format <format>", "Output format (default: terminal, or `format` in config)").choices([
-      "terminal",
-      "json",
-      "sarif",
-      "github",
-      "markdown",
-      "html",
+      ...OUTPUT_FORMATS,
     ]),
   )
+  .addOption(new Option("--spec-version <version>", SPEC_VERSION_HELP).choices(SPEC_VERSION_CHOICES))
   .option("--config <path>", "Load options from a config file (default: mcp-compliance.config.json in cwd)")
   .option("--output <file>", "Write a local SVG badge to the given path after the run (works with any transport)")
-  .option("--list", "Print the test IDs that would run given current filters, then exit (no connection)")
+  .option(
+    "--list",
+    "Print the test IDs that would run given current filters, then exit (no connection; with --spec-version auto, both catalogs are listed)",
+  )
   .addOption(
     new Option(
       "--transport <kind>",
@@ -244,7 +260,7 @@ program
   )
   .option(
     "--startup-timeout <ms>",
-    "Deadline for the initial initialize handshake (default: max(--timeout, 60000); covers cold `npx` cache fetches before a stdio server starts)",
+    "Budget for the server's first reply: the stdio era probe under auto, the 2025-11-25 initialize handshake on either transport, and on HTTP the second era probe sent when the preflight times out (default: max(--timeout, 60000); covers cold `npx` cache fetches before a stdio server starts)",
   )
   .option("--no-color", "Disable colored output (also honors NO_COLOR env var)")
   .option("--watch", "Re-run tests when files in the cwd change (stdio targets only)")
@@ -253,11 +269,14 @@ program
     "Max parallel-safe tests in flight (default 1; see docs/PERFORMANCE.md before raising)",
     "1",
   )
-  .option("--preflight-timeout <ms>", "Preflight connectivity check timeout in milliseconds")
+  .option(
+    "--preflight-timeout <ms>",
+    "HTTP only: deadline for the preflight server/discover request, which under auto is also the era probe; a timeout here re-probes once within --startup-timeout before the run defaults to 2025-11-25 (default: min(--timeout, 10000))",
+  )
   .option("--retries <n>", "Number of retries for failed tests (default: 0, or `retries` in config)")
   .option(
     "--only <items>",
-    'Only run matching categories or test IDs, comma-separated (e.g., "transport,lifecycle" or "transport-post,lifecycle-init")',
+    'Only run matching categories or test IDs, comma-separated (e.g., "transport,lifecycle" or "transport-post,lifecycle-jsonrpc"); ids belong to one catalog -- see --list',
     parseList,
   )
   .option(
@@ -279,6 +298,7 @@ program
         watch?: boolean;
         concurrency: string;
         format?: string;
+        specVersion?: SpecVersionOption;
         strict?: boolean;
         minGrade?: "A" | "B" | "C" | "D" | "F";
         header: Record<string, string>;
@@ -300,6 +320,9 @@ program
       try {
         const config = loadConfig(opts.config);
 
+        // CLI flag > config `specVersion` > auto, like --format.
+        const specVersion: SpecVersionOption = opts.specVersion ?? config?.specVersion ?? "auto";
+
         // --list short-circuits before connecting. Transport defaults to
         // http when not specified and no target is provided; if a target
         // is given we infer from it (URL → http, else stdio).
@@ -309,16 +332,52 @@ program
             const t = target ? (looksLikeUrl(target) ? "http" : "stdio") : config?.target?.type;
             if (t === "http" || t === "stdio") transportKind = t;
           }
-          const defs = previewTests({
+          const filters = {
             transport: transportKind,
             only: opts.only ?? config?.only,
             skip: opts.skip ?? config?.skip,
-          });
-          for (const d of defs) {
-            const req = d.required ? chalk.yellow("required") : chalk.dim("optional");
-            console.log(`${chalk.bold(d.id.padEnd(38))} ${chalk.cyan(d.category.padEnd(10))} ${req}  ${d.name}`);
+          };
+          // A preview never connects, so `auto` cannot be resolved here:
+          // an explicit spec prints that one catalog, `auto` prints every
+          // catalog in its own labelled section so the reader can find
+          // the ids of whichever suite the live run will pick.
+          const versions: readonly SpecVersion[] = specVersion !== "auto" ? [specVersion] : SUPPORTED_SPEC_VERSIONS;
+          const catalogs = versions.map((v) => ({ version: v, defs: previewTests({ ...filters, specVersion: v }) }));
+          // One id column for everything printed: the longest 2026-07-28
+          // ids run past a fixed width and shift the columns after them.
+          const idWidth = Math.max(0, ...catalogs.flatMap((c) => c.defs.map((d) => d.id.length)));
+          const printCatalog = (version: SpecVersion, defs: TestDefinition[]) => {
+            for (const d of defs) {
+              const req = d.required ? chalk.yellow("required") : chalk.dim("optional");
+              console.log(`${chalk.bold(d.id.padEnd(idWidth))} ${chalk.cyan(d.category.padEnd(10))} ${req}  ${d.name}`);
+            }
+            // The same filter-miss warnings a live run would print: a
+            // value that names nothing in this catalog, or only tests
+            // gated off this transport, otherwise lists "0 tests" with no
+            // explanation.
+            for (const w of filterWarnings(version, transportKind, filters.only, filters.skip)) {
+              console.log(chalk.yellow(`! ${w}`));
+            }
+          };
+          if (specVersion !== "auto") {
+            const [{ defs }] = catalogs;
+            printCatalog(specVersion, defs);
+            console.log(
+              chalk.dim(`\n${defs.length} tests would run for transport=${transportKind} spec=${specVersion}`),
+            );
+            return;
           }
-          console.log(chalk.dim(`\n${defs.length} tests would run for transport=${transportKind}`));
+          const counts: string[] = [];
+          for (const { version: v, defs } of catalogs) {
+            console.log(chalk.bold(`\nMCP ${v} catalog (${defs.length} tests)`));
+            printCatalog(v, defs);
+            counts.push(`${defs.length} (${v})`);
+          }
+          console.log(
+            chalk.dim(
+              `\n${counts.join(" or ")} tests would run for transport=${transportKind}; --spec-version auto picks one catalog at run time from the era the server speaks`,
+            ),
+          );
           return;
         }
 
@@ -367,14 +426,23 @@ program
             concurrency: parsePositiveInt(opts.concurrency, "--concurrency", 1),
             only,
             skip,
-            onProgress: verbose
-              ? (testId, passed, details) => {
-                  const icon = passed ? chalk.green("PASS") : chalk.red("FAIL");
+            specVersion,
+            // Status lines (what the runner is waiting on before any test
+            // has started -- the stdio era probe against a silent legacy
+            // server costs the whole startup timeout) go to stderr, dim,
+            // in terminal mode only; machine-readable formats stay clean.
+            onStatus:
+              opts.format === "terminal" ? (message) => process.stderr.write(chalk.dim(`  ${message}\n`)) : undefined,
+            // onTestComplete, not onProgress: only the full result carries
+            // `skipped`, and a skip is a pass on onProgress's `passed`, so
+            // it would print PASS for a check that measured nothing.
+            onTestComplete: verbose
+              ? (result) => {
                   // Progress goes to stderr so `--format=json > out.json` produces
                   // clean JSON on stdout even with --verbose. chalk auto-strips
                   // color when stderr is not a TTY (e.g., piped/captured by CI).
                   const stream = opts.format === "terminal" ? process.stdout : process.stderr;
-                  stream.write(`  ${icon} ${testId} — ${details}\n`);
+                  stream.write(`${formatProgressLine(result)}\n`);
                 }
               : undefined,
           });
@@ -492,12 +560,24 @@ program
 
 program
   .command("benchmark")
-  .description("Measure ping latency and throughput against an MCP server (URL or stdio command)")
+  .description(
+    "Measure request latency and throughput against an MCP server (URL or stdio command): ping on 2025-11-25, server/discover on 2026-07-28",
+  )
   .argument("[target]", "Server URL or stdio command")
   .argument("[extraArgs...]", "Additional args for stdio command")
-  .option("-r, --requests <n>", "Number of ping requests to send", "100")
+  .option("-r, --requests <n>", "Number of probe requests to send", "100")
   .option("-c, --concurrency <n>", "Concurrent in-flight requests", "1")
   .option("--timeout <ms>", "Per-request timeout in milliseconds", "15000")
+  .option(
+    "--startup-timeout <ms>",
+    "Budget for the server's first reply: the era probe under auto and the unmeasured warm-up (the 2025-11-25 initialize handshake, or a pinned 2026-07-28 run's first server/discover) (default: max(--timeout, 60000), or `startupTimeout` in config; covers cold `npx` cache fetches before a stdio server starts)",
+  )
+  .addOption(
+    new Option(
+      "--spec-version <version>",
+      "MCP spec revision whose probe to measure (default: auto, or `specVersion` in config). auto sends one 2026-07-28 server/discover first and picks the newest revision the server speaks.",
+    ).choices(SPEC_VERSION_CHOICES),
+  )
   .option("--config <path>", "Load options from a config file")
   .option("--format <format>", "terminal or json", "terminal")
   .option("-H, --header <header>", "HTTP header (repeatable)", parseHeaderArg, {})
@@ -513,6 +593,8 @@ program
         requests: string;
         concurrency: string;
         timeout: string;
+        startupTimeout?: string;
+        specVersion?: SpecVersionOption;
         config?: string;
         format: string;
         header: Record<string, string>;
@@ -534,6 +616,15 @@ program
           requests: parsePositiveInt(opts.requests, "--requests", 1),
           concurrency: parsePositiveInt(opts.concurrency, "--concurrency", 1),
           timeout: parsePositiveInt(opts.timeout, "--timeout", 1),
+          startupTimeout: opts.startupTimeout
+            ? parsePositiveInt(opts.startupTimeout, "--startup-timeout", 1)
+            : config?.startupTimeout,
+          specVersion: opts.specVersion ?? config?.specVersion ?? "auto",
+          // Same status line the test command prints while a silent
+          // legacy stdio server costs the whole startup timeout on the era
+          // probe: stderr, dim, terminal mode only (JSON stays clean).
+          onStatus:
+            opts.format === "terminal" ? (message) => process.stderr.write(chalk.dim(`  ${message}\n`)) : undefined,
         });
         if (opts.format === "json") {
           console.log(JSON.stringify(result, null, 2));

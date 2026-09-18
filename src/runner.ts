@@ -7,15 +7,65 @@ import { request } from "undici";
 // share the same code path. If you find yourself reaching for `request`
 // below the lifecycle gate, first check whether Transport.rawRequest /
 // rawPost already exposes what you need.
-import { computeScore } from "./grader.js";
+import {
+  INJECTION_PAYLOADS,
+  INTERNAL_IP_PATTERNS,
+  POISONING_PATTERNS,
+  STACK_TRACE_PATTERNS,
+  VALID_CONTENT_TYPES,
+} from "./checks/patterns.js";
+import { errorWithCode } from "./checks/validators.js";
+import { getTestDefinitionMap } from "./definitions/index.js";
+import {
+  type AuthRefusal,
+  authRefusalHint,
+  buildDiscoverProbe,
+  classifyDiscoverResponse,
+  type DetectionResult,
+  detectSpecVersion,
+  namesHostOrOriginValidation,
+  type ProbeExit,
+  probeAnswerShowsEra,
+  probeExitOf,
+  probeExitWarning,
+  REASON_PREFIX,
+  readAuthRefusal,
+  settledStderr,
+  summarizeStderr,
+} from "./detect.js";
+import { createHarness, supportsTransportByDefinition, type TestOutcome } from "./harness.js";
 import { readPackageVersion } from "./pkg-version.js";
+import { assembleReport } from "./report.js";
+import {
+  AUTO_DETECT_NOTE_PREFIX,
+  LEGACY_SPEC_VERSION,
+  MODERN_SPEC_VERSION,
+  type SpecVersion,
+  type SpecVersionOption,
+  specBaseFor,
+} from "./spec.js";
+import { runModernSuite } from "./suites/modern/index.js";
+import { classifyInjectionOutput, classifyTransportError, retryAfterMs } from "./suites/modern/security.js";
 import { createHttpTransport } from "./transport/http.js";
-import type { Transport } from "./transport/index.js";
-import { createStdioTransport } from "./transport/stdio.js";
+import type { Transport, TransportResponse } from "./transport/index.js";
+import { createStdioTransport, type StdioTransport } from "./transport/stdio.js";
 import type { ComplianceReport, TestDefinition, TestResult, TransportTarget } from "./types.js";
-import { REPORT_SCHEMA_VERSION, TEST_DEFINITIONS } from "./types.js";
+import { TEST_DEFINITIONS } from "./types.js";
 
+export { findTestDefinition, getTestDefinitions, MODERN_TEST_DEFINITIONS } from "./definitions/index.js";
+export { classifyDiscoverResponse, type DetectionResult, detectSpecVersion } from "./detect.js";
 export { computeGrade, computeScore } from "./grader.js";
+export { dedupAndCapWarnings } from "./harness.js";
+export {
+  DEFAULT_SPEC_VERSION,
+  LEGACY_SPEC_VERSION,
+  MODERN_SPEC_VERSION,
+  parseSpecVersionOption,
+  type SpecVersion,
+  type SpecVersionOption,
+  SUPPORTED_SPEC_VERSIONS,
+  specBaseFor,
+} from "./spec.js";
 export type { ComplianceReport, TestResult } from "./types.js";
 export { TEST_DEFINITIONS } from "./types.js";
 
@@ -23,55 +73,17 @@ const TEST_DEFINITIONS_MAP = new Map(TEST_DEFINITIONS.map((t) => [t.id, t]));
 
 const TOOL_VERSION = readPackageVersion(import.meta.url);
 
-export const SPEC_VERSION = "2025-11-25";
-export const SPEC_BASE = `https://modelcontextprotocol.io/specification/${SPEC_VERSION}`;
-
-const VALID_CONTENT_TYPES = ["text", "image", "audio", "resource", "resource_link"];
-
-const INJECTION_PAYLOADS = {
-  command: ["; cat /etc/passwd", "$(whoami)", "| ls -la", "`id`", "&& echo pwned"],
-  sql: ["' OR 1=1 --", "'; DROP TABLE users; --", "1 UNION SELECT * FROM information_schema.tables--"],
-  pathTraversal: ["../../etc/passwd", "..\\..\\windows\\system.ini", "%2e%2e%2f%2e%2e%2fetc%2fpasswd"],
-  ssrf: ["http://169.254.169.254/latest/meta-data/", "http://127.0.0.1:22", "http://[::1]/", "http://10.0.0.1/"],
-};
-
-// Patterns that indicate leakage of server internals in an error
-// response. The test name (security-error-no-stacktrace) is historical —
-// this catches stack traces *and* adjacent implementation-detail leaks
-// (filesystem paths, DB connection strings) as the rubric calls out.
-// Deliberately NOT included:
-//   - /password|passwd|secret|credential/i — false-positives every
-//     legitimate auth error ("Invalid password", "Missing credential").
-//     If you want a secrets-leak check, it belongs in its own test with
-//     a narrower signature (e.g. Bearer tokens, AWS keys).
-//   - bare /ENOENT|EACCES|EPERM/ — these appear in well-formed error
-//     messages ("ENOENT: no such file"), so we only flag them when they
-//     co-occur with a filesystem path below.
-const STACK_TRACE_PATTERNS = [
-  /at\s+\S+\s+\(.*:\d+:\d+\)/i, // Node.js: "at Function (file.js:10:5)"
-  /Traceback\s+\(most recent/i, // Python
-  /\.py",\s+line\s+\d+/i, // Python file reference
-  /\.java:\d+\)/i, // Java
-  /\.go:\d+/i, // Go
-  /from\s+\S+\.rb:\d+/i, // Ruby
-  /\.cs:line\s+\d+/i, // C#/.NET
-  /#\d+\s+\/.*\.php\(\d+\)/i, // PHP
-  /panicked\s+at\s+'/i, // Rust
-  /node_modules\//, // Node.js module paths (filesystem layout leak)
-  /\/usr\/local\/|\/home\/|\/root\//, // Unix absolute paths
-  /[A-Z]:\\[\w\s.-]+\\[\w\s.-]+/, // Windows absolute paths (drive + 2+ segments)
-  /jdbc:|mysql:\/\/|postgres(?:ql)?:\/\/|mongodb(?:\+srv)?:\/\//i, // DB connection strings
-];
-
-const INTERNAL_IP_PATTERNS = [
-  /\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
-  /\b172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/,
-  /\b192\.168\.\d{1,3}\.\d{1,3}\b/,
-  /\b127\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
-  /\b::1\b/, // IPv6 loopback
-  /\bfe80:/i, // IPv6 link-local
-  /\bf[cd][0-9a-f]{2}:/i, // IPv6 unique local (fc00::/fd00::)
-];
+/**
+ * The legacy (2025-11-25) spec version. Kept for library consumers that
+ * pinned against a single global; runs may now resolve to a different
+ * version (see `RunOptions.specVersion`), so read `report.specVersion`
+ * and use `specBaseFor(report.specVersion)` for spec links.
+ *
+ * @deprecated Use `LEGACY_SPEC_VERSION` / `SUPPORTED_SPEC_VERSIONS` and `specBaseFor()`.
+ */
+export const SPEC_VERSION: SpecVersion = LEGACY_SPEC_VERSION;
+/** @deprecated Use `specBaseFor(version)`. */
+export const SPEC_BASE = specBaseFor(LEGACY_SPEC_VERSION);
 
 function createIdCounter(start = 0) {
   let id = start;
@@ -79,25 +91,507 @@ function createIdCounter(start = 0) {
 }
 
 /**
- * Dedupe and cap a list of warnings, preserving insertion order and
- * appending a truncation sentinel when capped. Extracted so the cap
- * semantics can be unit-tested without spinning up a suite run.
- *
- * @internal Exported for testing.
+ * undici rejects an `AbortSignal.timeout()` with a DOMException named
+ * `TimeoutError`; its own deadlines reject with `HeadersTimeoutError` /
+ * `BodyTimeoutError`. A refused connection or DNS failure is a plain
+ * Error with an errno code (ECONNREFUSED, ENOTFOUND) and no such name.
  */
-export function dedupAndCapWarnings(warnings: readonly string[], max: number): string[] {
-  const seen = new Set<string>();
-  const deduped: string[] = [];
-  for (const w of warnings) {
-    if (seen.has(w)) continue;
-    seen.add(w);
-    deduped.push(w);
+function isTimeoutError(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return typeof name === "string" && /timeout/i.test(name);
+}
+
+function formatSeconds(ms: number): string {
+  return ms % 1000 === 0 ? `${ms / 1000}s` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** Collapse whitespace (a transport error carries a multi-line stderr tail) and cap the length for a details string. */
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 3)}...` : flat;
+}
+
+/** The first line of an error's message, capped: the stdio transport appends the child's stderr below it. */
+function errorLine(err: unknown, max: number): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return oneLine(message.split("\n")[0] ?? "", max);
+}
+
+/**
+ * What a request that got no response ran into, read from the error the
+ * way the 2026-07-28 suite reads it (classifyTransportError): "no response
+ * within Nms" for a timeout, "no response (connection closed: ...)" for a
+ * connection the server closed or reset (or a stdio child that exited),
+ * and "no response (connection failed: ...)" for everything else, a
+ * connection that was never established included.
+ */
+function noResponse(err: unknown, timeoutMs: number): string {
+  const failure = classifyTransportError(err);
+  if (failure === "timeout") return `no response within ${timeoutMs}ms`;
+  const how = failure === "dropped" ? "connection closed" : "connection failed";
+  return `no response (${how}: ${errorLine(err, 90)})`;
+}
+
+/**
+ * One check's verdict, as the legacy suite's test bodies return it: the
+ * harness's own TestOutcome, so a pass that measured nothing carries
+ * `skipped: true` through every helper to the report (TestResult.skipped).
+ */
+type LegacyOutcome = TestOutcome;
+
+/** The verdict for a probe that got no HTTP answer at all: "server unreachable: <what> got no response ...". */
+function unreachable(what: string, err: unknown, timeoutMs: number): LegacyOutcome {
+  return { passed: false, details: `server unreachable: ${what} got ${noResponse(err, timeoutMs)}` };
+}
+
+/**
+ * The verdict for a negative probe (no credential, a token in the query
+ * string, a foreign Origin, a duplicate initialize) that got no HTTP
+ * response, or null when the missing answer counts as the server refusing
+ * the probe. The 2026-07-28 suite's `unansweredProbe` rule, applied to the
+ * 2025-11-25 checks:
+ *
+ * - a run the caller aborted is rethrown, never graded;
+ * - a timeout is never a refusal: the connection stayed open and nothing
+ *   came back, so the probe measured nothing (a hung server or gateway);
+ * - a connection that was never established (ECONNREFUSED, ENOTFOUND, a
+ *   connect timeout) is never a refusal either: the server never saw the
+ *   request, so nothing about the probe's defect was decided;
+ * - an accepted connection the server closed or reset without answering is
+ *   the one shape a connection-level refusal takes (some gateways drop a
+ *   request that lacks a credential instead of answering 401). A drop
+ *   carries no reason, so it counts only when `attributable` -- the
+ *   comparison request that differs from the probe in nothing but the
+ *   defect (the same request carrying the credential, or without the
+ *   offending header) was served, so the defect is what drew the drop.
+ *   Without that comparison a server that drops everything would pass.
+ */
+function unansweredProbe(
+  what: string,
+  err: unknown,
+  attributable: boolean,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+): LegacyOutcome | null {
+  if (signal?.aborted) throw err;
+  if (attributable && classifyTransportError(err) === "dropped") return null;
+  return unreachable(what, err, timeoutMs);
+}
+
+/** "Connection closed without a response (<first line of the error>)" for a drop that counted as a refusal. */
+function closedWithoutResponse(err: unknown): string {
+  return `Connection closed without a response (${errorLine(err, 60)})`;
+}
+
+/** An undici header map with repeated headers joined, as the transports normalize it. */
+function flatHeaders(raw: Record<string, string | string[] | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(raw)) {
+    if (value !== undefined) out[name] = Array.isArray(value) ? value.join(", ") : value;
   }
-  if (deduped.length > max) {
-    const truncated = deduped.length - max;
-    return [...deduped.slice(0, max), `... and ${truncated} more warning(s) suppressed`];
+  return out;
+}
+
+/** ", JSON-RPC error <code>" when a response body carries a JSON-RPC error, "" otherwise. */
+function rpcErrorSuffix(body: unknown): string {
+  const error = (body as { error?: unknown } | null | undefined)?.error;
+  if (!error || typeof error !== "object") return "";
+  return `, ${errorWithCode((error as { code?: unknown }).code)}`;
+}
+
+/**
+ * The details for an answer that is neither a 401 nor a 403 to a request
+ * sent without a valid credential -- security-auth-required's
+ * unauthenticated probe, security-auth-malformed's garbage token,
+ * security-session-not-auth's session-only ping. The 2025-11-25 counterpart
+ * of the 2026-07-28 suite's unauthenticatedOtherStatus, and it FAILS every
+ * case the same way; only the reason differs, because the fix does:
+ *
+ * - a 2xx carrying a JSON-RPC result is the request being served, the one
+ *   answer worded `accepted` ("server accepted unauthenticated request");
+ * - a 2xx carrying a JSON-RPC error is no HTTP authentication refusal:
+ *   whether the server dispatched the request and failed it or refused the
+ *   credential in JSON-RPC, a client cannot tell (basic/authorization
+ *   refuses a missing or invalid token with 401);
+ * - a 2xx carrying anything else (a login page, an intermediary's page) was
+ *   neither served nor refused;
+ * - another 4xx refused the request, but not as an authentication refusal
+ *   (a wrong path, a gateway or a rate limiter);
+ * - a 5xx is the server failing on the request rather than refusing it;
+ * - a 3xx sent the client somewhere else instead of answering.
+ *
+ * `what` names the probe ("the unauthenticated ping"); `tail` is what the
+ * spec expects instead, appended to every case but the served one.
+ */
+function unrefusedAnswer(
+  res: { statusCode: number; body: unknown },
+  what: string,
+  accepted: string,
+  tail: string,
+): LegacyOutcome {
+  const status = res.statusCode;
+  const body = res.body as { result?: unknown; error?: unknown } | null | undefined;
+  const is2xx = status >= 200 && status < 300;
+  if (is2xx && body?.result !== undefined && body?.error === undefined) {
+    return { passed: false, details: `HTTP ${status} — ${accepted}` };
   }
-  return deduped;
+  const seen = `HTTP ${status}${rpcErrorSuffix(body)} on ${what}`;
+  let reading: string;
+  if (is2xx) {
+    reading =
+      body?.error !== undefined && body?.error !== null
+        ? "a JSON-RPC error on a 2xx, not an HTTP authentication refusal (a client cannot tell it from the server failing the request)"
+        : "a non-JSON-RPC body, neither served nor refused (a login page or an intermediary's page)";
+  } else if (status >= 500) {
+    reading =
+      "the server failed on the request rather than refusing it (a broken server, or a gateway with no backend)";
+  } else if (status >= 400) {
+    reading =
+      "the request was refused, but not as an authentication refusal (a wrong path, a gateway or a rate limiter)";
+  } else {
+    reading = "the server redirected the request instead of answering it";
+  }
+  return { passed: false, details: `${seen} -- ${reading}; ${tail}` };
+}
+
+/**
+ * What the conformant twin of a negative probe got: the request the probe
+ * differs from in nothing but its defect (a ping next to the same ping
+ * without a credential, or next to an unknown method; a single
+ * application/json ping next to a text/plain one or a batch).
+ */
+interface TwinAnswer {
+  /** Whether the twin was served: a JSON-RPC result on a 2xx. */
+  served: boolean;
+  /** "was served", "was refused (HTTP 403, JSON-RPC error -32000)", "was not served (HTTP 400, ...)", "got no response ...". */
+  outcome: string;
+  /** The twin's HTTP status, when it got an answer. */
+  statusCode?: number;
+}
+
+/** Read a twin's answer (see TwinAnswer). */
+function twinAnswer(res: { statusCode: number; body: unknown }): TwinAnswer {
+  const body = res.body as { result?: unknown } | null | undefined;
+  if (res.statusCode >= 200 && res.statusCode < 300 && body?.result !== undefined) {
+    return { served: true, outcome: "was served", statusCode: res.statusCode };
+  }
+  const refused = res.statusCode === 401 || res.statusCode === 403;
+  return {
+    served: false,
+    outcome: `${refused ? "was refused" : "was not served"} (HTTP ${res.statusCode}${rpcErrorSuffix(res.body)})`,
+    statusCode: res.statusCode,
+  };
+}
+
+/** A server-chosen message for a details string: quoted, with anything outside printable ASCII replaced by "?". */
+function quoteMessage(message: string): string {
+  return JSON.stringify(message.replace(/[^\x20-\x7e]/g, "?"));
+}
+
+/** A raw HTTP body read the way the preflight reads one: SSE, then JSON, else undefined. */
+function parseRawBody(text: string, contentType: string | string[] | undefined): unknown {
+  const ct = (Array.isArray(contentType) ? contentType[0] : contentType || "").toLowerCase();
+  if (ct.includes("text/event-stream")) {
+    const parsed = parseSSEResponse(text);
+    if (parsed !== null) return parsed;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The JSON-RPC error codes that are a server's own rejection of each
+ * negative probe's defect: -32600 (Invalid Request) for a batch, -32600 or
+ * -32602 (Invalid params) for an initialize requesting an unknown protocol
+ * version, -32601 (Method not found) for an unknown method. A gateway with
+ * no backend cannot produce them -- it has not read the request -- so a
+ * 5xx carrying one is the server rejecting the defect on an odd status
+ * (gateRefusal). -32603 (Internal error), a server-defined -32000..-32099
+ * code, or no JSON-RPC error at all is no such rejection.
+ */
+const BATCH_REJECTION_CODES: readonly number[] = [-32600];
+const VERSION_REJECTION_CODES: readonly number[] = [-32600, -32602];
+const METHOD_REJECTION_CODES: readonly number[] = [-32601];
+
+/** The JSON-RPC error code a response body carries, when it is one of `codes`. */
+function ownRejectionCode(body: unknown, codes: readonly number[]): number | undefined {
+  const code = (body as { error?: { code?: unknown } } | null | undefined)?.error?.code;
+  return typeof code === "number" && codes.includes(code) ? code : undefined;
+}
+
+/**
+ * The warning for a negative probe the server rejected with its own
+ * JSON-RPC error (see ownRejectionCode) on a 5xx: credited, but the status
+ * tells clients and gateways that the server failed.
+ */
+function rejectionOn5xxWarning(check: string, statusCode: number, code: number, defect: string): string {
+  return `${check}: the server rejected ${defect} with JSON-RPC error ${code} on HTTP ${statusCode}; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).`;
+}
+
+/**
+ * The verdict for an answer to a negative probe -- a text/plain POST, a
+ * batch, an initialize requesting an unknown protocol version, an unknown
+ * method -- that something in front of the server gave in its place, read
+ * much as lifecycle-reinit-reject reads the duplicate initialize (which,
+ * unlike these probes, also fails a 403 naming Host/Origin validation and
+ * every 5xx without asking a twin or the body). Read from
+ * the status, so a JSON-RPC error body on it (a gateway's -32001
+ * "Unauthorized") is the gate's too:
+ *
+ * - a 429: a rate limiter answered before the server read the request (the
+ *   caller has already resent the probe once after Retry-After);
+ * - a 5xx: the server failed on the request rather than refusing it, or a
+ *   gateway with no backend answered -- no rejection either way -- unless
+ *   its body carries one of `ownCodes`, the JSON-RPC error that is the
+ *   server's own rejection of the defect (see ownRejectionCode): that 5xx
+ *   is credited, and the caller warns about the status;
+ * - a 401, or a 403 carrying a Bearer challenge: an auth gate (readAuthRefusal),
+ *   which refuses the credential, not the defect.
+ *
+ * Null for any other answer, every 403 without a Bearer challenge included:
+ * whether one is a gate is for the probe's conformant twin to say (see
+ * bare403Verdict), even when its message names Host or Origin validation.
+ * `seen` opens the details ("HTTP 401, JSON-RPC error -32001 on the batch");
+ * `defect` names what the probe varies ("the Content-Type").
+ */
+function gateRefusal(
+  seen: string,
+  res: { statusCode: number; headers: Record<string, string>; body: unknown },
+  authorizationSent: boolean,
+  defect: string,
+  ownCodes: readonly number[] = [],
+): LegacyOutcome | null {
+  if (res.statusCode === 429) {
+    return {
+      passed: false,
+      details: `${seen} -- not evaluable: a rate limiter answered before the server read the request, so ${defect} was never looked at`,
+    };
+  }
+  if (res.statusCode >= 500) {
+    if (ownRejectionCode(res.body, ownCodes) !== undefined) return null;
+    return {
+      passed: false,
+      details: `${seen} -- the server failed on the request rather than refusing it (a broken server, or a gateway with no backend), which is no rejection of ${defect}`,
+    };
+  }
+  const refusal = readAuthRefusal(res, authorizationSent);
+  if (!refusal || refusal.kind === "forbidden") return null;
+  return {
+    passed: false,
+    details: `${seen} -- not evaluable: an auth gate answered before the server read the request (${authRefusalHint(refusal, "pass --auth")})`,
+  };
+}
+
+/**
+ * A 403 without a Bearer challenge on a negative probe is the one refusal
+ * that may be either: a gate refusing every request, or the server (or a
+ * WAF) refusing the defect. `twin` -- the conformant request the probe
+ * differs from in nothing but the defect, with the same headers (Host and
+ * Origin included) -- tells them apart: when it was served, or drew a
+ * different status, the defect is what drew the 403, and the refusal is
+ * credited (null here), whatever its message says. When it drew the same
+ * 403, or no answer, the 403 is not attributable and the probe fails as not
+ * evaluable, security-origin-validation's reading of the same 403: quoting
+ * the message when the twin drew the same 403 and the message names Host
+ * or Origin validation (a guard that refuses a request whatever it
+ * carries), naming the twin's answer otherwise. `twinName` names the twin
+ * ("the same request for ping"). Only asked for a 403, so a server that
+ * answers otherwise is sent nothing more. A caller's abort (while the twin
+ * is sent) is rethrown by `twin`.
+ */
+async function bare403Verdict(
+  seen: string,
+  res: { statusCode: number; headers: Record<string, string>; body: unknown },
+  authorizationSent: boolean,
+  defect: string,
+  twinName: string,
+  twin: () => Promise<TwinAnswer>,
+): Promise<LegacyOutcome | null> {
+  if (res.statusCode !== 403) return null;
+  const answer = await twin();
+  if (answer.served || (answer.statusCode !== undefined && answer.statusCode !== res.statusCode)) return null;
+  const message = readAuthRefusal(res, authorizationSent)?.message;
+  if (answer.statusCode === res.statusCode && namesHostOrOriginValidation(message)) {
+    return {
+      passed: false,
+      details: `${seen} (${quoteMessage(message ?? "")}) -- not evaluable: the message names Host/Origin validation, which refuses a request whatever it carries`,
+    };
+  }
+  return {
+    passed: false,
+    details: `${seen} -- not evaluable: ${twinName} ${answer.outcome} too, so the 403 is not attributable to ${defect} (see security-auth-required)`,
+  };
+}
+
+/** Resolve after `ms`, or reject with the abort reason as soon as `signal` aborts. */
+function pause(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** The probe answer in a pinned-run warning: "a DiscoverResult (...)" or the raw shape ("JSON-RPC error -32601"). */
+function describeProbeAnswer(d: DetectionResult): string {
+  if (d.discover) return `a DiscoverResult (supportedVersions [${(d.supportedVersions ?? []).join(", ")}])`;
+  const rest = d.reason.startsWith(REASON_PREFIX) ? d.reason.slice(REASON_PREFIX.length) : d.reason;
+  const shape = rest.replace(/, legacy$/, "");
+  return /^(JSON-RPC|HTTP|modern|no )/.test(shape) ? shape : `a ${shape}`;
+}
+
+/**
+ * Why a credential-rejected 401/403 refused the token, from its Bearer
+ * challenge's `error` when it names one (RFC 6750 3.1), else from the
+ * status (basic/authorization: "Invalid or expired tokens MUST receive a
+ * HTTP 401"; 403 is "Invalid scopes or insufficient permissions").
+ */
+function credentialRejectionReason(refusal: AuthRefusal): string {
+  const { statusCode: status, bearerError: error } = refusal;
+  if (error === undefined) {
+    return status === 403
+      ? "a 403 means the token lacks a required scope or permission"
+      : "a 401 means the token is invalid or expired";
+  }
+  const challenge = `the ${status}'s Bearer error="${error}" challenge`;
+  switch (error) {
+    case "invalid_token":
+      return `${challenge} means the token is invalid or expired${status === 403 ? " (basic/authorization requires a 401 for that)" : ""}`;
+    case "insufficient_scope":
+      return `${challenge} means the token lacks a required scope or permission`;
+    case "invalid_request":
+      return `${challenge} means the request is malformed (an unsupported parameter, or the token sent more than one way)`;
+    default:
+      return `${challenge} refuses the token`;
+  }
+}
+
+/**
+ * The first-position warning for a preflight / era probe that drew
+ * 401/403, worded from how the refusal reads (see readAuthRefusal):
+ * - `auth-required` (no Authorization header; a 401, or a 403 with a
+ *   Bearer challenge): re-run with --auth.
+ * - `credential-rejected` (a header was sent; a 401, or a 403 whose Bearer
+ *   challenge carries an error): check the --auth value, with the reason
+ *   named from the challenge's error.
+ * - `forbidden` (any other 403): neutral. It is as likely Host/Origin
+ *   validation (streamable-http requires 403 for an invalid Origin; the
+ *   SDK's Host guard answers a tunnel hostname with it) or a gateway, so
+ *   it names those first, then the token's permissions or, with no header
+ *   sent, --auth only if the server does require a credential (a server
+ *   that wants a token answers 401). A JSON-RPC error message in the body
+ *   ("Invalid Host: ...") is quoted.
+ */
+function authRejectionWarning(opts: {
+  displayUrl: string;
+  refusal: AuthRefusal;
+  spec: SpecVersion;
+  auto: boolean;
+}): string {
+  const { displayUrl, refusal, spec } = opts;
+  const status = refusal.statusCode;
+  const probe = opts.auto ? "the server/discover probe" : "the preflight";
+  const era = opts.auto ? "the era could not be determined and " : "";
+  switch (refusal.kind) {
+    case "auth-required":
+      return `Server at ${displayUrl} requires authentication (${probe} got HTTP ${status}) and no Authorization header was sent, so ${era}the ${spec} grade below is not meaningful. Re-run with --auth <token> (or -H "Authorization: ...").`;
+    case "credential-rejected":
+      return `Server at ${displayUrl} rejected the configured credential (${probe} carried an Authorization header and got HTTP ${status}), so ${era}the ${spec} grade below is not meaningful. Check the --auth value (or the -H "Authorization: ..." header): ${credentialRejectionReason(refusal)}.`;
+  }
+  const said = refusal.message ? ` (${JSON.stringify(refusal.message)})` : "";
+  if (refusal.authorizationSent) {
+    return `Server at ${displayUrl} refused ${probe} with HTTP ${status}${said}, so ${era}the ${spec} grade below is not meaningful. The request carried an Authorization header, but the ${status} has no WWW-Authenticate: Bearer challenge with an error parameter, so it need not be about the credential: check the server's Host and Origin validation (a tunnel or proxy hostname it does not allow), any gateway in front of it, and the permissions of the --auth token.`;
+  }
+  return `Server at ${displayUrl} refused ${probe} with HTTP ${status}${said} and no Authorization header was sent, so ${era}the ${spec} grade below is not meaningful. The ${status} has no WWW-Authenticate: Bearer challenge, and a server that requires a token answers 401, so it need not be about authentication: check the server's Host and Origin validation (a tunnel or proxy hostname it does not allow) and any gateway in front of it; re-run with --auth <token> (or -H "Authorization: ...") only if the server does require a credential.`;
+}
+
+/** The refusal to word a warning from when an undetermined era carries none (classifyDiscoverResponse always sets one). */
+function assumedRefusal(authorizationSent: boolean): AuthRefusal {
+  return { statusCode: 401, authorizationSent, kind: authorizationSent ? "credential-rejected" : "auth-required" };
+}
+
+/** Propagate a caller's abort between phases that no test() gate covers (preflight, detection, handshake). */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
+}
+
+/**
+ * Spawn the stdio child a target describes. Shared with the benchmark so
+ * both re-spawn the same way when the era probe kills a legacy child.
+ * @internal
+ */
+export function spawnStdioTarget(target: Extract<TransportTarget, { type: "stdio" }>): StdioTransport {
+  return createStdioTransport({
+    command: target.command,
+    args: target.args,
+    env: target.env,
+    cwd: target.cwd,
+    verbose: target.verbose,
+  });
+}
+
+/**
+ * Whether a server-chosen value can go out verbatim as an HTTP header
+ * value: one or more visible ASCII characters, so no whitespace, no CR/LF
+ * and nothing non-ASCII. The negotiated protocolVersion is carried into
+ * MCP-Protocol-Version on every later request, and undici throws "invalid
+ * mcp-protocol-version header" for anything else -- one bad initialize
+ * result would fail every request after it on the client's side. Shared
+ * with the benchmark's handshake.
+ * @internal
+ */
+export function isHeaderToken(value: unknown): value is string {
+  return typeof value === "string" && /^[\x21-\x7e]+$/.test(value);
+}
+
+/**
+ * Warnings for `only` / `skip` values that select nothing in a catalog:
+ * values that name no test id or category in it (ids are only meaningful
+ * within one catalog -- a legacy id such as lifecycle-init does not exist
+ * in 2026-07-28), and `only` values whose every match is gated off the
+ * target transport (transport-post on a stdio target). Without these a
+ * filtered run silently produces an empty (grade F) or partial report.
+ * Shared by the live run and `--list`.
+ * @internal
+ */
+export function filterWarnings(
+  specVersion: SpecVersion,
+  transport: "http" | "stdio",
+  only: readonly string[] | undefined,
+  skip: readonly string[] | undefined,
+): string[] {
+  const catalog = getTestDefinitionMap(specVersion);
+  const defs = [...catalog.values()];
+  const categories = new Set(defs.map((d) => d.category as string));
+  const supports = specVersion === LEGACY_SPEC_VERSION ? supportsTransport : supportsTransportByDefinition;
+  const out: string[] = [];
+  const unknown = [...(only ?? []), ...(skip ?? [])].filter((f) => !catalog.has(f) && !categories.has(f));
+  if (unknown.length > 0) {
+    out.push(
+      `Filter value(s) ${unknown.map((u) => `"${u}"`).join(", ")} match no test id or category in the ${specVersion} catalog; run --list --spec-version ${specVersion} to see valid ids.`,
+    );
+  }
+  const other = transport === "http" ? "stdio" : "http";
+  const gated = (only ?? []).filter((f) => {
+    const matches = defs.filter((d) => d.id === f || d.category === f);
+    return matches.length > 0 && matches.every((d) => !supports(d, transport));
+  });
+  if (gated.length > 0) {
+    out.push(
+      `Filter value(s) ${gated.map((g) => `"${g}"`).join(", ")} match only tests that do not apply to a ${transport} target (${other}-only), so they select nothing here; run --list --transport ${transport} --spec-version ${specVersion} to see the ids that apply.`,
+    );
+  }
+  return out;
 }
 
 /**
@@ -173,34 +667,50 @@ export interface PreviewOptions {
   only?: string[];
   /** Exclude matching categories or test IDs. */
   skip?: string[];
+  /**
+   * Spec revision whose catalog to preview. Defaults to 2025-11-25.
+   * There is no `auto` here: a preview never connects, so it cannot
+   * detect the server's era.
+   */
+  specVersion?: SpecVersion;
 }
 
 /**
  * Return the set of TestDefinitions that would actually run given the
  * filters. Powers the CLI's --list flag without requiring a connection.
  * Capability-gated tests are still included — that gating happens after
- * the live initialize handshake and can't be predicted offline.
+ * the live handshake / discover and can't be predicted offline.
+ *
+ * Filter precedence mirrors the live run (`only` wins; `skip` is only
+ * consulted when `only` is empty) so `--list` predicts what will run.
  */
 export function previewTests(opts: PreviewOptions = {}): TestDefinition[] {
   const transport = opts.transport ?? "http";
-  return TEST_DEFINITIONS.filter((def) => {
-    if (!supportsTransport(def, transport)) return false;
+  const specVersion = opts.specVersion ?? LEGACY_SPEC_VERSION;
+  const supports = specVersion === LEGACY_SPEC_VERSION ? supportsTransport : supportsTransportByDefinition;
+  const defs = [...getTestDefinitionMap(specVersion).values()];
+  return defs.filter((def) => {
+    if (!supports(def, transport)) return false;
     if (opts.only?.length) {
-      if (!opts.only.includes(def.category) && !opts.only.includes(def.id)) return false;
+      return opts.only.includes(def.category) || opts.only.includes(def.id);
     }
     if (opts.skip?.length) {
-      if (opts.skip.includes(def.category) || opts.skip.includes(def.id)) return false;
+      return !opts.skip.includes(def.category) && !opts.skip.includes(def.id);
     }
     return true;
   });
 }
 
 export interface RunOptions {
-  /** Optional callback for progress updates (legacy minimal signature). */
+  /**
+   * Optional callback for progress updates (legacy minimal signature).
+   * It carries no skip flag: a skip arrives as `passed: true`. Use
+   * `onTestComplete` and read `result.skipped` to tell them apart.
+   */
   onProgress?: (testId: string, passed: boolean, details: string) => void;
   /**
    * Optional callback fired after each test completes with the full
-   * TestResult (category, required, durationMs, specRef). Prefer this
+   * TestResult (category, required, skipped, durationMs, specRef). Prefer this
    * over onProgress for live dashboards and streaming UIs that need
    * structured data per test.
    */
@@ -227,8 +737,22 @@ export interface RunOptions {
   only?: string[];
   /** Skip tests matching these category names or test IDs */
   skip?: string[];
-  /** Preflight connectivity check timeout in milliseconds (default: min(timeout, 10000)) */
+  /**
+   * HTTP only: deadline for the preflight request, in milliseconds
+   * (default: min(timeout, 10000)). The preflight body is the era probe,
+   * so under `specVersion: "auto"` a preflight that TIMES OUT (as
+   * opposed to a refused connection) is re-probed once within
+   * `startupTimeout` before the run defaults to 2025-11-25.
+   */
   preflightTimeout?: number;
+  /**
+   * Optional callback for human-facing status lines while the runner is
+   * waiting on something no test has started yet -- today the stdio era
+   * probe, which fires this ~2s in when a 2025-11-25 server that ignores
+   * unknown methods is silently costing the whole startup timeout. Not
+   * part of the report; the CLI prints it dim to stderr in terminal mode.
+   */
+  onStatus?: (message: string) => void;
   /**
    * Maximum number of parallel-safe tests in flight at once. Default 1
    * (strictly sequential — matches pre-0.12 behavior). Tests are only
@@ -248,6 +772,16 @@ export interface RunOptions {
    * stops the server from burning compute on a dropped client.
    */
   signal?: AbortSignal;
+  /**
+   * Which MCP specification revision to test against. `auto` (default)
+   * probes the server with a modern `server/discover` request and grades
+   * the newest era it speaks: a DiscoverResult or a recognised modern
+   * error (-32020/-32021/-32022) selects 2026-07-28, anything else —
+   * including no reply — selects 2025-11-25. A dual-era server is graded
+   * as 2026-07-28 and the report warns that the legacy side was not
+   * tested. The report's `specVersion` is always the RESOLVED version.
+   */
+  specVersion?: SpecVersionOption;
 }
 
 /**
@@ -276,20 +810,22 @@ export async function runComplianceSuite(
     throw new Error("stdio target requires a command");
   }
 
-  // Construct transport.
-  const transport: Transport =
+  // Construct transport. The stdio factory is kept so the modern suite
+  // can spawn an independent second instance for probes that must not
+  // share the suite's process (a dual-era stdio server pins its era per
+  // process).
+  const spawnStdio = () => (resolvedTarget.type === "stdio" ? spawnStdioTarget(resolvedTarget) : null);
+  // Reassigned once, and only on stdio: when the era probe kills the child
+  // (a legacy server that exits on an unknown pre-initialize request) the
+  // suite runs against a fresh instance; `finally` closes whichever is
+  // current.
+  let transport: Transport =
     resolvedTarget.type === "http"
       ? createHttpTransport({
           url: resolvedTarget.url,
           headers: resolvedTarget.headers ?? options.headers,
         })
-      : createStdioTransport({
-          command: resolvedTarget.command,
-          args: resolvedTarget.args,
-          env: resolvedTarget.env,
-          cwd: resolvedTarget.cwd,
-          verbose: resolvedTarget.verbose,
-        });
+      : (spawnStdio() as Transport);
 
   // Wrap everything below in try/finally so the child process is always
   // cleaned up — even if a test throws or the runner aborts mid-suite.
@@ -307,48 +843,269 @@ export async function runComplianceSuite(
         ? resolvedTarget.url
         : `stdio:${resolvedTarget.command}${resolvedTarget.args?.length ? ` ${resolvedTarget.args.join(" ")}` : ""}`;
 
+    const clientInfo = { name: "mcp-compliance", version: TOOL_VERSION };
+    const requested: SpecVersionOption = options.specVersion ?? "auto";
+
+    // Use high start offset for the main ID counter to avoid collision with transport test hardcoded IDs
+    const nextId = createIdCounter(1000);
+    const timeout = options.timeout || 15000;
+    // Startup budget covers the first exchange: the stdio era probe, the
+    // legacy initialize + initialized notification, and on HTTP the era
+    // re-probe after a preflight timeout. Cold `npx @pkg serve` targets
+    // can take 20-40s to resolve and exec the package before the MCP loop
+    // runs; a 15s request timeout would fire before the first byte.
+    // Default to max(timeout, 60000).
+    const startupTimeout = options.startupTimeout ?? Math.max(timeout, 60000);
+    const preflightTimeout = options.preflightTimeout ?? Math.min(timeout, 10000);
+
     // Preflight connectivity check — fail fast instead of running all tests
-    // against an unreachable server. HTTP-only: a quick ping catches DNS,
-    // TLS, and connection-refused failures before we burn through 80
-    // tests. For stdio there's no equivalent — spawn errors surface via
-    // the child 'error' event (handled by the transport) and the
-    // lifecycle-init test is the real reachability signal.
+    // against an unreachable server. HTTP-only: a quick request catches DNS,
+    // TLS, and connection-refused failures before we burn through the
+    // suite. For stdio there's no equivalent — spawn errors surface via
+    // the child 'error' event (handled by the transport) and the first
+    // exchange is the real reachability signal.
+    //
+    // The preflight body is the spec's era probe — a modern
+    // `server/discover` with full `_meta` and headers — so on HTTP one
+    // round-trip answers both "is it up" and "which era does it speak".
+    // Any HTTP response at all counts as reachable. A thrown error is
+    // split two ways: a TIMEOUT (the server may just be cold; under
+    // `auto` the probe is retried within the startup budget below) and a
+    // connection failure (refused, DNS, TLS), which marks the server
+    // unreachable right away.
     let serverReachable = true;
+    let preflightResponse: TransportResponse | null = null;
+    let preflightTimedOut = false;
+    let preflightError = "";
     if (resolvedTarget.type === "http") {
       try {
-        const preflightTimeout = options.preflightTimeout ?? Math.min(options.timeout || 15000, 10000);
+        const probe = buildDiscoverProbe(clientInfo);
+        // The caller's abort must cancel the preflight too: on HTTP it is
+        // the era probe, and the first test() gate is up to
+        // preflightTimeout away.
+        const deadline = AbortSignal.timeout(preflightTimeout);
         const preflight = await request(resolvedTarget.url, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Accept: "application/json, text/event-stream",
+            ...probe.headers,
             ...userHeaders,
           },
-          body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "ping" }),
-          signal: AbortSignal.timeout(preflightTimeout),
+          body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "server/discover", params: probe.params }),
+          signal: options.signal ? AbortSignal.any([options.signal, deadline]) : deadline,
         });
-        await preflight.body.text();
-      } catch {
+        const text = await preflight.body.text();
+        const rawCt = preflight.headers["content-type"];
+        const ct = (Array.isArray(rawCt) ? rawCt[0] : rawCt || "").toLowerCase();
+        let body: unknown = null;
+        if (ct.includes("text/event-stream")) body = parseSSEResponse(text);
+        if (body === null) {
+          try {
+            body = JSON.parse(text);
+          } catch {
+            body = { _raw: text };
+          }
+        }
+        // The headers are kept: a 401/403's WWW-Authenticate challenge
+        // decides how the refusal reads (readAuthRefusal).
+        const headers: Record<string, string> = {};
+        for (const [name, value] of Object.entries(preflight.headers)) {
+          if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(", ") : value;
+        }
+        preflightResponse = { body, requestId: 0, statusCode: preflight.statusCode, headers };
+      } catch (err: unknown) {
+        throwIfAborted(options.signal);
         serverReachable = false;
+        preflightTimedOut = isTimeoutError(err);
+        preflightError = err instanceof Error ? err.message : String(err);
       }
     }
 
-    const tests: TestResult[] = [];
-    const warnings: string[] = [];
-    if (!serverReachable) {
-      warnings.push(
-        `Server at ${displayUrl} is unreachable — all tests will fail. Check the URL or command and ensure the server is running.`,
+    const preWarnings: string[] = [];
+    const hasAuthHeader = Object.keys(userHeaders).some((h) => h.toLowerCase() === "authorization");
+
+    // ── Spec version resolution ──────────────────────────────────────
+    // `auto` classifies the spec's own era probe (a modern
+    // `server/discover`). On HTTP the preflight already sent it; on stdio
+    // it is the first exchange and shares the startup budget. An
+    // unreachable HTTP server takes the legacy default, so today's
+    // "everything fails" report shape is preserved.
+    let detection: DetectionResult | undefined;
+    let resolvedSpec: SpecVersion;
+    let reprobedAfterTimeout = false;
+    if (requested === "auto" && resolvedTarget.type === "http" && preflightTimedOut) {
+      // The preflight deadline is short by design (min(timeout, 10s)) and
+      // a modern server on a cold start can miss it; the legacy path gave
+      // that server the whole startup budget for `initialize`, so give
+      // the era probe the same budget before defaulting to 2025-11-25.
+      reprobedAfterTimeout = true;
+      options.onStatus?.(
+        `Preflight got no reply within ${preflightTimeout}ms; re-sending the era probe (server/discover, up to ${formatSeconds(startupTimeout)}) before defaulting to ${LEGACY_SPEC_VERSION}.`,
       );
+      const retry = await detectSpecVersion(transport, {
+        nextId,
+        timeout: startupTimeout,
+        clientInfo,
+        signal: options.signal,
+        authorizationSent: hasAuthHeader,
+      });
+      throwIfAborted(options.signal);
+      if (retry.responded) {
+        serverReachable = true;
+        detection = retry;
+      }
     }
-    // Use high start offset for the main ID counter to avoid collision with transport test hardcoded IDs
-    const nextId = createIdCounter(1000);
-    const timeout = options.timeout || 15000;
-    // Startup budget covers initialize + initialized notification. Cold
-    // `npx @pkg serve` targets can take 20-40s to resolve and exec the
-    // package before the MCP loop runs; a 15s request timeout would fire
-    // before the first byte. Default to max(timeout, 60000).
-    const startupTimeout = options.startupTimeout ?? Math.max(timeout, 60000);
-    const retries = options.retries || 0;
+    // The unreachable warning is provisional on a preflight TIMEOUT: a
+    // pinned run is not re-probed, so a slow cold start can miss the
+    // preflight and still answer the handshake; once it does, the
+    // warning is replaced (see settleUnreachableWarning).
+    let unreachableWarning: string | null = null;
+    if (!serverReachable) {
+      unreachableWarning = preflightTimedOut
+        ? `Server at ${displayUrl} did not answer the preflight within ${preflightTimeout}ms${reprobedAfterTimeout ? ` or the era probe within ${startupTimeout}ms` : ""}; treating it as unreachable -- every test that needs the server will fail. A slow cold start needs a higher --preflight-timeout${reprobedAfterTimeout ? " / --startup-timeout" : ""}.`
+        : `Server at ${displayUrl} is unreachable (${preflightError}) -- every test that needs the server will fail. Check the URL or command and ensure the server is running.`;
+      preWarnings.push(unreachableWarning);
+    }
+    const settleUnreachableWarning = (warnings: string[], answered: boolean) => {
+      if (!unreachableWarning || !preflightTimedOut || !answered) return;
+      const i = warnings.indexOf(unreachableWarning);
+      if (i === -1) return;
+      // Re-probed means auto with no era seen, so the legacy suite ran by
+      // default (a modern verdict needs an answered probe). A slow cold
+      // start is one reading; a server that never answers server/discover
+      // (a bridge in front of a 2025-11-25 server that ignores unknown
+      // methods) is the other, and for it a higher timeout only adds wait.
+      warnings[i] = reprobedAfterTimeout
+        ? `Server at ${displayUrl} did not answer the preflight within ${preflightTimeout}ms or the era probe within ${startupTimeout}ms but did answer initialize, so its era was not detected and this run defaulted to ${LEGACY_SPEC_VERSION}. A slow cold start needs a higher --preflight-timeout / --startup-timeout; a server that never answers server/discover costs that wait on every auto run, and --spec-version ${LEGACY_SPEC_VERSION} skips the re-probe.`
+        : `Server at ${displayUrl} did not answer the preflight within ${preflightTimeout}ms but did answer later requests; a slow cold start needs a higher --preflight-timeout.`;
+    };
+    // A stdio child that died on the era probe; the warning is composed
+    // once the fresh instance's first exchange has settled (a server that
+    // exits at startup regardless of the probe must not be told to pin).
+    let probeExit: ProbeExit | null = null;
+    if (requested === "auto" && serverReachable) {
+      if (!detection) {
+        detection =
+          resolvedTarget.type === "http"
+            ? classifyDiscoverResponse(preflightResponse, { authorizationSent: hasAuthHeader })
+            : await detectSpecVersion(transport, {
+                nextId,
+                timeout: startupTimeout,
+                clientInfo,
+                signal: options.signal,
+                onStatus: options.onStatus,
+              });
+        throwIfAborted(options.signal);
+      }
+      resolvedSpec = detection.version;
+      preWarnings.push(
+        `${AUTO_DETECT_NOTE_PREFIX}${resolvedSpec} (${detection.reason}). Pin with --spec-version to override.`,
+      );
+      // A legacy server whose dispatcher throws on an unknown method dies
+      // on the probe. The transport already rejected the probe with the
+      // exit diagnostic (detectSpecVersion folds that into "no response");
+      // give the suite a live child instead of a dead one, and say so
+      // once that child has shown whether it survives at all.
+      probeExit = await probeExitOf(transport);
+      if (probeExit) {
+        await transport.close().catch(() => {});
+        transport = spawnStdio() as Transport;
+        if (detection.era === "modern") {
+          // The modern suite's first exchange is its own discover; the
+          // probe was answered, so the child did not exit at startup.
+          preWarnings.push(
+            await probeExitWarning(probeExit, transport, { era: "modern", answered: true, spawner: "suite" }),
+          );
+          probeExit = null;
+        }
+      }
+      if (detection.eraUndetermined) {
+        // Read from the classified answer: after a preflight timeout the
+        // re-probe answered, and the preflight holds nothing.
+        preWarnings.unshift(
+          authRejectionWarning({
+            displayUrl,
+            refusal: detection.refusal ?? assumedRefusal(hasAuthHeader),
+            spec: resolvedSpec,
+            auto: true,
+          }),
+        );
+      }
+    } else {
+      resolvedSpec = requested === "auto" ? LEGACY_SPEC_VERSION : requested;
+      // A pinned HTTP run still sent the probe as its preflight; when the
+      // answer plainly belongs to the OTHER era, say so -- a pinned
+      // 2025-11-25 run against a modern-only server otherwise fails 20
+      // tests whose headline ("lifecycle-init: ...") never mentions
+      // 2026-07-28. A dual-era server pinned to its legacy side is not a
+      // mismatch, and a 5xx or an intermediary's page is not an era.
+      if (requested !== "auto" && preflightResponse) {
+        const seen = classifyDiscoverResponse(preflightResponse, { authorizationSent: hasAuthHeader });
+        if (seen.eraUndetermined) {
+          preWarnings.unshift(
+            authRejectionWarning({
+              displayUrl,
+              refusal: seen.refusal ?? assumedRefusal(hasAuthHeader),
+              spec: resolvedSpec,
+              auto: false,
+            }),
+          );
+        } else if (seen.version !== requested && !seen.eraUndetermined) {
+          if (seen.supportedVersions?.includes(requested)) {
+            preWarnings.push(
+              `Server is dual-era (server/discover advertised supportedVersions [${seen.supportedVersions.join(", ")}]); this run grades its ${requested} side.`,
+            );
+          } else if (seen.era === "modern" || probeAnswerShowsEra(preflightResponse)) {
+            preWarnings.push(
+              `Server answered the ${MODERN_SPEC_VERSION} server/discover probe with ${describeProbeAnswer(seen)}; this run is pinned to ${requested}. Re-run with --spec-version ${seen.version} (or auto) to grade it.`,
+            );
+          }
+        }
+      }
+    }
+
+    // `--only` / `--skip` values that match nothing in the resolved
+    // catalog, or only tests gated off this transport, would silently
+    // produce an empty (grade F) or partial run: name the miss.
+    preWarnings.push(...filterWarnings(resolvedSpec, transport.kind, options.only, options.skip));
+
+    if (resolvedSpec === MODERN_SPEC_VERSION) {
+      const report = await runModernSuite({
+        transport,
+        options,
+        nextId,
+        timeout,
+        startupTimeout,
+        backendUrl,
+        userHeaders,
+        displayUrl,
+        toolVersion: TOOL_VERSION,
+        detection,
+        warnings: preWarnings,
+        spawnFresh: resolvedTarget.type === "stdio" ? () => spawnStdio() as Transport : undefined,
+      });
+      // A served discover (the suite's first exchange) is proof the server
+      // was reachable after all.
+      settleUnreachableWarning(report.warnings, report.serverInfo.protocolVersion !== null);
+      return report;
+    }
+
+    const harness = createHarness({
+      definitions: TEST_DEFINITIONS_MAP,
+      specBase: SPEC_BASE,
+      transportKind: transport.kind,
+      supportsTransport,
+      only: options.only,
+      skip: options.skip,
+      retries: options.retries,
+      concurrency: options.concurrency,
+      signal: options.signal,
+      onProgress: options.onProgress,
+      onTestComplete: options.onTestComplete,
+    });
+    const { tests, warnings, test, drainPool } = harness;
+    warnings.push(...preWarnings);
 
     // Session state — kept as locals for backwards-compat with existing
     // call sites that reference `sessionId`/`negotiatedProtocolVersion`
@@ -380,12 +1137,14 @@ export async function runComplianceSuite(
         timeout: timeoutMs,
         headers: extraHeaders,
         omitUserHeaders,
+        signal: options.signal,
       });
       return {
         statusCode: res.statusCode ?? 200,
         body: res.body as any,
         headers: res.headers ?? {},
-        requestId: res.requestId,
+        // The legacy suite only ever allocates numeric ids.
+        requestId: res.requestId as number,
       };
     }
     async function mcpNotification(
@@ -398,24 +1157,13 @@ export async function runComplianceSuite(
       const res = await transport.notify(method, params, {
         timeout: timeoutMs,
         headers: extraHeaders,
+        signal: options.signal,
       });
       return { statusCode: res.statusCode ?? 200, headers: res.headers ?? {} };
     }
 
     const rpc = (method: string, params?: unknown) =>
       mcpRequest(backendUrl, method, params, nextId, buildHeaders(), timeout);
-
-    function shouldRun(id: string, category: string): boolean {
-      const def = TEST_DEFINITIONS_MAP.get(id);
-      if (!supportsTransport(def, transport.kind)) return false;
-      if (options.only && options.only.length > 0) {
-        return options.only.includes(category) || options.only.includes(id);
-      }
-      if (options.skip && options.skip.length > 0) {
-        return !options.skip.includes(category) && !options.skip.includes(id);
-      }
-      return true;
-    }
 
     const serverInfo = {
       protocolVersion: null as string | null,
@@ -430,98 +1178,90 @@ export async function runComplianceSuite(
     let promptCount = 0;
     let promptNames: string[] = [];
 
-    // Parallel execution pool. Tests marked `parallelSafe: true` in
-    // TEST_DEFINITIONS are queued here up to `concurrency` at a time.
-    // Sequential tests call `drainPool()` first to barrier against any
-    // pending parallel work, so order-dependent state (cachedToolsList,
-    // sessionId, etc.) stays consistent.
-    const concurrency = Math.max(1, options.concurrency ?? 1);
-    const inFlight = new Set<Promise<void>>();
-
-    async function drainPool(): Promise<void> {
-      while (inFlight.size > 0) {
-        await Promise.race(inFlight);
-      }
-    }
-
-    async function runTestFn(
-      id: string,
-      name: string,
-      category: TestResult["category"],
-      required: boolean,
-      specRef: string,
-      fn: () => Promise<{ passed: boolean; details: string }>,
-    ): Promise<void> {
-      const start = Date.now();
-      let lastResult = { passed: false, details: "" };
-
-      for (let attempt = 0; attempt <= retries; attempt++) {
-        try {
-          lastResult = await fn();
-          if (lastResult.passed) break;
-          if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
-          lastResult = { passed: false, details: `Error: ${message}` };
-          if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-        }
-      }
-
-      const result: TestResult = {
-        id,
-        name,
-        category,
-        required,
-        passed: lastResult.passed,
-        details: lastResult.details,
-        durationMs: Date.now() - start,
-        specRef: `${SPEC_BASE}/${specRef}`,
-      };
-      tests.push(result);
-      options.onProgress?.(id, lastResult.passed, lastResult.details);
-      options.onTestComplete?.(result);
-    }
-
-    async function test(
-      id: string,
-      name: string,
-      category: TestResult["category"],
-      required: boolean,
-      specRef: string,
-      fn: () => Promise<{ passed: boolean; details: string }>,
-    ): Promise<void> {
-      // Abort gate: if the caller's signal has fired, drop any pending
-      // parallel work and propagate the reason. We check at the top of
-      // every test() call so the first awaited test after abort returns
-      // immediately rather than waiting on the rest of the suite.
-      if (options.signal?.aborted) {
-        if (inFlight.size > 0) await drainPool().catch(() => {});
-        throw options.signal.reason ?? new Error("Aborted");
-      }
-
-      if (!shouldRun(id, category)) return;
-
-      const def = TEST_DEFINITIONS_MAP.get(id);
-      const eligible = concurrency > 1 && def?.parallelSafe === true;
-
-      if (!eligible) {
-        // Sequential path: barrier against any in-flight parallel tests
-        // first, then execute synchronously. Preserves the pre-0.12
-        // ordering semantics.
-        if (inFlight.size > 0) await drainPool();
-        await runTestFn(id, name, category, required, specRef, fn);
-        return;
-      }
-
-      // Parallel path: wait for a slot, then launch without awaiting.
-      while (inFlight.size >= concurrency) await Promise.race(inFlight);
-      const p = runTestFn(id, name, category, required, specRef, fn).finally(() => {
-        inFlight.delete(p);
-      });
-      inFlight.add(p);
-    }
-
     // ── 1. TRANSPORT (basic, pre-init) ───────────────────────────────
+
+    /**
+     * The conformant twin of transport-content-type-reject's text/plain POST
+     * and transport-batch-reject's batch: the same ping sent on its own as
+     * application/json, before initialization, with the same headers --
+     * transport-post's request. The handshake cannot be the twin of these
+     * two: they run before it. Sent at most once per run, and only when one
+     * of them drew a 403 without a Bearer challenge -- one whose message
+     * names Host/Origin validation included (see bare403Verdict). A
+     * caller's abort is rethrown.
+     */
+    let preInitPingOnce: Promise<TwinAnswer> | null = null;
+    const preInitPing = (): Promise<TwinAnswer> => {
+      preInitPingOnce ??= (async () => {
+        try {
+          const res = await request(backendUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json, text/event-stream",
+              ...userHeaders,
+            },
+            body: JSON.stringify({ jsonrpc: "2.0", id: 99906, method: "ping" }),
+            signal: options.signal
+              ? AbortSignal.any([options.signal, AbortSignal.timeout(timeout)])
+              : AbortSignal.timeout(timeout),
+          });
+          const text = await res.body.text();
+          return twinAnswer({ statusCode: res.statusCode, body: parseRawBody(text, res.headers["content-type"]) });
+        } catch (err: unknown) {
+          if (options.signal?.aborted) throw err;
+          return { served: false, outcome: `got ${noResponse(err, timeout)}` };
+        }
+      })();
+      return preInitPingOnce;
+    };
+    const PRE_INIT_TWIN = "the same ping sent on its own as application/json";
+
+    /**
+     * POST a pre-initialization probe (the text/plain ping, the batch) with
+     * the run's headers, resending it once after Retry-After (capped at 2 s,
+     * retryAfterMs) when a rate limiter answered 429, as
+     * lifecycle-reinit-reject does; the second answer decides. `throttled`
+     * is "HTTP 429, then after Nms " once it was resent; `body` is the
+     * answer parsed as JSON (undefined when it is not), `text` the raw one.
+     * A caller's abort is rethrown.
+     */
+    const sendRawProbe = async (
+      headers: Record<string, string>,
+      body: string,
+    ): Promise<{
+      statusCode: number;
+      headers: Record<string, string>;
+      body: unknown;
+      text: string;
+      throttled: string;
+    }> => {
+      const send = async () => {
+        const res = await request(backendUrl, {
+          method: "POST",
+          headers: { ...headers, ...userHeaders },
+          body,
+          signal: options.signal
+            ? AbortSignal.any([options.signal, AbortSignal.timeout(timeout)])
+            : AbortSignal.timeout(timeout),
+        });
+        const text = await res.body.text();
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {}
+        return { statusCode: res.statusCode, headers: flatHeaders(res.headers), body: parsed, text };
+      };
+      let res = await send();
+      let throttled = "";
+      if (res.statusCode === 429) {
+        const wait = retryAfterMs(res.headers);
+        await pause(wait, options.signal);
+        throttled = `HTTP 429, then after ${wait}ms `;
+        res = await send();
+      }
+      return { ...res, throttled };
+    };
 
     await test(
       "transport-post",
@@ -544,8 +1284,13 @@ export async function runComplianceSuite(
         if (res.statusCode >= 200 && res.statusCode < 300) {
           return { passed: true, details: `HTTP ${res.statusCode}` };
         }
-        if (res.statusCode === 401 || res.statusCode === 403) {
-          return { passed: false, details: `HTTP ${res.statusCode} (auth required — pass --auth)` };
+        // "pass --auth" only when the status asks for a credential none was
+        // sent for; "credential rejected" only when it refused the one sent;
+        // any other 403 may be Host/Origin validation (readAuthRefusal).
+        const refusal = readAuthRefusal({ statusCode: res.statusCode, headers: res.headers }, hasAuthHeader);
+        if (refusal) {
+          const hint = authRefusalHint(refusal, "auth required — pass --auth", "—");
+          return { passed: false, details: `HTTP ${res.statusCode} (${hint})` };
         }
         // 400 with a JSON-RPC error body is acceptable — server processed the POST
         // but rejected the pre-init request (e.g., session required)
@@ -596,14 +1341,22 @@ export async function runComplianceSuite(
       false,
       "basic/transports#streamable-http",
       async () => {
-        // Send a request with text/plain instead of application/json
-        const res = await request(backendUrl, {
-          method: "POST",
-          headers: { "Content-Type": "text/plain", Accept: "application/json, text/event-stream", ...userHeaders },
-          body: JSON.stringify({ jsonrpc: "2.0", id: 99905, method: "ping" }),
-          signal: AbortSignal.timeout(timeout),
-        });
-        await res.body.text();
+        // Send a request with text/plain instead of application/json. A 4xx
+        // is the server rejecting it -- unless something in front of the
+        // server answered in its place (gateRefusal: an auth gate, a rate
+        // limiter, a 5xx), or a 403 that the same ping as application/json
+        // drew too (bare403Verdict: a guard, Host/Origin validation among
+        // them, refusing every request). A 403 the twin did not draw is the
+        // Content-Type's, whatever its message names.
+        const res = await sendRawProbe(
+          { "Content-Type": "text/plain", Accept: "application/json, text/event-stream" },
+          JSON.stringify({ jsonrpc: "2.0", id: 99905, method: "ping" }),
+        );
+        const seen = `${res.throttled}HTTP ${res.statusCode}${rpcErrorSuffix(res.body)} on the text/plain POST`;
+        const gated =
+          gateRefusal(seen, res, hasAuthHeader, "the Content-Type") ??
+          (await bare403Verdict(seen, res, hasAuthHeader, "the Content-Type", PRE_INIT_TWIN, preInitPing));
+        if (gated) return gated;
         if (res.statusCode >= 400 && res.statusCode < 500) {
           return { passed: true, details: `HTTP ${res.statusCode} (incorrect Content-Type rejected)` };
         }
@@ -664,21 +1417,29 @@ export async function runComplianceSuite(
       true,
       "basic/transports#streamable-http",
       async () => {
-        const res = await request(backendUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json, text/event-stream",
-            ...userHeaders,
-          },
-          body: JSON.stringify([
+        const res = await sendRawProbe(
+          { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+          JSON.stringify([
             { jsonrpc: "2.0", id: 99903, method: "ping" },
             { jsonrpc: "2.0", id: 99904, method: "ping" },
           ]),
-          signal: AbortSignal.timeout(timeout),
-        });
-        const text = await res.body.text();
-        // Server should reject batch with error or 4xx
+        );
+        const text = res.text;
+        // Server should reject batch with error or 4xx -- its own rejection:
+        // an answer something in front of it gave in its place (gateRefusal),
+        // or a 403 that the same ping sent on its own drew too
+        // (bare403Verdict), is no rejection of the batch, JSON-RPC error body
+        // or not. A 5xx is no rejection either, unless it carries the
+        // server's own -32600 (credited, with a warning about the status).
+        const seen = `${res.throttled}HTTP ${res.statusCode}${rpcErrorSuffix(res.body)} on the batch`;
+        const gated =
+          gateRefusal(seen, res, hasAuthHeader, "the batch", BATCH_REJECTION_CODES) ??
+          (await bare403Verdict(seen, res, hasAuthHeader, "the batch", PRE_INIT_TWIN, preInitPing));
+        if (gated) return gated;
+        const on5xx = res.statusCode >= 500 ? ownRejectionCode(res.body, BATCH_REJECTION_CODES) : undefined;
+        if (on5xx !== undefined) {
+          warnings.push(rejectionOn5xxWarning("transport-batch-reject", res.statusCode, on5xx, "the batch"));
+        }
         if (res.statusCode >= 400 && res.statusCode < 500) {
           return { passed: true, details: `HTTP ${res.statusCode} (batch rejected)` };
         }
@@ -699,32 +1460,44 @@ export async function runComplianceSuite(
     // ── 2. LIFECYCLE SETUP (always runs) ─────────────────────────────
 
     let initRes: any = null;
+    /**
+     * Whether the handshake was served. It is the conformant twin of every
+     * negative probe the suite sends later -- the same request without a
+     * foreign Origin, without a duplicate, without a token in the query
+     * string, and (with `hasAuth`) carrying the credential -- so a probe
+     * that got dropped is pinned on its defect only when this is true. The
+     * 2026-07-28 suite pins the same drops on its setup server/discover
+     * (credentialedDiscoverServed).
+     */
+    const handshakeServed = () => initRes?.body?.result !== undefined;
+    // Why the handshake produced no response at all (transport error:
+    // timeout, crashed child, refused connection); lifecycle-init prints it.
+    let initError: string | null = null;
     const initStart = Date.now();
+    // The handshake uses `startupTimeout` (not `timeout`) to give
+    // slow-starting stdio servers room (see RunOptions.startupTimeout) --
+    // unless the server has already sat silent through the preflight AND
+    // the era re-probe's full startup budget, in which case a third
+    // startup-sized wait buys nothing and the per-request timeout bounds
+    // it instead.
+    const handshakeTimeout = reprobedAfterTimeout && !serverReachable ? timeout : startupTimeout;
+    // Declare all three client capabilities so servers see us as a
+    // fully-capable client. Servers that break on unknown or
+    // unexpected client capabilities (they shouldn't — spec is
+    // forward-compatible) will fail the lifecycle-*-capability
+    // tests below. Shared with the handshake a restarted stdio child gets.
+    const initializeParams = {
+      protocolVersion: SPEC_VERSION,
+      capabilities: {
+        sampling: {},
+        roots: { listChanged: true },
+        elicitation: {},
+      },
+      clientInfo: { name: "mcp-compliance", version: TOOL_VERSION },
+    };
+    throwIfAborted(options.signal);
     try {
-      // Declare all three client capabilities so servers see us as a
-      // fully-capable client. Servers that break on unknown or
-      // unexpected client capabilities (they shouldn't — spec is
-      // forward-compatible) will fail the lifecycle-*-capability
-      // tests below.
-      //
-      // The handshake uses `startupTimeout` (not `timeout`) to give
-      // slow-starting stdio servers room. See RunOptions.startupTimeout.
-      initRes = await mcpRequest(
-        backendUrl,
-        "initialize",
-        {
-          protocolVersion: SPEC_VERSION,
-          capabilities: {
-            sampling: {},
-            roots: { listChanged: true },
-            elicitation: {},
-          },
-          clientInfo: { name: "mcp-compliance", version: TOOL_VERSION },
-        },
-        nextId,
-        buildHeaders(),
-        startupTimeout,
-      );
+      initRes = await mcpRequest(backendUrl, "initialize", initializeParams, nextId, buildHeaders(), handshakeTimeout);
       const result = initRes?.body?.result;
       if (result) {
         serverInfo.protocolVersion = result.protocolVersion || null;
@@ -736,14 +1509,41 @@ export async function runComplianceSuite(
           sessionId = sid;
           transport.setSessionId(sid);
         }
-        if (result.protocolVersion) {
+        // Only a value that can be sent as a header is carried. Anything
+        // else (CR/LF, spaces, non-ASCII) is left off the later requests
+        // instead of failing each of them client-side; lifecycle-proto-version
+        // still reports the value the server sent.
+        if (isHeaderToken(result.protocolVersion)) {
           negotiatedProtocolVersion = result.protocolVersion;
           transport.setProtocolVersion(result.protocolVersion);
         }
       }
-    } catch {
-      // Init failed — lifecycle tests will report the failure
+    } catch (err: unknown) {
+      throwIfAborted(options.signal);
+      // Init failed — lifecycle-init reports the failure with this reason.
+      const message = err instanceof Error ? err.message : String(err);
+      if (transport.kind === "stdio") {
+        // The transport's message appends the raw stderr tail, which for a
+        // crashing Node child is mostly stack frames; keep the diagnostic
+        // ("server crashed with exit code 1 ...") and summarize the stderr
+        // so the line naming the cause survives ahead of the frames.
+        const head = message.split(/\n\s*child stderr:/)[0];
+        const tail = summarizeStderr(await settledStderr(transport as StdioTransport));
+        initError = tail ? `${head} (last stderr: ${tail})` : head;
+      } else {
+        initError = message;
+      }
     }
+    if (probeExit && detection) {
+      warnings.push(
+        await probeExitWarning(probeExit, transport, {
+          era: detection.era,
+          answered: initRes !== null,
+          spawner: "suite",
+        }),
+      );
+    }
+    settleUnreachableWarning(warnings, initRes !== null);
 
     // Warn if initialize crossed the per-request timeout. The server
     // answered in the end (we got here), but steady-state tests will
@@ -757,12 +1557,16 @@ export async function runComplianceSuite(
       );
     }
 
-    // Send initialized notification (always, for session setup). Shares
-    // the startup budget — some servers don't write their prompt to
-    // stdout until this lands.
-    try {
-      await mcpNotification(backendUrl, "notifications/initialized", undefined, buildHeaders(), startupTimeout);
-    } catch {}
+    // Send initialized notification (for session setup). Shares the
+    // startup budget — some servers don't write their prompt to stdout
+    // until this lands. Skipped when initialize got no response at all:
+    // there is nothing to acknowledge, and against a hung server the
+    // notification would only cost a second startup-sized wait.
+    if (initRes !== null) {
+      try {
+        await mcpNotification(backendUrl, "notifications/initialized", undefined, buildHeaders(), handshakeTimeout);
+      } catch {}
+    }
 
     // Capability flags computed once post-init. Some later-section tests
     // read these from closures declared before the tools/resources/prompts
@@ -770,6 +1574,116 @@ export async function runComplianceSuite(
     const hasTools = !!serverInfo.capabilities.tools;
     const hasResources = !!serverInfo.capabilities.resources;
     const hasPrompts = !!serverInfo.capabilities.prompts;
+
+    /**
+     * Replace a stdio child that exited on a check's own request -- an
+     * injection payload, security-oversized-input's 1 MB line,
+     * security-extra-params' unknown arguments, lifecycle-version-negotiate's
+     * second initialize (requesting an unknown version) -- with a fresh instance
+     * and redo the initialize handshake. Declared ahead of every check that
+     * calls it (a const arrow is not usable before its declaration runs). That check already
+     * fails as "server died"; left dead, the child would fail every later
+     * test with a diagnosis of its own -- stdio-framing's "framing likely
+     * broken" (a required test), security-extra-params' "server
+     * unreachable" -- so one crash would be counted over and over under the
+     * wrong names. `check` is the check that killed the child, which the
+     * warning names along with `cause`; it also says the later tests ran
+     * against a restarted instance, and whether its handshake was served.
+     * Only a child that died on the check's own request is restarted (one
+     * already gone was not killed by it), so a server that dies on every
+     * tools/call is respawned once per check attempt that sends one
+     * (--retries repeats the attempt). A run
+     * the caller aborts during the handshake is rethrown.
+     */
+    const restartStdioServer = async (check: string, cause: string): Promise<void> => {
+      await transport.close().catch(() => {});
+      transport = spawnStdio() as Transport;
+      const restarted = `${check}: the server exited on ${cause} and was restarted`;
+      const consequence = "the tests after it ran against the new instance and may fail for that reason";
+      try {
+        const res = await mcpRequest(
+          backendUrl,
+          "initialize",
+          initializeParams,
+          nextId,
+          buildHeaders(),
+          startupTimeout,
+        );
+        const result = res.body?.result;
+        if (result) {
+          if (isHeaderToken(result.protocolVersion)) transport.setProtocolVersion(result.protocolVersion);
+          try {
+            await mcpNotification(backendUrl, "notifications/initialized", undefined, buildHeaders(), startupTimeout);
+          } catch {}
+          warnings.push(
+            `${restarted} with a fresh initialize handshake, so the tests after it ran against the new instance.`,
+          );
+          return;
+        }
+        const code = rpcErrorSuffix(res.body);
+        warnings.push(
+          `${restarted}, but the new instance answered initialize with no result${code ? ` (${code.slice(2)})` : ""}; ${consequence}.`,
+        );
+      } catch (err: unknown) {
+        if (options.signal?.aborted) throw err;
+        warnings.push(
+          `${restarted}, but the new instance's initialize got ${noResponse(err, startupTimeout)}; ${consequence}.`,
+        );
+      }
+    };
+
+    /**
+     * The same ping carrying the configured credential (and the session):
+     * whether it was served (a JSON-RPC result on a 2xx), or else what it
+     * got, as a clause ("was refused (HTTP 403)", "was not served (HTTP
+     * 400, JSON-RPC error -32600)", "got no response ..."; see TwinAnswer).
+     * Next to an unauthenticated ping that differs from it only in the
+     * missing credential, a served twin pins a bare 403 or a dropped
+     * connection on that credential; next to error-unknown-method's probe,
+     * which differs from it only in the method, it pins a bare 403 on the
+     * method. `statusCode` is the twin's status, when it got one. A caller's
+     * abort is rethrown.
+     */
+    const credentialedPing = async (): Promise<TwinAnswer> => {
+      try {
+        return twinAnswer(await rpc("ping"));
+      } catch (err: unknown) {
+        if (options.signal?.aborted) throw err;
+        return { served: false, outcome: `got ${noResponse(err, timeout)}` };
+      }
+    };
+
+    /**
+     * How an answer reads in a details string: "HTTP 400, JSON-RPC error
+     * -32600" over HTTP; "JSON-RPC error -32600" (or "no JSON-RPC error")
+     * over stdio, where every status is a synthetic 200.
+     */
+    const answerShape = (res: { statusCode: number; body: unknown }): string => {
+      if (resolvedTarget.type === "http") return `HTTP ${res.statusCode}${rpcErrorSuffix(res.body)}`;
+      const suffix = rpcErrorSuffix(res.body);
+      return suffix ? suffix.slice(2) : "no JSON-RPC error";
+    };
+
+    /**
+     * The not-evaluable failure for a rejection of a negative probe sent
+     * after the handshake (an initialize requesting an unknown version, an
+     * unknown method) when the handshake -- the conformant request -- was
+     * not served either and drew the same status, or no answer: a server
+     * that rejects everything proves nothing by rejecting the defect too.
+     * The 2026-07-28 suite's notEvaluable, read from the handshake the way
+     * lifecycle-reinit-reject reads it. Null when the handshake was served
+     * or drew a different status (over stdio only a served one counts).
+     * `seen` opens the details; `defect` names what the probe varies.
+     */
+    const handshakeUnattributable = (seen: string, status: number, defect: string): LegacyOutcome | null => {
+      if (handshakeServed()) return null;
+      if (initRes && initRes.statusCode !== status) return null;
+      const handshake = initRes ? `was not served either (${answerShape(initRes)})` : "got no response";
+      return {
+        passed: false,
+        details: `${seen} -- not evaluable: the initialize handshake ${handshake}, so this rejection proves nothing about ${defect} (see lifecycle-init)`,
+      };
+    };
 
     // ── 3. LIFECYCLE TESTS ───────────────────────────────────────────
 
@@ -780,9 +1694,25 @@ export async function runComplianceSuite(
       true,
       "basic/lifecycle#initialization",
       async () => {
-        if (!initRes) return { passed: false, details: "Initialize request failed" };
+        if (!initRes) {
+          return { passed: false, details: `Initialize request failed: ${oneLine(initError ?? "no response", 400)}` };
+        }
         const result = initRes.body?.result;
-        if (!result) return { passed: false, details: "No result in response" };
+        if (!result) {
+          // A modern-only server answers initialize with a JSON-RPC error
+          // that (per spec SHOULD) names the versions it does speak; that
+          // message is the one diagnostic a pinned legacy run can show.
+          const err = initRes.body?.error;
+          if (err && typeof err === "object") {
+            const code = typeof err.code === "number" ? err.code : "?";
+            const message = typeof err.message === "string" ? err.message : "";
+            return {
+              passed: false,
+              details: `Initialize answered with JSON-RPC error ${code}${message ? `: ${oneLine(message, 300)}` : ""}${initRes.statusCode !== 200 ? ` (HTTP ${initRes.statusCode})` : ""}`,
+            };
+          }
+          return { passed: false, details: "No result in response" };
+        }
         return { passed: !!result.protocolVersion, details: `Protocol: ${result.protocolVersion || "missing"}` };
       },
     );
@@ -811,9 +1741,44 @@ export async function runComplianceSuite(
       false,
       "basic/lifecycle#version-negotiation",
       async () => {
-        // Send initialize with a future version — server should respond with its own supported version
-        try {
-          const futureRes = await mcpRequest(
+        // Send initialize with a future version — server should respond with
+        // its own supported version, or reject it. How the answer reads:
+        //
+        // - a version offered back is judged on its own;
+        // - a rejection (a JSON-RPC error, or a status >= 400) is the
+        //   server's only next to a handshake -- the same request with a
+        //   version it knows, and the same headers -- that was served or
+        //   drew a different status (handshakeUnattributable), so a 403 the
+        //   handshake did not draw is the version's whatever its message
+        //   names; and only when nothing in front of the server answered in
+        //   its place (gateRefusal: an auth gate, a JSON-RPC error body on
+        //   its 401/403 included, a 429 -- resent once after Retry-After
+        //   first -- or a 5xx that does not carry the server's own -32600 or
+        //   -32602); otherwise it fails as not evaluable. A -32600/-32602 on
+        //   a 5xx is credited, with a warning about the status.
+        //
+        // No answer at all is read from the error the way
+        // security-extra-params reads it (classifyTransportError), never as
+        // a rejection by default:
+        // - a caller's abort is rethrown, never graded;
+        // - a timeout, a connection never established, or a stdio child
+        //   already gone before the probe is "server unreachable";
+        // - a stdio child that exits on the probe crashed on a request: it
+        //   fails as died, and is restarted (restartStdioServer) so the tests
+        //   after it measure the server. Over stdio this probe is always a
+        //   second initialize on the live session, so the exit is not pinned
+        //   on the version: the details say it died on a second initialize.
+        //   (An HTTP drop leaves the server running, a stdio exit does not:
+        //   the drop below is a refusal, the exit a crash.)
+        // - an HTTP connection closed without a response is the (crude)
+        //   rejection only next to the served handshake (unansweredProbe);
+        // - anything else got no usable response, and fails.
+        const what = "the initialize requesting protocol version 2099-01-01";
+        const stdio = transport.kind === "stdio" ? (transport as StdioTransport) : null;
+        // A child already gone was not killed by this probe.
+        const alreadyGone = stdio?.exited === true;
+        const send = () =>
+          mcpRequest(
             backendUrl,
             "initialize",
             {
@@ -825,29 +1790,77 @@ export async function runComplianceSuite(
             userHeaders,
             timeout,
           );
-          const result = futureRes.body?.result;
-          const error = futureRes.body?.error;
-          if (error) {
+        let futureRes: Awaited<ReturnType<typeof send>>;
+        /** "HTTP 429, then after Nms " once a throttled probe was resent. */
+        let throttled = "";
+        try {
+          futureRes = await send();
+          if (futureRes.statusCode === 429) {
+            const wait = retryAfterMs(futureRes.headers);
+            await pause(wait, options.signal);
+            throttled = `HTTP 429, then after ${wait}ms `;
+            futureRes = await send();
+          }
+        } catch (err: unknown) {
+          if (options.signal?.aborted) throw err;
+          const failure = classifyTransportError(err);
+          // The stdio transport rejects every pending request with the
+          // child's exit diagnostic the moment it goes away.
+          if (stdio && (failure === "dropped" || stdio.exited)) {
+            if (alreadyGone) return unreachable(what, err, timeout);
+            const secondInit = "a second initialize (requesting protocol version 2099-01-01)";
+            const died = {
+              passed: false,
+              details: `server died on ${secondInit} on the live session, so the exit is not pinned on the version: ${errorLine(err, 120)}`,
+            };
+            await restartStdioServer("lifecycle-version-negotiate", secondInit);
+            return died;
+          }
+          if (failure === "dropped" || failure === "connect" || failure === "timeout") {
+            // The comparison is the handshake: the same request with a known
+            // version, served. A drop is pinned on the version only then.
+            const verdict = unansweredProbe(what, err, handshakeServed(), timeout, options.signal);
+            if (verdict) return verdict;
+            return { passed: true, details: `${closedWithoutResponse(err)} (unknown version rejected)` };
+          }
+          // Neither an answer nor a transport failure the server can be
+          // judged by: bytes that are not an HTTP response, a TLS failure.
+          return { passed: false, details: `no usable response to ${what}: ${errorLine(err, 120)}` };
+        }
+        const result = futureRes.body?.result;
+        const error = futureRes.body?.error;
+        if (!error && result?.protocolVersion) {
+          const offered = result.protocolVersion;
+          if (offered === "2099-01-01") {
             return {
-              passed: true,
-              details: `Server rejected unknown version with error: ${error.code} — ${error.message}`,
+              passed: false,
+              details:
+                'Server accepted impossible future version "2099-01-01" — should offer a version it actually supports',
             };
           }
-          if (result?.protocolVersion) {
-            const offered = result.protocolVersion;
-            if (offered === "2099-01-01") {
-              return {
-                passed: false,
-                details:
-                  'Server accepted impossible future version "2099-01-01" — should offer a version it actually supports',
-              };
-            }
-            return { passed: true, details: `Server negotiated down to ${offered} (correct)` };
-          }
-          return { passed: false, details: "No protocolVersion or error in response" };
-        } catch {
-          return { passed: true, details: "Connection rejected for unknown version (acceptable)" };
+          return { passed: true, details: `Server negotiated down to ${offered} (correct)` };
         }
+        const seen = `${throttled}${answerShape(futureRes)} on ${what}`;
+        if (error || futureRes.statusCode >= 400) {
+          const unattributable =
+            handshakeUnattributable(seen, futureRes.statusCode, "the unknown version") ??
+            gateRefusal(seen, futureRes, hasAuthHeader, "the unknown version", VERSION_REJECTION_CODES);
+          if (unattributable) return unattributable;
+          const on5xx =
+            futureRes.statusCode >= 500 ? ownRejectionCode(futureRes.body, VERSION_REJECTION_CODES) : undefined;
+          if (on5xx !== undefined) {
+            warnings.push(
+              rejectionOn5xxWarning("lifecycle-version-negotiate", futureRes.statusCode, on5xx, "the unknown version"),
+            );
+          }
+        }
+        if (error) {
+          return {
+            passed: true,
+            details: `Server rejected unknown version with error: ${error.code} — ${error.message}`,
+          };
+        }
+        return { passed: false, details: "No protocolVersion or error in response" };
       },
     );
 
@@ -979,12 +1992,69 @@ export async function runComplianceSuite(
       "basic/lifecycle#initialization",
       async () => {
         // Spec: client MUST NOT send initialize more than once per session
-        try {
-          const res = await rpc("initialize", {
+        const reinitialize = () =>
+          rpc("initialize", {
             protocolVersion: SPEC_VERSION,
             capabilities: {},
             clientInfo: { name: "mcp-compliance", version: TOOL_VERSION },
           });
+        try {
+          let res = await reinitialize();
+          const seen = (prefix: string) =>
+            `${prefix}HTTP ${res.statusCode}${rpcErrorSuffix(res.body)} on the second initialize`;
+          // A duplicate is one only next to a served first initialize: when
+          // the handshake was refused or failed, this request is just another
+          // first one, and whatever refuses it (the auth gate, Host
+          // validation, the dead backend that refused the first) says nothing
+          // about how the server treats a duplicate. The catch below applies
+          // the same gate to a dropped connection.
+          if (!handshakeServed()) {
+            return {
+              passed: false,
+              details: `${seen("")} -- not evaluable: the first initialize was not served, so this one is no duplicate (see lifecycle-init)`,
+            };
+          }
+          /** "HTTP 429, then after Nms " once a throttled duplicate was resent. */
+          let throttled = "";
+          if (res.statusCode === 429) {
+            // A rate limiter answers before the server reads the request:
+            // wait what it asks (capped at 2 s, retryAfterMs) and send the
+            // duplicate once more; the second answer decides.
+            const wait = retryAfterMs(res.headers);
+            await pause(wait, options.signal);
+            throttled = `HTTP 429, then after ${wait}ms `;
+            res = await reinitialize();
+          }
+          // The handshake was served with the same headers, so an answer
+          // that is not the server's own verdict on the duplicate came from
+          // something in front of it: an auth gate (a credential that
+          // expired mid-run), Host/Origin validation, a rate limiter, or a
+          // proxy whose backend failed. None of them rejected a duplicate.
+          const refusal = readAuthRefusal(res, hasAuthHeader);
+          if (refusal && refusal.kind !== "forbidden") {
+            return {
+              passed: false,
+              details: `${seen(throttled)} -- not evaluable: an auth gate answered before the server read the request (${authRefusalHint(refusal, "pass --auth")})`,
+            };
+          }
+          if (refusal && namesHostOrOriginValidation(refusal.message)) {
+            return {
+              passed: false,
+              details: `${seen(throttled)} (${JSON.stringify(refusal.message)}) -- not evaluable: the message names Host/Origin validation, which refuses a request whatever it carries`,
+            };
+          }
+          if (res.statusCode === 429) {
+            return {
+              passed: false,
+              details: `${seen(throttled)} -- not evaluable: a rate limiter answered before the server read the request`,
+            };
+          }
+          if (res.statusCode >= 500) {
+            return {
+              passed: false,
+              details: `${seen(throttled)} -- not evaluable: a server error (or a gateway with no backend) is a failure, not a rejection of the duplicate`,
+            };
+          }
           const error = res.body?.error;
           if (error) {
             return { passed: true, details: `Re-initialization rejected with error: ${error.code} — ${error.message}` };
@@ -992,12 +2062,25 @@ export async function runComplianceSuite(
           if (res.statusCode >= 400) {
             return { passed: true, details: `HTTP ${res.statusCode} (re-initialization rejected)` };
           }
+          if (res.statusCode >= 300) {
+            return {
+              passed: false,
+              details: `${seen(throttled)} -- redirected instead of answered: neither a rejection nor a served duplicate`,
+            };
+          }
           return {
             passed: false,
             details: `Server accepted second initialize (HTTP ${res.statusCode}) — should reject duplicate initialization`,
           };
-        } catch {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+        } catch (err: unknown) {
+          // The comparison is the handshake: the same request, served.
+          // A connection dropped on the duplicate is then a (crude)
+          // rejection of it; a timeout or a connection never established
+          // measured nothing, and neither does a drop from a server whose
+          // handshake was not served either.
+          const verdict = unansweredProbe("the second initialize", err, handshakeServed(), timeout, options.signal);
+          if (verdict) return verdict;
+          return { passed: true, details: `${closedWithoutResponse(err)} (re-initialization rejected)` };
         }
       },
     );
@@ -1149,64 +2232,6 @@ export async function runComplianceSuite(
           passed: true,
           details: `${applicable.length} listChanged notification(s) accepted: ${applicable.map((n) => n.method).join(", ")}`,
         };
-      },
-    );
-
-    // Progress token test — send request with _meta.progressToken and check for progress events
-    await test(
-      "lifecycle-progress-token",
-      "Supports progress tokens in requests",
-      "lifecycle",
-      false,
-      "basic/utilities#progress",
-      async () => {
-        if (!hasTools || toolNames.length === 0) {
-          return { passed: true, details: "No tools available for progress token test (skipped)" };
-        }
-        // Send a tools/call with _meta.progressToken via raw request to read SSE for progress events
-        const progressToken = "compliance-progress-test";
-        const reqBody = JSON.stringify({
-          jsonrpc: "2.0",
-          id: nextId(),
-          method: "tools/call",
-          params: {
-            name: toolNames[0],
-            arguments: {},
-            _meta: { progressToken },
-          },
-        });
-        try {
-          const res = await request(backendUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Accept: "text/event-stream",
-              ...buildHeaders(),
-            },
-            body: reqBody,
-            signal: AbortSignal.timeout(timeout),
-          });
-          const text = await res.body.text();
-          const rawCtProgress = res.headers["content-type"];
-          const ct = (Array.isArray(rawCtProgress) ? rawCtProgress[0] : rawCtProgress || "").toLowerCase();
-          // Check if any SSE events contain progress notifications
-          if (ct.includes("text/event-stream") && text.includes("notifications/progress")) {
-            return { passed: true, details: "Server sent progress notifications via SSE with progressToken" };
-          }
-          // Server may not support progress — that's acceptable, just note it
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            return {
-              passed: true,
-              details: "Server accepted request with progressToken (no progress events observed — optional)",
-            };
-          }
-          return { passed: true, details: `HTTP ${res.statusCode} — request with progressToken accepted` };
-        } catch {
-          return {
-            passed: true,
-            details: "Request with progressToken handled (no progress events observed — optional)",
-          };
-        }
       },
     );
 
@@ -1568,6 +2593,10 @@ export async function runComplianceSuite(
       async () => {
         if (!toolsListOk) return { passed: false, details: "Skipped: tools/list failed" };
         const tools = cachedToolsList ?? [];
+        // An empty list leaves nothing to validate (it read "All tools have
+        // valid schemas"): a skip, worded as its siblings and the 2026-07-28
+        // twin word it.
+        if (tools.length === 0) return { passed: true, details: "No tools to validate", skipped: true };
         const issues: string[] = [];
         for (const tool of tools) {
           if (!tool.name) {
@@ -1602,7 +2631,7 @@ export async function runComplianceSuite(
       async () => {
         if (!toolsListOk) return { passed: false, details: "Skipped: tools/list failed" };
         const tools = cachedToolsList ?? [];
-        if (tools.length === 0) return { passed: true, details: "No tools to validate" };
+        if (tools.length === 0) return { passed: true, details: "No tools to validate", skipped: true };
         const issues: string[] = [];
         let annotatedCount = 0;
         for (const tool of tools) {
@@ -1640,7 +2669,7 @@ export async function runComplianceSuite(
       async () => {
         if (!toolsListOk) return { passed: false, details: "Skipped: tools/list failed" };
         const tools = cachedToolsList ?? [];
-        if (tools.length === 0) return { passed: true, details: "No tools to validate" };
+        if (tools.length === 0) return { passed: true, details: "No tools to validate", skipped: true };
         const withTitle = tools.filter((t: any) => typeof t.title === "string");
         const issues: string[] = [];
         for (const tool of tools) {
@@ -1665,7 +2694,7 @@ export async function runComplianceSuite(
       async () => {
         if (!toolsListOk) return { passed: false, details: "Skipped: tools/list failed" };
         const tools = cachedToolsList ?? [];
-        if (tools.length === 0) return { passed: true, details: "No tools to validate" };
+        if (tools.length === 0) return { passed: true, details: "No tools to validate", skipped: true };
         const issues: string[] = [];
         let withSchema = 0;
         for (const tool of tools) {
@@ -1733,7 +2762,14 @@ export async function runComplianceSuite(
             return { passed: true, details: `Tool returned error (content types not applicable): code ${error.code}` };
           }
           const content = result?.content;
-          if (!Array.isArray(content) || content.length === 0) {
+          // Only an empty content array leaves nothing to judge: a skip. A
+          // content field that is not an array, or an answer with no result,
+          // was answered and is malformed (tools-call fails it): not a skip,
+          // and its verdict is left as it was (a plain pass here).
+          if (Array.isArray(content) && content.length === 0) {
+            return { passed: true, details: "No content items to validate", skipped: true };
+          }
+          if (!Array.isArray(content)) {
             return { passed: true, details: "No content items to validate" };
           }
           const issues: string[] = [];
@@ -1803,6 +2839,83 @@ export async function runComplianceSuite(
       );
     }
 
+    // Progress token test — send request with _meta.progressToken and check
+    // for progress events. Lives after the tools section on purpose: it
+    // needs `toolNames`, which tools-list fills. It used to sit among the
+    // lifecycle tests and always saw an empty list, so it never ran.
+    await test(
+      "lifecycle-progress-token",
+      "Supports progress tokens in requests",
+      "lifecycle",
+      false,
+      "basic/utilities#progress",
+      async () => {
+        if (!hasTools || toolNames.length === 0) {
+          return { passed: true, details: "No tools available for progress token test (skipped)" };
+        }
+        // Send a tools/call with _meta.progressToken via raw request to read SSE for progress events
+        const progressToken = "compliance-progress-test";
+        const reqBody = JSON.stringify({
+          jsonrpc: "2.0",
+          id: nextId(),
+          method: "tools/call",
+          params: {
+            name: toolNames[0],
+            arguments: {},
+            _meta: { progressToken },
+          },
+        });
+        try {
+          // Both media types: a Streamable HTTP server MUST see both in
+          // Accept on a POST (basic/transports#sending-messages-to-the-server),
+          // and the SDK answers "text/event-stream" alone with 406 without
+          // ever calling the tool.
+          const res = await request(backendUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json, text/event-stream",
+              ...buildHeaders(),
+            },
+            body: reqBody,
+            signal: AbortSignal.timeout(timeout),
+          });
+          const text = await res.body.text();
+          const rawCtProgress = res.headers["content-type"];
+          const ct = (Array.isArray(rawCtProgress) ? rawCtProgress[0] : rawCtProgress || "").toLowerCase();
+          // Check if any SSE events contain progress notifications
+          if (ct.includes("text/event-stream") && text.includes("notifications/progress")) {
+            return { passed: true, details: "Server sent progress notifications via SSE with progressToken" };
+          }
+          // Server may not support progress — that's acceptable, just note it
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            return {
+              passed: true,
+              details: "Server accepted request with progressToken (no progress events observed — optional)",
+            };
+          }
+          // The call was answered, but not served. Not a skip: the server
+          // answered, and the call differs from tools-call's only in the
+          // progressToken, so the status is an observation. (Whether it
+          // should fail when tools-call was served is a verdict decision
+          // not taken here: it stays an optional, informational pass.)
+          return {
+            passed: true,
+            details: `HTTP ${res.statusCode} — tools/call with progressToken was not served (no progress events observed — optional)`,
+          };
+        } catch (err: unknown) {
+          if (options.signal?.aborted) throw err;
+          // No answer at all: nothing about the token was observed. The
+          // details said "handled", a claim about an answer that never came.
+          return {
+            passed: true,
+            details: `tools/call with progressToken got ${noResponse(err, timeout)} (no progress events observed -- optional)`,
+            skipped: true,
+          };
+        }
+      },
+    );
+
     // ── 6. RESOURCES ─────────────────────────────────────────────────
 
     const resourcesCap = serverInfo.capabilities.resources;
@@ -1843,6 +2956,8 @@ export async function runComplianceSuite(
         async () => {
           if (!resourcesListOk) return { passed: false, details: "Skipped: resources/list failed" };
           const resources = cachedResourcesList ?? [];
+          // An empty list leaves nothing to validate (it read "All resources valid").
+          if (resources.length === 0) return { passed: true, details: "No resources to validate", skipped: true };
           const issues: string[] = [];
           for (const r of resources) {
             if (!r.uri) issues.push("Resource missing uri");
@@ -2015,6 +3130,8 @@ export async function runComplianceSuite(
       await test("prompts-schema", "Prompts have name field", "schema", true, "server/prompts#data-types", async () => {
         if (!promptsListOk) return { passed: false, details: "Skipped: prompts/list failed" };
         const prompts = cachedPromptsList ?? [];
+        // An empty list leaves nothing to validate (it read "All prompts valid").
+        if (prompts.length === 0) return { passed: true, details: "No prompts to validate", skipped: true };
         const issues: string[] = [];
         for (const p of prompts) {
           if (!p.name) issues.push("Prompt missing name");
@@ -2092,8 +3209,46 @@ export async function runComplianceSuite(
       true,
       "basic",
       async () => {
-        const res = await rpc("nonexistent/method");
+        // A rejection is the server's answer to the unknown method only when
+        // the handshake was served or drew a different status
+        // (handshakeUnattributable), nothing in front of the server answered
+        // in its place (gateRefusal: an auth gate, a JSON-RPC error body on
+        // its 401/403 included, a 429 -- resent once after Retry-After first
+        // -- or a 5xx that does not carry the server's own -32601), and a 403
+        // is one that the same request for ping did not draw too
+        // (bare403Verdict: a gateway that lets initialize through and refuses
+        // every other method, or Host/Origin validation refusing every
+        // request). A -32601 on a 5xx is credited, with a warning about the
+        // status.
+        let res = await rpc("nonexistent/method");
+        /** "HTTP 429, then after Nms " once a throttled probe was resent. */
+        let throttled = "";
+        if (res.statusCode === 429) {
+          const wait = retryAfterMs(res.headers);
+          await pause(wait, options.signal);
+          throttled = `HTTP 429, then after ${wait}ms `;
+          res = await rpc("nonexistent/method");
+        }
         const error = res.body?.error;
+        if (error || res.statusCode >= 400) {
+          const seen = `${throttled}${answerShape(res)} on nonexistent/method`;
+          const unattributable =
+            handshakeUnattributable(seen, res.statusCode, "the unknown method") ??
+            gateRefusal(seen, res, hasAuthHeader, "the unknown method", METHOD_REJECTION_CODES) ??
+            (await bare403Verdict(
+              seen,
+              res,
+              hasAuthHeader,
+              "the unknown method",
+              "the same request for ping",
+              credentialedPing,
+            ));
+          if (unattributable) return unattributable;
+          const on5xx = res.statusCode >= 500 ? ownRejectionCode(res.body, METHOD_REJECTION_CODES) : undefined;
+          if (on5xx !== undefined) {
+            warnings.push(rejectionOn5xxWarning("error-unknown-method", res.statusCode, on5xx, "the unknown method"));
+          }
+        }
         if (!error) return { passed: false, details: "No JSON-RPC error returned for unknown method" };
         const correctCode = error.code === -32601;
         return {
@@ -2263,9 +3418,11 @@ export async function runComplianceSuite(
       "basic/lifecycle#capability-negotiation",
       async () => {
         if (undeclared.length === 0) {
+          // Nothing undeclared, so nothing to probe: a skip, not a verdict.
           return {
             passed: true,
             details: "Server declares all capabilities (tools, resources, prompts) — no undeclared methods to test",
+            skipped: true,
           };
         }
         const issues: string[] = [];
@@ -2321,7 +3478,134 @@ export async function runComplianceSuite(
     // Auth & Transport security tests
     // These tests detect whether the server requires authentication.
     // If --auth was passed and the server accepted it, we test with auth stripped.
-    const hasAuth = !!userHeaders.Authorization || !!userHeaders.authorization;
+    //
+    // HTTP header names are case-insensitive (RFC 9110 5.1) and so is the
+    // transport's own merge, so `-H "AUTHORIZATION: Bearer x"` configures a
+    // credential just as `--auth` does: reading only the two spellings
+    // `Authorization` and `authorization` made every auth check behave as
+    // if none had been passed (2026-07-28's context does the same lookup,
+    // case-insensitively).
+    const authorizationHeader = (): string => {
+      const key = Object.keys(userHeaders).find((h) => h.toLowerCase() === "authorization");
+      return key ? userHeaders[key] : "";
+    };
+    const hasAuth = authorizationHeader() !== "";
+
+    /**
+     * Whether a drop on a credential-less probe can be pinned on the
+     * missing credential: --auth was given and the handshake, which carried
+     * it, was served (`handshakeServed`).
+     */
+    const credentialedRequestServed = () => hasAuth && handshakeServed();
+
+    /**
+     * The legacy ping the auth tests probe with, sent without the
+     * Authorization header. The transport re-injects configured user
+     * headers via sessionHeaders(), so Authorization must be omitted
+     * explicitly -- otherwise the "unauthenticated" probe still carries
+     * auth and false-passes against an auth-requiring server.
+     */
+    const unauthenticatedPing = () => {
+      const noAuthHeaders: Record<string, string> = {};
+      if (sessionId) noAuthHeaders["mcp-session-id"] = sessionId;
+      return mcpRequest(backendUrl, "ping", undefined, nextId, noAuthHeaders, timeout, ["authorization"]);
+    };
+
+    // With --auth, security-auth-required's unauthenticated ping and the
+    // credentialed twin it compares a bare 403 with are shared: each
+    // attempt of auth-required sends them afresh (`fresh`, so --retries
+    // still re-asks) and keeps the answers, and authNotEvaluable below reads
+    // the very answers auth-required graded -- or, when --only / --skip left
+    // auth-required out of the run, sends them itself, once.
+    let unauthenticatedPingOnce: ReturnType<typeof unauthenticatedPing> | null = null;
+    const sharedUnauthenticatedPing = (fresh = false) => {
+      if (fresh || !unauthenticatedPingOnce) unauthenticatedPingOnce = unauthenticatedPing();
+      return unauthenticatedPingOnce;
+    };
+    let credentialedPingOnce: ReturnType<typeof credentialedPing> | null = null;
+    const sharedCredentialedPing = (fresh = false) => {
+      if (fresh || !credentialedPingOnce) credentialedPingOnce = credentialedPing();
+      return credentialedPingOnce;
+    };
+
+    /**
+     * Whether, with --auth, the unauthenticated ping drew a bare 403 that
+     * security-auth-required cannot attribute to authentication: no Bearer
+     * challenge, and the same ping carrying the credential was not served
+     * either. The sibling auth probes (www-authenticate, auth-malformed,
+     * session-not-auth, token-in-uri) send a request without a valid
+     * credential and credit a 401/403: that 403 is the same refusal -- a
+     * Host guard answers every request with it -- so they skip, pointing at
+     * auth-required, instead of passing on it.
+     *
+     * Read from the shared probes rather than from a flag auth-required
+     * sets, so it holds when --only / --skip filtered auth-required out (the
+     * 2026-07-28 suite's authNotEvaluable reads its memoized probe the same
+     * way). False when the ping got no HTTP answer at all: each sibling reads
+     * a missing answer through unansweredProbe itself. A caller's abort is
+     * rethrown.
+     */
+    let attribution: Promise<boolean> | null = null;
+    const authNotEvaluable = (): Promise<boolean> => {
+      attribution ??= (async () => {
+        if (!hasAuth) return false;
+        let res: Awaited<ReturnType<typeof unauthenticatedPing>>;
+        try {
+          res = await sharedUnauthenticatedPing();
+        } catch (err: unknown) {
+          if (options.signal?.aborted) throw err;
+          return false;
+        }
+        if (readAuthRefusal(res, false)?.kind !== "forbidden") return false;
+        return !(await sharedCredentialedPing()).served;
+      })();
+      return attribution;
+    };
+    /**
+     * The skip itself says what was seen and why it proves nothing -- only a
+     * 403 reads as "forbidden" -- so it stands on its own in a report that
+     * was filtered (--only, --skip) to leave security-auth-required out; the
+     * pointer is where the full reading (the quoted message, the advice) is.
+     * Worded exactly as the 2026-07-28 suite's AUTH_NOT_EVALUABLE, so both
+     * eras say the same thing about the same server.
+     */
+    const authNotEvaluableSkip: LegacyOutcome = {
+      passed: true,
+      details:
+        "Skipped: HTTP 403 without a Bearer challenge, not attributable to authentication (see security-auth-required)",
+    };
+
+    /**
+     * 401 when --auth was given and the same ping carrying the configured
+     * credential drew 401 -- "Authorization required or token invalid"
+     * (basic/authorization#error-handling): the server refused the very
+     * credential the run was given. Next to that, the 401 an invalid token
+     * or a token moved into the query string draws is what the configured
+     * one drew too, so it cannot tell token validation from a server that
+     * refuses every credential. Null otherwise: no --auth, a credentialed
+     * ping that was served, one refused some other way (a 403 may be
+     * insufficient scope on a token the server did validate), or one never
+     * answered. The 2026-07-28 suite's credentialRefusedStatus reads its
+     * credentialed setup server/discover the same way; here the comparison
+     * is the credentialed twin ping, the very request the probes differ
+     * from in the credential alone. Read from the shared twin, so it costs
+     * at most one ping per run, and only when a probe passed.
+     */
+    const credentialRefusedStatus = async (): Promise<number | null> => {
+      if (!hasAuth) return null;
+      return (await sharedCredentialedPing()).statusCode === 401 ? 401 : null;
+    };
+
+    /**
+     * The skip for a check whose only evidence is a refusal of a credential
+     * when the configured credential was refused too (credentialRefusedStatus).
+     * `what` names what the refusal would otherwise have shown. Worded as
+     * the 2026-07-28 suite's credentialRefusedSkip, naming the ping.
+     */
+    const credentialRefusedSkip = (status: number, what: string): LegacyOutcome => ({
+      passed: true,
+      details: `Skipped: the configured credential was refused too (the credentialed ping drew HTTP ${status}), so ${what} (check the configured credential)`,
+    });
 
     await test(
       "security-auth-required",
@@ -2330,30 +3614,178 @@ export async function runComplianceSuite(
       false,
       "basic/authorization",
       async () => {
+        // How a 401/403 reads (readAuthRefusal): a 401, or a 403 carrying a
+        // WWW-Authenticate: Bearer challenge, asks for the credential the
+        // request lacked. A bare 403 does not: streamable-http requires one
+        // for an invalid Origin, the SDK's Host validation answers a tunnel
+        // or proxy hostname with one, gateways send them, and
+        // basic/authorization requires 401 for a missing token anyway. It is
+        // an auth rejection only next to the same request WITH the
+        // credential being served.
+        const bare403 = (what: string, message: string | undefined) =>
+          `HTTP 403${message ? ` (${JSON.stringify(message)})` : ""} on the ${what} with no WWW-Authenticate: Bearer challenge`;
+        // A message naming Host/Origin validation (the SDK's "Invalid Host:
+        // ...") refuses the request whatever it carries, so --auth is no way
+        // past it: the advice is the allowed hostname instead.
+        const hostOriginAdvice =
+          "allow the hostname you tested through in the server's allowed hosts/origins, or test an address it allows";
         if (!hasAuth) {
-          return {
+          // The preflight was itself an unauthenticated request; when it
+          // drew an auth rejection the server does reject unauthenticated
+          // requests, and saying it "accepted" them would contradict
+          // transport-post's HTTP 401/403 failure on the same report. It
+          // holds its headers, so a Bearer challenge is read from it.
+          let probe: { statusCode?: number; headers?: Record<string, string>; body?: unknown } | null =
+            preflightResponse;
+          let what = "unauthenticated preflight";
+          let rejected = "unauthenticated preflight rejected";
+          if (!probe) {
+            // The preflight got no HTTP answer (a timeout -- re-probed or
+            // not -- or a failed connection): ask again now, after the
+            // handshake, rather than read "accepted" from a missing answer.
+            what = "unauthenticated ping";
+            rejected = "unauthenticated request rejected";
+            try {
+              probe = await unauthenticatedPing();
+            } catch (err: unknown) {
+              if (options.signal?.aborted) throw err;
+              // Nothing to compare a dropped connection with: no credential
+              // was configured, so it is not pinned on the missing one.
+              return unreachable(what, err, timeout);
+            }
+          }
+          const refusal = readAuthRefusal(probe, false);
+          const accepted = {
             passed: false,
             details: "Server does not require auth (no --auth provided and server accepted unauthenticated requests)",
           };
-        }
-        // Re-send without the Authorization header. The transport
-        // re-injects configured user headers via sessionHeaders(), so we
-        // must explicitly omit Authorization for this one request —
-        // otherwise the "unauthenticated" probe still carries auth and
-        // the test false-passes against an auth-requiring server.
-        const noAuthHeaders: Record<string, string> = {};
-        if (sessionId) noAuthHeaders["mcp-session-id"] = sessionId;
-        try {
-          const res = await mcpRequest(backendUrl, "ping", undefined, nextId, noAuthHeaders, timeout, [
-            "authorization",
-          ]);
-          if (res.statusCode === 401 || res.statusCode === 403) {
-            return { passed: true, details: `HTTP ${res.statusCode} (unauthenticated request rejected)` };
+          // Whatever refused this probe, a handshake served with no
+          // credential IS the server serving an unauthenticated request:
+          // the run holds proof of acceptance, so no refusal of another
+          // request makes the server one that requires authorization.
+          if (handshakeServed()) {
+            // A bare 403 (or no refusal at all) says nothing about
+            // authentication on its own, so the plain wording stands. A
+            // 401, or a 403 with a Bearer challenge, did ask for a
+            // credential: name both halves rather than either alone.
+            if (!refusal || refusal.kind === "forbidden") return accepted;
+            return {
+              passed: false,
+              details: `Server does not require auth: initialize was served with no credential, although the ${what} got HTTP ${refusal.statusCode} (a server that requires authorization rejects every unauthenticated request, initialize included)`,
+            };
           }
-          return { passed: false, details: `HTTP ${res.statusCode} — server accepted unauthenticated request` };
-        } catch (_err: unknown) {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+          if (refusal && refusal.kind !== "forbidden") {
+            return {
+              passed: true,
+              details: `HTTP ${refusal.statusCode} (${rejected}; pass --auth to run the authenticated suite and the remaining auth tests)`,
+            };
+          }
+          // Only a probe that was served (a JSON-RPC result on a 2xx) is
+          // proof of acceptance on its own; any other answer is read below.
+          const status = probe.statusCode ?? 200;
+          const probeBody = probe.body as { result?: unknown; error?: unknown } | null | undefined;
+          if (!refusal && status >= 200 && status < 300 && probeBody?.result !== undefined && !probeBody?.error) {
+            return accepted;
+          }
+          // The handshake was the other unauthenticated request of this run.
+          // A gateway can refuse server/discover (a method outside its
+          // policy) with a bare 403, or let it through to a server that
+          // answers it -32601, and answer every method it guards, without a
+          // token, with the 401 authentication answers: that 401 decides.
+          const initRefusal = initRes ? readAuthRefusal(initRes, false) : undefined;
+          if (initRefusal && initRefusal.kind !== "forbidden") {
+            return {
+              passed: true,
+              details: `HTTP ${initRefusal.statusCode} on initialize (unauthenticated request rejected; pass --auth to run the authenticated suite and the remaining auth tests)`,
+            };
+          }
+          if (refusal) {
+            if (namesHostOrOriginValidation(refusal.message)) {
+              return {
+                passed: false,
+                details: `${bare403(what, refusal.message)} -- not evaluable: the message names Host/Origin validation, which refuses the request with or without a credential (--auth does not get past it); ${hostOriginAdvice}`,
+              };
+            }
+            return {
+              passed: false,
+              details: `${bare403(what, refusal.message)} -- not evaluable: it may be Host/Origin validation or a gateway rather than authentication (a server that requires a token answers 401); re-run with --auth to compare the same request with and without the credential`,
+            };
+          }
+          // Neither served nor refused as authentication, and nothing else in
+          // the run was served either: say what the answer was (a 5xx, a
+          // redirect to a login page, another 4xx) instead of "accepted".
+          return unrefusedAnswer(
+            { statusCode: status, body: probe.body },
+            `the ${what}`,
+            "server accepted unauthenticated request",
+            "the spec answers a missing credential with 401",
+          );
         }
+        let res: Awaited<ReturnType<typeof mcpRequest>>;
+        try {
+          res = await sharedUnauthenticatedPing(true);
+        } catch (err: unknown) {
+          if (options.signal?.aborted) throw err;
+          const unmeasured = unreachable("unauthenticated ping", err, timeout);
+          // A timeout or a connection never established measured nothing. A
+          // connection the server accepted and closed without answering is
+          // how some gateways refuse a request that lacks a credential, but
+          // it carries no reason: it counts only when the same ping with the
+          // credential is served, so the credential is what drew the drop.
+          // This check asks a twin ping live (its outcome goes into the
+          // details); its siblings read the served handshake instead.
+          if (classifyTransportError(err) !== "dropped") return unmeasured;
+          const twin = await sharedCredentialedPing(true);
+          if (!twin.served) {
+            return {
+              passed: false,
+              details: `${unmeasured.details}; the same ping with the credential ${twin.outcome}`,
+            };
+          }
+          return {
+            passed: true,
+            details: `${closedWithoutResponse(err)}; the same request with the credential was served (unauthenticated request rejected)`,
+          };
+        }
+        const refusal = readAuthRefusal(res, false);
+        if (refusal && refusal.kind !== "forbidden") {
+          return { passed: true, details: `HTTP ${res.statusCode} (unauthenticated request rejected)` };
+        }
+        if (refusal) {
+          const twin = await sharedCredentialedPing(true);
+          if (twin.served) {
+            return {
+              passed: true,
+              details:
+                "HTTP 403 (unauthenticated request rejected; the same ping with the credential was served) -- basic/authorization expects 401 with a WWW-Authenticate challenge for a missing token",
+            };
+          }
+          // The siblings read this same verdict through authNotEvaluable().
+          const head = `${bare403("unauthenticated ping", refusal.message)}, and the same ping with the credential ${twin.outcome} -- not evaluable`;
+          if (namesHostOrOriginValidation(refusal.message)) {
+            return {
+              passed: false,
+              details: `${head}: the message names Host/Origin validation rather than authentication; ${hostOriginAdvice}`,
+            };
+          }
+          // Refused the same way with the credential: the gate stands in
+          // front of every request, and re-running with --auth compares
+          // nothing until the credentialed request is served.
+          const advice =
+            twin.statusCode === 403
+              ? "; allow the hostname you tested through or fix the gateway (--auth compares only when the request carrying the credential is served)"
+              : "";
+          return {
+            passed: false,
+            details: `${head}: the 403 may be Host/Origin validation or a gateway rather than authentication${advice}`,
+          };
+        }
+        return unrefusedAnswer(
+          res,
+          "the unauthenticated ping",
+          "server accepted unauthenticated request",
+          "the spec answers a missing credential with 401",
+        );
       },
     );
 
@@ -2365,8 +3797,9 @@ export async function runComplianceSuite(
       "basic/authorization",
       async () => {
         if (!hasAuth) {
-          return { passed: true, details: "Skipped: server does not require auth" };
+          return { passed: true, details: "Skipped: no --auth provided" };
         }
+        if (await authNotEvaluable()) return authNotEvaluableSkip;
         // Send request without auth and check for WWW-Authenticate header on 401.
         // Omit Authorization for this request (see security-auth-required).
         const noAuthHeaders: Record<string, string> = {};
@@ -2375,11 +3808,22 @@ export async function runComplianceSuite(
           const res = await mcpRequest(backendUrl, "ping", undefined, nextId, noAuthHeaders, timeout, [
             "authorization",
           ]);
-          if (res.statusCode === 401) {
-            const wwwAuth = res.headers["www-authenticate"];
+          // Read the refusal the way security-auth-required reads it. A 401,
+          // or a 403 carrying a Bearer challenge, asks for the credential the
+          // request lacked, and the challenge is what a client starts
+          // authorization from either way (basic/authorization: the
+          // insufficient-scope 403 carries resource_metadata "for
+          // consistency with 401 responses"), so both are checked -- the
+          // details name the status when it is not the 401 the spec expects.
+          const refusal = readAuthRefusal(res, false);
+          if (refusal && refusal.kind !== "forbidden") {
+            const wwwAuth = Object.entries(res.headers).find(([k]) => k.toLowerCase() === "www-authenticate")?.[1];
             if (wwwAuth) {
-              return { passed: true, details: `WWW-Authenticate: ${wwwAuth}` };
+              const where = res.statusCode === 401 ? "" : ` (HTTP ${res.statusCode})`;
+              return { passed: true, details: `WWW-Authenticate: ${wwwAuth}${where}` };
             }
+            // Only a 401 reaches this: a 403 reads as asking for a credential
+            // precisely when it carries a Bearer challenge.
             return {
               passed: false,
               details:
@@ -2389,9 +3833,28 @@ export async function runComplianceSuite(
           if (res.statusCode === 403) {
             return { passed: true, details: "HTTP 403 (WWW-Authenticate not applicable for 403)" };
           }
-          return { passed: true, details: `HTTP ${res.statusCode} — not a 401 response` };
-        } catch {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+          // No 401, so no challenge to check: a skip, as the 2026-07-28
+          // twin's "HTTP N -- not a 401 response (skipped)" is.
+          return { passed: true, details: `HTTP ${res.statusCode} — not a 401 response`, skipped: true };
+        } catch (err: unknown) {
+          // A drop is a refusal only next to the served handshake, which
+          // carried the credential this ping omits. Either way there is no
+          // 401 and no challenge to read: the refusal is the "not a 401"
+          // pass (a skip: nothing was checked), the rest is a server that
+          // answered nothing.
+          const verdict = unansweredProbe(
+            "unauthenticated ping",
+            err,
+            credentialedRequestServed(),
+            timeout,
+            options.signal,
+          );
+          if (verdict) return verdict;
+          return {
+            passed: true,
+            details: `${closedWithoutResponse(err)} — not a 401 response, no challenge to check`,
+            skipped: true,
+          };
         }
       },
     );
@@ -2404,27 +3867,59 @@ export async function runComplianceSuite(
       "basic/authorization",
       async () => {
         if (!hasAuth) {
-          return { passed: true, details: "Skipped: server does not require auth" };
+          return { passed: true, details: "Skipped: no --auth provided" };
         }
+        if (await authNotEvaluable()) return authNotEvaluableSkip;
         const malformedHeaders: Record<string, string> = {
           Authorization: "Bearer INVALID_GARBAGE_TOKEN_!@#$%^&*()",
         };
         if (sessionId) malformedHeaders["mcp-session-id"] = sessionId;
-        try {
-          // Omit the configured (valid) Authorization first, then let the
-          // malformed value in malformedHeaders take its place — without the
-          // omit, the valid user header would survive the case-insensitive
-          // merge and the server would accept the request.
-          const res = await mcpRequest(backendUrl, "ping", undefined, nextId, malformedHeaders, timeout, [
-            "authorization",
-          ]);
-          if (res.statusCode === 401 || res.statusCode === 403) {
-            return { passed: true, details: `HTTP ${res.statusCode} (malformed auth rejected)` };
+        const probe = async (): Promise<LegacyOutcome> => {
+          try {
+            // Omit the configured (valid) Authorization first, then let the
+            // malformed value in malformedHeaders take its place — without the
+            // omit, the valid user header would survive the case-insensitive
+            // merge and the server would accept the request.
+            const res = await mcpRequest(backendUrl, "ping", undefined, nextId, malformedHeaders, timeout, [
+              "authorization",
+            ]);
+            if (res.statusCode === 401 || res.statusCode === 403) {
+              return { passed: true, details: `HTTP ${res.statusCode} (malformed auth rejected)` };
+            }
+            return unrefusedAnswer(
+              res,
+              "the ping carrying a malformed credential",
+              "server accepted malformed auth token",
+              "the spec answers an invalid token with 401",
+            );
+          } catch (err: unknown) {
+            // The probe differs from the served handshake only in the
+            // credential it carries, so a drop is pinned on that; a timeout
+            // or a failed connection measured nothing.
+            const verdict = unansweredProbe(
+              "the ping carrying a malformed credential",
+              err,
+              credentialedRequestServed(),
+              timeout,
+              options.signal,
+            );
+            if (verdict) return verdict;
+            return { passed: true, details: `${closedWithoutResponse(err)} (malformed auth rejected)` };
           }
-          return { passed: false, details: `HTTP ${res.statusCode} — server accepted malformed auth token` };
-        } catch (_err: unknown) {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+        };
+        const outcome = await probe();
+        // Nor when the server refused the configured credential too: then
+        // the refusal the malformed one drew is what every credential draws,
+        // the "rejects everything" the comparison exists to rule out. Only a
+        // pass turns into the skip -- a malformed credential the server
+        // ACCEPTED, or a 5xx on one, is a finding whatever the valid one drew.
+        if (outcome.passed) {
+          const refused = await credentialRefusedStatus();
+          if (refused !== null) {
+            return credentialRefusedSkip(refused, "rejecting invalid tokens cannot be told from rejecting everything");
+          }
         }
+        return outcome;
       },
     );
 
@@ -2505,8 +4000,9 @@ export async function runComplianceSuite(
       "basic/transports#streamable-http",
       async () => {
         if (!hasAuth) {
-          return { passed: true, details: "Skipped: server does not require auth" };
+          return { passed: true, details: "Skipped: no --auth provided" };
         }
+        if (await authNotEvaluable()) return authNotEvaluableSkip;
         if (!sessionId) {
           return { passed: true, details: "Skipped: server does not issue session IDs" };
         }
@@ -2523,12 +4019,24 @@ export async function runComplianceSuite(
           if (res.statusCode === 401 || res.statusCode === 403) {
             return { passed: true, details: `HTTP ${res.statusCode} (session ID alone not sufficient for auth)` };
           }
-          return {
-            passed: false,
-            details: `HTTP ${res.statusCode} — server accepted session ID without auth (spec: MUST NOT use sessions for authentication)`,
-          };
-        } catch {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+          return unrefusedAnswer(
+            res,
+            "the ping carrying only the session ID",
+            "server accepted session ID without auth (spec: MUST NOT use sessions for authentication)",
+            "the spec answers a request without a credential with 401, whatever session it names",
+          );
+        } catch (err: unknown) {
+          // The session-only probe differs from the served handshake in
+          // nothing but the missing credential, so a drop is pinned on it.
+          const verdict = unansweredProbe(
+            "the ping carrying only the session ID",
+            err,
+            credentialedRequestServed(),
+            timeout,
+            options.signal,
+          );
+          if (verdict) return verdict;
+          return { passed: true, details: `${closedWithoutResponse(err)} (session ID alone not sufficient for auth)` };
         }
       },
     );
@@ -2541,67 +4049,90 @@ export async function runComplianceSuite(
       "basic/authorization",
       async () => {
         if (!hasAuth) {
-          return { passed: true, details: "Skipped: server does not require auth" };
+          return { passed: true, details: "Skipped: no --auth provided" };
         }
         const parsedUrl = new URL(backendUrl);
         // Per MCP 2025-11-25: the MCP server hosts Protected Resource Metadata (RFC 9728)
         // at /.well-known/oauth-protected-resource, which points to the authorization server(s).
         const prmUrl = `${parsedUrl.protocol}//${parsedUrl.host}/.well-known/oauth-protected-resource`;
+        let res: Awaited<ReturnType<typeof request>>;
+        let text: string;
         try {
-          const res = await request(prmUrl, {
+          res = await request(prmUrl, {
             method: "GET",
             headers: { Accept: "application/json" },
             signal: AbortSignal.timeout(Math.min(timeout, 5000)),
           });
-          const text = await res.body.text();
-          if (res.statusCode === 200) {
-            try {
-              const meta = JSON.parse(text);
-              if (!meta.resource) {
-                return { passed: false, details: "PRM response missing required 'resource' field" };
-              }
-              if (!Array.isArray(meta.authorization_servers) || meta.authorization_servers.length === 0) {
-                return { passed: false, details: "PRM response missing 'authorization_servers' array" };
-              }
-              return {
-                passed: true,
-                details: `Protected Resource Metadata found: resource=${meta.resource}, ${meta.authorization_servers.length} auth server(s)`,
-              };
-            } catch {
-              return { passed: false, details: "PRM endpoint returned non-JSON response" };
-            }
-          }
-          // Fall back to legacy /.well-known/oauth-authorization-server check
-          const legacyUrl = `${parsedUrl.protocol}//${parsedUrl.host}/.well-known/oauth-authorization-server`;
-          try {
-            const legacyRes = await request(legacyUrl, {
-              method: "GET",
-              headers: { Accept: "application/json" },
-              signal: AbortSignal.timeout(Math.min(timeout, 5000)),
-            });
-            const legacyText = await legacyRes.body.text();
-            if (legacyRes.statusCode === 200) {
-              try {
-                const legacyMeta = JSON.parse(legacyText);
-                if (legacyMeta.issuer && legacyMeta.token_endpoint) {
-                  warnings.push(
-                    "Server uses legacy /.well-known/oauth-authorization-server instead of /.well-known/oauth-protected-resource (RFC 9728). Update to PRM for 2025-11-25 compliance.",
-                  );
-                  return {
-                    passed: true,
-                    details: `Legacy OAuth AS metadata found: issuer=${legacyMeta.issuer} (should migrate to PRM)`,
-                  };
-                }
-              } catch {}
-            }
-          } catch {}
-          return {
-            passed: false,
-            details: `PRM endpoint returned HTTP ${res.statusCode} and no legacy OAuth metadata found`,
-          };
+          text = await res.body.text();
         } catch {
           return { passed: false, details: "PRM endpoint unreachable" };
         }
+        if (res.statusCode === 200) {
+          try {
+            const meta = JSON.parse(text);
+            if (!meta.resource) {
+              return { passed: false, details: "PRM response missing required 'resource' field" };
+            }
+            if (!Array.isArray(meta.authorization_servers) || meta.authorization_servers.length === 0) {
+              return { passed: false, details: "PRM response missing 'authorization_servers' array" };
+            }
+            return {
+              passed: true,
+              details: `Protected Resource Metadata found: resource=${meta.resource}, ${meta.authorization_servers.length} auth server(s)`,
+            };
+          } catch {
+            return { passed: false, details: "PRM endpoint returned non-JSON response" };
+          }
+        }
+        // Fall back to legacy /.well-known/oauth-authorization-server check
+        const legacyUrl = `${parsedUrl.protocol}//${parsedUrl.host}/.well-known/oauth-authorization-server`;
+        /** The legacy document's status, when it got an HTTP answer. */
+        let legacyStatus: number | undefined;
+        try {
+          const legacyRes = await request(legacyUrl, {
+            method: "GET",
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(Math.min(timeout, 5000)),
+          });
+          legacyStatus = legacyRes.statusCode;
+          const legacyText = await legacyRes.body.text();
+          if (legacyRes.statusCode === 200) {
+            try {
+              const legacyMeta = JSON.parse(legacyText);
+              if (legacyMeta.issuer && legacyMeta.token_endpoint) {
+                warnings.push(
+                  "Server uses legacy /.well-known/oauth-authorization-server instead of /.well-known/oauth-protected-resource (RFC 9728). Update to PRM for 2025-11-25 compliance.",
+                );
+                return {
+                  passed: true,
+                  details: `Legacy OAuth AS metadata found: issuer=${legacyMeta.issuer} (should migrate to PRM)`,
+                };
+              }
+            } catch {}
+          }
+        } catch {}
+        // A Host guard or gateway that refuses every request refuses the
+        // well-known locations too. When security-auth-required could not
+        // attribute the endpoint's bare 403 to authentication
+        // (authNotEvaluable, which only a 403 satisfies) and both metadata
+        // locations drew that same 403, the lookup met the guard again, not
+        // a missing document: it skips the way the 2026-07-28 suite's
+        // checkProtectedResourceMetadata does, instead of advising a
+        // document the guard would never let through. A document found, or
+        // any other answer (a 404, a 401), decides as before -- and the
+        // attribution is asked only then, so a healthy server sends nothing
+        // extra.
+        if (res.statusCode === 403 && legacyStatus === 403 && (await authNotEvaluable())) {
+          return {
+            passed: true,
+            details:
+              "Skipped: HTTP 403 without a Bearer challenge on the endpoint and on every well-known metadata location, not attributable to authentication (see security-auth-required)",
+          };
+        }
+        return {
+          passed: false,
+          details: `PRM endpoint returned HTTP ${res.statusCode} and no legacy OAuth metadata found`,
+        };
       },
     );
 
@@ -2613,33 +4144,79 @@ export async function runComplianceSuite(
       "basic/authorization",
       async () => {
         if (!hasAuth) {
-          return { passed: true, details: "Skipped: server does not require auth" };
+          return { passed: true, details: "Skipped: no --auth provided" };
         }
-        const authValue = userHeaders.Authorization || userHeaders.authorization || "";
-        const token = authValue.replace(/^Bearer\s+/i, "");
+        const token = authorizationHeader().replace(/^Bearer\s+/i, "");
         if (!token) {
           return { passed: true, details: "Skipped: could not extract token from auth header" };
         }
+        // The probe is sent whatever the refusals so far say: a server that
+        // accepts the token in the query string fails however it treats the
+        // header (the 2026-07-28 twin reads it in the same order). Only a
+        // refusal is read against them. A 401/403 is no evidence when the
+        // unauthenticated ping drew a bare 403 nothing could attribute to
+        // authentication (a Host guard or gateway answers this probe with
+        // the same 403: see authNotEvaluable), and no refusal is when the
+        // server refused the configured credential in the header too
+        // (credentialRefusedStatus): the token was never going to be
+        // accepted anywhere, so where it travelled decided nothing.
+        const notAccepted = async (details: string): Promise<LegacyOutcome> => {
+          const refused = await credentialRefusedStatus();
+          return refused === null
+            ? { passed: true, details }
+            : credentialRefusedSkip(refused, "refusing it in the query string proves nothing");
+        };
         const uriWithToken = `${backendUrl}${backendUrl.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(token)}`;
+        let status: number;
         try {
-          // Send WITHOUT auth header, WITH token in URI
-          const noAuthHeaders: Record<string, string> = {};
+          // Send WITHOUT the Authorization header, WITH the token in the
+          // URI. This goes through undici directly: the transport is bound
+          // to the plain URL and re-injects the configured Authorization
+          // header on every request, which used to turn this probe into an
+          // ordinary authenticated call whose 2xx read as "accepted a token
+          // in the query string" — a false failure on every server with auth.
+          const noAuthHeaders: Record<string, string> = {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+          };
+          for (const [k, v] of Object.entries(userHeaders)) {
+            if (k.toLowerCase() !== "authorization") noAuthHeaders[k] = v;
+          }
           if (sessionId) noAuthHeaders["mcp-session-id"] = sessionId;
-          const res = await mcpRequest(uriWithToken, "ping", undefined, nextId, noAuthHeaders, timeout);
-          if (res.statusCode === 401 || res.statusCode === 403) {
-            return { passed: true, details: `HTTP ${res.statusCode} (token in query string rejected)` };
-          }
-          // If server accepted it, that's a fail
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            return {
-              passed: false,
-              details: "Server accepted auth token in query string (spec: MUST NOT transmit credentials in URIs)",
-            };
-          }
-          return { passed: true, details: `HTTP ${res.statusCode} (token in query string not accepted)` };
-        } catch {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+          if (negotiatedProtocolVersion) noAuthHeaders["mcp-protocol-version"] = negotiatedProtocolVersion;
+          const res = await request(uriWithToken, {
+            method: "POST",
+            headers: noAuthHeaders,
+            body: JSON.stringify({ jsonrpc: "2.0", id: nextId(), method: "ping" }),
+            signal: AbortSignal.timeout(timeout),
+          });
+          await res.body.text();
+          status = res.statusCode;
+        } catch (err: unknown) {
+          // The probe differs from the served handshake only in where the
+          // token travels, so a drop is pinned on that.
+          const verdict = unansweredProbe(
+            "the ping with the token in the query string",
+            err,
+            credentialedRequestServed(),
+            timeout,
+            options.signal,
+          );
+          if (verdict) return verdict;
+          return notAccepted(`${closedWithoutResponse(err)} (token in query string not accepted)`);
         }
+        // If server accepted it, that's a fail, whatever else is true.
+        if (status >= 200 && status < 300) {
+          return {
+            passed: false,
+            details: "Server accepted auth token in query string (spec: MUST NOT transmit credentials in URIs)",
+          };
+        }
+        if (status === 401 || status === 403) {
+          if (await authNotEvaluable()) return authNotEvaluableSkip;
+          return notAccepted(`HTTP ${status} (token in query string rejected)`);
+        }
+        return notAccepted(`HTTP ${status} (token in query string not accepted)`);
       },
     );
 
@@ -2689,8 +4266,32 @@ export async function runComplianceSuite(
       false,
       "basic/transports#streamable-http",
       async () => {
-        // Send a POST with a suspicious Origin header — server should validate it for DNS rebinding protection
-        try {
+        // A POST ping with the handshake's headers (session, credential)
+        // plus a suspicious Origin, which streamable-http says MUST draw 403
+        // Forbidden (DNS rebinding protection). What the answer shows, read
+        // the way the 2026-07-28 twin reads it:
+        //
+        // - a 2xx: the server accepted the request; fails;
+        // - a 429: a rate limiter answered before the server read the
+        //   request. The probe is resent once after Retry-After (capped at
+        //   2 s, retryAfterMs), and a second 429 is not evaluable -- the
+        //   Origin was never looked at;
+        // - a 5xx: the server failed on the request rather than refusing it
+        //   (the reading security-auth-required and security-oversized-input
+        //   give the same status); fails;
+        // - a 401/403: the refusal the spec asks for when the Origin is the
+        //   one variable -- initialize, the same request without it, was
+        //   served, or was answered with a different status (a server that
+        //   checks the Origin before auth answers the credential-less
+        //   initialize 401 and the foreign Origin 403). When initialize drew
+        //   the same status or no answer, the 401/403 is what an auth gate,
+        //   a Host guard or a gateway answers every request with, and it says
+        //   nothing about the Origin: the check skips, pointing at
+        //   security-auth-required the way the auth siblings skip;
+        // - any other 4xx (400, 404, ...): refused, and passes -- the spec's
+        //   status is 403, but a request rejected for its Origin is rejected;
+        // - anything else (a redirect): fails, naming the status.
+        const send = async () => {
           const res = await request(backendUrl, {
             method: "POST",
             headers: {
@@ -2700,70 +4301,206 @@ export async function runComplianceSuite(
               ...buildHeaders(),
             },
             body: JSON.stringify({ jsonrpc: "2.0", id: createIdCounter(99970)(), method: "ping" }),
-            signal: AbortSignal.timeout(timeout),
+            signal: options.signal
+              ? AbortSignal.any([options.signal, AbortSignal.timeout(timeout)])
+              : AbortSignal.timeout(timeout),
           });
-          await res.body.text();
-          if (res.statusCode === 403 || res.statusCode === 401) {
-            return { passed: true, details: `HTTP ${res.statusCode} (suspicious Origin rejected)` };
+          const text = await res.body.text();
+          let body: unknown;
+          try {
+            body = JSON.parse(text);
+          } catch {}
+          return { statusCode: res.statusCode, headers: flatHeaders(res.headers), body };
+        };
+        try {
+          let res = await send();
+          /** "HTTP 429, then after Nms " once a throttled probe was resent. */
+          let throttled = "";
+          if (res.statusCode === 429) {
+            const wait = retryAfterMs(res.headers);
+            await pause(wait, options.signal);
+            throttled = `HTTP 429, then after ${wait}ms `;
+            res = await send();
           }
-          if (res.statusCode >= 200 && res.statusCode < 300) {
+          const status = res.statusCode;
+          if (status >= 200 && status < 300) {
             return {
               passed: false,
-              details: `HTTP ${res.statusCode} — server accepted request with untrusted Origin header (spec: MUST validate Origin for DNS rebinding protection)`,
+              details: `${throttled}HTTP ${status} — server accepted request with untrusted Origin header (spec: MUST validate Origin for DNS rebinding protection)`,
             };
           }
-          if (res.statusCode >= 400) {
-            return { passed: true, details: `HTTP ${res.statusCode} (suspicious Origin rejected)` };
+          if (status === 429) {
+            return {
+              passed: false,
+              details: `${throttled}HTTP 429 -- not evaluable: a rate limiter answered before the server read the request, so the Origin was never checked`,
+            };
           }
-          return { passed: false, details: `HTTP ${res.statusCode}` };
-        } catch {
-          return { passed: true, details: "Connection rejected (acceptable)" };
+          if (status >= 500) {
+            return {
+              passed: false,
+              details: `${throttled}HTTP ${status}${rpcErrorSuffix(res.body)} -- the server failed on the request rather than refusing it (a broken server, or a gateway with no backend); an untrusted Origin MUST draw 403`,
+            };
+          }
+          const setupStatus: unknown = initRes?.statusCode;
+          const originDecided = handshakeServed() || (typeof setupStatus === "number" && setupStatus !== status);
+          if ((status === 401 || status === 403) && !originDecided) {
+            return {
+              passed: true,
+              details: `Skipped: HTTP ${status} to the foreign Origin, but initialize was not served either, so the refusal is not attributable to the Origin (see security-auth-required)`,
+            };
+          }
+          if (status >= 400) {
+            return { passed: true, details: `${throttled}HTTP ${status} (suspicious Origin rejected)` };
+          }
+          return { passed: false, details: `${throttled}HTTP ${status}` };
+        } catch (err: unknown) {
+          // The probe is the handshake's request plus a foreign Origin, so
+          // a drop is pinned on the Origin when that handshake was served
+          // (no credential needed here: the Origin is the one variable).
+          const verdict = unansweredProbe(
+            "the ping carrying a foreign Origin",
+            err,
+            handshakeServed(),
+            timeout,
+            options.signal,
+          );
+          if (verdict) return verdict;
+          return { passed: true, details: `${closedWithoutResponse(err)} (suspicious Origin rejected)` };
         }
       },
     );
 
-    // Input validation security tests (only run if tools are available)
-    // Shared helper for injection tests: sends payloads to a tool param, checks output against a detection pattern
-    /**
-     * Heuristic patterns that indicate the server REJECTED the payload
-     * rather than executing it. If a response matches both `detectPattern`
-     * (suggesting execution) AND a rejection pattern, treat as a pass —
-     * the server defended correctly and just happened to echo the payload
-     * in its error message. Without this, well-defended servers like
-     * @modelcontextprotocol/server-filesystem look like they're vulnerable
-     * just because their error responses include the offending input.
-     */
-    const REJECTION_PATTERNS = [
-      /access denied/i,
-      /permission denied/i,
-      /not allowed/i,
-      /not permitted/i,
-      /outside (allowed|permitted)/i,
-      /forbidden/i,
-      /unauthorized/i,
-      /invalid (path|input|argument|parameter|request)/i,
-      /(payload|request) (rejected|blocked|refused)/i,
-      /enoent|eacces|eperm/i,
-      /sandbox(ed)?/i,
-      /(no such file|file not found)/i,
-      /\binvalid\b.*\b(input|json|argument|parameter|character)/i,
-    ];
+    // The two helpers below serve the injection checks,
+    // security-oversized-input and security-extra-params: declared ahead of
+    // all of them, since a const arrow is not usable before its declaration
+    // runs.
 
-    function looksRejected(text: string, isErrorFlag: boolean): boolean {
-      if (isErrorFlag) return true;
-      return REJECTION_PATTERNS.some((p) => p.test(text));
-    }
+    /**
+     * After an HTTP connection was dropped on a tools/call (the 1 MB value,
+     * an injection payload, unknown arguments), one follow-up ping (with the session, the way
+     * every later request goes) tells a connection-level rejection from a
+     * crash -- the 2026-07-28 suite's follow-up server/discover, in this
+     * era's method:
+     *
+     * - served (a JSON-RPC result): the server is up;
+     * - refused with 401 or 403: a gate in front of the server answered --
+     *   an auth gate when the refusal reads as one (readAuthRefusal), any
+     *   other 403 most likely a WAF or IPS now blocking this client -- so
+     *   this is no crash either;
+     * - refused with 429: a rate limiter answers before the server reads the
+     *   request (and one running as a separate gateway answers for a backend
+     *   that is gone), so the ping is retried once after Retry-After (capped
+     *   at 2 s, retryAfterMs) and the retry's answer decides; a second 429
+     *   counts as gone;
+     * - a JSON-RPC error answering the ping by its id, at any status below
+     *   500 other than 401, 403 and 429 (read above): the server read and
+     *   dispatched the request, so it is up (one that does not implement
+     *   ping answers -32601, and both eras let an error travel on an HTTP
+     *   4xx);
+     * - anything else (no response, a proxy's 502 for a backend that went
+     *   away, a JSON-RPC error that does not answer the ping -- the id-null
+     *   404 "Session not found" of a server that restarted and lost the
+     *   session -- or one on a 5xx, which a gateway in front of a dead
+     *   backend can synthesize with the request's id): the server may have
+     *   crashed.
+     *
+     * `alive` / `gone` is the clause the details quote. A run the caller
+     * aborted (during the ping or the wait before its retry) is rethrown.
+     */
+    const pingAfterDrop = async (): Promise<{ alive: string } | { gone: string }> => {
+      /** "answered HTTP 429, then after Nms " once the ping has been retried. */
+      let retried = "";
+      for (;;) {
+        let res: Awaited<ReturnType<typeof mcpRequest>>;
+        try {
+          res = await rpc("ping");
+        } catch (err: unknown) {
+          if (options.signal?.aborted) throw err;
+          return { gone: `${retried}got ${noResponse(err, timeout)}` };
+        }
+        if (res.body?.result !== undefined) {
+          return {
+            alive: retried ? `a follow-up ping ${retried}was served` : "the server still served a follow-up ping",
+          };
+        }
+        // A 401/403 reads as the gate it is before its body is read: a gate's
+        // JSON-RPC error can echo the id as well.
+        const refusal = readAuthRefusal(res, hasAuthHeader);
+        if (refusal) {
+          const gate =
+            refusal.kind === "forbidden"
+              ? "a gate in front of the server such as a WAF or IPS now blocking this client"
+              : "an auth gate";
+          return { alive: `a follow-up ping ${retried}was still answered (HTTP ${res.statusCode}, ${gate})` };
+        }
+        // A 429 is the limiter's, whatever its body echoes: retried below.
+        const error = res.body?.error;
+        if (
+          res.statusCode < 500 &&
+          res.statusCode !== 429 &&
+          error !== undefined &&
+          error !== null &&
+          res.body?.id === res.requestId
+        ) {
+          return {
+            alive: `a follow-up ping ${retried}was answered (HTTP ${res.statusCode}${rpcErrorSuffix(res.body)})`,
+          };
+        }
+        if (res.statusCode !== 429 || retried) {
+          return { gone: `${retried}answered HTTP ${res.statusCode}${rpcErrorSuffix(res.body)}` };
+        }
+        const wait = retryAfterMs(res.headers);
+        await pause(wait, options.signal);
+        retried = `answered HTTP 429, then after ${wait}ms `;
+      }
+    };
+
+    // Input validation security tests (only run if tools are available)
+    // Shared helper for injection tests: sends payloads to a tool param and
+    // classifies the output the way the 2026-07-28 suite does
+    // (classifyInjectionOutput): every verbatim copy of the payload is
+    // scrubbed before the detector runs, so an echo tool returning
+    // "&& echo pwned" as-is is benign reflection, not "pwned" produced by
+    // a shell, and only execution evidence (uid=..., root:x:..., a real
+    // database error) counts as an issue. Rejection heuristics live in
+    // src/checks/patterns.ts (looksRejected).
+    //
+    // A payload that got no answer at all is read from the error the way
+    // the 2026-07-28 twin reads it (classifyTransportError), never as the
+    // server rejecting the input:
+    // - a stdio child that exits on a payload died on it -- the crash the
+    //   check exists to catch: it fails naming the payload, and the child
+    //   is restarted (restartStdioServer) so the checks after it measure
+    //   the server rather than the corpse;
+    // - an HTTP connection closed or reset on a payload is resolved with a
+    //   follow-up ping (pingAfterDrop): a server gone after it fails as a
+    //   possible crash; one still up means the payload never reached the
+    //   tool (a WAF or IPS, a keep-alive close), counted as unanswered, with
+    //   a warning;
+    // - a server already gone before a payload (a child an earlier check
+    //   killed, a refused connection) stops the probe as unreachable;
+    // - a timeout is a payload that got no answer, counted as unanswered;
+    // - a caller's abort is rethrown, never graded.
 
     async function runInjectionTest(
+      check: string,
       toolName: string,
       paramName: string,
       payloads: string[],
       detectPattern: RegExp,
       label: string,
-    ): Promise<{ passed: boolean; details: string }> {
+      evidence: string,
+    ): Promise<LegacyOutcome> {
+      const where = `${toolName}.${paramName}`;
       const issues: string[] = [];
-      let defended = 0;
+      let rejected = 0;
+      let benign = 0;
+      /** Payloads that got no answer: a timeout, or a dropped connection the server outlived. */
+      let unanswered = 0;
       for (const payload of payloads) {
+        const stdio = transport.kind === "stdio" ? (transport as StdioTransport) : null;
+        // A child already gone was not killed by this payload.
+        const alreadyGone = stdio?.exited === true;
         try {
           const res = await rpc("tools/call", { name: toolName, arguments: { [paramName]: payload } });
           const result = res.body?.result;
@@ -2771,28 +4508,86 @@ export async function runComplianceSuite(
           const isErrorFlag = result?.isError === true;
           if (Array.isArray(content)) {
             const text = content.map((c: any) => c.text || "").join(" ");
-            if (detectPattern.test(text)) {
-              if (looksRejected(text, isErrorFlag)) {
-                defended++;
-              } else {
-                issues.push(`Payload "${payload}" ${label} (output: ${text.substring(0, 100)})`);
-              }
+            const verdict = classifyInjectionOutput(text, payload, detectPattern, isErrorFlag);
+            if (verdict === "issue") {
+              issues.push(`Payload "${payload}" ${label} (output: ${text.substring(0, 100)})`);
+            } else if (verdict === "rejected") {
+              rejected++;
             } else {
-              defended++;
+              benign++;
             }
+          } else {
+            // A JSON-RPC error (invalid params, unknown tool): the input
+            // never reached a handler.
+            rejected++;
           }
-        } catch {
-          // Error is acceptable — server rejected the input
-          defended++;
+        } catch (err: unknown) {
+          if (options.signal?.aborted) throw err;
+          const failure = classifyTransportError(err);
+          const sent = `payload "${payload}" sent to ${where}`;
+          // Execution evidence found on earlier payloads comes first.
+          const afterIssues = (crash: string) => [...issues, crash].join("; ");
+          if (stdio && !alreadyGone && (failure === "dropped" || stdio.exited)) {
+            const died = { passed: false, details: afterIssues(`server died on ${sent}: ${errorLine(err, 120)}`) };
+            await restartStdioServer(check, `an injection payload sent to ${where}`);
+            return died;
+          }
+          if (!stdio && failure === "dropped") {
+            const after = await pingAfterDrop();
+            if ("gone" in after) {
+              return {
+                passed: false,
+                details: afterIssues(
+                  `server may have crashed: connection dropped on ${sent}: ${errorLine(err, 40)}; ping then ${after.gone}`,
+                ),
+              };
+            }
+            warnings.push(
+              `${check}: a tools/call to ${where} carrying a payload had its connection closed without a response, but ${after.alive}, so the payload is counted as unanswered rather than as a crash or a rejection. The drop may be a WAF or IPS dropping the request, a keep-alive connection closed as it was sent, or one crashed worker of several; refuse a payload with HTTP 4xx or a JSON-RPC error so a client can tell a refusal from a crash.`,
+            );
+            unanswered++;
+            continue;
+          }
+          // Gone before this payload (a child an earlier check killed, a
+          // refused connection): no payload after it can be sent either.
+          if (failure === "dropped" || failure === "connect") {
+            if (issues.length > 0) return { passed: false, details: issues.join("; ") };
+            const gone = unreachable(`tools/call ${where} with payload "${payload}"`, err, timeout);
+            const earlier = rejected + benign + unanswered;
+            return earlier === 0
+              ? gone
+              : { passed: false, details: `${gone.details}, after ${earlier} earlier payload(s)` };
+          }
+          // A timeout (the tool may just be slow) or an unclassifiable
+          // error: the payload got no answer, which rejects nothing.
+          unanswered++;
         }
       }
       if (issues.length > 0) return { passed: false, details: issues.join("; ") };
+      const scope = `Tested ${payloads.length} payloads against ${where}`;
+      if (unanswered === 0) {
+        return {
+          passed: true,
+          details:
+            benign === 0
+              ? `${scope} — server defended (rejected or sanitized)`
+              : `${scope} — no ${evidence} detected (${rejected} rejected, ${benign} returned without it)`,
+        };
+      }
+      if (unanswered === payloads.length) {
+        // Nothing was measured: say so rather than pass as "defended".
+        warnings.push(
+          `${check}: no payload sent to ${where} got an answer (every tools/call timed out, was dropped, or got no usable response), so the verdict is inconclusive.`,
+        );
+        return {
+          passed: true,
+          details: `${scope} — inconclusive: no payload got an answer (see warning)`,
+          skipped: true,
+        };
+      }
       return {
         passed: true,
-        details:
-          defended === payloads.length
-            ? `Tested ${payloads.length} payloads against ${toolName}.${paramName} — server defended (rejected or sanitized)`
-            : `Tested ${payloads.length} payloads against ${toolName}.${paramName} — no ${label.split(" ")[0]} detected`,
+        details: `${scope} — no ${evidence} detected (${rejected} rejected, ${benign} returned without it, ${unanswered} unanswered)`,
       };
     }
 
@@ -2819,13 +4614,15 @@ export async function runComplianceSuite(
         "server/tools#calling-tools",
         async () => {
           if (!injectionTarget || !targetStringParam)
-            return { passed: true, details: "No tools with string parameters to test" };
+            return { passed: true, details: "No tools with string parameters to test", skipped: true };
           return runInjectionTest(
+            "security-command-injection",
             injectionTarget.name,
             targetStringParam,
             INJECTION_PAYLOADS.command,
             /root:.*:\d+:\d+:.*:\/|uid=\d+\(\w+\)|drwxr|pwned/i,
             "appears to have executed",
+            "command execution",
           );
         },
       );
@@ -2838,13 +4635,15 @@ export async function runComplianceSuite(
         "server/tools#calling-tools",
         async () => {
           if (!injectionTarget || !targetStringParam)
-            return { passed: true, details: "No tools with string parameters to test" };
+            return { passed: true, details: "No tools with string parameters to test", skipped: true };
           return runInjectionTest(
+            "security-sql-injection",
             injectionTarget.name,
             targetStringParam,
             INJECTION_PAYLOADS.sql,
             /syntax error|sql|mysql|postgres|sqlite|information_schema|table_name/i,
             "triggered database error",
+            "database error",
           );
         },
       );
@@ -2857,13 +4656,15 @@ export async function runComplianceSuite(
         "server/tools#calling-tools",
         async () => {
           if (!injectionTarget || !targetStringParam)
-            return { passed: true, details: "No tools with string parameters to test" };
+            return { passed: true, details: "No tools with string parameters to test", skipped: true };
           return runInjectionTest(
+            "security-path-traversal",
             injectionTarget.name,
             targetStringParam,
             INJECTION_PAYLOADS.pathTraversal,
             /root:.*:0:0|\[boot loader\]|\[extensions\]/i,
             "returned sensitive file content",
+            "sensitive file content",
           );
         },
       );
@@ -2886,13 +4687,15 @@ export async function runComplianceSuite(
           const urlParam = Object.entries(urlParamTool.inputSchema.properties).find(
             ([k, v]: [string, any]) => v.type === "string" && /url|uri|endpoint|link|href/i.test(k),
           )?.[0];
-          if (!urlParam) return { passed: true, details: "No URL parameter found" };
+          if (!urlParam) return { passed: true, details: "No URL parameter found", skipped: true };
           return runInjectionTest(
+            "security-ssrf-internal",
             urlParamTool.name,
             urlParam,
             INJECTION_PAYLOADS.ssrf,
             /ami-|instance-id|hostname|iam|security-credentials/i,
             "returned internal data",
+            "internal data",
           );
         },
       );
@@ -2923,36 +4726,167 @@ export async function runComplianceSuite(
       "server/tools#calling-tools",
       async () => {
         const largeValue = "A".repeat(1_048_576);
+        const toolName = toolNames[0] || "test";
+        const where = `${toolName}.data`;
+        const unreachable = (err: unknown) => ({
+          passed: false,
+          details: `server unreachable: tools/call ${where} with a 1 MB value got ${noResponse(err, timeout)}`,
+        });
+        // Sent through the transport, so it runs on stdio too (a raw POST to
+        // backendUrl, which is empty for a stdio target, failed client-side
+        // and passed as "Connection rejected"), parses an SSE answer, and
+        // honours the caller's abort.
+        const stdio = transport.kind === "stdio" ? (transport as StdioTransport) : null;
+        // Scopes the stdio overflow verdict to output produced during THIS
+        // call: the transport counts overflows for its whole life.
+        const overflowsBefore = stdio?.stdoutOverflows ?? 0;
+        // A child already gone was not killed by the 1 MB value.
+        const alreadyGone = stdio?.exited === true;
+        const callBig = () =>
+          mcpRequest(
+            backendUrl,
+            "tools/call",
+            { name: toolName, arguments: { data: largeValue } },
+            nextId,
+            buildHeaders(),
+            timeout,
+          );
         try {
-          const res = await request(backendUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Accept: "application/json, text/event-stream",
-              ...buildHeaders(),
-            },
-            body: JSON.stringify({
-              jsonrpc: "2.0",
-              id: nextId(),
-              method: "tools/call",
-              params: { name: toolNames[0] || "test", arguments: { data: largeValue } },
-            }),
-            signal: AbortSignal.timeout(timeout),
-          });
-          await res.body.text();
-          if (res.statusCode === 413) {
-            return { passed: true, details: "HTTP 413 Payload Too Large (good)" };
+          let res = await callBig();
+          /** "HTTP 429, then after Nms " once a throttled call was resent. */
+          let throttled = "";
+          if (!stdio && res.statusCode === 429) {
+            // A rate limiter answers before the server reads the request, so
+            // a 429 says nothing about the 1 MB value: wait what it asks
+            // (capped at 2 s, retryAfterMs) and send the call once more.
+            const wait = retryAfterMs(res.headers);
+            await pause(wait, options.signal);
+            throttled = `HTTP 429, then after ${wait}ms `;
+            res = await callBig();
           }
-          if (res.statusCode >= 400) {
-            return { passed: true, details: `HTTP ${res.statusCode} (oversized input rejected)` };
+          const body = res.body;
+          const rpcError = body?.error !== undefined && body?.error !== null;
+          if (!stdio) {
+            const status = res.statusCode;
+            if (status === 413) return { passed: true, details: "HTTP 413 Payload Too Large (good)" };
+            if (status === 429) {
+              return {
+                passed: false,
+                details: `${throttled}HTTP 429 on a 1 MB ${where} -- not evaluable: a rate limiter answered before the server read the request`,
+              };
+            }
+            // A 401, or a 403 that reads as an auth gate (readAuthRefusal),
+            // answered before the server read the request: nothing about the
+            // 1 MB value was measured. A bare 403 is what a WAF or size rule
+            // blocking the body answers too, and counts when initialize --
+            // sent with the same headers -- was served: the value is then
+            // the one variable. Otherwise it may be Host/Origin validation
+            // or a gateway refusing every request.
+            const refusal = readAuthRefusal(res, hasAuthHeader);
+            if (refusal && refusal.kind !== "forbidden") {
+              return {
+                passed: false,
+                details: `HTTP ${status} on a 1 MB ${where} -- not evaluable: an auth gate answered before the server read the request (${authRefusalHint(refusal, "pass --auth")})`,
+              };
+            }
+            if (refusal && !handshakeServed()) {
+              const quoted = refusal.message ? ` (${JSON.stringify(refusal.message)})` : "";
+              return {
+                passed: false,
+                details: `HTTP 403${quoted} on a 1 MB ${where} -- not evaluable: initialize was not served either, so the 403 may be Host/Origin validation or a gateway refusing every request rather than a size limit`,
+              };
+            }
+            if (status >= 400 && status < 500) {
+              return { passed: true, details: `HTTP ${status} (oversized input rejected)` };
+            }
+            if (status >= 500) {
+              return {
+                passed: false,
+                details: `HTTP ${status} -- server error on a 1 MB ${where} (should answer 413/4xx or a JSON-RPC error)`,
+              };
+            }
           }
-          return { passed: true, details: `HTTP ${res.statusCode} — server handled 1MB payload without crashing` };
+          // What the server itself answered, read the way the 2026-07-28 twin
+          // reads it: a JSON-RPC error rejected the value; a result is a
+          // server that processed a megabyte it could have refused -- it
+          // survived, so it passes, with the warning that says so.
+          if (rpcError) {
+            return { passed: true, details: `${errorWithCode(body.error.code)} (oversized input rejected)` };
+          }
+          if (body?.result !== undefined) {
+            warnings.push(
+              `security-oversized-input: the server completed a tools/call carrying a 1 MB string argument (${where}) instead of rejecting it; enforce a request body limit (413) or maxLength in inputSchema.`,
+            );
+            const prefix = stdio ? "result" : `HTTP ${res.statusCode}, result`;
+            return {
+              passed: true,
+              details: `${prefix} -- server processed a 1 MB ${where} without rejecting it (survived)`,
+            };
+          }
+          const frame = stdio ? "broken stdio frame" : `HTTP ${res.statusCode}, non-JSON-RPC body`;
+          return { passed: false, details: `${frame} -- no result or error for a 1 MB ${where}` };
         } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (msg.includes("timeout") || msg.includes("abort")) {
+          if (options.signal?.aborted) throw err;
+          const failure = classifyTransportError(err);
+          if (stdio) {
+            // The exit decides before the overflow does: a child that wrote
+            // an over-long line and then exited was rejected by its exit.
+            if (failure === "dropped" || stdio.exited) {
+              if (alreadyGone) return unreachable(err);
+              const died = { passed: false, details: `server died on a 1 MB ${where}: ${errorLine(err, 120)}` };
+              await restartStdioServer("security-oversized-input", `a 1 MB ${where}`);
+              return died;
+            }
+            if (stdio.stdoutOverflows > overflowsBefore) {
+              // The server answered with a single line longer than the
+              // runner's 1 MiB stdio buffer and is still running: a runner
+              // limit, not a server fault.
+              warnings.push(
+                `security-oversized-input: the server's reply to a 1 MB ${where} exceeded the runner's 1 MiB stdio line buffer and was dropped; treated as survived. Prefer rejecting oversized arguments with a JSON-RPC error.`,
+              );
+              return {
+                passed: true,
+                details: `response to a 1 MB ${where} exceeded the runner's stdio line buffer (server survived)`,
+              };
+            }
+          } else {
+            // Refused before anything was sent: nothing about the 1 MB value was measured.
+            if (failure === "connect") return unreachable(err);
+            // Closing the connection on a 1 MB body is an acceptable
+            // refusal only when the server is still there afterwards.
+            if (failure === "dropped") {
+              const reason = errorLine(err, 40);
+              const after = await pingAfterDrop();
+              if ("gone" in after) {
+                if (!serverReachable && initRes === null) {
+                  // Neither the preflight nor initialize was ever answered:
+                  // the server was not reachable in this run at all, so the
+                  // drop says nothing about the 1 MB value.
+                  return {
+                    passed: false,
+                    details: `${unreachable(err).details}; ping then ${after.gone} (the preflight and initialize got no answer either)`,
+                  };
+                }
+                return {
+                  passed: false,
+                  details: `server may have crashed: connection dropped on a 1 MB ${where}: ${reason}; ping then ${after.gone}`,
+                };
+              }
+              return {
+                passed: true,
+                details: `Connection rejected (acceptable for oversized input): ${reason}; ${after.alive}`,
+              };
+            }
+          }
+          if (failure === "timeout") {
             return { passed: false, details: "Request timed out — server may be struggling with oversized input" };
           }
-          return { passed: true, details: "Connection rejected (acceptable for oversized input)" };
+          // A rejection is an answer (a 4xx, a JSON-RPC error) or a
+          // connection closed on the body that the server outlives, all read
+          // above. What is left got no usable response at all -- bytes that
+          // are not an HTTP response, a TLS failure, a child that never
+          // spawned -- and rejects nothing.
+          return { passed: false, details: `no usable response to a 1 MB ${where}: ${errorLine(err, 120)}` };
         }
       },
     );
@@ -2967,6 +4901,29 @@ export async function runComplianceSuite(
         if (toolNames.length === 0) {
           return { passed: true, details: "No tools available to test (skipped)" };
         }
+        // Unknown arguments on the first tool, read the way the 2026-07-28
+        // twin reads them. Rejected (a JSON-RPC error) or ignored (a result)
+        // both pass; a 5xx, or an answer that is neither, fails. A request
+        // that got no answer is read from the error, never as a rejection:
+        // - a stdio child that exits on the call died on it -- the crash the
+        //   check hunts: it fails as died, and the child is restarted
+        //   (restartStdioServer) so the checks after it measure the server;
+        // - an HTTP connection closed or reset on the call is resolved with
+        //   a follow-up ping (pingAfterDrop): a server gone after it fails as
+        //   a possible crash; one still up passes as inconclusive, with a
+        //   warning (a WAF or IPS dropping the payload, a keep-alive close);
+        // - a server already gone before the call (a child an earlier check
+        //   killed, a refused connection) is unreachable, not a crash on
+        //   these arguments;
+        // - a timeout passes as inconclusive, with a warning: the tool may
+        //   just be slow;
+        // - anything else got no usable response, and fails;
+        // - a caller's abort is rethrown, never graded.
+        const name = toolNames[0];
+        const what = `tools/call ${name} with unknown arguments`;
+        const stdio = transport.kind === "stdio" ? (transport as StdioTransport) : null;
+        // A child already gone was not killed by these arguments.
+        const alreadyGone = stdio?.exited === true;
         try {
           // Build arguments via JSON.parse so "__proto__" lands as a real own
           // enumerable property: the `__proto__:` object-literal form sets the
@@ -2974,17 +4931,79 @@ export async function runComplianceSuite(
           // pollution payload would never reach the wire.
           const maliciousArgs = JSON.parse('{"__injected_param__":"malicious_value","__proto__":{"admin":true}}');
           const res = await rpc("tools/call", {
-            name: toolNames[0],
+            name,
             arguments: maliciousArgs,
           });
+          // A stdio answer always reads 200 (mcpRequest), so this is HTTP's:
+          // the server failed on the payload rather than refusing it.
+          if (res.statusCode >= 500) {
+            return { passed: false, details: `HTTP ${res.statusCode} -- server error on unknown tool arguments` };
+          }
           const error = res.body?.error;
           if (error) {
             return { passed: true, details: `Extra params rejected with error: ${error.code} — ${error.message}` };
           }
           // If server accepted but ignored extra params, that's acceptable
-          return { passed: true, details: "Server processed request (extra params likely ignored)" };
-        } catch {
-          return { passed: true, details: "Request rejected (acceptable)" };
+          if (res.body?.result !== undefined) {
+            return { passed: true, details: "Server processed request (extra params likely ignored)" };
+          }
+          const seen = stdio ? "" : `HTTP ${res.statusCode}, `;
+          return {
+            passed: false,
+            details: `malformed response to unknown tool arguments (${seen}no result or error)`,
+          };
+        } catch (err: unknown) {
+          if (options.signal?.aborted) throw err;
+          const failure = classifyTransportError(err);
+          // The stdio transport rejects every pending request with the
+          // child's exit diagnostic the moment it goes away.
+          if (stdio && (failure === "dropped" || stdio.exited)) {
+            if (alreadyGone) return unreachable(what, err, timeout);
+            const died = {
+              passed: false,
+              details: `server died on unknown tool arguments (tools/call ${name}): ${errorLine(err, 120)}`,
+            };
+            await restartStdioServer("security-extra-params", `unknown tool arguments (tools/call ${name})`);
+            return died;
+          }
+          if (!stdio) {
+            // Refused before anything was sent: an earlier check took the server down.
+            if (failure === "connect") return unreachable(what, err, timeout);
+            if (failure === "dropped") {
+              const after = await pingAfterDrop();
+              if ("gone" in after) {
+                return {
+                  passed: false,
+                  details: `server may have crashed: connection dropped on unknown tool arguments (tools/call ${name}): ${errorLine(err, 40)}; ping then ${after.gone}`,
+                };
+              }
+              warnings.push(
+                `security-extra-params: tools/call ${name} with unknown arguments had its connection closed without a response, but ${after.alive}, so the verdict is inconclusive rather than a crash. The drop may be a WAF or IPS dropping the request, a keep-alive connection closed as it was sent, or one crashed worker of several; reject unknown arguments with a JSON-RPC error or ignore them so a client can tell a refusal from a crash.`,
+              );
+              // No answer to read: a skip, whatever the warning says.
+              return {
+                passed: true,
+                details: `tools/call ${name} had its connection closed without a response -- extra-params verdict inconclusive (see warning)`,
+                skipped: true,
+              };
+            }
+          }
+          if (failure === "timeout") {
+            warnings.push(
+              `security-extra-params: tools/call ${name} with unknown arguments did not answer within ${timeout}ms, so the verdict is inconclusive (no answer is neither a rejection nor a crash). Re-run with a larger --timeout or a faster first tool.`,
+            );
+            return {
+              passed: true,
+              details: `tools/call ${name} did not answer within ${timeout}ms -- extra-params verdict inconclusive (see warning)`,
+              skipped: true,
+            };
+          }
+          // Neither an answer nor a transport failure the server can be
+          // judged by: bytes that are not an HTTP response, a TLS failure.
+          return {
+            passed: false,
+            details: `no usable response to unknown tool arguments (tools/call ${name}): ${errorLine(err, 120)}`,
+          };
         }
       },
     );
@@ -2999,7 +5018,7 @@ export async function runComplianceSuite(
       async () => {
         if (!toolsListOk) return { passed: true, details: "Skipped: tools/list not available" };
         const tools = cachedToolsList ?? [];
-        if (tools.length === 0) return { passed: true, details: "No tools to validate" };
+        if (tools.length === 0) return { passed: true, details: "No tools to validate", skipped: true };
         const missing = tools.filter((t: any) => t.inputSchema?.type !== "object");
         if (missing.length > 0) {
           return {
@@ -3068,18 +5087,7 @@ export async function runComplianceSuite(
       async () => {
         if (!toolsListOk) return { passed: true, details: "Skipped: tools/list not available" };
         const tools = cachedToolsList ?? [];
-        if (tools.length === 0) return { passed: true, details: "No tools to validate" };
-
-        const suspiciousPatterns = [
-          { pattern: /ignore\s+(all\s+)?previous/i, label: "ignore previous instructions" },
-          { pattern: /override\s+(system|instructions|rules)/i, label: "override instructions" },
-          { pattern: /system\s+prompt/i, label: "system prompt reference" },
-          { pattern: /you\s+must\s+(always|never)/i, label: "behavioral override" },
-          { pattern: /do\s+not\s+(tell|inform|mention)/i, label: "concealment instruction" },
-          { pattern: /\b[A-Za-z0-9+/]{40,}={0,2}\b/, label: "possible Base64-encoded payload" },
-          // Zero-width characters (U+200B, U+200C, U+200D, U+FEFF)
-          { pattern: /\u200B|\u200C|\u200D|\uFEFF/, label: "hidden Unicode characters" },
-        ];
+        if (tools.length === 0) return { passed: true, details: "No tools to validate", skipped: true };
 
         const issues: string[] = [];
         for (const tool of tools) {
@@ -3090,7 +5098,7 @@ export async function runComplianceSuite(
               : []),
           ];
           const combined = textsToCheck.join(" ");
-          for (const { pattern, label } of suspiciousPatterns) {
+          for (const { pattern, label } of POISONING_PATTERNS) {
             if (pattern.test(combined)) {
               issues.push(`Tool "${tool.name}": ${label}`);
             }
@@ -3133,6 +5141,19 @@ export async function runComplianceSuite(
     );
 
     // Information disclosure tests
+    //
+    // Both send their error probes as raw HTTP POSTs to backendUrl, which a
+    // stdio target does not have (it is ""): every probe failed client-side
+    // and the checks passed on nothing -- "0 error responses checked" and
+    // "No response to check (connection error)" on every stdio run. There
+    // they skip, saying so. Over HTTP a probe that got no answer is read the
+    // way the rest of the suite reads one: a timeout, a refused connection
+    // or a dropped one left no error response to scan, so when nothing
+    // answered the check fails as "server unreachable" (the 2026-07-28
+    // suite's information-disclosure checks do the same when the server
+    // never answered), and a caller's abort is rethrown.
+    const rawHttpSignal = () =>
+      options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout);
     await test(
       "security-error-no-stacktrace",
       "Error responses do not leak stack traces",
@@ -3140,6 +5161,14 @@ export async function runComplianceSuite(
       false,
       "basic",
       async () => {
+        if (transport.kind === "stdio") {
+          return {
+            passed: true,
+            details:
+              "Skipped: the error probes are raw HTTP requests, which a stdio target cannot receive, so no error response was scanned",
+            skipped: true,
+          };
+        }
         const errorResponses: string[] = [];
         // Trigger several error conditions and collect response text
         const errorPayloads = [
@@ -3152,6 +5181,8 @@ export async function runComplianceSuite(
             params: { name: "___nonexistent___tool___" },
           }),
         ];
+        /** Why the first unanswered probe got no response, for the verdict when none answered. */
+        let firstFailure: unknown;
         for (const payload of errorPayloads) {
           try {
             const res = await request(backendUrl, {
@@ -3162,13 +5193,21 @@ export async function runComplianceSuite(
                 ...buildHeaders(),
               },
               body: payload,
-              signal: AbortSignal.timeout(timeout),
+              signal: rawHttpSignal(),
             });
             const text = await res.body.text();
             errorResponses.push(text);
-          } catch {
-            // Connection error — no response to check
+          } catch (err: unknown) {
+            if (options.signal?.aborted) throw err;
+            // No response to check from this probe.
+            firstFailure ??= err;
           }
+        }
+        if (errorResponses.length === 0) {
+          return {
+            passed: false,
+            details: `server unreachable: none of the ${errorPayloads.length} error probes was answered (the first got ${noResponse(firstFailure, timeout)}), so there are no error responses to scan`,
+          };
         }
 
         const issues: string[] = [];
@@ -3195,7 +5234,16 @@ export async function runComplianceSuite(
       false,
       "basic",
       async () => {
+        if (transport.kind === "stdio") {
+          return {
+            passed: true,
+            details:
+              "Skipped: the error probe is a raw HTTP request, which a stdio target cannot receive, so no error response was scanned",
+            skipped: true,
+          };
+        }
         // Trigger an error and check for internal IPs
+        let text: string;
         try {
           const res = await request(backendUrl, {
             method: "POST",
@@ -3205,19 +5253,25 @@ export async function runComplianceSuite(
               ...buildHeaders(),
             },
             body: JSON.stringify({ jsonrpc: "2.0", id: nextId(), method: "___trigger_error___" }),
-            signal: AbortSignal.timeout(timeout),
+            signal: rawHttpSignal(),
           });
-          const text = await res.body.text();
-          for (const pattern of INTERNAL_IP_PATTERNS) {
-            const match = text.match(pattern);
-            if (match) {
-              return { passed: false, details: `Error response contains internal IP: ${match[0]}` };
-            }
-          }
-          return { passed: true, details: "No internal IP addresses found in error responses" };
-        } catch {
-          return { passed: true, details: "No response to check (connection error)" };
+          text = await res.body.text();
+        } catch (err: unknown) {
+          if (options.signal?.aborted) throw err;
+          // Before: PASS "No response to check (connection error)" -- a
+          // pass on a request nothing answered.
+          return {
+            passed: false,
+            details: `${unreachable("the error probe (an unknown method)", err, timeout).details}, so there is no error response to scan`,
+          };
         }
+        for (const pattern of INTERNAL_IP_PATTERNS) {
+          const match = text.match(pattern);
+          if (match) {
+            return { passed: false, details: `Error response contains internal IP: ${match[0]}` };
+          }
+        }
+        return { passed: true, details: "No internal IP addresses found in error responses" };
       },
     );
 
@@ -3231,17 +5285,28 @@ export async function runComplianceSuite(
         // Send a burst of 50 rapid requests
         const burstSize = 50;
         let got429 = false;
+        /** Why the first request that got no response got none. */
+        let firstError: unknown;
         const promises = Array.from({ length: burstSize }, () =>
           mcpRequest(backendUrl, "ping", undefined, nextId, buildHeaders(), timeout)
             .then((res) => {
               if (res.statusCode === 429) got429 = true;
-              return res.statusCode;
+              return res;
             })
-            .catch(() => 0),
+            .catch((err: unknown) => {
+              firstError ??= err;
+              return null;
+            }),
         );
-        const statusCodes = await Promise.all(promises);
+        const responses = await Promise.all(promises);
         if (got429) {
           return { passed: true, details: `Rate limiting detected (429 returned after ${burstSize} rapid requests)` };
+        }
+        throwIfAborted(options.signal);
+        const statusCodes = responses.map((res) => res?.statusCode ?? 0);
+        // A burst nothing answered measured no limiter, missing or not.
+        if (statusCodes.every((c) => c === 0)) {
+          return unreachable(`every one of the ${burstSize} rapid pings`, firstError, timeout);
         }
         const errorCount = statusCodes.filter((c) => c >= 500).length;
         if (errorCount > burstSize / 2) {
@@ -3250,9 +5315,34 @@ export async function runComplianceSuite(
             details: `Server returned ${errorCount}/${burstSize} 5xx errors under load — should return 429 instead of crashing`,
           };
         }
+        const observed = [...new Set(statusCodes)].join(",");
+        if (statusCodes.every((c) => c === 401 || c === 403)) {
+          // A burst refused before it reached a handler measured no limiter
+          // either, and the refusal is read the way security-auth-required
+          // reads it (readAuthRefusal): a 403 that neither asks for a
+          // credential nor refuses the one sent is what a Host guard, an
+          // Origin check or a gateway answers every request with, so the
+          // credential is not what to check. The verdict stays a failure,
+          // as for any burst that drew no 429.
+          const refusals = responses.map((res) => (res ? readAuthRefusal(res, hasAuthHeader) : undefined));
+          const unattributed = refusals.find((r) => r?.kind === "forbidden");
+          if (unattributed) {
+            const quoted = unattributed.message ? ` (${JSON.stringify(unattributed.message)})` : "";
+            return {
+              passed: false,
+              details: `HTTP ${observed}${quoted} on all ${burstSize} rapid pings, which does not read as an auth refusal -- not evaluable: it may be Host/Origin validation or a gateway refusing every request before the server reads it, so rate limiting was not measured (see security-auth-required)`,
+            };
+          }
+          const refusal = refusals.find((r) => r !== undefined);
+          const hint = refusal ? authRefusalHint(refusal, "pass --auth") : "pass --auth";
+          return {
+            passed: false,
+            details: `HTTP ${observed} on all ${burstSize} rapid pings -- not evaluable: an auth gate answered before the server read the requests (${hint}), so rate limiting was not measured`,
+          };
+        }
         return {
           passed: false,
-          details: `No rate limiting detected (${burstSize} rapid requests all returned ${[...new Set(statusCodes)].join(",")})`,
+          details: `No rate limiting detected (${burstSize} rapid requests all returned ${observed})`,
         };
       },
     );
@@ -3355,13 +5445,28 @@ export async function runComplianceSuite(
           return { passed: false, details: `tools/call threw — ${err instanceof Error ? err.message : String(err)}` };
         }
       }
+      // No tool to carry the probe, so no unicode is sent at all: whatever
+      // follows is a skip. A server that declares no tools is not asked for
+      // a list it never offered (its -32601 used to FAIL the check as
+      // "tools/list returned error" on a conformant server).
+      if (!hasTools) {
+        return {
+          passed: true,
+          details: "Skipped: server declares no tools, so there is no tool call to carry the unicode probe",
+          skipped: true,
+        };
+      }
       // Fallback: just ensure tools/list (a canonical call) succeeds.
       // If the server can parse this at all, encoding is plausible.
       const res = await rpc("tools/list");
       if ((res.body as { error?: unknown }).error) {
         return { passed: false, details: "tools/list returned error" };
       }
-      return { passed: true, details: "tools/list returned successfully (no tools to probe with unicode)" };
+      return {
+        passed: true,
+        details: "tools/list returned successfully (no tools to probe with unicode)",
+        skipped: true,
+      };
     });
 
     await test(
@@ -3395,38 +5500,17 @@ export async function runComplianceSuite(
     // last-declared test was parallel-safe we still have work in flight
     // when we get here. MUST happen before warning dedup/cap below —
     // draining can push more warnings.
-    if (inFlight.size > 0) await drainPool();
+    await drainPool();
 
-    // ── Dedup + cap warnings ─────────────────────────────────────────
-    // A server with, say, 60 tools all missing descriptions produces 60
-    // near-identical lines that crowd out every other signal. Preserve
-    // insertion order but collapse exact duplicates, then cap. Mutates
-    // the array in place so the return value below picks up the change.
+    // Dedup + cap warnings: a server with, say, 60 tools all missing
+    // descriptions produces 60 near-identical lines that crowd out every
+    // other signal.
+    harness.finalizeWarnings();
 
-    const MAX_WARNINGS = 50;
-    const capped = dedupAndCapWarnings(warnings, MAX_WARNINGS);
-    warnings.length = 0;
-    warnings.push(...capped);
-
-    // ── Compute score ────────────────────────────────────────────────
-
-    const { score, grade, overall, summary, categories } = computeScore(tests);
-    // Badge URLs are retired (the mcp.hosting renderer is gone); the field is
-    // kept empty for report-schema back-compat. Use `--output <file>.svg` for
-    // a local badge image instead.
-    const badge = { imageUrl: "", reportUrl: "", markdown: "", html: "" };
-
-    return {
-      schemaVersion: REPORT_SCHEMA_VERSION,
-      specVersion: SPEC_VERSION,
+    return assembleReport({
+      specVersion: LEGACY_SPEC_VERSION,
       toolVersion: TOOL_VERSION,
       url: displayUrl,
-      timestamp: new Date().toISOString(),
-      score,
-      grade,
-      overall,
-      summary,
-      categories,
       tests,
       warnings,
       serverInfo,
@@ -3436,8 +5520,7 @@ export async function runComplianceSuite(
       resourceNames,
       promptCount,
       promptNames,
-      badge,
-    };
+    });
   } finally {
     // Always close the transport — swallow any close error so we don't
     // mask the real failure that brought us here.
