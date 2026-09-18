@@ -1,4 +1,5 @@
 import { errorCodeText, errorWithCode } from "../../checks/validators.js";
+import { readAuthRefusal } from "../../detect.js";
 import type { TestOutcome } from "../../harness.js";
 import {
   createModernClient,
@@ -30,6 +31,7 @@ import {
   publishList,
 } from "./context.js";
 import { gateVerdict, httpStatusText, resendOn429 } from "./gate.js";
+import { classifyTransportError } from "./security.js";
 
 /**
  * Lifecycle category of the 2026-07-28 suite. There is no handshake in
@@ -1039,6 +1041,139 @@ function pickProgressTool(tools: unknown[]): Record<string, unknown> | undefined
   return noArgs.find(mentionsProgress) ?? noArgs[0] ?? named[0];
 }
 
+/** ASCII-only, whitespace-collapsed, bounded copy of server-supplied text (a tool name, an error message) for a details string. */
+function clipDetail(text: string, max: number): string {
+  const ascii = text.replace(/\s+/g, " ").replace(/[^\x20-\x7e]/g, "?");
+  return ascii.length > max ? `${ascii.slice(0, max - 3)}...` : ascii;
+}
+
+/**
+ * What a request that got no response ran into, read from the error the
+ * way the security checks read it (classifyTransportError): "no response
+ * within Nms" for a timeout, "no response (connection closed: ...)" for a
+ * connection the server closed or a stdio child that exited, "no response
+ * (connection failed: ...)" otherwise.
+ */
+function noResponseTo(ctx: ModernSuiteContext, err: unknown): string {
+  const failure = classifyTransportError(err);
+  if (failure === "timeout") return `no response within ${ctx.timeout}ms`;
+  const how = failure === "dropped" ? "connection closed" : "connection failed";
+  return `no response (${how}: ${clipDetail(short(messageOf(err), 200), 90)})`;
+}
+
+/** One tools/call of lifecycle-progress-token: its answer, and the notifications/progress observed for it. */
+interface ProgressCall {
+  /** The response, or null when none came back (timeout, connection failure, a stdio child that exited). */
+  res: RpcResponse | null;
+  /** The transport error when `res` is null. */
+  err?: unknown;
+  notifications: unknown[];
+}
+
+/**
+ * The tools/call lifecycle-progress-token sends: `name` with no arguments,
+ * carrying `_meta.progressToken` next to the conformant envelope when
+ * `withToken`, and otherwise identical (the same envelope, the same
+ * standard headers). The notifications/progress it drew are collected from
+ * the response (HTTP: they ride its stream) and from the recording (stdio:
+ * only the recorder sees them), unioned by identity so the HTTP copies are
+ * not counted twice. A caller's abort is rethrown; any other transport
+ * error comes back as `err`.
+ */
+async function sendProgressCall(
+  ctx: ModernSuiteContext,
+  name: string,
+  inputSchema: unknown,
+  withToken: boolean,
+): Promise<ProgressCall> {
+  const seqStart = ctx.recorder.received.length;
+  const params: Record<string, unknown> = { name, arguments: {} };
+  if (withToken) params._meta = { progressToken: PROGRESS_TOKEN };
+  let res: RpcResponse | null = null;
+  let err: unknown;
+  try {
+    res = await ctx.client.rpc("tools/call", params, { toolInputSchema: inputSchema });
+  } catch (e) {
+    if (ctx.signal?.aborted) throw e;
+    err = e;
+  }
+  const seen = new Set<unknown>();
+  const notifications: unknown[] = [];
+  const consider = (m: unknown) => {
+    if (isObject(m) && m.method === PROGRESS_METHOD && !seen.has(m)) {
+      seen.add(m);
+      notifications.push(m);
+    }
+  };
+  for (const m of res?.messages ?? []) consider(m);
+  for (const r of ctx.recorder.received.slice(seqStart)) consider(r.message);
+  return res ? { res, notifications } : { res: null, err, notifications };
+}
+
+/** Whether the call was served: a result (on HTTP, on a 2xx). */
+function servedCall(ctx: ModernSuiteContext, res: RpcResponse): boolean {
+  if (!resultOf(res.body)) return false;
+  return ctx.kind !== "http" || (res.statusCode >= 200 && res.statusCode < 300);
+}
+
+/**
+ * What answered the call in the server's place, or undefined: on HTTP a
+ * 429 (a rate limiter), or a 401 / a 403 carrying a Bearer challenge (an
+ * auth gate, read the way readAuthRefusal reads one). A 403 without a
+ * challenge is not a gate here: whether it refused the token is for the
+ * same call without it to say.
+ */
+function gateOnCall(ctx: ModernSuiteContext, res: RpcResponse): string | undefined {
+  if (ctx.kind !== "http") return undefined;
+  if (res.statusCode === 429) return TRANSPORT_LEVEL_STATUS[429];
+  const refusal = readAuthRefusal(res, ctx.hasAuth);
+  return refusal && refusal.kind !== "forbidden" ? TRANSPORT_LEVEL_STATUS[refusal.statusCode] : undefined;
+}
+
+/** A server error on the call: a JSON-RPC error, or on HTTP a status >= 400, other than a gate's answer (gateOnCall). */
+function failedCall(ctx: ModernSuiteContext, res: RpcResponse): boolean {
+  if (gateOnCall(ctx, res)) return false;
+  return errorOf(res.body) !== undefined || (ctx.kind === "http" && res.statusCode >= 400);
+}
+
+/** "JSON-RPC error -32602 (Invalid params) (HTTP 400)", "a result (HTTP 200)", "HTTP 502 with no JSON-RPC response". */
+function callShape(ctx: ModernSuiteContext, res: RpcResponse): string {
+  const status = statusOf(ctx, res);
+  const err = errorOf(res.body);
+  if (err) {
+    const code = clipDetail(errorWithCode(err.rawCode), 80);
+    return `${code}${err.message ? ` (${clipDetail(err.message, 60)})` : ""}${status}`;
+  }
+  if (resultOf(res.body)) return `a result${status}`;
+  return ctx.kind === "http"
+    ? `HTTP ${res.statusCode} with no JSON-RPC response`
+    : "a message with neither result nor error";
+}
+
+/** How a call was answered, for a details string: "succeeded", "returned <error>", "answered <shape>", "got no response ...". */
+function callOutcome(ctx: ModernSuiteContext, c: ProgressCall): string {
+  if (!c.res) return `got ${noResponseTo(ctx, c.err)}`;
+  if (servedCall(ctx, c.res)) return "succeeded";
+  const gate = gateOnCall(ctx, c.res);
+  if (gate) return `answered HTTP ${c.res.statusCode} (${gate})`;
+  return `${failedCall(ctx, c.res) ? "returned" : "answered"} ${callShape(ctx, c.res)}`;
+}
+
+/**
+ * The verdict over the notifications/progress a call drew (evaluateProgress):
+ * a failure naming the problem, a pass naming the values, or null when it
+ * drew none. `call` is "tools/call <name>", `when` qualifies the answer
+ * (" when resent").
+ */
+function judgeProgress(ctx: ModernSuiteContext, c: ProgressCall, call: string, when = ""): TestOutcome | null {
+  const verdict = evaluateProgress(PROGRESS_TOKEN, c.notifications);
+  if (!verdict.ok) return fail(clipDetail(`${verdict.problem} (${call} ${callOutcome(ctx, c)}${when})`, 220));
+  if (c.notifications.length === 0) return null;
+  return pass(
+    `${c.notifications.length} ${PROGRESS_METHOD} echoed token "${PROGRESS_TOKEN}" with increasing progress (${listOf(verdict.values, 8)})`,
+  );
+}
+
 /**
  * First variable name of an RFC 6570 template ("{id}", "{?q,lang}",
  * "{+path*}" -> id, q, path): the operator prefix, any further variables
@@ -1322,39 +1457,61 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
     if (tools.length === 0) return pass("skipped: server lists no tools");
     const tool = pickProgressTool(tools);
     if (!tool) return pass("skipped: no listed tool has a name");
+    // Progress is optional (basic/patterns/progress: a server MAY send no
+    // notifications), but what the server does send is judged
+    // (evaluateProgress): every notifications/progress for the call MUST
+    // carry its token and a progress value that increases with each one.
+    //
+    // With no notification, the call's own answer is read. Served (or
+    // answered in some other way that is no server error) passes. A server
+    // error -- a JSON-RPC error, or on HTTP a status >= 400 other than a
+    // rate limiter's 429 or an auth gate's refusal (gateOnCall) -- is blamed
+    // on the token only once it is reproduced: the same call without the
+    // token, sent right after, is served, and the call carrying the token,
+    // resent after that, fails again. A tool whose first call fails
+    // whatever it carries (a cold backend) is served by then, and passes on
+    // the resent call; a failure the call without the token shares, or that
+    // the resent call does not repeat, stays an observation. A call nothing
+    // answered measured nothing about the token: a skip, never a verdict.
     const name = String(tool.name);
-    const seqStart = ctx.recorder.received.length;
-    let res: RpcResponse;
-    try {
-      res = await client.rpc(
-        "tools/call",
-        { name, arguments: {}, _meta: { progressToken: PROGRESS_TOKEN } },
-        { toolInputSchema: tool.inputSchema },
-      );
-    } catch (err) {
-      return fail(`tools/call ${name} with progressToken: no response (${short(messageOf(err), 60)})`);
-    }
-    // HTTP: notifications ride the response stream (res.messages) and are
-    // also emitted to the recorder; stdio: only the recorder sees them.
-    // Union by identity so the HTTP copies are not counted twice.
-    const seen = new Set<unknown>();
-    const notifications: unknown[] = [];
-    const consider = (m: unknown) => {
-      if (isObject(m) && m.method === PROGRESS_METHOD && !seen.has(m)) {
-        seen.add(m);
-        notifications.push(m);
+    const call = `tools/call ${clipDetail(name, 60)}`;
+    const none = `no ${PROGRESS_METHOD} observed (optional)`;
+    const send = (withToken: boolean) => sendProgressCall(ctx, name, tool.inputSchema, withToken);
+    const first = await send(true);
+    const judged = judgeProgress(ctx, first, call);
+    if (judged) return judged;
+    if (!first.res) {
+      if (ctx.kind === "stdio" && (ctx.transport as StdioTransport).exited) {
+        harness.warnings.push(
+          `lifecycle-progress-token: the server exited on ${call}, which carried _meta.progressToken (${await describeExit(ctx.transport as StdioTransport)}); the tests after it ran against the exited process.`,
+        );
       }
-    };
-    for (const m of res.messages) consider(m);
-    for (const r of ctx.recorder.received.slice(seqStart)) consider(r.message);
-    const callNote = errorOf(res.body)
-      ? `tools/call ${name} returned ${describeResponse(res)}`
-      : `tools/call ${name} succeeded`;
-    const verdict = evaluateProgress(PROGRESS_TOKEN, notifications);
-    if (!verdict.ok) return fail(`${verdict.problem} (${callNote})`);
-    if (notifications.length === 0) return pass(`${callNote}; no ${PROGRESS_METHOD} observed (optional)`);
+      return unanswered(`${call} with progressToken ${callOutcome(ctx, first)}; ${none}`);
+    }
+    if (!failedCall(ctx, first.res)) return pass(`${call} ${callOutcome(ctx, first)}; ${none}`);
+    const firstShape = callShape(ctx, first.res);
+    const twin = await send(false);
+    if (!twin.res || !servedCall(ctx, twin.res)) {
+      const twinOutcome = twin.res ? `was not served either (${callShape(ctx, twin.res)})` : callOutcome(ctx, twin);
+      return pass(
+        `${call} returned ${firstShape}, and the same call without the token ${twinOutcome}, so the progress token is not what failed it; ${none}`,
+      );
+    }
+    const again = await send(true);
+    const judgedAgain = judgeProgress(ctx, again, call, " when resent");
+    if (judgedAgain) return judgedAgain;
+    if (again.res && failedCall(ctx, again.res)) {
+      return fail(
+        `${call} carrying _meta.progressToken returned ${firstShape}, and ${callShape(ctx, again.res)} when it was resent, while the same call without it, sent in between, was served -- the server failed the request because of its progress token (basic/patterns/progress lets a server ignore the token and send no notifications, not fail the request)`,
+      );
+    }
+    if (again.res && servedCall(ctx, again.res)) {
+      return pass(
+        `${call} succeeded when resent: it first returned ${firstShape}, then the same call without the token and the resent one were served; ${none}`,
+      );
+    }
     return pass(
-      `${notifications.length} ${PROGRESS_METHOD} echoed token "${PROGRESS_TOKEN}" with increasing progress (${listOf(verdict.values, 8)})`,
+      `${call} returned ${firstShape}; the same call without the token was served, but resent, the call carrying it ${callOutcome(ctx, again)}, so the failure was not reproduced; ${none}`,
     );
   });
 
