@@ -906,7 +906,7 @@ async function startSdkBehindHostGuard(allowed: string[]): Promise<{ url: string
  * Before the flag existed a skip was indistinguishable from a pass in
  * every format -- the terminal listed only failures, so a gated server
  * whose auth checks could not be evaluated read as if it had satisfied
- * them. Each format now names them and says they still count as passes.
+ * them. Each format now names them and says the score leaves them out.
  */
 describe("skipped checks", () => {
   const plain = (s: string) => stripVTControlCharacters(s);
@@ -955,13 +955,44 @@ describe("skipped checks", () => {
     it("counts the skips next to the failures and on the category bar", () => {
       const out = plain(formatTerminal(mixed));
       expect(out).toMatch(/Tests {5}3\/4 {2}\(1 failed, 2 skipped\)/);
-      expect(out).toMatch(/Security .* 3\/4 +75% {2}2 skipped$/m);
+      // The ratio keeps the pass total; the bar and percentage count what
+      // was measured, as the score does: 1 pass of 2 measured, 50% (it
+      // read 75% while skips scored as passes).
+      expect(out).toMatch(/Security {2}█{12}░{12} +3\/4 +50% {2}2 skipped$/m);
     });
 
-    it("names every skipped check with its details, under a caveat that they still score as passes", () => {
+    it("a category bar scores what was measured: 18/23 with 16 skips reads 29%, the same as the grade of an --only run", () => {
+      const tests: TestResult[] = [
+        ...Array.from({ length: 16 }, (_, i) => ({ ...skipA, id: `s${i}` })),
+        { ...pass, id: "p0" },
+        { ...pass, id: "p1" },
+        ...Array.from({ length: 5 }, (_, i) => ({ ...fail, id: `f${i}` })),
+      ];
+      const report = reportOf(tests);
+      expect([report.score, report.grade]).toEqual([29, "F"]);
+      const out = plain(formatTerminal(report));
+      // round(2/7 * 24) = 7 cells filled.
+      expect(out).toMatch(/Security {2}█{7}░{17} +18\/23 +29% {2}16 skipped$/m);
+      expect(out).not.toMatch(/Security .* 78%/);
+    });
+
+    it("a category in which every check skipped reads '--' over an empty dim bar, not a full bar at 100%", () => {
+      const out = plain(formatTerminal(reportOf([skipA, skipB])));
+      expect(out).toMatch(/Security {2}─{24} +2\/2 +-- {2}2 skipped$/m);
+      expect(out).not.toContain("100%");
+    });
+
+    it("a category without skips keeps its bar and percentage (older reports too)", () => {
+      const out = plain(formatTerminal(reportOf([pass, fail])));
+      expect(out).toMatch(/Security {2}█{12}░{12} +1\/2 +50%$/m);
+      // No flags: raw counts, as before skips were tracked.
+      expect(plain(formatTerminal(unflagged(mixed)))).toMatch(/Security {2}█{18}░{6} +3\/4 +75%$/m);
+    });
+
+    it("names every skipped check with its details, under a caveat that the score leaves them out", () => {
       const out = plain(formatTerminal(mixed));
       expect(out).toContain("SKIPPED CHECKS (2)");
-      expect(out).toContain("These measured nothing -- counted as passes in the score above.");
+      expect(out).toContain("These measured nothing -- left out of the score above.");
       expect(out).toContain("- WWW-Authenticate on 401  [security-www-authenticate]  optional");
       expect(out).toContain("      Skipped: not evaluable (see security-auth-required)");
       expect(out).toContain("- Rejects token in URI  [security-token-in-uri]  required");
@@ -1080,7 +1111,7 @@ describe("skipped checks", () => {
       const out = formatMarkdown(mixed);
       expect(out).toContain('_2 of those passes measured nothing -- see "Skipped checks" below._');
       expect(out).toContain("## Skipped checks (2)");
-      expect(out).toContain("These measured nothing -- counted as passes in the score above.");
+      expect(out).toContain("These measured nothing -- left out of the score above.");
       expect(out).toContain("- ⊘ **security-www-authenticate** — Skipped: not evaluable (see security-auth-required)");
       expect(out).toContain(
         "- ⊘ **security-token-in-uri** *(required)* — Skipped: needs a valid credential to place in the URI (pass --auth)",
@@ -1120,10 +1151,101 @@ describe("skipped checks", () => {
       expect(out).toContain('<div class="cat-label">2 skipped</div>');
     });
 
+    it("colours a category card by what it measured: skips are left out, and an all-skipped category is neutral, not green", () => {
+      // 3/4 with 2 skips is 1 of 2 measured: partial (it was "partial" by
+      // the raw counts too, but for a different reason).
+      expect(formatHtml(mixed)).toContain('<div class="cat-stat partial">3/4</div>');
+      // 2 passes, both skips: nothing measured. By the raw counts it was "full".
+      const allSkipped = formatHtml(reportOf([skipA, skipB]));
+      expect(allSkipped).toContain('<div class="cat-stat none">2/2</div>');
+      expect(allSkipped).not.toContain("cat-stat full");
+      // A measured pass next to skips is full; a measured failure next to them is empty.
+      expect(formatHtml(reportOf([pass, skipA]))).toContain('<div class="cat-stat full">2/2</div>');
+      expect(formatHtml(reportOf([fail, skipA]))).toContain('<div class="cat-stat empty">1/2</div>');
+      // Without flags the raw counts decide, as before.
+      expect(formatHtml(unflagged(reportOf([skipA, skipB])))).toContain('<div class="cat-stat full">2/2</div>');
+    });
+
     it("a report without skips renders exactly as before", () => {
       const clean = reportOf([pass, fail]);
       expect(formatHtml(clean)).toBe(formatHtml(unflagged(clean)));
       expect(formatHtml(clean)).not.toContain("SKIP");
+    });
+  });
+
+  /**
+   * Every test that ran was a skip. The score leaves skips out, so there
+   * is nothing to score: 0 / F with nothing failed. The terminal, GitHub,
+   * markdown and HTML reports and the SARIF invocation properties say so
+   * in the same words, naming the count, so the F cannot read as a server
+   * that failed everything (as an empty run says "No tests ran"). The
+   * JSON report carries no prose; its counts show it.
+   */
+  describe("every test skipped", () => {
+    const allSkipped = reportOf([skipA, skipB]);
+    const NOTE = "No test measured anything -- all 2 that ran were skipped, and skips are left out of the score";
+
+    it("scores 0 / F, while overall stays pass (nothing failed) and the counts keep the skips as passes", () => {
+      expect(allSkipped.score).toBe(0);
+      expect(allSkipped.grade).toBe("F");
+      expect(allSkipped.overall).toBe("pass");
+      expect(allSkipped.summary).toEqual({
+        total: 2,
+        passed: 2,
+        failed: 0,
+        required: 1,
+        requiredPassed: 1,
+        skipped: 2,
+      });
+      expect(schemaCheck(JSON.parse(formatJson(allSkipped)))).toBe("valid");
+    });
+
+    it("terminal: says nothing was measured instead of 'No test failed', and still lists the skips", () => {
+      const out = plain(formatTerminal(allSkipped));
+      expect(out).toContain(`! ${NOTE} (see SKIPPED CHECKS below)`);
+      expect(out).toMatch(/GRADE +F +0%/);
+      expect(out).not.toContain("No test failed");
+      expect(out).not.toContain("All tests passed");
+      expect(out).not.toContain("No tests ran");
+      expect(out).toContain("SKIPPED CHECKS (2)");
+      expect(out).toContain("These measured nothing -- left out of the score above.");
+    });
+
+    it("github: the ::notice carries the note in place of the counts", () => {
+      const out = formatGithub(allSkipped);
+      // "%" is workflow-command escaped.
+      expect(out).toContain(`::notice title=MCP Compliance::Grade F (0%25) — ${NOTE}; spec `);
+      expect(out.split("\n")).toHaveLength(1);
+    });
+
+    it("markdown: a quoted line under the grade, and the skip list", () => {
+      const lines = formatMarkdown(allSkipped).split("\n");
+      expect(lines).toContain(`> **${NOTE}.** See "Skipped checks" below.`);
+      expect(lines).toContain("## Skipped checks (2)");
+    });
+
+    it("html: a warning in the grade card", () => {
+      expect(formatHtml(allSkipped)).toContain(`<div class="warn" style="margin-top:12px">${NOTE}.</div>`);
+    });
+
+    it("sarif: the invocation properties carry the note next to grade F / score 0; results stay failures-only", () => {
+      const run = JSON.parse(formatSarif(allSkipped)).runs[0];
+      expect(run.results).toEqual([]);
+      expect(run.invocations[0].properties).toMatchObject({ grade: "F", score: 0, testsSkipped: 2, note: NOTE });
+      // Only on such a run: a measured run's property bag is unchanged.
+      expect(JSON.parse(formatSarif(mixed)).runs[0].invocations[0].properties).not.toHaveProperty("note");
+      expect(JSON.parse(formatSarif(reportOf([]))).runs[0].invocations[0].properties).not.toHaveProperty("note");
+    });
+
+    it("says it only when every test skipped: a measured test, or an empty run, prints no such line", () => {
+      for (const report of [reportOf([skipA, skipB, fail]), reportOf([skipA, pass]), reportOf([])]) {
+        expect(plain(formatTerminal(report))).not.toContain("No test measured anything");
+        expect(formatGithub(report)).not.toContain("No test measured anything");
+        expect(formatMarkdown(report)).not.toContain("No test measured anything");
+        expect(formatHtml(report)).not.toContain("No test measured anything");
+      }
+      // A report from an older tool (no flags) has no skips to be all of.
+      expect(plain(formatTerminal(unflagged(allSkipped)))).not.toContain("No test measured anything");
     });
   });
 });
@@ -1214,16 +1336,33 @@ describe("skipped checks, end to end against real servers", () => {
     }
   });
 
-  it("the flag moves no verdict: score, grade, overall and every count match the same tests without it", () => {
+  it("the flag moves only the score: overall and every count match the same tests without it", () => {
     for (const report of [hostGuarded, clean]) {
       const without = computeScore(report.tests.map(({ skipped: _s, ...t }) => t));
-      expect(report.score).toBe(without.score);
-      expect(report.grade).toBe(without.grade);
       expect(report.overall).toBe(without.overall);
       const { skipped: _count, ...summary } = report.summary;
       const { skipped: _none, ...before } = without.summary;
       expect(summary).toEqual(before);
+      // The score is the measured tests' score: the skips are left out.
+      const measured = computeScore(report.tests.filter((t) => !(t.passed && t.skipped === true)));
+      expect(report.score).toBe(measured.score);
+      expect(report.grade).toBe(measured.grade);
     }
+  });
+
+  it("bare 403: scored over what it measured, the Host-guarded run is an F, not the B its skips made it", () => {
+    // Pinned for the run the change was measured on. Every test here is
+    // optional (--only security); the checks that measured something are
+    // the two passes (CORS, stack traces) and the five failures
+    // (auth-required, TLS, oversized-input, internal IP, rate limiting):
+    // 2/7 = 29 (F). Scored as passes, the 16 skips made it 18/23 = 78 (B).
+    const measured = hostGuarded.tests.filter((t) => !(t.passed && t.skipped === true));
+    expect(measured.filter((t) => t.passed)).toHaveLength(2);
+    expect(measured.filter((t) => !t.passed)).toHaveLength(5);
+    expect(hostGuarded.summary.skipped).toBe(16);
+    expect([hostGuarded.score, hostGuarded.grade]).toEqual([29, "F"]);
+    const asPasses = computeScore(hostGuarded.tests.map(({ skipped: _s, ...t }) => t));
+    expect([asPasses.score, asPasses.grade]).toEqual([78, "B"]);
   });
 
   it("both reports validate against report.v1", () => {

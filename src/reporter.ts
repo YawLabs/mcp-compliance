@@ -99,6 +99,16 @@ function makeBar(passed: number, total: number, width = 24): { filled: string; r
   return { filled: "█".repeat(n), rest: "░".repeat(width - n) };
 }
 
+/**
+ * A category's measured counts: its passes and total without its skips,
+ * the way the score counts them. `skips` is the category's skip count
+ * read from the test list (see skippedTestsOf), so a report from an older
+ * tool (no flags) reads exactly as its raw counts.
+ */
+function measuredOf(stats: { passed: number; total: number }, skips: number): { passed: number; total: number } {
+  return { passed: Math.max(0, stats.passed - skips), total: Math.max(0, stats.total - skips) };
+}
+
 function barColor(passed: number, total: number): (s: string) => string {
   if (total === 0) return (s) => chalk.dim(s);
   const pct = passed / total;
@@ -124,8 +134,8 @@ const HEAVY_RULE = "═".repeat(62);
  * is not a failure), so without singling it out a reader cannot tell a
  * check the server satisfied from one that never ran -- which is exactly
  * how a gated server's whole auth suite could read as clean. Every
- * formatter names them; the score still counts them as passes, and the
- * terminal, markdown and HTML reports say so.
+ * formatter names them; the score leaves them out, and the terminal,
+ * markdown and HTML reports say so.
  *
  * Read from the test list rather than `summary.skipped`, so every count
  * and list in one report agrees, and a report from an older tool (no
@@ -136,7 +146,23 @@ export function skippedTestsOf(report: ComplianceReport): TestResult[] {
 }
 
 /** The one-line caveat that goes with every list of skips. */
-export const SKIP_CAVEAT = "measured nothing -- counted as passes in the score above";
+export const SKIP_CAVEAT = "measured nothing -- left out of the score above";
+
+/**
+ * Tests ran, but every one of them was a skip: the score leaves skips out,
+ * so there was nothing to score and the run reads 0 / F with nothing
+ * failed. The terminal, markdown, HTML and GitHub reports, the SARIF
+ * invocation properties (`note`) and the MCP test tool say so in these
+ * words (as an empty run says "No tests ran"), so the F cannot read as a
+ * server that failed everything. The JSON report carries no prose: its
+ * reader sees `summary.skipped === summary.total`. Null when anything
+ * was measured, and on an empty run.
+ */
+export function nothingMeasuredNote(report: ComplianceReport): string | null {
+  const skipped = skippedTestsOf(report).length;
+  if (skipped === 0 || skipped < report.tests.length) return null;
+  return `No test measured anything -- all ${skipped} that ran ${skipped === 1 ? "was" : "were"} skipped, and skips are left out of the score`;
+}
 
 /**
  * A result's one-word status: a skip is neither PASS nor FAIL. Every
@@ -216,16 +242,21 @@ export function formatTerminal(report: ComplianceReport): string {
   for (const cat of cats) {
     const stats = report.categories[cat];
     const label = CATEGORY_LABELS[cat] || cat;
-    const { filled, rest } = makeBar(stats.passed, stats.total, 24);
-    const colorFn = barColor(stats.passed, stats.total);
-    const pct = stats.total === 0 ? 0 : Math.round((stats.passed / stats.total) * 100);
-    const ratio = `${stats.passed}/${stats.total}`;
-    // A bar that reads 18/23 while four of the 18 measured nothing is the
-    // headline version of the same false comfort, so annotate it.
+    // A bar that reads 18/23 while 16 of the 18 measured nothing is the
+    // headline version of the same false comfort, so annotate it -- and
+    // since the score leaves skips out, so do the bar, its colour and the
+    // percentage: 18/23 with 16 skips is 2 of 7 measured, 29%. The ratio
+    // keeps the pass total. A category in which nothing was measured
+    // prints "--" over an empty dim bar, not 100% in green.
     const skips = skipped.filter((t) => t.category === cat).length;
+    const measured = measuredOf(stats, skips);
+    const { filled, rest } = makeBar(measured.passed, measured.total, 24);
+    const colorFn = barColor(measured.passed, measured.total);
+    const pct = measured.total === 0 ? "--" : `${Math.round((measured.passed / measured.total) * 100)}%`;
+    const ratio = `${stats.passed}/${stats.total}`;
     const skipNote = skips > 0 ? `  ${chalk.yellow(`${skips} skipped`)}` : "";
     out.push(
-      `  ${padRight(label, maxLabel)}  ${colorFn(filled)}${chalk.dim(rest)}  ${padLeft(ratio, 7)}  ${padLeft(`${pct}%`, 4)}${skipNote}`,
+      `  ${padRight(label, maxLabel)}  ${colorFn(filled)}${chalk.dim(rest)}  ${padLeft(ratio, 7)}  ${padLeft(pct, 4)}${skipNote}`,
     );
   }
   out.push("");
@@ -233,6 +264,7 @@ export function formatTerminal(report: ComplianceReport): string {
   // Failed tests — full detail
   const catalog = catalogVersionOf(report);
   const failed = report.tests.filter((t) => !t.passed);
+  const nothingMeasured = nothingMeasuredNote(report);
   if (report.summary.total === 0) {
     // Nothing ran: --only/--skip matched nothing in the resolved catalog,
     // or only tests gated off this transport (the runner's filter warning
@@ -241,6 +273,11 @@ export function formatTerminal(report: ComplianceReport): string {
     out.push(
       `  ${chalk.yellow.bold(`! No tests ran -- check --only/--skip${warnings.length > 0 ? " (see warnings)" : ""}`)}`,
     );
+    out.push("");
+  } else if (nothingMeasured) {
+    // Tests ran and every one skipped: grade F / 0% here is "nothing was
+    // measured", not a server that failed everything.
+    out.push(`  ${chalk.yellow.bold(`! ${nothingMeasured} (see SKIPPED CHECKS below)`)}`);
     out.push("");
   } else if (failed.length > 0) {
     out.push(chalk.bold.red(`  FAILED TESTS (${failed.length})`));
@@ -396,6 +433,10 @@ export function formatSarif(report: ComplianceReport): string {
   // would raise one alert per skipped check on every upload. `results`
   // stays failures-only, exactly as before; the skips are named here.
   const skippedTests = skippedTestsOf(report).map((t) => ({ id: t.id, details: t.details }));
+  // A run in which every check skipped reads grade F / score 0 with
+  // nothing failed; the property bag says why, in the words the other
+  // formats print. Absent otherwise, so other runs' SARIF is unchanged.
+  const nothingMeasured = nothingMeasuredNote(report);
 
   const sarif = {
     $schema: "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
@@ -434,6 +475,7 @@ export function formatSarif(report: ComplianceReport): string {
               // How many of testsPassed measured nothing, and which.
               testsSkipped: skippedTests.length,
               skippedTests,
+              ...(nothingMeasured ? { note: nothingMeasured } : {}),
             },
           },
         ],
@@ -482,10 +524,13 @@ export function formatGithub(report: ComplianceReport): string {
   // measured nothing. Omitted at zero, so a clean run reads as before.
   const skippedCount = skippedTestsOf(report).length;
   const skipNote = skippedCount > 0 ? `, ${skippedCount} skipped` : "";
+  const nothingMeasured = nothingMeasuredNote(report);
   const summary =
     report.summary.total === 0
       ? `No tests ran -- check --only/--skip${warnings.length > 0 ? " (see warnings)" : ""}; ${spec}`
-      : `Grade ${report.grade} (${report.score}%) — ${report.summary.passed}/${report.summary.total} passed, ${report.summary.failed} failed${skipNote} (${report.summary.requiredPassed}/${report.summary.required} required); ${spec}`;
+      : nothingMeasured
+        ? `Grade ${report.grade} (${report.score}%) — ${nothingMeasured}; ${spec}`
+        : `Grade ${report.grade} (${report.score}%) — ${report.summary.passed}/${report.summary.total} passed, ${report.summary.failed} failed${skipNote} (${report.summary.requiredPassed}/${report.summary.required} required); ${spec}`;
   lines.push(`::notice title=${ghEscape(summaryTitle)}::${ghEscape(summary)}`);
   return lines.join("\n");
 }
@@ -502,6 +547,11 @@ export function formatMarkdown(report: ComplianceReport): string {
     `**Grade: ${gradeEmoji[report.grade] || ""} ${report.grade} (${report.score}%)** — ${report.overall.toUpperCase()}`,
   );
   lines.push("");
+  const mdNothingMeasured = nothingMeasuredNote(report);
+  if (mdNothingMeasured) {
+    lines.push(`> **${mdNothingMeasured}.** See "Skipped checks" below.`);
+    lines.push("");
+  }
   const { specNote: mdSpecNote, warnings: mdWarnings } = splitSpecNote(report);
   lines.push(`- **Target:** \`${report.url}\``);
   lines.push(`- **Spec:** ${report.specVersion}${mdSpecNote ? ` (${mdSpecNote})` : ""}`);
@@ -550,7 +600,7 @@ export function formatMarkdown(report: ComplianceReport): string {
   }
 
   // Skipped checks get their own section rather than disappearing into
-  // the Passed column, with the caveat that they still scored as passes.
+  // the Passed column, with the caveat that the score leaves them out.
   if (mdSkipped.length > 0) {
     lines.push(`## Skipped checks (${mdSkipped.length})`);
     lines.push("");
@@ -595,6 +645,7 @@ export function formatHtml(report: ComplianceReport): string {
 
   const failed = report.tests.filter((t) => !t.passed);
   const htmlSkippedTests = skippedTestsOf(report);
+  const htmlNothingMeasured = nothingMeasuredNote(report);
   const grouped = new Map<string, TestResult[]>();
   for (const cat of CATEGORY_ORDER) grouped.set(cat, []);
   for (const t of report.tests) grouped.get(t.category)?.push(t);
@@ -628,6 +679,7 @@ export function formatHtml(report: ComplianceReport): string {
   .cat-stat.full { color: #10b981; }
   .cat-stat.partial { color: #eab308; }
   .cat-stat.empty { color: #ef4444; }
+  .cat-stat.none { color: #9ca3af; }
   .card { background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 20px; margin: 16px 0; }
   .card h2 { margin-top: 0; font-size: 16px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -660,15 +712,18 @@ export function formatHtml(report: ComplianceReport): string {
     <div class="grade-letter">${esc(report.grade)}</div>
     <div class="grade-score">${report.score}%</div>
     <div class="grade-overall ${esc(report.overall)}">${esc(report.overall)}</div>
-    <div class="muted" style="margin-top:12px">${report.summary.passed} / ${report.summary.total} tests passed · ${report.summary.requiredPassed} / ${report.summary.required} required${htmlSkippedTests.length > 0 ? ` · ${htmlSkippedTests.length} skipped` : ""}</div>
+    <div class="muted" style="margin-top:12px">${report.summary.passed} / ${report.summary.total} tests passed · ${report.summary.requiredPassed} / ${report.summary.required} required${htmlSkippedTests.length > 0 ? ` · ${htmlSkippedTests.length} skipped` : ""}</div>${htmlNothingMeasured ? `\n    <div class="warn" style="margin-top:12px">${esc(htmlNothingMeasured)}.</div>` : ""}
   </div>
 
   <div class="grid">
     ${CATEGORY_ORDER.filter((c) => report.categories[c] && report.categories[c].total > 0)
       .map((c) => {
         const s = report.categories[c];
-        const cls = s.passed === s.total ? "full" : s.passed > 0 ? "partial" : "empty";
         const skips = htmlSkippedTests.filter((t) => t.category === c).length;
+        // Coloured by what was measured, as the score is: skips are left
+        // out, and a category that measured nothing is neutral, not green.
+        const m = measuredOf(s, skips);
+        const cls = m.total === 0 ? "none" : m.passed === m.total ? "full" : m.passed > 0 ? "partial" : "empty";
         const note = skips > 0 ? `<div class="cat-label">${skips} skipped</div>` : "";
         return `<div class="cat-card"><div class="cat-stat ${cls}">${s.passed}/${s.total}</div><div class="cat-label">${esc(CATEGORY_LABELS[c] || c)}</div>${note}</div>`;
       })

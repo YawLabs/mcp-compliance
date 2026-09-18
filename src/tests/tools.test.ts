@@ -280,7 +280,7 @@ describe("mcp_compliance_test tool: skipped checks", () => {
     const text = await textFor(reportOf([pass, fail, skipA, skipB]));
     const lines = text.split("\n");
     expect(lines).toContain("Tests: 3/4 passed, 2 skipped (1/1 required)");
-    expect(lines).toContain("Skipped tests measured nothing -- counted as passes in the score above.");
+    expect(lines).toContain("Skipped tests measured nothing -- left out of the score above.");
     expect(lines).toContain("PASS Server requires authentication — HTTP 401 (unauthenticated request rejected)");
     expect(lines).toContain("FAIL HTTPS required — Server uses plain HTTP");
     expect(lines).toContain("SKIP WWW-Authenticate on 401 — Skipped: not evaluable (see security-auth-required)");
@@ -289,6 +289,23 @@ describe("mcp_compliance_test tool: skipped checks", () => {
     );
     expect(text).not.toContain("PASS WWW-Authenticate");
     expect(text).not.toContain("PASS Rejects token in URI");
+    // Scored over the measured tests only: the one required test skipped,
+    // so optional carries the score, 1 pass / 1 fail = 50. Scored as
+    // passes, the skips made it 1/1 * 70 + 2/3 * 30 = 90, an A.
+    expect(lines[0]).toBe("Grade: D (50%)");
+    expect(text).not.toContain("No test measured anything");
+  });
+
+  it("a run in which every test skipped says so plainly, naming the count, under its 0 / F", async () => {
+    const text = await textFor(reportOf([skipA, skipB]));
+    expect(text.split("\n").slice(0, 6)).toEqual([
+      "Grade: F (0%)",
+      "Overall: pass",
+      "Spec: 2026-07-28",
+      "Tests: 2/2 passed, 2 skipped (1/1 required)",
+      "No test measured anything -- all 2 that ran were skipped, and skips are left out of the score.",
+      "Skipped tests measured nothing -- left out of the score above.",
+    ]);
   });
 
   it("the full report JSON it returns carries the flags and the count", async () => {

@@ -698,8 +698,8 @@ const out = {
   title: src.title,
   description:
     "Machine-readable catalog of compliance test rules for MCP servers. Rules are grouped by the MCP specification revision they apply to (specVersion); ids are only comparable within one revision.",
-  specVersion: "2.0.0",
-  specDate: "2026-09-14",
+  specVersion: "3.0.0",
+  specDate: "2026-09-18",
   mcpSpecCompatibility: [LEGACY, MODERN],
   categories: CATEGORIES,
   rules: [...legacyRules.map(legacyRule), ...MODERN_TEST_DEFINITIONS.map(modernRule)],

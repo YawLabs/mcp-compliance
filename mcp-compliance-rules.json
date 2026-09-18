@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MCP Server Compliance Test Rules",
   "description": "Machine-readable catalog of compliance test rules for MCP servers. Rules are grouped by the MCP specification revision they apply to (specVersion); ids are only comparable within one revision.",
-  "specVersion": "2.0.0",
-  "specDate": "2026-09-14",
+  "specVersion": "3.0.0",
+  "specDate": "2026-09-18",
   "mcpSpecCompatibility": ["2025-11-25", "2026-07-28"],
   "categories": [
     {
@@ -287,8 +287,8 @@
       "capabilityGated": null,
       "specRef": "basic",
       "description": "Verifies the server returns valid JSON-RPC 2.0 responses",
-      "passCriteria": "Response has jsonrpc=\"2.0\", id present, and result or error present",
-      "failCriteria": "Missing jsonrpc, id, or both result and error fields"
+      "passCriteria": "Response has jsonrpc=\"2.0\", id present, and result or error present; an error envelope counts only when it is the server's own (a 403 that the same ping sent on its own as application/json did not draw is; so is the server's own -32600/-32601/-32602 on a 5xx, with a warning that a rejected request should get a 4xx)",
+      "failCriteria": "Missing jsonrpc, id, or both result and error fields; an initialize answered without a result by a 401/auth 403, a 429, a 5xx without the server's own refusal, or a 403 the same ping sent on its own as application/json drew too (or that ping got no answer) is not evaluable, whatever JSON-RPC error its body carries"
     },
     {
       "id": "lifecycle-ping",
@@ -365,8 +365,8 @@
       "capabilityGated": null,
       "specRef": "basic/lifecycle#initialization",
       "description": "Sends second initialize in same session, verifies server rejects it",
-      "passCriteria": "Server returns a JSON-RPC error or 4xx for the duplicate initialize (a 429 is retried once after Retry-After); a closed connection counts only next to the served handshake",
-      "failCriteria": "Server accepts second initialize without error; a 3xx; not evaluable when the handshake was not served or a 401/auth 403/Host-validation 403/repeated 429/5xx answered in the server's place; a timeout or refused connection is server unreachable"
+      "passCriteria": "Server returns a JSON-RPC error or 4xx for the duplicate initialize (a 429 is retried once after Retry-After); a 403 counts whatever its message names, since the handshake was served with the same Host and Origin; the server's own -32600 on a 5xx passes with a warning that a rejected request should get a 4xx; a closed connection counts only next to the served handshake",
+      "failCriteria": "Server accepts second initialize without error; a 3xx; a 5xx without the server's own -32600; not evaluable when the handshake was not served or a 401/auth 403/repeated 429 answered in the server's place; a timeout or refused connection is server unreachable"
     },
     {
       "id": "lifecycle-logging",
@@ -442,9 +442,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/utilities#progress",
-      "description": "Sends request with _meta.progressToken and checks for progress events in SSE",
-      "passCriteria": "Server accepts request with progressToken (progress events optional); a tools/call that gets no answer measured nothing (a skip); one answered with a 4xx/5xx passes as an observation, not a skip",
-      "failCriteria": "Never fails on its own: progress support is optional, so every answer passes"
+      "description": "Calls a tool (the first without required arguments, preferring one that mentions progress) with _meta.progressToken and judges every notifications/progress on the response",
+      "passCriteria": "Every notifications/progress carries the request's token with a strictly increasing numeric progress value (no notifications at all also passes); a served call, a 2xx with no JSON-RPC response, a 429/401/auth 403, or a server error the token is not shown to cause is an observation, not a skip; a tools/call that gets no answer measured nothing (a skip)",
+      "failCriteria": "A progress notification carrying a foreign token, without params, or with a non-numeric or non-increasing progress value; a server error (a JSON-RPC error, or an HTTP status >= 400 other than 429/401/auth 403) on the call carrying the token when the same call without it is served and the call carrying it, resent after that, draws a server error again"
     },
     {
       "id": "tools-list",
@@ -638,8 +638,8 @@
       "capabilityGated": null,
       "specRef": "basic",
       "description": "Verifies the server handles malformed JSON-RPC requests",
-      "passCriteria": "JSON-RPC error response or HTTP 4xx status",
-      "failCriteria": "Neither JSON-RPC error nor HTTP 4xx"
+      "passCriteria": "JSON-RPC error response or HTTP 4xx status that is the server's own rejection (a 429 is retried once after Retry-After; any other 403 counts only when a well-formed ping with the same headers was served or drew a different status; the server's own -32600 on a 5xx passes with a warning that a rejected request should get a 4xx)",
+      "failCriteria": "Neither JSON-RPC error nor HTTP 4xx, or a 5xx without the server's own -32600; not evaluable when the handshake was rejected the same way, a 401/auth 403/repeated 429 answered in the server's place whatever JSON-RPC error its body carries, or the ping drew the same 403 (quoted when its message names Host/Origin validation) or got no answer"
     },
     {
       "id": "error-invalid-json",
@@ -651,8 +651,8 @@
       "capabilityGated": null,
       "specRef": "basic",
       "description": "Verifies the server handles invalid JSON in the request body",
-      "passCriteria": "JSON-RPC error response or HTTP 4xx status",
-      "failCriteria": "Neither JSON-RPC error nor HTTP 4xx"
+      "passCriteria": "JSON-RPC error response or HTTP 4xx status that is the server's own rejection (a 429 is retried once after Retry-After; any other 403 counts only when a well-formed ping with the same headers was served or drew a different status; the server's own -32700 on a 5xx passes with a warning that a rejected request should get a 4xx)",
+      "failCriteria": "Neither JSON-RPC error nor HTTP 4xx, or a 5xx without the server's own -32700; not evaluable when the handshake was rejected the same way, a 401/auth 403/repeated 429 answered in the server's place whatever JSON-RPC error its body carries, or the ping drew the same 403 (quoted when its message names Host/Origin validation) or got no answer"
     },
     {
       "id": "error-missing-params",
@@ -664,8 +664,8 @@
       "capabilityGated": null,
       "specRef": "server/tools#error-handling",
       "description": "Verifies the server returns an error when tools/call is missing the name parameter",
-      "passCriteria": "JSON-RPC error or isError flag in result",
-      "failCriteria": "No error returned"
+      "passCriteria": "The server's own JSON-RPC error, or isError flag in result (a 429 is retried once after Retry-After; any other 403 counts only when the same request for ping was served or drew a different status; the server's own -32602 on a 5xx passes with a warning that a rejected request should get a 4xx)",
+      "failCriteria": "No error returned, or a 5xx without the server's own -32602; not evaluable when the handshake was rejected the same way, a 401/auth 403/repeated 429 answered in the server's place whatever JSON-RPC error its body carries, or the ping drew the same 403 or got no answer"
     },
     {
       "id": "error-parse-code",
@@ -716,8 +716,8 @@
       "capabilityGated": null,
       "specRef": "basic/lifecycle#capability-negotiation",
       "description": "Calls list methods for undeclared capabilities and verifies server returns errors",
-      "passCriteria": "Server returns error for methods of undeclared capabilities; a server that declares all three capabilities has nothing to probe (a skip)",
-      "failCriteria": "Server returns success for methods it did not declare capability for"
+      "passCriteria": "Server returns its own error for methods of undeclared capabilities (a 429 is retried once after Retry-After; the server's own -32601 on a 5xx passes with a warning that a rejected request should get a 4xx); a server that declares all three capabilities has nothing to probe (a skip)",
+      "failCriteria": "Server returns success for methods it did not declare capability for, or a 5xx without the server's own -32601; not evaluable when the initialize handshake was not served (no declaration was seen; each method's answer is listed), or when a 401/auth 403/repeated 429 answered in the server's place, or the same request for ping (asked once) drew the same 403 or got no answer"
     },
     {
       "id": "error-invalid-cursor",
@@ -897,9 +897,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/authorization",
-      "description": "Verifies the Protected Resource Metadata (RFC 9728) endpoint exists at /.well-known/oauth-protected-resource. Falls back to legacy /.well-known/oauth-authorization-server with a warning.",
-      "passCriteria": "/.well-known/oauth-protected-resource returns valid JSON with resource and authorization_servers, or legacy OAuth AS metadata exists; skipped without --auth; skipped as not evaluable when both metadata locations drew the same bare 403 security-auth-required could not attribute to authentication",
-      "failCriteria": "Neither PRM nor legacy OAuth AS metadata endpoint is reachable or valid"
+      "description": "Verifies Protected Resource Metadata (RFC 9728) is published where clients look for it: the WWW-Authenticate resource_metadata URL when the unauthenticated ping's challenge carries one, else /.well-known/oauth-protected-resource followed by the endpoint path, then /.well-known/oauth-protected-resource. Falls back to legacy /.well-known/oauth-authorization-server with a warning.",
+      "passCriteria": "The WWW-Authenticate resource_metadata URL (only it), or without one the first well-known location with a valid document, returns JSON with resource and a non-empty authorization_servers array (a resource that is not the endpoint passes with a warning), or, with no document at any well-known location, legacy OAuth AS metadata exists (with a warning); skipped without --auth; skipped as not evaluable when every well-known location and the legacy document drew the same bare 403 security-auth-required could not attribute to authentication",
+      "failCriteria": "A challenge resource_metadata that is not an absolute http(s) URL, or is unreachable, non-200 or malformed; no well-known location answers; a malformed document and no valid one; no PRM and no legacy OAuth AS metadata; an unauthenticated ping with no HTTP answer is server unreachable (except a connection closed next to the served credentialed handshake)"
     },
     {
       "id": "security-token-in-uri",
@@ -923,9 +923,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/transports#streamable-http",
-      "description": "Verifies CORS headers do not use wildcard origin",
-      "passCriteria": "No CORS headers, or Access-Control-Allow-Origin is not '*' or reflected; an OPTIONS request that gets no HTTP answer also passes, as no CORS",
-      "failCriteria": "Access-Control-Allow-Origin is '*' or reflects arbitrary origins"
+      "description": "Verifies CORS headers on an OPTIONS preflight and on a ping POST carrying a foreign Origin do not allow a wildcard or reflected origin",
+      "passCriteria": "No CORS headers on either answer, or Access-Control-Allow-Origin is not '*' or reflected; when neither probe gets an HTTP answer, connections closed on both pass as cross-origin refused only next to the served initialize handshake",
+      "failCriteria": "Access-Control-Allow-Origin is '*' or reflects arbitrary origins on either answer; when neither probe gets an HTTP answer (a timeout, a refused connection, any other failure, or connections closed when the handshake was not served) it is server unreachable"
     },
     {
       "id": "security-origin-validation",
@@ -1041,7 +1041,7 @@
       "capabilityGated": "tools",
       "specRef": "server/tools#listing-tools",
       "description": "Verifies tool definitions do not change between consecutive tools/list calls",
-      "passCriteria": "Tool count, names, and descriptions are identical across 2 calls (the first is the list cached when the tools tests ran, so after a stdio restart it came from the process that exited)",
+      "passCriteria": "Tool count, names, and descriptions are identical across 2 calls; after a stdio restart that followed tools-list, both lists come from the new process (one read at the restart before any tools/call, one after a tools/call with no arguments), and the test skips with a warning when the new process leaves nothing to compare",
       "failCriteria": "Tool definitions changed between calls (possible rug-pull attack)"
     },
     {
@@ -1132,9 +1132,9 @@
       "defaultRequired": false,
       "capabilityGated": null,
       "specRef": "basic/transports#stdio",
-      "description": "Sends non-ASCII (CJK + emoji) parameters to a stdio server and verifies the response preserves the byte-level encoding",
-      "passCriteria": "The tools/call to the first listed tool carrying the non-ASCII probe is answered (the reply is not required to echo it, and is not checked for mangling); skipped when the server declares no tools, and a served tools/list is a skip when it lists none",
-      "failCriteria": "The tools/call carrying the probe gets no answer (a crash, a timeout), or the tools/list fallback returns an error; mojibake in a reply is not detected",
+      "description": "Sends non-ASCII (Latin-1, CJK + emoji) parameters to a stdio server and verifies they survive the round trip",
+      "passCriteria": "The chosen tool (one named echo, else the first with a string property named message/text/input/query, else the first tool; tools/list read on demand) reproduces the probe byte-for-byte or piece by piece; or, when the tool does not echo or there is no tool to call, a ping whose _meta carries the probe is answered with a result",
+      "failCriteria": "The tool reply or the ping reply shows mangling (U+FFFD, a Latin-1 mis-decode, '?' substitution, or the non-ASCII characters dropped), the tool call draws -32700, the ping is rejected or answered with a non-JSON-RPC reply, or a probe gets no reply (a child that exited is restarted; one already gone is server unreachable)",
       "transports": ["stdio"]
     },
     {

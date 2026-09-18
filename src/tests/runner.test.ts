@@ -801,9 +801,12 @@ describe("runComplianceSuite — legacy lifecycle-progress-token", () => {
     const sdk = await startSdkProgressServer(true);
     try {
       const report = await run(sdk.url);
+      // The notifications are judged now (legacy-small-gaps.test.ts):
+      // the request's token, increasing values. Before: "Server sent
+      // progress notifications via SSE with progressToken".
       expect(progressToken(report)).toEqual({
         passed: true,
-        details: "Server sent progress notifications via SSE with progressToken",
+        details: '2 notifications/progress echoed token "compliance-progress-test" with increasing progress (1, 2)',
       });
       expect(sdk.tokens).toEqual(["compliance-progress-test"]);
     } finally {
@@ -840,16 +843,22 @@ describe("runComplianceSuite — legacy lifecycle-progress-token", () => {
       // The server answered: an observation, not a skip (only a call
       // nothing answered measured nothing).
       expect(skippedOf(report, "lifecycle-progress-token")).toBeUndefined();
-      expect(stub.hits.filter((h) => h.method === "tools/call")).toHaveLength(1);
+      // The call with the token, then the same call without it: that one
+      // failed too, so the 500 is not the token's.
+      expect(stub.hits.filter((h) => h.method === "tools/call")).toHaveLength(2);
     } finally {
       await stub.stop();
     }
   }, 15000);
 
-  it("a tools/call that fails only when it carries the progressToken: an answer about the token, not a skip", async () => {
+  it("a tools/call that fails only when it carries the progressToken FAILS: the token is what the server failed on", async () => {
     // tools-call sends the same call without _meta and is served, so the
     // 500 is the server's answer to the progressToken. It used to carry
-    // skipped: true ("measured nothing").
+    // skipped: true ("measured nothing"), then passed as an observation
+    // ("HTTP 500 — tools/call with progressToken was not served (no
+    // progress events observed — optional)"); the check now sends that same
+    // call without the token itself, and when that one is served, resends
+    // the call carrying the token: a second failure fails the check.
     const stub = await startLegacyStub({ toolCall: "http-500-with-token" });
     try {
       const report = await runComplianceSuite(stub.url, {
@@ -859,11 +868,14 @@ describe("runComplianceSuite — legacy lifecycle-progress-token", () => {
       });
       expect(verdictOf(report, "tools-call")).toEqual({ passed: true, details: "Returned 1 content item(s)" });
       expect(progressToken(report)).toEqual({
-        passed: true,
-        details: "HTTP 500 — tools/call with progressToken was not served (no progress events observed — optional)",
+        passed: false,
+        details:
+          "HTTP 500, JSON-RPC error -32603 on tools/call shell carrying _meta.progressToken, and HTTP 500, JSON-RPC error -32603 when it was resent, while the same call without it, sent in between, was served -- the server failed the request because of its progress token (basic/utilities#progress lets a receiver ignore the token and send no notifications, not fail the request)",
       });
       expect(skippedOf(report, "lifecycle-progress-token")).toBeUndefined();
-      expect(stub.hits.filter((h) => h.method === "tools/call")).toHaveLength(2);
+      // tools-call's, the one carrying the token, the same call without it,
+      // and the one carrying the token resent.
+      expect(stub.hits.filter((h) => h.method === "tools/call")).toHaveLength(4);
     } finally {
       await stub.stop();
     }
@@ -1689,23 +1701,29 @@ describe("runComplianceSuite — legacy auth siblings read a gate the way the 20
   }, 20_000);
 
   it("security-oauth-metadata: a document found, a 404, a 401, or a 403 the credential gets past decide as before", async () => {
+    // The lookup is the 2026-07-28 one now (legacy-small-gaps.test.ts): the
+    // endpoint-path location, then the root, each named in the details.
+    // Before: "Protected Resource Metadata found: resource=..." and "PRM
+    // endpoint returned HTTP <status> and no legacy OAuth metadata found".
     const found = await run({ noAuth: "bare-403", authedPing: "bare-403", wellKnown: "prm" }, [OAUTH]);
     expect(found.verdicts[OAUTH]).toBe(
-      `PASS: Protected Resource Metadata found: resource=${found.url}, 1 auth server(s)`,
+      `PASS: Protected Resource Metadata found at /.well-known/oauth-protected-resource: resource=${found.url}, 1 auth server(s)`,
     );
+    const nowhere = (status: number) =>
+      `FAIL: No Protected Resource Metadata (/.well-known/oauth-protected-resource/mcp -> HTTP ${status}; /.well-known/oauth-protected-resource -> HTTP ${status}) and no legacy OAuth metadata`;
     const missing = await run({ noAuth: "bare-403", authedPing: "bare-403", wellKnown: 404 }, [OAUTH]);
-    expect(missing.verdicts[OAUTH]).toBe("FAIL: PRM endpoint returned HTTP 404 and no legacy OAuth metadata found");
+    expect(missing.verdicts[OAUTH]).toBe(nowhere(404));
     // A 403 next to a served credentialed ping is the gate refusing the
     // missing credential: a finding about the metadata, not the guard.
     const attributed = await run({ noAuth: "bare-403" }, [OAUTH]);
-    expect(attributed.verdicts[OAUTH]).toBe("FAIL: PRM endpoint returned HTTP 403 and no legacy OAuth metadata found");
+    expect(attributed.verdicts[OAUTH]).toBe(nowhere(403));
     const unauthorized = await run({ noAuth: "401" }, [OAUTH]);
-    expect(unauthorized.verdicts[OAUTH]).toBe(
-      "FAIL: PRM endpoint returned HTTP 401 and no legacy OAuth metadata found",
-    );
-    // The attribution is asked only when both locations drew a 403: a
-    // server answering 401 is sent no ping for it.
-    expect(pingAuths(unauthorized.hits)).toEqual([]);
+    expect(unauthorized.verdicts[OAUTH]).toBe(nowhere(401));
+    // The unauthenticated ping is sent to read the challenge (its
+    // resource_metadata URL comes first); the credentialed twin that
+    // attributes a bare 403 is asked only for a bare 403, so a server
+    // answering 401 is sent no ping carrying the credential. Before: no ping.
+    expect(pingAuths(unauthorized.hits)).toEqual([undefined]);
   }, 30_000);
 
   it("security-token-in-uri: a query-string token accepted behind an unattributable bare 403 FAILS", async () => {
@@ -1994,7 +2012,8 @@ describe("runComplianceSuite — legacy auth checks read the configured Authoriz
         "security-token-in-uri": "PASS: HTTP 401 (token in query string rejected)",
         // The whole --auth-gated set is measured, this one included: the
         // stub has no Protected Resource Metadata to find.
-        "security-oauth-metadata": "FAIL: PRM endpoint returned HTTP 401 and no legacy OAuth metadata found",
+        "security-oauth-metadata":
+          "FAIL: No Protected Resource Metadata (/.well-known/oauth-protected-resource/mcp -> HTTP 401; /.well-known/oauth-protected-resource -> HTTP 401) and no legacy OAuth metadata",
       });
       // The probes reached the server carrying no Authorization header,
       // while the handshake carried the configured one.
@@ -2510,13 +2529,24 @@ describe("runComplianceSuite — legacy security-oversized-input over stdio", ()
     // stdio-framing (required) FAILED "5/5 rapid pings failed — framing likely
     // broken", security-extra-params PASSED "Request rejected (acceptable)",
     // and rug-pull, unicode and unknown-method-recovers FAILED on the crash.
+    // Rug-pull compares two lists from the restarted child, not the first
+    // child's list with the new one's (see legacy-rug-pull-restart.test.ts).
     expect(Object.fromEntries(AFTER.map((id) => [id, verdictOf(report, id)]))).toEqual({
       "security-extra-params": { passed: true, details: "Server processed request (extra params likely ignored)" },
-      "security-tool-rug-pull": { passed: true, details: "1 tool(s) consistent across 2 calls" },
+      "security-tool-rug-pull": {
+        passed: true,
+        details:
+          "1 tool(s) consistent across 2 calls to the server restarted after security-oversized-input (before and after a tools/call)",
+      },
       "stdio-framing": { passed: true, details: "5/5 rapid pings returned cleanly" },
+      // The fixture's tool answers "ok" whatever it is sent, so the verdict
+      // rests on the ping carrying the probe in _meta (see
+      // legacy-small-gaps.test.ts). Before: "Tool echoed something, but not
+      // the exact probe — likely still UTF-8-safe".
       "stdio-unicode": {
         passed: true,
-        details: "Tool echoed something, but not the exact probe — likely still UTF-8-safe",
+        details:
+          "tools/call echo did not echo the probe; envelope round-trip verified: ping answered a request whose _meta carries CJK/emoji (no echo path to compare byte-for-byte)",
       },
       "stdio-unknown-method-recovers": {
         passed: true,
@@ -2659,11 +2689,21 @@ describe("runComplianceSuite — legacy injection checks over stdio: a child tha
         details: "result -- server processed a 1 MB echo.data without rejecting it (survived)",
       },
       "security-extra-params": { passed: true, details: "Server processed request (extra params likely ignored)" },
-      "security-tool-rug-pull": { passed: true, details: "1 tool(s) consistent across 2 calls" },
+      // Both lists from the restarted child (see legacy-rug-pull-restart.test.ts).
+      "security-tool-rug-pull": {
+        passed: true,
+        details:
+          "1 tool(s) consistent across 2 calls to the server restarted after security-command-injection (before and after a tools/call)",
+      },
       "stdio-framing": { passed: true, details: "5/5 rapid pings returned cleanly" },
+      // The fixture's tool answers "ok" whatever it is sent, so the verdict
+      // rests on the ping carrying the probe in _meta (see
+      // legacy-small-gaps.test.ts). Before: "Tool echoed something, but not
+      // the exact probe — likely still UTF-8-safe".
       "stdio-unicode": {
         passed: true,
-        details: "Tool echoed something, but not the exact probe — likely still UTF-8-safe",
+        details:
+          "tools/call echo did not echo the probe; envelope round-trip verified: ping answered a request whose _meta carries CJK/emoji (no echo path to compare byte-for-byte)",
       },
       "stdio-unknown-method-recovers": {
         passed: true,
@@ -3024,9 +3064,11 @@ describe("runComplianceSuite — legacy security-extra-params over stdio: a chil
     expect(report.warnings.filter((w) => w.startsWith(ID))).toEqual([
       "security-extra-params: the server exited on unknown tool arguments (tools/call echo) and was restarted with a fresh initialize handshake, so the tests after it ran against the new instance.",
     ]);
+    // Both lists from the restarted child (see legacy-rug-pull-restart.test.ts).
     expect(verdictOf(report, "security-tool-rug-pull")).toEqual({
       passed: true,
-      details: "1 tool(s) consistent across 2 calls",
+      details:
+        "1 tool(s) consistent across 2 calls to the server restarted after security-extra-params (before and after a tools/call)",
     });
     expect(verdictOf(report, "stdio-framing")).toEqual({ passed: true, details: "5/5 rapid pings returned cleanly" });
   }, 60_000);
@@ -3499,31 +3541,36 @@ describe("runComplianceSuite — legacy lifecycle-reinit-reject credits only the
     expect(await reinit({ token: "tok-3e9d", noAuth: 503 })).toBe(`FAIL: HTTP 503 on the second initialize -- ${tail}`);
   }, 30_000);
 
-  it("the handshake was served: an edge's 5xx or a rate limiter's 429 in place of the server's answer is not evaluable", async () => {
+  it("the handshake was served: an edge's 5xx or a rate limiter's 429 in place of the server's answer fails", async () => {
+    // Worded as the other negative probes word the same answers (gateRefusal).
+    const failed =
+      "the server failed on the request rather than refusing it (a broken server, or a gateway with no backend), which is no rejection of the duplicate initialize";
     // Before: PASS "Re-initialization rejected with error: -32000 — Service Unavailable".
     expect(await reinit({ reinit: 503 })).toBe(
-      "FAIL: HTTP 503, JSON-RPC error -32000 on the second initialize -- not evaluable: a server error (or a gateway with no backend) is a failure, not a rejection of the duplicate",
+      `FAIL: HTTP 503, JSON-RPC error -32000 on the second initialize -- ${failed}`,
     );
     // Before: PASS "HTTP 502 (re-initialization rejected)".
-    expect(await reinit({ reinit: "502-html" })).toBe(
-      "FAIL: HTTP 502 on the second initialize -- not evaluable: a server error (or a gateway with no backend) is a failure, not a rejection of the duplicate",
-    );
+    expect(await reinit({ reinit: "502-html" })).toBe(`FAIL: HTTP 502 on the second initialize -- ${failed}`);
     // Before: PASS "HTTP 429 (re-initialization rejected)". Resent once after
     // Retry-After; the second 429 decides.
     expect(await reinit({ reinit: 429 })).toBe(
-      "FAIL: HTTP 429, then after 0ms HTTP 429 on the second initialize -- not evaluable: a rate limiter answered before the server read the request",
+      "FAIL: HTTP 429, then after 0ms HTTP 429 on the second initialize -- not evaluable: a rate limiter answered before the server read the request, so the duplicate initialize was never looked at",
     );
   }, 30_000);
 
-  it("the handshake was served: an auth gate's 401 or a Host guard's 403 on the duplicate is not evaluable", async () => {
+  it("the handshake was served: an auth gate's 401 on the duplicate is not evaluable; a Host-worded 403 is the duplicate's", async () => {
     // A credential refused mid-run. Before: PASS "Re-initialization rejected
     // with error: -32001 — Unauthorized".
     expect(await reinit({ reinit: 401 }, { Authorization: "Bearer tok-3e9d" })).toBe(
       "FAIL: HTTP 401, JSON-RPC error -32001 on the second initialize -- not evaluable: an auth gate answered before the server read the request (credential rejected -- check --auth)",
     );
-    // Before: PASS "Re-initialization rejected with error: -32000 — Invalid Host: mcp.internal.example".
+    // The handshake, sent with the same Host and Origin, was served, so a
+    // guard refusing every request would have refused it too: the 403 is
+    // the server's answer to the duplicate, whatever its message names --
+    // lifecycle-version-negotiate's reading of the same 403 next to the
+    // same handshake. (0.19.0 failed it as not evaluable.)
     expect(await reinit({ reinit: "host-403" })).toBe(
-      'FAIL: HTTP 403, JSON-RPC error -32000 on the second initialize ("Invalid Host: mcp.internal.example") -- not evaluable: the message names Host/Origin validation, which refuses a request whatever it carries',
+      "PASS: Re-initialization rejected with error: -32000 — Invalid Host: mcp.internal.example",
     );
   }, 30_000);
 
@@ -3565,8 +3612,9 @@ describe("runComplianceSuite — legacy lifecycle-reinit-reject credits only the
 // answer came back to read -- carry TestResult.skipped, as the checks worded
 // "Skipped ...", "(skipped)" or "not applicable" already did. Before, these
 // were plain passes: the harness infers a skip only from those markers.
-// Score math does not move (a skip is still passed: true); only the flag,
-// and details that claimed an answer that never came, do.
+// A skip is still passed: true; what changes is the flag, details that
+// claimed an answer that never came, and, through the flag, the score,
+// which leaves skips out (pinned in grader.test.ts).
 // ---------------------------------------------------------------------------
 describe("runComplianceSuite — legacy passes that measured nothing are flagged as skips", () => {
   async function runStub(

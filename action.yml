@@ -57,7 +57,7 @@ outputs:
     description: 'Final grade (A-F)'
     value: ${{ steps.run.outputs.grade }}
   score:
-    description: 'Numeric score 0-100'
+    description: 'Numeric score 0-100, over the checks that measured something (skipped checks are left out; 0 when every check skipped)'
     value: ${{ steps.run.outputs.score }}
   passed:
     description: 'Number of passing tests (includes skipped checks, which measured nothing -- see skipped)'

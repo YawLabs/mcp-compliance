@@ -156,6 +156,8 @@ Per spec: JSON-RPC messages in SSE streams MUST be tagged with `event: message`.
 - `id` (same type as the request's id)
 - Exactly one of `result` OR `error`, never both, never neither
 
+On 2025-11-25 a failure that says `not evaluable` is not about your envelope: the `initialize` was answered without a result by something in front of your server, so the envelope need not be yours -- a 401 or an auth-gate 403 (pass or fix `--auth`), a 429 from a rate limiter, a 5xx without your own `-32600`, `-32601` or `-32602` (a broken server, or a gateway with no backend), or a 403 that the same `ping` sent on its own drew too (when the details quote `Invalid Host` / `Invalid Origin`, allow the hostname you tested through). Fix `lifecycle-init` first.
+
 ### `lifecycle-id-match` — Response ID matches request ID (required)
 
 **Failure:** `Request id=1001, response id=1002`.
@@ -174,7 +176,22 @@ if (session.initialized) {
 }
 ```
 
-A failure that says `not evaluable` is not about your duplicate handling: either the first `initialize` was not served (fix `lifecycle-init` first), or something in front of the server answered the duplicate in its place -- a 401 or an auth-gate 403 (pass or fix `--auth`), a 403 quoting `Invalid Host` / `Invalid Origin` (allow the hostname you tested through), a 429 that survived one retry, or a 5xx from a gateway with no backend.
+A failure that says `not evaluable` is not about your duplicate handling: either the first `initialize` was not served (fix `lifecycle-init` first), or something in front of the server answered the duplicate in its place -- a 401 or an auth-gate 403 (pass or fix `--auth`), or a 429 that survived one retry. Any other 403 counts as your rejection, since the handshake went out with the same Host and Origin and was served. A 5xx fails as the server failing on the request unless it carries your own `-32600`, which passes with a warning: reject the duplicate with a 4xx or a JSON-RPC error on a 2xx, never a 5xx.
+
+### `lifecycle-progress-token` — Supports progress tokens in requests
+
+**Failure:** `notifications/progress carries token "job-17", expected "compliance-progress-test"`, `progress did not increase (2 -> 1)`, or a server error on the `tools/call` carrying `_meta.progressToken` while the same call without it was served.
+
+**Fix:** progress is optional -- sending no notifications passes -- but every notification you do send must carry the token from the request's `_meta.progressToken` and a `progress` value that grows with each one:
+
+```ts
+const token = msg.params?._meta?.progressToken;
+if (token !== undefined) {
+  send({ jsonrpc: '2.0', method: 'notifications/progress', params: { progressToken: token, progress: done, total } });
+}
+```
+
+A server that does not report progress should ignore the token, not fail the request because of it. The 2025-11-25 check blames the token only when the failure reproduces: the call without the token was served, and the call carrying it failed again when resent.
 
 ---
 
@@ -256,6 +273,8 @@ if (typeof msg.jsonrpc !== 'string' || typeof msg.method !== 'string') {
 }
 ```
 
+On 2025-11-25, `error-invalid-jsonrpc`, `error-invalid-json`, `error-missing-params` and `error-capability-gated` read their answer the way `error-unknown-method` does, so a failure that says `not evaluable` is not about your validation: the rejection did not come from your server. Either `initialize` was rejected the same way (fix `lifecycle-init` first; `error-capability-gated` then also never saw which capabilities you declare), or a gate answered in the server's place -- a 401 or an auth-gate 403 (pass or fix `--auth`), a 429 that survived one retry, or a 403 that a `ping` with the same headers drew too (when the details quote `Invalid Host` / `Invalid Origin`, allow the hostname you tested through). A 5xx fails as the server failing on the request unless it carries your own code (`-32600` for the malformed message, `-32700` for invalid JSON, `-32602` for the missing tool name, `-32601` for an undeclared capability's method), which passes with a warning: reject bad input with a 4xx or a JSON-RPC error on a 2xx, never a 5xx.
+
 ---
 
 ## Schema validation
@@ -290,7 +309,7 @@ Skip this for stdio servers (no external caller) or tightly-scoped internal HTTP
 
 On 2025-11-25 without `--auth`, the unauthenticated preflight stands in for the probe: a 401, or a 403 carrying a `WWW-Authenticate: Bearer` challenge, passes (`HTTP 401 (unauthenticated preflight rejected; pass --auth ...)`), and so does a 401 on the unauthenticated `initialize` when the preflight was neither served nor refused as authentication (a gateway's bare 403, or the `-32601` a server gives behind a gateway that lets `server/discover` through); a bare 403 fails as not evaluable (it may be Host/Origin validation or a gateway) -- answer a missing token with 401 and `WWW-Authenticate: Bearer`, and if the details quote `Invalid Host`, add the hostname you tested through to the server's allowed hosts. The report's first warning says the grade is not meaningful until you re-run with `--auth <token>` -- most of the suite never got past your auth gate. In both eras "server accepted unauthenticated request" means a request was actually served; a 429, a 5xx, a redirect or a login page is reported for what it is (a rate limiter, a failing backend, an SSO redirect in front of the endpoint), and the fix is to answer a missing token with 401 before any of those.
 
-On 2026-07-28 the probe is sent with or without `--auth`: a 401, or a 403 with a `WWW-Authenticate: Bearer` challenge, passes either way. A 403 without a challenge -- what Origin validation, the SDK's Host validation (`Invalid Host: ...`) and gateways answer -- passes only with `--auth` when your credentialed request got past that gate (served, or answered at 2xx even with a JSON-RPC error such as `-32021`), and otherwise fails as `not evaluable`, naming how the credentialed request was answered; answer a missing token with 401 and a Bearer challenge, and if the details quote `Invalid Host`, add the hostname you tested through to the server's allowed hosts. The sibling `security-auth-malformed` sends two credentials in place of yours -- a well-formed token no authorization server issued (`Bearer aW52YWxpZC10b2tlbg`), which MUST draw 401, and a value outside the RFC 6750 `b64token` grammar, for which the spec's error table allows `400 Bad Request` as well as 401 -- so a strict bearer parser that answers 400 for garbage is no longer marked as "accepted". And `security-oauth-metadata` treats the `resource_metadata` URL in your `WWW-Authenticate` challenge as authoritative: clients MUST use it, so when you advertise one it is the only URL fetched, and an advertised URL that is relative, unreachable, non-200, non-JSON or missing `resource` / `authorization_servers` fails even if a valid document sits at a well-known location (the details name that location -- the fix is then one header). Only without a challenge URL does it try `/.well-known/oauth-protected-resource<endpoint path>`, then the root.
+On 2026-07-28 the probe is sent with or without `--auth`: a 401, or a 403 with a `WWW-Authenticate: Bearer` challenge, passes either way. A 403 without a challenge -- what Origin validation, the SDK's Host validation (`Invalid Host: ...`) and gateways answer -- passes only with `--auth` when your credentialed request got past that gate (served, or answered at 2xx even with a JSON-RPC error such as `-32021`), and otherwise fails as `not evaluable`, naming how the credentialed request was answered; answer a missing token with 401 and a Bearer challenge, and if the details quote `Invalid Host`, add the hostname you tested through to the server's allowed hosts. The sibling `security-auth-malformed` sends two credentials in place of yours -- a well-formed token no authorization server issued (`Bearer aW52YWxpZC10b2tlbg`), which MUST draw 401, and a value outside the RFC 6750 `b64token` grammar, for which the spec's error table allows `400 Bad Request` as well as 401 -- so a strict bearer parser that answers 400 for garbage is no longer marked as "accepted". And `security-oauth-metadata` treats the `resource_metadata` URL in your `WWW-Authenticate` challenge as authoritative: clients MUST use it, so when you advertise one it is the only URL fetched, and an advertised URL that is relative, unreachable, non-200, non-JSON or missing `resource` / `authorization_servers` fails even if a valid document sits at a well-known location (the details name that location -- the fix is then one header). Only without a challenge URL does it try `/.well-known/oauth-protected-resource<endpoint path>`, then the root. The 2025-11-25 `security-oauth-metadata` looks the document up the same way (it still runs only with `--auth`), reading the challenge on the unauthenticated ping `security-auth-required` sends, and falls back to a legacy `/.well-known/oauth-authorization-server` document with a warning.
 
 ### `security-rate-limiting` — Rate limiting is enforced (HTTP only)
 
@@ -399,7 +418,7 @@ Not `console.log`, which pretty-prints and may split.
 
 **Failure:** tool output corrupted non-ASCII characters.
 
-**Fix:** don't override Node's default stdout encoding (UTF-8). On Windows specifically, check `chcp` isn't set to a non-UTF-8 code page if you're spawning child processes. On 2026-07-28 the failure names the evidence: U+FFFD replacement characters, a Latin-1 mis-decode, the non-ASCII characters replaced by `?` (a legacy code page's encoder), or the CJK/emoji characters dropped. A tool that splits its input into tokens passes as long as every non-ASCII piece comes back somewhere in the reply. The 2025-11-25 check is weaker: it fails only when the tool call carrying the probe gets no answer, so a mangled reply passes there, and a server that declares no tools is skipped.
+**Fix:** don't override Node's default stdout encoding (UTF-8). On Windows specifically, check `chcp` isn't set to a non-UTF-8 code page if you're spawning child processes. In both eras the failure names the evidence: U+FFFD replacement characters, a Latin-1 mis-decode, the non-ASCII characters replaced by `?` (a legacy code page's encoder), or the CJK/emoji characters dropped. A tool that splits its input into tokens passes as long as every non-ASCII piece comes back somewhere in the reply. When the tool does not echo its input, or you have no tool, the verdict rests on a request whose envelope carries the same characters -- a `ping` whose `_meta` carries them on 2025-11-25, a `server/discover` whose `clientInfo` name carries them on 2026-07-28 -- so a server that serves it passes. On 2025-11-25 a server that exits on the probe fails and is restarted for the checks after it (a warning names the check).
 
 ### `stdio-unknown-method-recovers` — Recovers after unknown method
 

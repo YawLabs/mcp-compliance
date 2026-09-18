@@ -72,8 +72,9 @@ export interface TestOutcome {
  * Details can echo server text (a tool name, an error message), so a
  * server could word a pass into a skip. That only ever moves a check
  * from "passed" to "passed, measured nothing" -- it cannot turn a
- * failure into anything else, and a skip never scores higher than the
- * pass it replaces.
+ * failure into anything else, and since the score leaves a skip out, a
+ * pass turned into one can only lower the score or keep it (see
+ * computeScore in grader.ts).
  */
 const SKIP_MARKERS: readonly RegExp[] = [/^\s*skipped\b/i, /\(skipped\)/i, /\bnot applicable\b/i];
 

@@ -9,6 +9,188 @@ out explicitly here.
 
 ## [Unreleased]
 
+### Changed
+- **A skipped check no longer counts in the score, so grades can move.** A
+  check that measured nothing (`skipped: true`: no `--auth`, no tools
+  declared, a check that does not apply on the transport, a refusal an
+  earlier check could not attribute) used to score as a pass. It is now left
+  out of both the numerator and the denominator: the 70% required / 30%
+  optional weighting applies to the checks that measured something, and when
+  every required or every optional check skipped, the other pool carries the
+  whole score. A run in which every check skipped scores 0 (F), like a run in
+  which none ran, and the terminal, markdown, HTML and GitHub `::notice`
+  reports, the SARIF invocation properties (a `note` key) and the MCP
+  `mcp_compliance_test` tool say so in words: "No test measured anything --
+  all N that ran were skipped, and skips are left out of the score". The JSON
+  report carries no prose; there `summary.skipped` equals `summary.total`.
+  The skip caveats that said skips were "counted as passes in the score" now
+  say they are "left out of the score".
+  - How far a server moves depends on its failures and skips, not on whether
+    it is "clean". On the reference servers no rounded score moved: the SDK
+    v1 server's full 2025-11-25 run stays 96 (A) (95.7 unrounded, was 96.4),
+    and the modern fixture's full 2026-07-28 run stays 99 (A) over HTTP and
+    100 (A) over stdio. A run without skips does not move at all, nor does
+    one without failures that measured anything. Otherwise the drop grows
+    with the number of failures times the number of skips in a pool (in a
+    pool of N checks with F failures and S skips, weight x F x S / (N x
+    (N - S)) points, weight 70 or 30, while both pools have measured
+    checks), so a server whose required checks all pass can still lose a
+    grade: 15 of 50 optional checks failing and 20 skipped takes it from
+    91 (A) to 85 (B).
+  - A run where most checks measured nothing can drop several grades. With
+    `--only security --auth` against an SDK v1 server behind the SDK's Host
+    guard allowing only another hostname (every request draws a bare 403),
+    2025-11-25 goes from 78 (B) to 29 (F), because 16 of its 18 passes
+    measured nothing, and 2026-07-28 from 86 (B) to 40 (D), 16 of 18 as well.
+  - Unchanged: `overall` ("fail" on a required failure or an empty run), so
+    `--strict` exits as before, and a run in which every check skipped is
+    `pass` with grade F; `summary.passed` / `failed` / `total` / `required` /
+    `requiredPassed` / `skipped` and the per-category counts, where a skip
+    still counts as passed (`passed + failed = total`); report schema v1,
+    whose descriptions now say how the score treats skips. `--min-grade`
+    gates, badges and dashboards keyed on grade or score see the move.
+  - The terminal category bars (bar, colour and percentage) and the HTML
+    category cards count what was measured, as the score does: with
+    `--only security`, `Security 18/23` with 16 skips reads 29% under grade
+    F 29%, not 78%. A category in which every check skipped reads `--` over
+    an empty dim bar in the terminal and is grey, not green, in HTML. The
+    `passed/total` ratio next to the bar still counts skips as passes.
+  - `diff` scores both reports from their results as this version does,
+    instead of copying each file's stored score onto the grade line. A
+    report written by 0.19.0 or earlier scored skips as passes, so against
+    such a baseline the grade line used to show a drop
+    (`Grade B (78%) ↓ F (29%)`) above "No changes between baseline and
+    current"; both sides now read the same, and a note under the grade line
+    names the score the file recorded and why it differs. A baseline from before skip tracking
+    (0.18.x) has its skips read from their wording, as for the per-check
+    statuses. The diff JSON adds `recordedScores` (`{ baseline, current }`,
+    each null when the file's score agrees with its results).
+  - The methodology (`COMPLIANCE_RUBRIC.md`, and `specVersion` in
+    `mcp-compliance-rules.json`) goes to 3.0.0: under its own versioning
+    rules a scoring algorithm change is a major bump. 0.19.0 implements
+    2.0.0; this release is the first to implement 3.0.0.
+  - Grades can move, so this is a minor release rather than a patch.
+
+### Fixed
+- **The 2025-11-25 checks that 0.19.0 left untightened now read their answers
+  honestly, most of them as the 2026-07-28 suite does.** These fixes leave
+  the score math alone (the skip change is under Changed); verdicts on the
+  checks below move.
+  - `error-invalid-jsonrpc`, `error-invalid-json`, `error-missing-params` and
+    `error-capability-gated` credited a gateway's JSON-RPC error body (a 401's
+    `-32001` "Unauthorized") as the server's rejection, and `lifecycle-jsonrpc`
+    passed the gateway's error envelope as the server's valid JSON-RPC: against
+    a server that answers 401 to every request, a 2025-11-25 run passed all
+    five. They now read an answer the way `transport-batch-reject`,
+    `lifecycle-version-negotiate` and `error-unknown-method` have since 0.19.0:
+    - A 401 or an auth-gate 403, or a 429, fails as not evaluable. The four
+      error checks resend a 429 once after `Retry-After` first (capped at 2 s);
+      `lifecycle-jsonrpc` reads the handshake's own answer.
+    - Any other 403 counts only when the conformant twin was served or drew a
+      different status; when the twin drew the same 403, or got no answer, the
+      check fails as not evaluable, quoting the message when the twin drew the
+      same 403 and the message names Host/Origin validation. The twin is a well-formed ping with the same headers (asked
+      at most once for `error-capability-gated`'s three methods); for
+      `lifecycle-jsonrpc` it is the same ping sent on its own as
+      `application/json`. Each twin is sent only for such a 403.
+    - A 5xx counts only when it carries the check's own JSON-RPC code:
+      `-32600` for the malformed message, `-32700` for invalid JSON, `-32602`
+      for `tools/call` without a name, `-32601` for an undeclared capability's
+      method, and `-32600`/`-32601`/`-32602` for the `initialize` itself. That
+      passes, with a warning that a rejected request should get a 4xx. Without
+      it the error checks fail as the server failing on the request, and
+      `lifecycle-jsonrpc` fails as not evaluable.
+    - The four error checks also fail as not evaluable when the `initialize`
+      handshake was not served and drew the same status (or no answer). In
+      that case `error-capability-gated` withholds its verdict whatever the
+      answers, as the 2026-07-28 rule does, because no capability declaration
+      was seen; it still probes and lists each method's answer.
+    - `error-invalid-jsonrpc` and `error-invalid-json` now honour the caller's
+      abort instead of waiting out the request timeout.
+  - `security-tool-rug-pull` over stdio compared the list cached from the first
+    process with a fresh one after a restart, so a server whose tools change
+    after use passed once an earlier check had crashed it, and a conformant
+    server whose tool descriptions name the process failed as a rug-pull. Once
+    the runner restarts a child after `tools-list` has read its list, it now
+    reads the new process's `tools/list` before any `tools/call` reaches it,
+    and the check compares that list with one read after a `tools/call` with no
+    arguments, as the 2026-07-28 rule has since 0.19.0; the details name the
+    check the restart followed. It skips, with a warning, when the new process
+    leaves nothing to compare: its list before use was not read (the restart's
+    warning now says why), or the `tools/call` killed it too, when the server
+    is restarted again. A restart before `tools-list` ran
+    (`lifecycle-version-negotiate`'s) is unchanged.
+  - `security-cors-headers` passed "OPTIONS request failed (no CORS,
+    acceptable)" on any transport error, a server nothing answered included.
+    It now reads CORS the way the 2026-07-28 check does, on two probes carrying
+    a foreign `Origin`: the OPTIONS preflight (capped at 5 s) and a `ping` sent
+    as a POST with the handshake's headers and the run's timeout, since MCP does
+    not require a server to handle OPTIONS. A wildcard or the reflected origin
+    on either answer fails. Only when neither probe gets an HTTP answer is
+    there nothing to inspect: connections the server closed on both pass as
+    cross-origin requests refused next to the served `initialize` handshake,
+    and anything else (a timeout, a refused connection) is `server
+    unreachable`. A caller's abort is rethrown.
+  - `stdio-unicode` never detected a mangled reply: it failed only when the
+    tool call got no answer, and it skipped a server with no tool to call. It
+    now judges the round trip as the 2026-07-28 check does. The tool is one
+    named `echo`, else one with a `message`/`text`/`input`/`query` string
+    argument, else the first (`tools/list` is read on demand). A byte-for-byte
+    or piece-by-piece echo passes; U+FFFD, a Latin-1 mis-decode, `?`
+    substitution, dropped CJK/emoji characters or a `-32700` fails. When the
+    tool does not echo, or there is no tool, a `ping` whose `_meta` carries the
+    probe decides: answered with a result, it passes as the envelope round-trip
+    verified (the official SDK v1 and v2 stdio servers answer it). A child that
+    exits on the probe fails in one line and is restarted, so
+    `stdio-unknown-method-recovers` after it measures the server instead of
+    the crash.
+  - `security-oauth-metadata` fetched only the root well-known locations and
+    ignored the challenge's `resource_metadata`. It now looks the document up
+    as clients must, as the 2026-07-28 check does: the `resource_metadata` URL
+    of the `WWW-Authenticate` challenge on the unauthenticated ping (the one
+    `security-auth-required` sends, shared with it), and only that URL -- a
+    relative, unreachable, non-200 or malformed one fails, naming any valid
+    well-known document -- otherwise `/.well-known/oauth-protected-resource`
+    followed by the endpoint path, then the root, then the legacy
+    authorization-server document. A `resource` that is not the endpoint
+    passes with a warning. The official SDK v1 deployment
+    (`mcpAuthMetadataRouter` + `requireBearerAuth`), which serves the document
+    at the path location, used to pass on its authorization-server document
+    with a "migrate to PRM" warning. The not-evaluable skip for a guard's 403
+    stays (it now requires every location to draw that 403), and so does the
+    skip without `--auth`. An unauthenticated ping that gets no answer is
+    `server unreachable`, except a connection closed next to the served
+    credentialed handshake.
+  - `lifecycle-progress-token` could never fail. It now judges the progress it
+    receives as the 2026-07-28 check does: a `notifications/progress` under
+    another token, without params, or with a progress value that is not a
+    number or does not increase fails. It also fails when the call carrying
+    the token draws a server error (a JSON-RPC error, or a status >= 400 other
+    than a 429, a 401 or an auth-gate 403) that reproduces: the same call
+    without the token, sent right after, is served, and the call carrying the
+    token, resent after that, fails again. A tool whose first call fails
+    whatever it carries (a cold backend) passes on the resend. The tool called
+    is the first without required arguments, preferring one that mentions
+    progress. A call nothing answers is still a skip, and a caller's abort is
+    rethrown.
+  - `lifecycle-reinit-reject` now reads the duplicate `initialize` as the other
+    negative probes read theirs. A 5xx carrying the server's own `-32600`
+    passes with a warning about the status, and a 403 whose message names
+    Host/Origin validation counts as the server's rejection, since the
+    handshake went out with the same Host and Origin and was served; before,
+    both failed as not evaluable. Any other 5xx still fails, now as the server
+    failing on the request; a 401, an auth-gate 403 and a repeated 429 are
+    still not evaluable.
+  - Not yet tightened: the 2025-11-25 `security-oauth-metadata` still skips
+    without `--auth` (the 2026-07-28 check runs whenever the unauthenticated
+    request drew a 401 or a Bearer 403). On 2026-07-28, `lifecycle-jsonrpc`
+    passes a gateway's 401 error envelope as valid JSON-RPC; next to a served
+    `server/discover`, `error-unknown-method`, `error-invalid-jsonrpc`,
+    `error-invalid-json` and `error-capability-gated` credit a gate's `-32001`
+    on a 401 as the server's rejection; `lifecycle-progress-token` does not
+    fail a server error that only the progress token draws; and
+    `stdio-unicode` does not restart a child that exits on the probe.
+
 ## [0.19.0] — 2026-09-18
 
 ### Added
