@@ -13,6 +13,24 @@ export interface TestResult {
   name: string;
   category: TestCategory;
   passed: boolean;
+  /**
+   * The check measured nothing. A precondition was absent (no `--auth`,
+   * the server declares no tools, the probe is HTTP-only on a stdio run)
+   * or an earlier check could not attribute the server's refusal, so this
+   * one had no evidence to judge.
+   *
+   * A skip is still recorded as `passed: true`: it is not a failure, and
+   * schema-v1 consumers that only know `passed` must not read it as one.
+   * The flag is what tells a reader the difference. Absent = not a skip;
+   * a result with `passed: false` is a failure whatever its details say,
+   * and never carries this flag.
+   *
+   * NOTE: skips currently still count toward `summary.passed` and sit in
+   * the score denominator, so the score is optimistic on a run where many
+   * checks measured nothing. Changing that moves every existing grade, so
+   * it is a deliberate, separate decision from surfacing the flag.
+   */
+  skipped?: boolean;
   required: boolean;
   details: string;
   durationMs: number;
@@ -47,8 +65,18 @@ export interface ComplianceReport {
     failed: number;
     required: number;
     requiredPassed: number;
+    /**
+     * How many of `passed` measured nothing (see `TestResult.skipped`).
+     * Optional so a report written by an older tool still types as a
+     * ComplianceReport; every report this tool writes carries it.
+     */
+    skipped?: number;
   };
-  categories: Record<string, { passed: number; total: number }>;
+  /**
+   * Per-category counts. `passed` includes that category's skips, which
+   * `skipped` counts separately; older reports omit `skipped`.
+   */
+  categories: Record<string, { passed: number; total: number; skipped?: number }>;
   tests: TestResult[];
   warnings: string[];
   serverInfo: {
@@ -177,7 +205,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/transports#streamable-http",
     description:
-      "Sends a POST with Content-Type: text/plain instead of application/json and verifies the server rejects it with a 4xx status.",
+      "Sends a POST with Content-Type: text/plain instead of application/json and verifies the server rejects it with a 4xx status. Only the server's own rejection counts: a 401 or an auth-gate 403 (one whose Bearer challenge reads as an auth refusal) and a 429 are answers something in front of the server gave in its place, and each fails as not evaluable. A 429 is first resent once after Retry-After, capped at 2 s, and the second answer decides. Any other 403 counts only when the same ping sent on its own as application/json was served or drew a different status, whatever its message says; that ping is sent only in this case (at most once per run, shared with transport-batch-reject). When that ping drew the same 403, or got no answer, the probe fails as not evaluable, quoting the message when the ping drew the same 403 and the message names Host/Origin validation. A 5xx fails as the server failing on the request rather than refusing it.",
     recommendation:
       "Validate the Content-Type header on incoming POST requests. Reject requests that are not application/json with HTTP 415 (Unsupported Media Type) or 400.",
   },
@@ -210,7 +238,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: true,
     specRef: "basic/transports#streamable-http",
     description:
-      "Sends a JSON-RPC batch request (array of messages) and verifies the server rejects it with an error. MCP does not support JSON-RPC batch requests.",
+      "Sends a JSON-RPC batch request (array of messages) and verifies the server rejects it with an error. MCP does not support JSON-RPC batch requests. A 4xx or a JSON-RPC error counts only as the server's own: a 401 or an auth-gate 403 (one whose Bearer challenge reads as an auth refusal) and a 429 are answers something in front of the server gave in its place, and each fails as not evaluable, whether or not it carries a JSON-RPC error body. A 429 is first resent once after Retry-After, capped at 2 s, and the second answer decides. Any other 403 counts only when the same ping sent on its own as application/json was served or drew a different status, whatever its message says; that ping is sent only in this case (at most once per run, shared with transport-content-type-reject). When that ping drew the same 403, or got no answer, the probe fails as not evaluable, quoting the message when the ping drew the same 403 and the message names Host/Origin validation. A 5xx fails as the server failing on the request rather than refusing it, unless it carries the server's own -32600 (Invalid Request): that passes, with a warning that a rejected request should get a 4xx. A 5xx with -32603, a server-defined -32000..-32099 code, or no JSON-RPC error still fails.",
     recommendation:
       "Check if the parsed JSON body is an array. If so, return a JSON-RPC error or HTTP 400. Do not process batch requests — MCP explicitly forbids them.",
   },
@@ -283,7 +311,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/transports#stdio",
     description:
-      "Sends a request with non-ASCII (CJK + emoji) parameters and verifies the response preserves the characters. Catches byte-level encoding mistakes in framing/parsing.",
+      "Sends a request with non-ASCII (CJK + emoji) parameters and verifies the response preserves the characters. Catches byte-level encoding mistakes in framing/parsing. The probe rides a tools/call to the first listed tool: a reply that echoes it passes, and so does a reply that does not (the check cannot tell a tool that ignores its input from one that mangled it, so it does not detect mojibake); only a call that gets no answer fails. A tool must carry the probe: a server that declares no tools is skipped ('Skipped: server declares no tools, so there is no tool call to carry the unicode probe'), and one that lists none passes on a served tools/list (a tools/list error fails), recorded as a skip, since no unicode was sent.",
     recommendation:
       "Decode stdin as UTF-8 and encode stdout as UTF-8. Avoid latin-1 or platform-default encodings on Windows. Most JSON libraries handle this correctly if you don't override defaults.",
     transports: ["stdio"],
@@ -410,7 +438,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/lifecycle#version-negotiation",
     description:
-      'Sends an initialize request with a future protocol version ("2099-01-01") and verifies the server either negotiates down to a version it supports or returns an error.',
+      "Sends an initialize request with a future protocol version (\"2099-01-01\") and verifies the server either negotiates down to a version it supports or returns an error. A version offered back is judged on its own (echoing 2099-01-01 fails). A JSON-RPC error counts as the rejection only when the initialize handshake -- the same request with a known version and the same headers -- was served or drew a different status: a server that rejects every initialize proves nothing by rejecting this one (an HTTP error status without a JSON-RPC error body fails too, as no protocolVersion or error). Next to such a handshake, a 403 without a Bearer challenge is the server's, whatever its message says. It must also be the server's own answer: a 401 or an auth-gate 403, or a 429, fails as not evaluable (a 429 is first resent once after Retry-After, capped at 2 s). A 5xx fails as the server failing on the request, unless it carries the server's own -32600 or -32602: that passes, with a warning that a rejected request should get a 4xx. A probe that gets no answer is not a rejection. A timeout, a connection that was never established, or a stdio server already gone fails as 'server unreachable'. Over stdio the probe is always a second initialize on the live session, so a server that exits on it fails as having died on a second initialize -- the details do not blame the version, which it may negotiate correctly on a first initialize -- and is restarted with a fresh handshake for the tests after it (a warning names the check). An HTTP connection closed without an answer passes as the rejection only next to the served handshake: a drop leaves the server running, where a stdio exit takes it down. Anything else (bytes that are not an HTTP response) fails as no usable response, and a caller's abort is rethrown.",
     recommendation:
       "When the client requests an unsupported protocol version, respond with the closest version your server supports. Do not blindly accept unknown versions.",
   },
@@ -421,7 +449,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/lifecycle#initialization",
     description:
-      "Sends a second initialize request within the same session. Per spec, the client MUST NOT send initialize more than once. The server should reject it.",
+      "Sends a second initialize request within the same session. Per spec, the client MUST NOT send initialize more than once. The server's own rejection passes: a JSON-RPC error, or another HTTP 4xx. It fails as not evaluable when the first initialize was not served (the second is then no duplicate), or when something in front of the server answered in its place: a 401 or an auth-gate 403, a 403 whose message names Host/Origin validation, a 429 (resent once after Retry-After, capped at 2 s; the second answer decides), or a 5xx. A 2xx without a JSON-RPC error fails as accepting the duplicate, and a 3xx fails as neither a rejection nor a served duplicate. A connection closed without an answer passes as a rejection only next to the served handshake; a timeout or a connection never established fails as 'server unreachable'.",
     recommendation:
       "Track initialization state per session. Reject duplicate initialize requests with a JSON-RPC error or HTTP 4xx. Do not reset session state on re-initialization.",
   },
@@ -490,7 +518,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/utilities#progress",
     description:
-      "Sends a tools/call request with _meta.progressToken and checks if the server sends progress notifications via SSE. Progress support is optional but recommended for long-running operations.",
+      "Sends a tools/call request with _meta.progressToken and checks if the server sends progress notifications via SSE. Progress support is optional but recommended for long-running operations. A tools/call that gets no answer measures nothing: it passes, recorded as a skip. One the server answers without serving it (a 4xx or 5xx) passes as an observation, not a skip.",
     recommendation:
       "When a request includes _meta.progressToken, send notifications/progress events via SSE to report progress. Include progressToken, progress (current), and optionally total fields.",
   },
@@ -584,7 +612,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "Validates that content items returned by tools/call have a recognized type field (text, image, audio, resource, resource_link).",
+      "Validates that content items returned by tools/call have a recognized type field (text, image, audio, resource, resource_link). A tool answering with an empty content array, or with an error, leaves nothing to validate; that pass is recorded as a skip. A malformed answer (content that is not an array, or no result) is not a skip: it passes here unflagged, and tools-call fails it.",
     recommendation:
       'Every content item returned by tools/call must have a type field set to one of: "text", "image", "audio", "resource", or "resource_link". Check for typos or missing type fields.',
   },
@@ -689,7 +717,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: true,
     specRef: "basic",
     description:
-      "Sends an unknown method and verifies the server returns a JSON-RPC error. The spec requires error code -32601 (Method not found).",
+      "Sends an unknown method and verifies the server returns a JSON-RPC error. The spec requires error code -32601 (Method not found). The error counts only when the initialize handshake was served or drew a different status: a server that rejects everything proves nothing by rejecting an unknown method too. It must also be the server's own answer: a 401 or an auth-gate 403, or a 429, fails as not evaluable, whether or not it carries a JSON-RPC error body (a 429 is first resent once after Retry-After, capped at 2 s). A 5xx fails as the server failing on the request, unless it carries the server's own -32601: that passes, with a warning that a rejected request should get a 4xx. Any other 403 counts only when a ping with the same headers was served or drew a different status, whatever its message says; that ping is sent only in this case. When that ping drew the same 403, or got no answer, the check fails as not evaluable, quoting the message when the ping drew the same 403 and the message names Host/Origin validation. A gateway that lets initialize through and refuses every other method never showed the server the unknown method.",
     recommendation:
       "Return a JSON-RPC error with code -32601 (Method not found) for any unrecognized method name. Do not silently ignore unknown methods.",
   },
@@ -776,7 +804,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/lifecycle#capability-negotiation",
     description:
-      "Calls list methods (tools/list, resources/list, prompts/list) for capabilities the server did NOT declare, and verifies the server returns an error instead of success.",
+      "Calls list methods (tools/list, resources/list, prompts/list) for capabilities the server did NOT declare, and verifies the server returns an error instead of success. A server that declares all three has no undeclared method to probe; that pass is recorded as a skip.",
     recommendation:
       "Return a JSON-RPC error (e.g., -32601 Method not found) for methods associated with capabilities not declared in your initialize response.",
   },
@@ -800,7 +828,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#data-types",
     description:
-      'Validates every tool has a valid name (1-128 chars, alphanumeric/underscore/hyphen/dot) and a required inputSchema of type "object".',
+      "Validates every tool has a valid name (1-128 chars, alphanumeric/underscore/hyphen/dot) and a required inputSchema of type \"object\". An empty tool list leaves nothing to validate ('No tools to validate', recorded as a skip).",
     recommendation:
       'Ensure every tool has a name (1-128 chars, [A-Za-z0-9_.-]) and an inputSchema with type: "object". Add descriptions to tools for better AI assistant integration.',
   },
@@ -811,7 +839,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#annotations",
     description:
-      "Validates tool annotation fields if present: readOnlyHint, destructiveHint, idempotentHint, openWorldHint should be booleans.",
+      "Validates tool annotation fields if present: readOnlyHint, destructiveHint, idempotentHint, openWorldHint should be booleans. An empty tool list leaves nothing to validate ('No tools to validate', recorded as a skip).",
     recommendation:
       "If you include annotations on tools, ensure readOnlyHint, destructiveHint, idempotentHint, and openWorldHint are booleans. Note: title belongs on the Tool object, not inside annotations.",
   },
@@ -822,7 +850,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#data-types",
     description:
-      "Checks if tools include the optional title field for human-readable display names. Added in spec version 2025-11-25.",
+      "Checks if tools include the optional title field for human-readable display names. Added in spec version 2025-11-25. An empty tool list leaves nothing to validate ('No tools to validate', recorded as a skip).",
     recommendation:
       "Add a title field (human-readable string) to each tool definition. This helps MCP clients display your tools in a user-friendly way.",
   },
@@ -833,7 +861,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#structured-content",
     description:
-      'If tools declare an outputSchema, validates it is a valid JSON Schema object with type "object". Used for structured output validation.',
+      "If tools declare an outputSchema, validates it is a valid JSON Schema object with type \"object\". Used for structured output validation. An empty tool list leaves nothing to validate ('No tools to validate', recorded as a skip).",
     recommendation:
       'If you declare outputSchema on a tool, ensure it is a valid JSON Schema object with type: "object". Remove outputSchema if you do not need structured output.',
   },
@@ -843,7 +871,8 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     category: "schema",
     required: false,
     specRef: "server/prompts#data-types",
-    description: "Validates every prompt has a name and that any arguments array contains items with name fields.",
+    description:
+      "Validates every prompt has a name and that any arguments array contains items with name fields. An empty prompt list leaves nothing to validate ('No prompts to validate', recorded as a skip).",
     recommendation:
       "Ensure every prompt has a name field. If the prompt has arguments, each argument object must include a name field.",
   },
@@ -853,7 +882,8 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     category: "schema",
     required: false,
     specRef: "server/resources#data-types",
-    description: "Validates every resource has a valid URI (parseable as a URL) and a name field.",
+    description:
+      "Validates every resource has a valid URI (parseable as a URL) and a name field. An empty resource list leaves nothing to validate ('No resources to validate', recorded as a skip).",
     recommendation:
       "Ensure every resource has a valid, parseable URI and a name field. Add description and mimeType for better client integration.",
   },
@@ -866,7 +896,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization",
     description:
-      "Sends a ping without an Authorization header (with --auth, the configured header removed) and expects HTTP 401. A 401, or a 403 carrying a WWW-Authenticate: Bearer challenge, passes. A bare 403 (no Bearer challenge) is not attributed to authentication on its own: streamable-http requires a 403 for an invalid Origin, the SDK's Host validation answers a tunnel or proxy hostname with one, and gateways send them. With --auth it passes only when the same ping carrying the credential is served (the details note that basic/authorization expects 401), and otherwise fails as not evaluable. Without --auth the unauthenticated preflight stands in for the probe; when the preflight got no HTTP answer, a ping is sent after the handshake instead. A 401 or Bearer 403 there passes (the details suggest --auth to run the authenticated suite and the remaining auth tests). A bare 403, or a 401, fails as not requiring auth when initialize was served without any credential (a server that requires authorization rejects every unauthenticated request, initialize included), and passes when the unauthenticated initialize itself drew a 401 or Bearer 403 (a gateway whose method policy refuses server/discover answers the methods it allows that way); otherwise it fails as not evaluable. The not-evaluable details advise allowing the hostname the server was reached through when the refusal's message names Host or Origin validation (the SDK's 'Invalid Host: ...'), or when the ping carrying the credential was refused with 403 too, and name --auth only when no credential was configured. A request with no HTTP answer fails as 'server unreachable': a timeout or a connection never established always, and a connection closed without an answer unless --auth was given and the same ping with the credential was served, which passes as a rejection. When --auth is given and a bare 403 is not evaluable, security-www-authenticate, security-auth-malformed, security-session-not-auth and security-token-in-uri skip as not evaluable instead of crediting the same 403.",
+      "Sends a ping without an Authorization header (with --auth, the configured header removed) and expects HTTP 401. A 401, or a 403 carrying a WWW-Authenticate: Bearer challenge, passes. A bare 403 (no Bearer challenge) is not attributed to authentication on its own: streamable-http requires a 403 for an invalid Origin, the SDK's Host validation answers a tunnel or proxy hostname with one, and gateways send them. With --auth it passes only when the same ping carrying the credential is served (the details note that basic/authorization expects 401), and otherwise fails as not evaluable. Without --auth the unauthenticated preflight stands in for the probe; when the preflight got no HTTP answer, a ping is sent after the handshake instead. It fails as not requiring auth when initialize was served without any credential, whatever the probe drew, or when the probe itself was served (a JSON-RPC result on a 2xx), whatever else was refused (a server that requires authorization rejects every unauthenticated request, initialize included). Otherwise a 401 or Bearer 403 on the probe passes (the details suggest --auth to run the authenticated suite and the remaining auth tests). When the probe drew neither -- a bare 403, or an answer that is no authentication refusal at all, such as the -32601 a server gives behind a gateway that lets server/discover through -- a 401 or Bearer 403 on the unauthenticated initialize passes; failing that, a bare 403 fails as not evaluable. With or without --auth, an answer that is neither a 401/403 nor a served request fails worded for what it was: another 4xx as refused but not as an authentication refusal (a wrong path, a gateway or a rate limiter), a 5xx as the server failing on the request, a 3xx as a redirect, a 2xx carrying a JSON-RPC error as no HTTP authentication refusal, and a 2xx carrying neither result nor error as neither served nor refused. Only a served request is reported as accepted. The not-evaluable details advise allowing the hostname the server was reached through when the refusal's message names Host or Origin validation (the SDK's 'Invalid Host: ...'), or when the ping carrying the credential was refused with 403 too, and name --auth only when no credential was configured. A request with no HTTP answer fails as 'server unreachable': a timeout or a connection never established always, and a connection closed without an answer unless --auth was given and the same ping with the credential was served, which passes as a rejection. When --auth is given and a bare 403 is not evaluable, security-www-authenticate, security-auth-malformed and security-session-not-auth skip as not evaluable ('Skipped: HTTP 403 without a Bearer challenge, not attributable to authentication (see security-auth-required)', the 2026-07-28 wording) instead of crediting the same 403, security-token-in-uri skips a 401/403 on its probe the same way (a query-string token the server accepts still fails), and security-oauth-metadata skips when both metadata locations drew that 403 too -- they read the same two pings, so the skip holds when --only / --skip leaves security-auth-required out of the run.",
     recommendation:
       "Implement authentication on your MCP endpoint. Return HTTP 401 Unauthorized for requests without valid credentials. Use OAuth 2.1 or Bearer tokens as recommended by the MCP spec.",
   },
@@ -877,7 +907,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization",
     description:
-      "When the server returns HTTP 401, checks for a WWW-Authenticate header indicating the required authentication scheme. Per HTTP spec (RFC 9110), servers SHOULD include this header. A 403 carrying a Bearer challenge is read the same way. A probe that gets no HTTP answer fails as 'server unreachable' -- a timeout or a connection that was never established always, and a connection the server closes without answering unless the same request carrying the credential was served, which counts as the rejection it looks for. Skipped without --auth ('Skipped: no --auth provided'), and skipped as not evaluable when security-auth-required found a bare 403 it could not attribute to authentication.",
+      "When the server returns HTTP 401, checks for a WWW-Authenticate header indicating the required authentication scheme. Per HTTP spec (RFC 9110), servers SHOULD include this header. A 403 carrying a Bearer challenge is read the same way (the details then name the HTTP 403); a bare 403 passes as not applicable (recorded as a skip). Any other answer, and a connection closed without an answer that counts as the rejection, leaves no challenge to check, so the pass is recorded as a skip. A probe that gets no HTTP answer fails as 'server unreachable' -- a timeout or a connection that was never established always, and a connection the server closes without answering unless the same request carrying the credential was served, which counts as the rejection it looks for. Skipped without --auth ('Skipped: no --auth provided'), and skipped as not evaluable ('Skipped: HTTP 403 without a Bearer challenge, not attributable to authentication (see security-auth-required)') when the unauthenticated ping draws a bare 403 and the same ping carrying the credential is not served either (security-auth-required's not-evaluable case), whether or not security-auth-required is in the run.",
     recommendation:
       "Include a WWW-Authenticate header in 401 responses to indicate the required auth scheme (e.g., 'WWW-Authenticate: Bearer realm=\"mcp\"').",
   },
@@ -888,7 +918,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization",
     description:
-      "Sends a request with a malformed Authorization header (garbage value) and verifies the server returns HTTP 401 or 403. Servers must validate auth tokens, not just check for presence. A probe that gets no HTTP answer fails as 'server unreachable' -- a timeout or a connection that was never established always, and a connection the server closes without answering unless the same request carrying the credential was served, which counts as the rejection it looks for. Skipped without --auth ('Skipped: no --auth provided'), and skipped as not evaluable when security-auth-required found a bare 403 it could not attribute to authentication.",
+      "Sends a request with a malformed Authorization header (garbage value) and verifies the server returns HTTP 401 or 403. Servers must validate auth tokens, not just check for presence. A status that is neither 401/403 nor a served request fails worded for what it was (another 4xx, a 5xx, a 3xx, a 2xx with no JSON-RPC result); 'server accepted ...' is kept for a served request. A probe that gets no HTTP answer fails as 'server unreachable' -- a timeout or a connection that was never established always, and a connection the server closes without answering unless the same request carrying the credential was served, which counts as the rejection it looks for. Skipped without --auth ('Skipped: no --auth provided'), and skipped as not evaluable ('Skipped: HTTP 403 without a Bearer challenge, not attributable to authentication (see security-auth-required)') when the unauthenticated ping draws a bare 403 and the same ping carrying the credential is not served either (security-auth-required's not-evaluable case), whether or not security-auth-required is in the run. It is also skipped when the same ping carrying the configured credential draws 401: the server refused the run's own credential, so a refusal of the malformed one cannot tell token validation from a server that refuses everything ('Skipped: the configured credential was refused too (the credentialed ping drew HTTP 401), so rejecting invalid tokens cannot be told from rejecting everything (check the configured credential)'). Only a pass becomes that skip: a malformed credential the server accepts, or any other failing answer, still fails.",
     recommendation:
       "Validate the format and signature of Authorization header values. Reject malformed or invalid tokens with HTTP 401. Do not treat any non-empty Authorization header as valid.",
   },
@@ -921,7 +951,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/transports#streamable-http",
     description:
-      "Verifies that presenting a valid MCP-Session-Id without an Authorization header is still rejected. Per spec, servers MUST NOT use sessions for authentication. A probe that gets no HTTP answer fails as 'server unreachable' -- a timeout or a connection that was never established always, and a connection the server closes without answering unless the same request carrying the credential was served, which counts as the rejection it looks for. Skipped without --auth ('Skipped: no --auth provided'), and skipped as not evaluable when security-auth-required found a bare 403 it could not attribute to authentication.",
+      "Verifies that presenting a valid MCP-Session-Id without an Authorization header is still rejected. Per spec, servers MUST NOT use sessions for authentication. A status that is neither 401/403 nor a served request fails worded for what it was (another 4xx, a 5xx, a 3xx, a 2xx with no JSON-RPC result); 'server accepted ...' is kept for a served request. A probe that gets no HTTP answer fails as 'server unreachable' -- a timeout or a connection that was never established always, and a connection the server closes without answering unless the same request carrying the credential was served, which counts as the rejection it looks for. Skipped without --auth ('Skipped: no --auth provided'), skipped when the server issues no session ID, and skipped as not evaluable ('Skipped: HTTP 403 without a Bearer challenge, not attributable to authentication (see security-auth-required)') when the unauthenticated ping draws a bare 403 and the same ping carrying the credential is not served either (security-auth-required's not-evaluable case), whether or not security-auth-required is in the run.",
     recommendation:
       "Always validate the Authorization header independently of the MCP-Session-Id. Sessions are for request routing, not authentication. Reject requests that lack valid auth even if they have a valid session ID.",
   },
@@ -932,7 +962,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization",
     description:
-      "Checks for a Protected Resource Metadata (RFC 9728) endpoint at /.well-known/oauth-protected-resource. Per MCP 2025-11-25, the MCP server publishes PRM with a resource identifier and authorization_servers array. Falls back to legacy /.well-known/oauth-authorization-server with a warning. Skipped without --auth ('Skipped: no --auth provided').",
+      "Checks for a Protected Resource Metadata (RFC 9728) endpoint at /.well-known/oauth-protected-resource. Per MCP 2025-11-25, the MCP server publishes PRM with a resource identifier and authorization_servers array. Falls back to legacy /.well-known/oauth-authorization-server with a warning. Skipped without --auth ('Skipped: no --auth provided'). When neither document is found and both locations answered HTTP 403, while security-auth-required could not attribute the endpoint's bare 403 to authentication (the unauthenticated ping drew a bare 403 and the same ping carrying the credential was not served either), the lookup met the same guard rather than a missing document: it is then skipped ('Skipped: HTTP 403 without a Bearer challenge on the endpoint and on every well-known metadata location, not attributable to authentication (see security-auth-required)') instead of failing. A document found, or any other status, decides as before. The check does not read a resource_metadata URL from a WWW-Authenticate challenge, and tries only the root well-known locations (the 2026-07-28 suite does both).",
     recommendation:
       "Publish a Protected Resource Metadata document at /.well-known/oauth-protected-resource on your server's origin. Include 'resource' (your server's URL) and 'authorization_servers' (array of OAuth AS URLs). See RFC 9728.",
   },
@@ -943,7 +973,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/authorization",
     description:
-      "Sends a request with the auth token in the URL query string instead of the Authorization header. The MCP spec forbids transmitting credentials in URIs. A probe that gets no HTTP answer fails as 'server unreachable' -- a timeout or a connection that was never established always, and a connection the server closes without answering unless the same request carrying the credential was served, which counts as the rejection it looks for. Skipped without --auth ('Skipped: no --auth provided'), and skipped as not evaluable when security-auth-required found a bare 403 it could not attribute to authentication.",
+      "Sends a request with the auth token in the URL query string instead of the Authorization header. The MCP spec forbids transmitting credentials in URIs. With --auth and a token to extract, the probe is always sent, and a 2xx fails as accepting the token whatever else the run found; a 401/403 or any other status passes as not accepted. A probe that gets no HTTP answer fails as 'server unreachable' -- a timeout or a connection that was never established always, and a connection the server closes without answering unless the same request carrying the credential was served, which counts as the rejection it looks for. Skipped without --auth ('Skipped: no --auth provided'), and when no token can be extracted from the auth header. A 401/403 on the probe is skipped as not evaluable ('Skipped: HTTP 403 without a Bearer challenge, not attributable to authentication (see security-auth-required)') when the unauthenticated ping draws a bare 403 and the same ping carrying the credential is not served either (security-auth-required's not-evaluable case), whether or not security-auth-required is in the run. Any not-accepted pass is skipped when the same ping carrying the configured credential in the header draws 401 ('Skipped: the configured credential was refused too (the credentialed ping drew HTTP 401), so refusing it in the query string proves nothing (check the configured credential)'): the token was never going to be accepted anywhere.",
     recommendation:
       "Never accept authentication tokens from URL query parameters. Tokens in URIs are logged by proxies, appear in browser history, and leak via the Referer header. Only accept tokens in the Authorization header.",
   },
@@ -954,7 +984,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/transports#streamable-http",
     description:
-      "If the server returns CORS headers, verifies that Access-Control-Allow-Origin is not set to wildcard (*). Wildcard CORS on an authenticated API allows cross-origin credential theft.",
+      "If the server returns CORS headers, verifies that Access-Control-Allow-Origin is not set to wildcard (*). Wildcard CORS on an authenticated API allows cross-origin credential theft. An OPTIONS request that gets no HTTP answer (a timeout, a refused or dropped connection) passes as no CORS; the 2026-07-28 check fails that as server unreachable instead.",
     recommendation:
       'Set Access-Control-Allow-Origin to specific trusted origins, not "*". If CORS is not needed (server-to-server only), do not send CORS headers at all.',
   },
@@ -966,7 +996,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/transports#streamable-http",
     description:
-      "Sends a request with a suspicious Origin header (https://evil-rebinding-attack.example.com) and verifies the server rejects it. Per spec, servers MUST validate the Origin header to prevent DNS rebinding attacks. A probe that gets no HTTP answer fails as 'server unreachable' -- a timeout or a connection that was never established always, and a connection the server closes without answering unless the same request without the Origin header was served, which counts as the rejection it looks for.",
+      "Sends a ping with the handshake's headers plus a suspicious Origin header (https://evil-rebinding-attack.example.com) and verifies the server rejects it. Per spec, servers MUST validate the Origin header to prevent DNS rebinding attacks, answering an invalid one with 403. A 2xx fails. A 429 is a rate limiter answering before the server reads the request: the probe is resent once after Retry-After (capped at 2 s) and a second 429 fails as not evaluable. A 5xx fails as the server failing on the request rather than refusing it. A 401 or 403 passes when initialize -- sent with the same headers and no Origin -- was served or drew a different status; when initialize drew the same status or no answer, that refusal is what an auth gate, a Host guard or a gateway answers every request with, and the check skips as not attributable to the Origin (see security-auth-required). Any other 4xx passes; a redirect fails. A probe that gets no HTTP answer fails as 'server unreachable' -- a timeout or a connection that was never established always, and a connection the server closes without answering unless initialize was served, which counts as the rejection it looks for.",
     recommendation:
       "Validate the Origin header on all incoming requests. Reject requests from untrusted origins with HTTP 403. Maintain an allowlist of permitted origins.",
   },
@@ -979,7 +1009,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "Calls each tool with OS command injection payloads in string parameters (e.g., '; cat /etc/passwd', '$(whoami)'). Verifies the server does not execute injected commands. Output that only reflects the payload back (an echo tool) is benign; the check fails on evidence of execution (uid=... id output, /etc/passwd lines, a directory listing).",
+      "Calls the first listed tool that has a string parameter, in its first string parameter, with OS command injection payloads (e.g., '; cat /etc/passwd', '$(whoami)'). Verifies the server does not execute injected commands. Output that only reflects the payload back (an echo tool) is benign; the check fails on evidence of execution (uid=... id output, /etc/passwd lines, a directory listing). A payload that gets no answer is never counted as rejected. A stdio child that exits on a payload fails the check ('server died on payload ...'), after any execution evidence found on earlier payloads, and the runner restarts it with a fresh handshake, with a warning naming the check, so the checks after it measure the server. On HTTP a connection closed on a payload is followed by a ping: a server gone after it fails as a possible crash, and one still up counts the payload as unanswered, with a warning. A timeout counts as unanswered. A server already gone before a payload (a dead child, a refused connection) fails as 'server unreachable'. A run in which no payload got an answer passes as inconclusive, with a warning, recorded as a skip; with no listed tool that has a string parameter there is nothing to inject into ('No tools with string parameters to test', recorded as a skip).",
     recommendation:
       "Never pass tool argument values directly to shell commands. Use parameterized APIs, execFile() instead of exec(), or allowlists. Sanitize all user-provided input before use in system calls.",
   },
@@ -990,7 +1020,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      'Calls each tool with SQL injection payloads in string parameters (e.g., "\' OR 1=1 --"). Verifies the server does not return database errors or unexpected data. Output that only reflects the payload is benign; the check fails on a database error message or schema names in the output.',
+      "Calls the same tool and parameter as security-command-injection with SQL injection payloads (e.g., \"' OR 1=1 --\"). Verifies the server does not return database errors or unexpected data. Output that only reflects the payload is benign; the check fails on a database error message or schema names in the output. A payload that gets no answer is never counted as rejected. A stdio child that exits on a payload fails the check ('server died on payload ...'), after any execution evidence found on earlier payloads, and the runner restarts it with a fresh handshake, with a warning naming the check, so the checks after it measure the server. On HTTP a connection closed on a payload is followed by a ping: a server gone after it fails as a possible crash, and one still up counts the payload as unanswered, with a warning. A timeout counts as unanswered. A server already gone before a payload (a dead child, a refused connection) fails as 'server unreachable'. A run in which no payload got an answer passes as inconclusive, with a warning, recorded as a skip; with no listed tool that has a string parameter there is nothing to inject into ('No tools with string parameters to test', recorded as a skip).",
     recommendation:
       "Use parameterized queries or prepared statements for all database operations. Never concatenate user input into SQL strings. Return generic error messages that do not reveal database structure.",
   },
@@ -1001,7 +1031,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "Calls each tool with path traversal payloads in string parameters (e.g., '../../etc/passwd', '..\\\\..\\\\windows\\\\system.ini'). Verifies the server does not expose files outside its intended scope. Output that only reflects the payload is benign; the check fails on sensitive file content (a root passwd entry, boot.ini / system.ini sections).",
+      "Calls the same tool and parameter as security-command-injection with path traversal payloads (e.g., '../../etc/passwd', '..\\\\..\\\\windows\\\\system.ini'). Verifies the server does not expose files outside its intended scope. Output that only reflects the payload is benign; the check fails on sensitive file content (a root passwd entry, boot.ini / system.ini sections). A payload that gets no answer is never counted as rejected. A stdio child that exits on a payload fails the check ('server died on payload ...'), after any execution evidence found on earlier payloads, and the runner restarts it with a fresh handshake, with a warning naming the check, so the checks after it measure the server. On HTTP a connection closed on a payload is followed by a ping: a server gone after it fails as a possible crash, and one still up counts the payload as unanswered, with a warning. A timeout counts as unanswered. A server already gone before a payload (a dead child, a refused connection) fails as 'server unreachable'. A run in which no payload got an answer passes as inconclusive, with a warning, recorded as a skip; with no listed tool that has a string parameter there is nothing to inject into ('No tools with string parameters to test', recorded as a skip).",
     recommendation:
       "Validate and sanitize file paths. Use path.resolve() and verify the result is within the allowed directory. Reject paths containing '..' segments. Use a chroot or sandboxed filesystem for file operations.",
   },
@@ -1012,7 +1042,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "For tools that accept URL parameters, submits internal IP addresses (169.254.169.254, 127.0.0.1, 10.0.0.0/8) and cloud metadata endpoints. Verifies the server blocks requests to internal networks. Output that only reflects the URL is benign; the check fails on metadata-service content (ami-, instance-id, hostname, iam, security-credentials).",
+      "For the first listed tool with a string parameter whose name suggests a URL (url, uri, endpoint, link, href), submits internal IP addresses (169.254.169.254, 127.0.0.1, 10.0.0.0/8) and cloud metadata endpoints. Verifies the server blocks requests to internal networks. Output that only reflects the URL is benign; the check fails on metadata-service content (ami-, instance-id, hostname, iam, security-credentials). A payload that gets no answer is never counted as rejected. A stdio child that exits on a payload fails the check ('server died on payload ...'), after any execution evidence found on earlier payloads, and the runner restarts it with a fresh handshake, with a warning naming the check, so the checks after it measure the server. On HTTP a connection closed on a payload is followed by a ping: a server gone after it fails as a possible crash, and one still up counts the payload as unanswered, with a warning. A timeout counts as unanswered. A server already gone before a payload (a dead child, a refused connection) fails as 'server unreachable'. A run in which no payload got an answer passes as inconclusive, with a warning, recorded as a skip; with no listed tool that has a URL-named string parameter there is nothing to probe ('No tools with URL parameters found (skipped)').",
     recommendation:
       "Validate and restrict URLs in tool parameters. Block requests to private IP ranges (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x), link-local addresses, and cloud metadata endpoints. Use an allowlist of permitted domains.",
   },
@@ -1023,7 +1053,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "Sends a tools/call to the first listed tool ('test' when none was listed) with a 1 MiB string in a 'data' argument, through the transport on HTTP and stdio. On HTTP, 413 passes. A 429 is a rate limiter answering before the server reads the request: the call is resent once after Retry-After (capped at 2 s) and a second 429 fails as not evaluable. A 401, or a 403 that reads as an auth gate, fails as not evaluable. A bare 403 passes when initialize was served with the same headers (a WAF or size rule blocking the body) and otherwise fails as not evaluable. Any other 4xx passes, and a JSON-RPC result or error passes as handled without crashing. A 5xx fails as a server error, and a 2xx or 3xx with no JSON-RPC result or error fails. A connection closed or reset on the 1 MB body passes as a connection-level rejection only when a follow-up ping (with the session) is served, is answered by its own id with a JSON-RPC error on a 2xx, or is refused with 401/403; a 429 is retried once after Retry-After, capped at 2 s. Otherwise it fails as a possible crash naming what the ping got -- or as 'server unreachable' when neither the preflight nor initialize was answered in this run. A refused connection fails as 'server unreachable', bytes that are not an HTTP response fail as 'no usable response', and a timeout fails. On stdio a JSON-RPC result or error passes. A child that exits on the call fails as died, and the runner then spawns a fresh instance and redoes the handshake so the tests after it measure the server rather than the crash (a warning says so, and says when the new instance did not complete initialize); a child already gone before the call fails as 'server unreachable'. A reply longer than the runner's 1 MiB line buffer passes as survived, with a warning, while the child is still running. A timeout, a frame with no result or error, or any other error fails.",
+      "Sends a tools/call to the first listed tool ('test' when none was listed) with a 1 MiB string in a 'data' argument, through the transport on HTTP and stdio. On HTTP, 413 passes. A 429 is a rate limiter answering before the server reads the request: the call is resent once after Retry-After (capped at 2 s) and a second 429 fails as not evaluable. A 401, or a 403 that reads as an auth gate, fails as not evaluable. A bare 403 passes when initialize was served with the same headers (a WAF or size rule blocking the body) and otherwise fails as not evaluable. Any other 4xx passes. A JSON-RPC error passes as a rejection; a JSON-RPC result passes as survived, with a warning to enforce a request body limit (413) or maxLength in inputSchema. A 5xx fails as a server error, and a 2xx or 3xx with no JSON-RPC result or error fails. A connection closed or reset on the 1 MB body passes as a connection-level rejection only when a follow-up ping (with the session) is served, is answered by its own id with a JSON-RPC error at a status below 500 (other than 429), or is refused with 401/403; a 429 is retried once after Retry-After, capped at 2 s. Otherwise it fails as a possible crash naming what the ping got -- or as 'server unreachable' when neither the preflight nor initialize was answered in this run. A refused connection fails as 'server unreachable', bytes that are not an HTTP response fail as 'no usable response', and a timeout fails. On stdio a JSON-RPC error passes as a rejection and a result as survived, with the same warning. A child that exits on the call fails as died, and the runner then spawns a fresh instance and redoes the handshake so the tests after it measure the server rather than the crash (a warning naming the check says so, and says when the new instance did not complete initialize; the injection checks, security-extra-params and lifecycle-version-negotiate restart a child that dies on their own request the same way, once for every attempt that kills it, so --retries can restart it again); a child already gone before the call fails as 'server unreachable'. A reply longer than the runner's 1 MiB line buffer passes as survived, with a warning, while the child is still running. A timeout, a frame with no result or error, or any other error fails.",
     recommendation:
       "Implement request body size limits. Return HTTP 413 or JSON-RPC error for oversized payloads. Set explicit maxBodyLength in your HTTP server configuration.",
   },
@@ -1034,7 +1064,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#calling-tools",
     description:
-      "Calls a tool with unexpected additional parameters beyond what the schema defines. Verifies the server either rejects them (strict) or silently ignores them (permissive) without errors. On stdio a child that is gone (it exited before or on this call) fails as 'server unreachable' instead of counting as a rejection.",
+      "Calls the first tool with unexpected additional parameters (__injected_param__ and a __proto__ pollution payload). A JSON-RPC error (rejected) or a result (ignored) passes. An HTTP 5xx fails as a server error, and an answer with neither a result nor an error fails as malformed. A call that gets no answer is never counted as a rejection: a stdio child that exits on the call fails as died, and the runner restarts it so the tests after it measure the server (a warning says so); an HTTP connection closed on the call fails as a possible crash unless a follow-up ping shows the server is still up, when it passes as inconclusive with a warning; a timeout passes as inconclusive with a warning (both recorded as skips); a server already gone before the call (a child an earlier check killed, a refused connection) fails as 'server unreachable'; anything else fails as 'no usable response'.",
     recommendation:
       "Use JSON Schema validation with additionalProperties: false to reject unexpected parameters, or strip unknown properties before processing. Do not pass unvalidated properties to internal functions.",
   },
@@ -1047,7 +1077,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#data-types",
     description:
-      "Verifies all tools have an inputSchema with type 'object'. Tools without schemas cannot have their inputs validated, creating an injection risk.",
+      "Verifies all tools have an inputSchema with type 'object'. Tools without schemas cannot have their inputs validated, creating an injection risk. An empty tool list leaves nothing to validate ('No tools to validate', recorded as a skip).",
     recommendation:
       "Define a complete JSON Schema (inputSchema with type: 'object') for every tool. Specify all expected properties, their types, and constraints. This enables input validation and prevents parameter injection.",
   },
@@ -1058,7 +1088,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#listing-tools",
     description:
-      "Calls tools/list twice and compares the results. Tool definitions should not change between calls within the same session, which could indicate a rug-pull attack.",
+      "Calls tools/list twice and compares the results. Tool definitions should not change between calls within the same session, which could indicate a rug-pull attack. The first list is the one cached when the tools tests ran; on stdio, after the runner restarted a child an earlier check killed (see security-oversized-input), that list came from the process that exited, so the comparison spans two processes (the 2026-07-28 suite compares two lists from the new process instead).",
     recommendation:
       "Ensure tools/list returns consistent results within a session. If tools change dynamically, send a tools/list_changed notification. Never silently alter tool definitions — this is a known MCP attack vector (tool poisoning).",
   },
@@ -1069,7 +1099,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "server/tools#data-types",
     description:
-      "Scans all tool names, descriptions, and parameter descriptions for prompt injection patterns: 'ignore previous', 'override', 'system prompt', hidden Unicode characters, and Base64-encoded strings.",
+      "Scans all tool names, descriptions, and parameter descriptions for prompt injection patterns: 'ignore previous', 'override', 'system prompt', hidden Unicode characters, and Base64-encoded strings. An empty tool list leaves nothing to scan ('No tools to validate', recorded as a skip).",
     recommendation:
       "Review all tool descriptions for prompt injection patterns. Remove any text that attempts to override LLM instructions, references system prompts, or contains hidden characters. Tool descriptions are rendered to LLMs and can be used for prompt injection.",
   },
@@ -1093,7 +1123,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic",
     description:
-      "Triggers various error conditions and inspects responses for stack traces, file paths, and internal implementation details. Error responses should not reveal server internals.",
+      "Triggers various error conditions and inspects responses for stack traces, file paths, and internal implementation details. Error responses should not reveal server internals. The probes are raw HTTP requests: over stdio the check is skipped ('Skipped: the error probes are raw HTTP requests, which a stdio target cannot receive, so no error response was scanned'). Over HTTP, when none of the probes gets an answer the check fails as 'server unreachable' instead of passing on an empty scan.",
     recommendation:
       "Sanitize error responses before returning them to clients. Remove stack traces, file paths, database connection strings, and internal IP addresses. Use generic error messages for unexpected failures.",
   },
@@ -1104,7 +1134,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic",
     description:
-      "Inspects error response bodies for private IP addresses (10.x, 172.16-31.x, 192.168.x, 127.x) that would reveal internal network topology.",
+      "Inspects error response bodies for private IP addresses (10.x, 172.16-31.x, 192.168.x, 127.x) that would reveal internal network topology. The probe is a raw HTTP request: over stdio the check is skipped ('Skipped: the error probe is a raw HTTP request, which a stdio target cannot receive, so no error response was scanned'). Over HTTP a probe that gets no answer fails as 'server unreachable'.",
     recommendation:
       "Strip internal IP addresses from error responses. Configure your reverse proxy to not forward X-Real-IP or internal addressing. Use a centralized error handler that sanitizes responses.",
   },
@@ -1115,7 +1145,7 @@ export const TEST_DEFINITIONS: TestDefinition[] = [
     required: false,
     specRef: "basic/transports#streamable-http",
     description:
-      "Sends a burst of rapid requests and checks if the server eventually returns HTTP 429 Too Many Requests. Production servers should implement rate limiting to prevent abuse.",
+      "Sends a burst of 50 rapid pings and checks whether the server returns HTTP 429 Too Many Requests. Production servers should implement rate limiting to prevent abuse. A burst with no 429 fails, and so does one where more than half the answers are 5xx. When every ping drew a 401 or 403 the burst never reached a handler, and it fails as not evaluable rather than as a missing limiter: when every refusal reads as an auth refusal (a 401, or a 403 whose Bearer challenge asks for a credential or refuses the one sent), the details name the auth gate (pass --auth, or check the credential); any other 403 -- what Host/Origin validation or a gateway answers every request with -- points at security-auth-required. A burst nothing answered fails as 'server unreachable'.",
     recommendation:
       "Implement rate limiting on your MCP endpoint. Return HTTP 429 with a Retry-After header when limits are exceeded. Consider per-IP, per-token, and per-session rate limits.",
   },

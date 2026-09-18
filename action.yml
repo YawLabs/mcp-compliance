@@ -60,11 +60,14 @@ outputs:
     description: 'Numeric score 0-100'
     value: ${{ steps.run.outputs.score }}
   passed:
-    description: 'Number of passing tests'
+    description: 'Number of passing tests (includes skipped checks, which measured nothing -- see skipped)'
     value: ${{ steps.run.outputs.passed }}
   failed:
     description: 'Number of failing tests'
     value: ${{ steps.run.outputs.failed }}
+  skipped:
+    description: 'How many of the passing tests were skipped (measured nothing); 0 for a report without skip data'
+    value: ${{ steps.run.outputs.skipped }}
   spec-version:
     description: 'MCP spec revision the suite actually graded against (2025-11-25 or 2026-07-28), resolved from the spec-version input'
     value: ${{ steps.run.outputs.spec-version }}
@@ -167,6 +170,7 @@ runs:
         score=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).score)}catch(e){console.log(0)}")
         passed=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).summary.passed)}catch(e){console.log(0)}")
         failed=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).summary.failed)}catch(e){console.log(0)}")
+        skipped=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).summary.skipped||0)}catch(e){console.log(0)}")
         reported_spec=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('compliance.json','utf8')).specVersion||'')}catch(e){console.log('')}")
 
         # Resolve the spec version the remaining passes are pinned to:
@@ -188,6 +192,7 @@ runs:
           echo "score=$score"
           echo "passed=$passed"
           echo "failed=$failed"
+          echo "skipped=$skipped"
           echo "spec-version=$reported_spec"
         } >> "$GITHUB_OUTPUT"
 

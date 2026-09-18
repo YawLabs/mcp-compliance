@@ -63,6 +63,19 @@ export interface ModernState {
    * instead of pointing at a test that is not in the report.
    */
   listFailures: Partial<Record<ListKey, string>>;
+  /**
+   * stdio: the server process the suite now talks to is not the one the
+   * lists above were read from. Set by security.ts's restartStdioServer
+   * each time it replaces a process that a check's own request killed
+   * (the latest replacement wins); null while the first process runs.
+   * `after` names the check whose request killed the previous process.
+   * `tools` is the replacement's tools/list result, read right after its
+   * server/discover and before any tools/call reached it; null when that
+   * list was not obtained. A check that compares the server with itself
+   * over time (security-tool-rug-pull) takes its "before" from here, so
+   * both of its lists come from one process.
+   */
+  replacement: { after: string; tools: unknown[] | null } | null;
 }
 
 export type ListKey = "tools" | "resources" | "prompts" | "resourceTemplates";
@@ -106,6 +119,12 @@ const LIST_TEST_CATEGORY: Record<ListKey, string> = {
 
 export interface ModernSuiteContext {
   harness: Harness;
+  /**
+   * The client every check sends through. On stdio it (and `transport`) is
+   * replaced when a check's own request killed the server process (see
+   * `replaceStdioProcess`), so read `ctx.client` / `ctx.transport` when
+   * sending rather than holding on to them across checks.
+   */
   client: ModernClient;
   recorder: Recorder;
   transport: Transport;
@@ -140,6 +159,17 @@ export interface ModernSuiteContext {
    * Callers own the returned transport and must close() it.
    */
   spawnFresh?: () => Transport;
+  /**
+   * stdio only: swap the suite's server process for a fresh instance --
+   * close the current one, spawn a new one, record everything it sends, and
+   * point `transport` and `client` at it. The suite owns the new instance
+   * and closes it when the run ends. Undefined on HTTP and when the run has
+   * no way to spawn the server (a context built by hand). Called only by
+   * security.ts's restartStdioServer, which decides when a restart is due
+   * (a check whose own request killed the child) and re-establishes the
+   * new instance (server/discover, the era pin).
+   */
+  replaceStdioProcess?: () => Promise<void>;
   state: ModernState;
 }
 
@@ -162,6 +192,7 @@ export function createModernState(): ModernState {
     legacyInitializeServed: false,
     listAttempts: new Set(),
     listFailures: {},
+    replacement: null,
   };
 }
 

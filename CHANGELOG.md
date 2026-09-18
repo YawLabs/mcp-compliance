@@ -67,6 +67,41 @@ out explicitly here.
   `REASON_PREFIX` (`server/discover -> `) on every detection reason; a 401/403
   on the probe reads `HTTP 401 (authentication required -- pass --auth); era not
   determinable, using 2025-11-25` instead of claiming the server is legacy.
+- **Skipped checks are reported as skips.** A check that measured nothing (no
+  `--auth`, no tools, not applicable on the transport, or a refusal an earlier
+  check could not attribute) carries `skipped: true` next to `passed: true`;
+  `summary.skipped` and a per-category `skipped` count them. The terminal
+  report lists them under `SKIPPED CHECKS` (and says `No test failed -- N
+  skipped` instead of "All tests passed"), markdown and HTML add a Skipped
+  checks section (HTML also marks each one SKIP in its test table), the GitHub
+  notice adds `N skipped`, and SARIF names them in the invocation properties
+  (`testsSkipped`, `skippedTests`) rather than as results, so Code Scanning
+  opens no alert for them. Each suite flags a pass that measured nothing, and
+  a pass worded as a skip (`Skipped: ...`, `(skipped)`, `not applicable`) is
+  read as one too; a failure is never flagged. Besides the worded skips, both
+  suites flag empty tool, resource and prompt lists (`No tools to validate`),
+  a tool result with no content (on 2025-11-25 only an empty content array;
+  a malformed one passes there unflagged and `tools-call` fails it), no
+  tool with a string argument to inject
+  into, injection and `security-extra-params` runs that were inconclusive
+  because nothing answered, `security-www-authenticate` with no 401 to read
+  (a dropped connection included), and `error-capability-gated` when every
+  capability is declared. On 2025-11-25 so are `lifecycle-progress-token`
+  calls that got no answer, the `stdio-unicode` fallback
+  that sent no unicode, and the error-leak scans over stdio, where their raw
+  HTTP probes cannot reach the server. On 2026-07-28 so are the leak scans
+  when no error response was received, `tools-list-deterministic-order` with
+  fewer than two tools or a tool set that changed between calls, the post-hoc
+  scans whose population was empty (`error-id-echo`, `error-retired-codes`,
+  `schema-result-type`, `schema-no-input-required-on-lists`,
+  `schema-input-required-shape`, `schema-wire-valid`; an empty recording
+  still fails them), and `lifecycle-dual-era` when the probe drew no answer
+  to read. A clean 2026-07-28 run therefore reports `error-capability-gated`
+  and `schema-input-required-shape` as skips. Skips still count as passes
+  in the score, so no grade moves; `schemas/report.v1.json` gains the three
+  optional fields without a `schemaVersion` bump, so a consumer validating
+  against a pre-0.19 copy of the schema (`additionalProperties: false`) must
+  update it.
 
 ### Changed
 - **`--spec-version` defaults to `auto`, which changes what existing users get.**
@@ -84,7 +119,30 @@ out explicitly here.
 - **`report.specVersion` is now a run-time value, not a tool-version constant.**
   One tool version emits `"2025-11-25"` or `"2026-07-28"` (always the resolved
   revision, never `"auto"`); consumers must read it before interpreting test ids.
-  The report schema is unchanged (`schemaVersion: "1"`).
+  The report `schemaVersion` is unchanged (`"1"`); the only schema change is
+  the optional skip fields listed under Added.
+- **Skips show up on every surface, not only in the report formats.**
+  `--verbose` prints `SKIP` (not `PASS`) for a check that measured nothing.
+  The MCP `mcp_compliance_test` tool adds `, N skipped` to its Tests line,
+  follows it with a note that skipped tests count as passes in the score,
+  and marks each skip `SKIP`. The markdown summary table notes each
+  category's skips (`| Security | 3 (2 skipped) | 4 |`). A run without skips
+  prints exactly as before on all three.
+- **`diff` reports checks that start or stop skipping** under "Newly skipped"
+  / "No longer skipped", in both terminal and JSON output. The diff JSON
+  gains `newlySkipped`, `noLongerSkipped` and `recordsSkips` on the summary
+  and `baselineStatus` / `currentStatus` on every entry; these fields are
+  additive and always present, even when neither report has a skip, and
+  every earlier field is unchanged. A failing check that starts skipping is
+  no longer listed as a fix, and a new check that skips is no longer a new
+  pass. Neither ever fails the diff; a skipped check that now fails is still
+  a regression. A report written by an earlier version carries no skip data,
+  so `diff` reads its skips from their wording (`(skipped)`, `Skipped: ...`,
+  `not applicable`), the same markers the harness reads in the current run:
+  a check that skipped then and still skips is not listed. Only a skip the
+  older tool worded as a plain pass (such as "No tools to validate") can
+  show up as newly skipped, and the output adds a note saying so. The
+  terminal diff of two reports without skips prints exactly as before.
 - **`diff` error text.** On a `specVersion` mismatch the message now names both
   versions and tells you to re-run with `--spec-version <baseline's>` or take a
   new baseline; the old advice to downgrade the tool no longer applies. The diff
@@ -319,6 +377,9 @@ out explicitly here.
 - **Config `format` accepted only `terminal`, `json`, `sarif`** (#67) and rejected
   `github`, `markdown` and `html`, which the CLI accepts. The config loader now
   takes every CLI format.
+- **The report schema's `warnings` description said the list is capped at 100
+  entries**; the cap is 50, plus one `... and N more warning(s) suppressed`
+  entry, after exact duplicates are dropped.
 - **`benchmark` counted JSON-RPC error replies as successful requests**, so a
   server answering `-32601` to every probe reported error-path latency with
   `failed: 0`. Error bodies are now failures.
@@ -549,11 +610,18 @@ out explicitly here.
     connection passes only with `--auth` when the credentialed ping is served.
     Without `--auth`, a preflight that got no HTTP answer is no longer read as
     "server accepted unauthenticated requests": a ping is sent after the
-    handshake and read the same way.
+    handshake and read the same way. With or without `--auth`, an answer that
+    is neither a 401/403 nor a served request -- a 429 or another 4xx, a 5xx, a
+    3xx, a 2xx without a JSON-RPC result -- is worded for what it was instead of
+    "server accepted unauthenticated request" (the verdict stays a failure), and
+    so are the same answers to `security-auth-malformed` and
+    `security-session-not-auth`. Only a served request reads as accepted.
   - `security-auth-required` (2025-11-25) without `--auth`: a gateway that
-    refuses the era probe with a bare 403 but answers every other
-    unauthenticated request with 401 and a Bearer challenge now passes on that
-    401 instead of failing as not evaluable.
+    refuses the era probe with a bare 403, or lets it through to a server that
+    answers it `-32601`, but answers every other unauthenticated request with
+    401 and a Bearer challenge now passes on that 401 instead of failing as not
+    evaluable or as accepting unauthenticated requests. "Accepted" is read only
+    from a served preflight or `initialize`.
   - `security-oversized-input` (2025-11-25) passed any HTTP status >= 400, a
     rate limiter's 429 and an auth gate's 401/403 included, passed any status
     below 400 without reading the body, and passed every transport error except
@@ -561,48 +629,67 @@ out explicitly here.
     included every stdio target, where the raw POST to an empty URL never left
     the client. It now goes through the transport on HTTP and stdio and follows
     the 2026-07-28 rules. A 5xx, or a 2xx without a JSON-RPC result or error,
-    fails. A dropped connection passes only when a follow-up ping is served or
-    refused with 401/403 (one 429 retried), and otherwise fails as a possible
-    crash. A refused connection is `server unreachable`, and unparseable bytes
-    are `no usable response`. On stdio, a child that exits on the 1 MB line
-    fails as died, and an over-long reply passes with a warning. A caller's
-    abort now cancels the 1 MB request instead of waiting out its timeout.
+    fails. A JSON-RPC error passes as a rejection and a completed result as
+    survived, with the 2026-07-28 body-limit warning. A dropped connection
+    passes only when a follow-up ping is served or refused with 401/403 (one
+    429 retried), and otherwise fails as a possible crash. A refused connection
+    is `server unreachable`, and unparseable bytes are `no usable response`. On
+    stdio, a child that exits on the 1 MB line fails as died, and an over-long
+    reply passes with a warning. A caller's abort now cancels the 1 MB request
+    instead of waiting out its timeout.
   - `security-oversized-input` (2025-11-25) sends the 1 MB `tools/call` over
     stdio now, and a server that exits on it used to leave every later check
     running against a dead child: the required `stdio-framing` failed as
     "framing likely broken", `security-extra-params` passed the crash as
     "Request rejected (acceptable)", and the run went from pass to fail. The
-    runner now restarts the child and redoes the handshake (a warning says so),
-    so the crash is counted once, on the check that caused it;
-    `security-extra-params` reports a stdio child that is gone as
-    `server unreachable`.
+    runner now restarts the child and redoes the handshake (a warning naming
+    the check says so), so the crash is counted once, on the check that caused
+    it. The same restart follows a child that exits on an injection payload,
+    on `security-extra-params`' unknown arguments, or on the second
+    `initialize` `lifecycle-version-negotiate` sends with an unknown version
+    (see below). A
+    child is restarted only when it died on the check's own request, so a
+    server that dies on every `tools/call` is respawned once per check
+    attempt that sends one (`--retries` repeats the attempt, and restarts it
+    again). `security-extra-params` reports a stdio child that was already
+    gone as `server unreachable`.
   - `security-oversized-input` (both eras): a 429 on the 1 MB call is resent
     once after `Retry-After` (capped at 2 s) and a second 429 is not evaluable;
     a 401, or a 403 an auth gate answers, is not evaluable; on 2025-11-25 a bare
     403 counts only next to a served `initialize`. A follow-up ping answered by
-    its own id with a JSON-RPC error now counts as the server being alive, and a
-    drop in a run where nothing was ever answered reports `server unreachable`
-    rather than a crash.
+    its own id with a JSON-RPC error at any status below 500 but 429 now counts
+    as the server being alive (a 5xx echoing the id may be a gateway's, and
+    still counts as gone), and a drop in a run where nothing was ever answered
+    reports `server unreachable` rather than a crash.
   - `security-auth-required` (2026-07-28): a 403 without a `WWW-Authenticate`
     Bearer challenge on the credential-less `server/discover` no longer passes
     as an authentication rejection -- Origin validation, the SDK's Host
     validation and gateways answer the same bare 403. It passes only with
-    `--auth` when the credentialed `server/discover` was served (the details
-    note the spec expects 401), and otherwise fails as not evaluable, quoting
-    the server's message.
+    `--auth` when the credentialed `server/discover` got past the gate --
+    served, or answered at HTTP 2xx even with a JSON-RPC error such as
+    `-32021`, which is the application answering (the details note the spec
+    expects 401) -- and otherwise fails as not evaluable, quoting the server's
+    message and naming the credentialed request's status and JSON-RPC code. The
+    same "got past the gate" reading decides whether a dropped connection on a
+    credential-less (or foreign-Origin) probe counts as a refusal.
   - `security-auth-required` (both eras): when the 403 quotes Host or Origin
     validation (the SDK's `Invalid Host: ...`), or the credentialed request drew
     the same 403, the details now say to allow the hostname you tested through
     instead of suggesting `--auth`, and the 2026-07-28 details keep the whole
     hostname inside the 220-character limit. The 2025-11-25 auth probes skip
     with `Skipped: no --auth provided` instead of "server does not require
-    auth", and with `--auth` they skip as `Skipped: not evaluable (see
-    security-auth-required)` rather than crediting a bare 403 that
-    `security-auth-required` refused to credit.
-- **Every auth and transport probe now reads a refusal the same way, in both
-  suites.** Follow-ups to the entry above, which had left the sibling checks
-  behind:
-  - The five 2025-11-25 probes that still answered a transport error with
+    auth", and with `--auth` they skip as `Skipped: HTTP 403 without a Bearer
+    challenge, not attributable to authentication (see
+    security-auth-required)` -- the 2026-07-28 wording, so both eras say the
+    same thing about the same server -- rather than crediting a bare 403
+    that `security-auth-required` refused to credit, also when `--only` /
+    `--skip` leaves `security-auth-required` out of the run, since they read
+    the same two pings.
+- **The auth, Origin, injection and extra-params probes read a refusal, and a
+  missing answer, the same way in both suites.** Follow-ups to the entry above,
+  which had left the sibling checks behind (the exceptions still outstanding
+  are listed at the end):
+  - The six 2025-11-25 probes that still answered a transport error with
     `Connection rejected (acceptable)` -- `security-www-authenticate`,
     `security-auth-malformed`, `security-session-not-auth`,
     `security-token-in-uri`, `security-origin-validation`, and the
@@ -625,12 +712,156 @@ out explicitly here.
     attribute to authentication. It now reads a Bearer-challenged 403 as the
     refusal it is and skips as not evaluable on a bare one, like its
     2025-11-25 counterpart; `security-auth-malformed` takes the same skip, and
+    so does `security-token-in-uri` when its query-string probe draws a 401/403
+    (a query-string token the server accepts still fails).
     `security-oauth-metadata` no longer treats a bare 403 as proof the server
-    is auth-protected before going on to well-known discovery.
+    is auth-protected: without `--auth` it skips, and with `--auth` it still
+    checks the well-known locations and skips as not evaluable only when every
+    one of them, and `/.well-known/oauth-authorization-server`, drew the
+    endpoint's bare 403 (a Host guard or gateway refusing every path) instead
+    of failing "No Protected Resource Metadata". The skip reads `Skipped: HTTP
+    403 without a Bearer challenge, not attributable to authentication (see
+    security-auth-required)` in both eras, so it stands on its own in a
+    filtered run.
+  - 2025-11-25 `security-oauth-metadata` failed `PRM endpoint returned HTTP
+    403 and no legacy OAuth metadata found` behind a Host guard or gateway
+    whose unattributable bare 403 also answered both well-known metadata
+    locations; it now skips (`Skipped: HTTP 403 without a Bearer challenge on
+    the endpoint and on every well-known metadata location, not attributable
+    to authentication (see security-auth-required)`). A document found, a
+    404, a 401 or any other status decides as before.
+  - 2025-11-25 `security-token-in-uri` skipped as not evaluable before
+    sending its probe, so a query-string token accepted behind an
+    unattributable bare 403 was never tested. It now sends the probe first:
+    a 2xx fails whatever else the run found, and only a 401/403 on the probe
+    takes the not-evaluable skip, as on 2026-07-28.
+  - `security-auth-malformed` and `security-token-in-uri` (both eras) skip
+    instead of passing when the configured credential itself drew 401 (on
+    2026-07-28 on the setup `server/discover`, on 2025-11-25 on the
+    credentialed ping): a server that refuses every credential cannot show
+    that it validates tokens. An invalid credential or query-string token the
+    server accepts still fails.
   - 2026-07-28 `security-auth-required` called every non-401/403 answer an
     accepted unauthenticated request. Only a 2xx is; a 4xx that is not 401/403
     refused the request without asking for a credential, a 5xx failed on it,
     and a 3xx redirected it. Each is worded for what it is.
+  - 2025-11-25 `security-www-authenticate` reads the challenge on a 403 that
+    carries a Bearer challenge (`WWW-Authenticate: ... (HTTP 403)`) instead of
+    calling it "not applicable", as its catalog entry already said.
+  - The 2025-11-25 injection checks (`security-command-injection`,
+    `-sql-injection`, `-path-traversal`, `-ssrf-internal`) counted every
+    transport error as the server rejecting a payload, so a stdio server that
+    exited on `$(whoami)` passed as having rejected it, and every check after it
+    measured a dead child (the required `stdio-framing` failed as "framing
+    likely broken"). A child that exits on a payload now fails the check naming
+    the payload and is restarted with a fresh handshake, with a warning naming
+    the check. On HTTP a connection closed on a payload is followed by a ping: a
+    server gone after it fails as a possible crash, and one still up counts the
+    payload as unanswered, with a warning. A timeout is unanswered, a server
+    gone before a payload is `server unreachable`, a run with no answered
+    payload passes as inconclusive with a warning, and a caller's abort is
+    rethrown instead of recorded as a pass.
+  - 2025-11-25 `security-extra-params` passed every HTTP transport error as
+    "Request rejected (acceptable)" and an HTTP 500 from the `__proto__`
+    payload as "extra params likely ignored". It now reads an answer, and a
+    missing one, the way the 2026-07-28 check does: a 5xx, or an answer with
+    neither result nor error, fails; a stdio child that exits on the unknown
+    arguments fails as `server died` (not `server unreachable`) and is
+    restarted; a dropped HTTP connection fails as a possible crash unless a
+    follow-up ping is answered, when it passes as inconclusive with a warning,
+    as a timeout does; a refused connection is `server unreachable`.
+  - 2026-07-28 suite over stdio: a check whose own request kills the server
+    -- an injection payload, `security-oversized-input`'s 1 MB argument,
+    `security-extra-params`' unknown arguments -- still fails as `server
+    died`, and the process is then restarted (a fresh `server/discover` plus
+    one request that pins its era), with a warning naming the check. Before,
+    every later check measured the dead process (`security-extra-params`
+    `server unreachable`, `security-tool-rug-pull` "Second tools/list call
+    threw"). The process is restarted every time a check's own request kills
+    it, `--retries` included, so a retry never leaves the checks after it
+    running against a dead process; a child already gone before the check's
+    own request is not restarted. This matches the 2025-11-25 suite's
+    restart.
+  - 2026-07-28 suite over stdio: after a restart, `security-tool-rug-pull`
+    compares two lists from the new process -- the one read at the restart,
+    before any `tools/call`, and one read after a `tools/call` -- instead of
+    the dead process's list against the new one's. Otherwise a server whose
+    tools change after use would pass once an earlier check had crashed it,
+    and a conformant server whose tool descriptions name the process would
+    fail as a rug-pull. It skips, with a warning, when the new process leaves
+    nothing to compare (its list before use was not read, or the `tools/call`
+    between the lists killed it -- the server is then restarted again). The
+    2025-11-25 `security-tool-rug-pull` still compares the list cached from
+    the first process with a fresh one after a restart.
+  - 2025-11-25 `security-error-no-stacktrace` and
+    `security-error-no-internal-ip` passed on nothing over stdio, where their
+    raw HTTP probes never reached the server (`0 error responses checked`,
+    `No response to check (connection error)`); they are now skipped there.
+    Over HTTP a probe nothing answers fails as `server unreachable` instead of
+    passing on an empty scan, and a caller's abort is rethrown.
+  - 2025-11-25 `stdio-unicode` failed a stdio server that declares no tools
+    (`tools/list returned error`, the `-32601` it gives a list it never
+    offered); it now skips, since no tool call can carry the probe.
+  - `security-origin-validation` (both eras) credited any status >= 400. A 5xx
+    now fails as the server failing on the request, a 429 is resent once after
+    `Retry-After` and a second one is not evaluable, and a 401/403 that the same
+    request without the Origin drew too (`initialize` on 2025-11-25, the setup
+    `server/discover` on 2026-07-28), or that request got no answer, skips as
+    not attributable to the Origin -- the SDK's Host guard and auth gates answer
+    every request that way. Any other 4xx still passes.
+  - `security-rate-limiting` (2025-11-25) no longer reports "No rate limiting
+    detected" for a burst refused 401/403 on every ping (it fails as not
+    evaluable, naming the auth gate, or `security-auth-required` for a 403 that
+    is no auth refusal) or for one nothing answered (`server unreachable`). The
+    2026-07-28 check words a burst of such 403s as Host/Origin validation or a
+    gateway (see `security-auth-required`) rather than asking you to check the
+    credential; it still skips.
+  - 2025-11-25 `lifecycle-reinit-reject` credited any JSON-RPC error or status
+    >= 400 on the duplicate `initialize`. It now fails as not evaluable when the
+    first `initialize` was not served (the second is then no duplicate), and
+    when a 401 or auth-gate 403, a 403 naming Host/Origin validation, a 429
+    (resent once after `Retry-After`) or a 5xx answered in the server's place; a
+    3xx fails as neither a rejection nor a served duplicate.
+  - The 2025-11-25 `transport-content-type-reject`, `transport-batch-reject`,
+    `lifecycle-version-negotiate` and `error-unknown-method` credited a
+    gateway's refusal, its JSON-RPC error body included, as the server's
+    rejection: a gateway answering 401 to every request earned all four. Each
+    now fails as not evaluable when something in front of the server answered
+    in its place: a 401 or auth-gate 403, or a 429 (resent once after
+    `Retry-After`). A 5xx fails as no rejection unless it carries the server's
+    own rejection of the defect (`-32600` on the batch, `-32600` or `-32602`
+    on the unknown version, `-32601` on the unknown method), which passes with
+    a warning that the status should be a 4xx; before, the last three passed a
+    5xx carrying any JSON-RPC error, a `-32603` or a server-defined code
+    included. Any other 403 counts only when the conformant twin was served or
+    drew a different status, whatever its message says; when the twin drew the
+    same 403 the check fails as not evaluable, quoting a message that names
+    Host/Origin validation, and so it does when the twin got no answer. For
+    the two transport checks, which run before the handshake, the twin is the
+    same ping sent on its own as `application/json`; for
+    `error-unknown-method` it is a ping with the same headers; each is sent
+    only in that case. For `lifecycle-version-negotiate` it is the
+    `initialize` handshake. `lifecycle-version-negotiate` and
+    `error-unknown-method` also fail as not evaluable when the `initialize`
+    handshake was not served and drew the same status (or no answer): a server
+    that rejects everything proves nothing by rejecting the defect.
+    `lifecycle-version-negotiate` no longer passes a request that got no
+    answer as "Connection rejected for unknown version (acceptable)". A
+    caller's abort is rethrown. A timeout, a refused connection or a stdio
+    child already gone is `server unreachable`. A stdio child that exits on
+    the probe fails as having died on a second `initialize` (over stdio the
+    probe always is one, so the details do not blame the version) and is
+    restarted. An HTTP connection closed without a response passes only next
+    to the served handshake. Anything else fails as no usable response.
+  - Not yet tightened: the 2025-11-25 `error-invalid-jsonrpc`,
+    `error-invalid-json`, `error-missing-params` and `error-capability-gated`
+    still credit a gateway's JSON-RPC error body (a 401's -32001
+    "Unauthorized") as the server's error, and `lifecycle-jsonrpc` passes the
+    gateway's error envelope as a valid JSON-RPC response. On 2025-11-25,
+    `security-cors-headers` still passes any transport error on its OPTIONS
+    request ("no CORS, acceptable"), `stdio-unicode` does not detect a mangled
+    reply, and `security-tool-rug-pull` compares across processes after a
+    stdio restart.
 
 ## [0.18.2] — 2026-09-15
 

@@ -1,12 +1,12 @@
 import { getTestDefinitionMap } from "../../definitions/index.js";
 import type { DetectionResult } from "../../detect.js";
 import { createHarness } from "../../harness.js";
-import { createModernClient } from "../../modern/client.js";
+import { createModernClient, type ModernClientOptions } from "../../modern/client.js";
 import { createRecorder } from "../../recorder.js";
 import { assembleReport } from "../../report.js";
 import type { RunOptions } from "../../runner.js";
 import { LEGACY_SPEC_VERSION, MODERN_SPEC_VERSION, specBaseFor } from "../../spec.js";
-import type { JsonRpcId, Transport } from "../../transport/index.js";
+import type { JsonRpcId, MessageMeta, Transport } from "../../transport/index.js";
 import type { ComplianceReport } from "../../types.js";
 import { createModernState, type ModernSuiteContext } from "./context.js";
 import { runErrors } from "./errors.js";
@@ -46,6 +46,14 @@ export interface ModernSuiteInput {
  * intermediary answering 429 for a while -- a bare 429 on a negative
  * probe is not the server rejecting the defect; post-hoc checks scan the
  * recorder last.
+ *
+ * On stdio a security check whose own request kills the server process
+ * (an injection payload, the 1 MB argument, unknown tool arguments) has
+ * it replaced (ctx.replaceStdioProcess, driven by security.ts's
+ * restartStdioServer) every time it does, --retries included, so the
+ * checks after it measure the server rather than a dead process. The
+ * replacement's messages go to the same recorder, and the suite closes it
+ * when the run ends.
  */
 export async function runModernSuite(input: ModernSuiteInput): Promise<ComplianceReport> {
   const { transport, options } = input;
@@ -65,9 +73,9 @@ export async function runModernSuite(input: ModernSuiteInput): Promise<Complianc
   harness.warnings.push(...input.warnings);
 
   const recorder = createRecorder();
-  const unsubscribe = transport.onMessage((m, meta) => recorder.recordReceived(m, meta));
-  const client = createModernClient({
-    transport,
+  const record = (m: unknown, meta: MessageMeta) => recorder.recordReceived(m, meta);
+  let unsubscribe = transport.onMessage(record);
+  const clientOptions: Omit<ModernClientOptions, "transport"> = {
     recorder,
     nextId: input.nextId,
     timeout: input.timeout,
@@ -78,7 +86,28 @@ export async function runModernSuite(input: ModernSuiteInput): Promise<Complianc
     clientCapabilities: { elicitation: {} },
     clientInfo: { name: "mcp-compliance", version: input.toolVersion },
     signal: options.signal,
-  });
+  };
+  const client = createModernClient({ transport, ...clientOptions });
+
+  /**
+   * The server process the suite spawned to replace one a check killed
+   * (replaceStdioProcess): the suite closes it when the run ends. The
+   * runner closes the transport it passed in.
+   */
+  const spawned: { current: Transport | null } = { current: null };
+  const spawnFresh = input.spawnFresh;
+  const replaceStdioProcess =
+    transport.kind === "stdio" && spawnFresh
+      ? async (): Promise<void> => {
+          await ctx.transport.close().catch(() => {});
+          unsubscribe();
+          const fresh = spawnFresh();
+          spawned.current = fresh;
+          unsubscribe = fresh.onMessage(record);
+          ctx.transport = fresh;
+          ctx.client = createModernClient({ transport: fresh, ...clientOptions });
+        }
+      : undefined;
 
   const ctx: ModernSuiteContext = {
     harness,
@@ -94,6 +123,7 @@ export async function runModernSuite(input: ModernSuiteInput): Promise<Complianc
     detection: input.detection,
     hasAuth: Object.keys(input.userHeaders).some((h) => h.toLowerCase() === "authorization"),
     spawnFresh: input.spawnFresh,
+    replaceStdioProcess,
     signal: options.signal,
     state: createModernState(),
   };
@@ -120,6 +150,7 @@ export async function runModernSuite(input: ModernSuiteInput): Promise<Complianc
     await harness.drainPool();
   } finally {
     unsubscribe();
+    await spawned.current?.close().catch(() => {});
   }
 
   // A served legacy initialize means "dual-era" only when the conformant

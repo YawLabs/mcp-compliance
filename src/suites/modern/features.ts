@@ -14,6 +14,7 @@ import {
   validateResourceContents,
   validateResourceTemplates,
 } from "../../checks/validators.js";
+import type { TestOutcome } from "../../harness.js";
 import { errorOf, type JsonRpcErrorInfo, type RpcResponse, resultOf } from "../../modern/client.js";
 import {
   ensureList,
@@ -50,10 +51,7 @@ import {
  * follows re-throws the same error instead of paying a second timeout.
  */
 
-interface Outcome {
-  passed: boolean;
-  details: string;
-}
+type Outcome = TestOutcome;
 
 /** What one list call produced: the response, or the error it threw. */
 type ListSlot = { res: RpcResponse } | { failed: Error };
@@ -66,6 +64,8 @@ interface ResponseCache {
 
 const pass = (details: string): Outcome => ({ passed: true, details });
 const fail = (details: string): Outcome => ({ passed: false, details });
+/** A pass that judged nothing: what the check inspects was not there (see `TestOutcome.skipped`). */
+const nothingToJudge = (details: string): Outcome => ({ passed: true, details, skipped: true });
 
 function errDetail(err: JsonRpcErrorInfo): string {
   const msg = err.message
@@ -237,11 +237,13 @@ async function runTools(ctx: ModernSuiteContext, cache: ResponseCache): Promise<
       if (!Array.isArray(list)) return fail(`tools/list call ${call} returned no tools array`);
       snapshots.push(namesOf(list));
     }
-    if (baseline.length < 2) return pass(`${baseline.length} tool(s); order is trivially deterministic`);
+    // Fewer than two tools have no order to compare, and a set that changed
+    // between calls has none either: nothing was judged.
+    if (baseline.length < 2) return nothingToJudge(`${baseline.length} tool(s); order is trivially deterministic`);
     const setKey = (names: string[]) => [...names].sort().join("\n");
     for (const snap of snapshots) {
       if (setKey(snap) !== setKey(baseline)) {
-        return pass(
+        return nothingToJudge(
           `tool set changed between calls (${baseline.length} vs ${snap.length} tools); order not comparable`,
         );
       }
@@ -305,7 +307,9 @@ async function runTools(ctx: ModernSuiteContext, cache: ResponseCache): Promise<
       if (!result) return fail(`${tool.name}: no result object (HTTP ${res.statusCode})`);
       if (isInputRequired(result)) return pass(`${tool.name}: input_required result (content types not applicable)`);
       const content = result.content;
-      if (!Array.isArray(content) || content.length === 0) return pass(`${tool.name}: no content items to validate`);
+      if (!Array.isArray(content) || content.length === 0) {
+        return nothingToJudge(`${tool.name}: no content items to validate`);
+      }
       const v = validateContentBlocks(content);
       if (v.issues.length > 0) return fail(`${tool.name}: ${summarizeIssues(v.issues)}`);
       return pass(`${tool.name}: content types: ${v.types.join(", ")}`);

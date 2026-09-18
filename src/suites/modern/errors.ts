@@ -199,9 +199,11 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
   await harness.check("error-capability-gated", async () => {
     const undeclared = LIST_METHODS.filter((m) => !m.declared(ctx));
     if (undeclared.length === 0) {
+      // Nothing undeclared, so nothing to probe: a skip, not a verdict.
       return {
         passed: true,
         details: "Server declares all capabilities (tools, resources, prompts); no undeclared methods to test",
+        skipped: true,
       };
     }
     // Without a served discover nothing counts as declared, so every list

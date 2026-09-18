@@ -323,6 +323,20 @@ describe("2026-07-28 post-hoc tests: the real suite over the clean fixture", () 
     expect(details["schema-wire-valid"]).toMatch(
       /^(no server messages to validate|1 server message validated against the 2026-07-28 schema; no violations)/,
     );
+    // A check whose population was empty measured nothing and is flagged
+    // as a skip; one that scanned what it judges is a verdict, however
+    // little it saw.
+    const skipped = Object.fromEntries(report.tests.map((t) => [t.id, t.skipped === true]));
+    expect(skipped).toEqual({
+      "transport-no-server-requests": false,
+      "lifecycle-log-level-gating": false,
+      "error-id-echo": true,
+      "error-retired-codes": true,
+      "schema-result-type": details["schema-result-type"].startsWith("no results recorded"),
+      "schema-no-input-required-on-lists": details["schema-no-input-required-on-lists"].startsWith("0 results"),
+      "schema-input-required-shape": true,
+      "schema-wire-valid": details["schema-wire-valid"].startsWith("no server messages"),
+    });
   });
 });
 
@@ -330,6 +344,8 @@ describe("2026-07-28 post-hoc tests: hand-driven traffic over the clean fixture 
   it.each<Kind>(["stdio", "http"])("every trigger is clean on %s: all eight pass", async (kind) => {
     const results = await scanAfter(kind, [], allTriggers);
     expectPassed(results, POSTHOC_IDS);
+    // Every check had something to judge: none is a skip.
+    expect(POSTHOC_IDS.filter((id) => results[id]?.skipped)).toEqual([]);
     // The scan saw real traffic, not an empty recorder.
     expect(results["schema-result-type"]?.details).toMatch(/^[1-9]\d* results scanned/);
     expect(results["schema-input-required-shape"]?.details).toMatch(/1 input_required result observed/);
@@ -558,6 +574,19 @@ describe("2026-07-28 post-hoc tests: error-id-echo and schema-wire-valid on tran
     expect(wire.details).toBe(
       "no server messages to validate (2 non-JSON-RPC bodies on HTTP error responses not validated (HTTP 401 x2))",
     );
+    // Two gateway bodies and nothing else: no JSON-RPC error, no result and
+    // nothing validatable, so the checks that judge those are skips; the
+    // scans over every received message are verdicts.
+    expect(Object.fromEntries(POSTHOC_IDS.map((id) => [id, results[id]?.skipped === true]))).toEqual({
+      "transport-no-server-requests": false,
+      "lifecycle-log-level-gating": false,
+      "error-id-echo": true,
+      "error-retired-codes": true,
+      "schema-result-type": true,
+      "schema-no-input-required-on-lists": true,
+      "schema-input-required-shape": true,
+      "schema-wire-valid": true,
+    });
     expectPassed(results, [...POSTHOC_IDS]);
   });
 
@@ -1888,6 +1917,8 @@ describe("2026-07-28 post-hoc tests: no retries, one id table", () => {
       const r = results[id] as TestResult;
       expect(r.passed, id).toBe(false);
       expect(r.details, id).toBe(NOTHING);
+      // A failure, never a skip: nothing received is not a vacuous pass.
+      expect(r.skipped, id).toBeUndefined();
     }
   });
 

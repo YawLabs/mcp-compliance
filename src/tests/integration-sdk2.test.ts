@@ -56,11 +56,18 @@ const LOCALHOST_AUTH_REQUIRED = "HTTP 200, result -- server accepted unauthentic
  * The auth checks that send a request with no valid credential and read the
  * 401/403 answering it. When security-auth-required cannot attribute that
  * 403 to authentication, the same refusal is no evidence for them either
- * and they skip (security-oauth-metadata only without --auth, which is the
- * only thing that says the server is auth-protected at all).
+ * and they skip (security-oauth-metadata without --auth, which is the only
+ * thing that says the server is auth-protected at all; with one, only when
+ * the well-known metadata locations drew the same 403).
  */
-const AUTH_SIBLINGS = ["security-www-authenticate", "security-auth-malformed", "security-oauth-metadata"];
-const SIBLING_SKIP = "Skipped: not evaluable (see security-auth-required)";
+const AUTH_SIBLINGS = [
+  "security-www-authenticate",
+  "security-auth-malformed",
+  "security-oauth-metadata",
+  "security-token-in-uri",
+];
+const SIBLING_SKIP =
+  "Skipped: HTTP 403 without a Bearer challenge, not attributable to authentication (see security-auth-required)";
 
 const detailsOf = (report: ComplianceReport, id: string) => resultOf(report, id).details;
 
@@ -372,6 +379,66 @@ describe("SDK v2 over HTTP, pinned --spec-version 2025-11-25", () => {
     // served: an accepted request, not a refusal.
     expect(resultOf(report, "security-auth-required").details).toMatch(/accepted unauthenticated/);
   });
+
+  it("the negative probes that now read a gate's answer as not evaluable keep their verdicts", () => {
+    // The SDK answers each probe itself next to a served handshake, so
+    // attributing the rejection changes nothing; the batch is the documented
+    // deviation (SDK_LEGACY_REQUIRED_DEVIATIONS) either way.
+    const verdict = (id: string) => {
+      const t = resultOf(report, id);
+      return `${t.passed ? "PASS" : "FAIL"}: ${t.details}`;
+    };
+    expect({
+      ct: verdict("transport-content-type-reject"),
+      batch: verdict("transport-batch-reject"),
+      version: verdict("lifecycle-version-negotiate"),
+      unknown: verdict("error-unknown-method"),
+    }).toEqual({
+      ct: "PASS: HTTP 415 (incorrect Content-Type rejected)",
+      batch: "FAIL: HTTP 200 — expected error or 4xx for batch request",
+      version: "PASS: Server negotiated down to 2025-11-25 (correct)",
+      unknown: "PASS: Error code: -32601 (correct: Method not found) — Method not found",
+    });
+  });
+});
+
+describe("SDK v2 behind its Host guard, pinned --spec-version 2025-11-25: the negative probes do not credit the guard", () => {
+  let mounted: Mounted;
+  let report: ComplianceReport;
+
+  beforeAll(async () => {
+    mounted = await mount("stateless", { allowedHosts: ["mcp.example.com"] });
+    report = await runComplianceSuite(mounted.url, {
+      timeout: 5000,
+      specVersion: "2025-11-25",
+      only: [
+        "transport-content-type-reject",
+        "transport-batch-reject",
+        "lifecycle-version-negotiate",
+        "error-unknown-method",
+      ],
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    await unmount(mounted);
+  });
+
+  it("every probe drew the guard's 403, so each fails as not evaluable (before: four passes)", () => {
+    // Before: PASS "HTTP 403 (incorrect Content-Type rejected)", PASS "HTTP
+    // 403 (batch rejected)", and the version and method checks credited the
+    // guard's -32000 "Invalid Host" error as the server's rejection.
+    const byId = Object.fromEntries(report.tests.map((t) => [t.id, `${t.passed ? "PASS" : "FAIL"}: ${t.details}`]));
+    const guard = `("Invalid Host: 127.0.0.1") -- not evaluable: the message names Host/Origin validation, which refuses a request whatever it carries`;
+    const handshake =
+      "not evaluable: the initialize handshake was not served either (HTTP 403, JSON-RPC error -32000), so this rejection proves nothing about";
+    expect(byId).toEqual({
+      "transport-content-type-reject": `FAIL: HTTP 403, JSON-RPC error -32000 on the text/plain POST ${guard}`,
+      "transport-batch-reject": `FAIL: HTTP 403, JSON-RPC error -32000 on the batch ${guard}`,
+      "lifecycle-version-negotiate": `FAIL: HTTP 403, JSON-RPC error -32000 on the initialize requesting protocol version 2099-01-01 -- ${handshake} the unknown version (see lifecycle-init)`,
+      "error-unknown-method": `FAIL: HTTP 403, JSON-RPC error -32000 on nonexistent/method -- ${handshake} the unknown method (see lifecycle-init)`,
+    });
+  });
 });
 
 describe("SDK v2 over HTTP, legacy: 'reject' (modern-only)", () => {
@@ -420,13 +487,15 @@ describe("SDK v2 over HTTP, legacy: 'reject' (modern-only)", () => {
  */
 describe("SDK v2 behind its Host guard: a bare 403 on every request is not an authentication rejection", () => {
   const ID = "security-auth-required";
+  const ORIGIN = "security-origin-validation";
+  const RATE = "security-rate-limiting";
   let mounted: Mounted;
   let noAuth: ComplianceReport;
   let withAuth: ComplianceReport;
 
   beforeAll(async () => {
     mounted = await mount("reject", { allowedHosts: ["mcp.example.com"] });
-    const pinned = { timeout: 5000, specVersion: "2026-07-28" as const, only: [ID, ...AUTH_SIBLINGS] };
+    const pinned = { timeout: 5000, specVersion: "2026-07-28" as const, only: [ID, ...AUTH_SIBLINGS, ORIGIN, RATE] };
     noAuth = await runComplianceSuite(mounted.url, pinned);
     withAuth = await runComplianceSuite(mounted.url, { ...pinned, headers: { Authorization: "Bearer tok" } });
   }, 60_000);
@@ -481,24 +550,56 @@ describe("SDK v2 behind its Host guard: a bare 403 on every request is not an au
     expect(detailsOf(noAuth, "security-www-authenticate")).toBe(SIBLING_SKIP);
     expect(detailsOf(withAuth, "security-www-authenticate")).toBe(SIBLING_SKIP);
     expect(detailsOf(withAuth, "security-auth-malformed")).toBe(SIBLING_SKIP);
+    // Before: PASSED "HTTP 403 (token in query string rejected)" -- the
+    // guard's 403, read as the server refusing a token it never looked at.
+    expect(detailsOf(withAuth, "security-token-in-uri")).toBe(SIBLING_SKIP);
     // Without a credential there is nothing to compare against, as before.
     expect(detailsOf(noAuth, "security-auth-malformed")).toBe(
       "Skipped: needs a valid credential to compare against (pass --auth)",
     );
+    expect(detailsOf(noAuth, "security-token-in-uri")).toBe(
+      "Skipped: needs a valid credential to place in the URI (pass --auth)",
+    );
+    for (const report of [noAuth, withAuth]) {
+      for (const id of AUTH_SIBLINGS) expect(resultOf(report, id).passed, id).toBe(true);
+    }
   });
 
-  it("security-oauth-metadata skips without --auth and, with one, reports what the guard answered", () => {
+  it("security-oauth-metadata skips without --auth and, with one, once the well-known locations drew the guard's 403 too", () => {
     // Before, without --auth: the bare 403 sent it to the well-known
     // locations and it FAILED "No Protected Resource Metadata", blaming the
     // server for metadata a Host guard was never going to serve.
     expect(detailsOf(noAuth, "security-oauth-metadata")).toBe(SIBLING_SKIP);
-    // With --auth the run is testing a protected resource whatever the 403
-    // was, so the lookup still happens (and the guard answers it too).
+    // With --auth the lookup still happens -- a document it finds would
+    // pass -- but the guard answers every well-known location with the same
+    // bare 403. Before: FAILED "No Protected Resource Metadata
+    // (/.well-known/oauth-protected-resource/mcp -> HTTP 403;
+    // /.well-known/oauth-protected-resource -> HTTP 403) and no legacy OAuth
+    // metadata", advising a document the guard would never let through.
     const withCredential = resultOf(withAuth, "security-oauth-metadata");
     expect([withCredential.passed, withCredential.details]).toEqual([
-      false,
-      "No Protected Resource Metadata (/.well-known/oauth-protected-resource/mcp -> HTTP 403; /.well-known/oauth-protected-resource -> HTTP 403) and no legacy OAuth metadata",
+      true,
+      "Skipped: HTTP 403 without a Bearer challenge on the endpoint and on every well-known metadata location, not attributable to authentication (see security-auth-required)",
     ]);
+  });
+
+  it("security-origin-validation and security-rate-limiting do not read the guard's 403 as an Origin check or an auth gate", () => {
+    // Before: origin-validation PASSED "HTTP 403 (suspicious Origin
+    // rejected)" on the guard's answer to every request, and
+    // rate-limiting skipped as "rejected by auth (HTTP 403)", advising
+    // --auth or the configured credential.
+    for (const report of [noAuth, withAuth]) {
+      const origin = resultOf(report, ORIGIN);
+      expect([origin.passed, origin.details]).toEqual([
+        true,
+        "Skipped: HTTP 403 to the foreign Origin, but the conformant server/discover was not served either, so the refusal is not attributable to the Origin (see security-auth-required)",
+      ]);
+      const rate = resultOf(report, RATE);
+      expect([rate.passed, rate.details]).toEqual([
+        true,
+        "Skipped: all 50 rapid server/discover requests drew HTTP 403 before reaching a handler, not as an auth refusal (Host/Origin validation or a gateway), so rate limiting was not measured (see security-auth-required)",
+      ]);
+    }
   });
 });
 
@@ -548,6 +649,7 @@ describe("SDK v2 reached through a tunnel hostname", () => {
 
 describe("SDK v2 behind a gate that answers a missing credential with a bare 403", () => {
   const ID = "security-auth-required";
+  const ORIGIN = "security-origin-validation";
   let mounted: Mounted;
   let noAuth: ComplianceReport;
   let withAuth: ComplianceReport;
@@ -555,7 +657,7 @@ describe("SDK v2 behind a gate that answers a missing credential with a bare 403
 
   beforeAll(async () => {
     mounted = await mount("reject", { bare403Unless: "Bearer tok" });
-    const pinned = { timeout: 5000, specVersion: "2026-07-28" as const, only: [ID, ...AUTH_SIBLINGS] };
+    const pinned = { timeout: 5000, specVersion: "2026-07-28" as const, only: [ID, ...AUTH_SIBLINGS, ORIGIN] };
     noAuth = await runComplianceSuite(mounted.url, pinned);
     withAuth = await runComplianceSuite(mounted.url, { ...pinned, headers: { Authorization: "Bearer tok" } });
     wrongAuth = await runComplianceSuite(mounted.url, { ...pinned, headers: { Authorization: "Bearer wrong" } });
@@ -598,16 +700,43 @@ describe("SDK v2 behind a gate that answers a missing credential with a bare 403
     expect(detailsOf(withAuth, "security-auth-malformed")).toBe(
       "well-formed invalid token: HTTP 403; malformed credential: HTTP 403",
     );
+    expect(detailsOf(withAuth, "security-token-in-uri")).toBe("HTTP 403 (token in query string rejected)");
+  });
+
+  it("with --auth the SDK's own Origin guard answering the foreign Origin with 403 is credited: the Origin is the one variable", () => {
+    // localhostOriginValidation refuses the foreign Origin before the gate
+    // or the SDK sees the request; the same request without it was served.
+    const origin = resultOf(withAuth, ORIGIN);
+    expect([origin.passed, origin.details]).toEqual([true, "HTTP 403 (suspicious Origin rejected)"]);
   });
 
   it("without a credential the gate accepts, the siblings skip rather than credit the same 403", () => {
     // Before: both runs PASSED www-authenticate on "HTTP 403
     // (WWW-Authenticate not applicable for 403)", and auth-malformed passed
-    // the wrongAuth run on the gate's 403.
+    // the wrongAuth run on the gate's 403; token-in-uri passed it as "HTTP
+    // 403 (token in query string rejected)".
     expect(detailsOf(noAuth, "security-www-authenticate")).toBe(SIBLING_SKIP);
     expect(detailsOf(wrongAuth, "security-www-authenticate")).toBe(SIBLING_SKIP);
     expect(detailsOf(wrongAuth, "security-auth-malformed")).toBe(SIBLING_SKIP);
+    expect(detailsOf(wrongAuth, "security-token-in-uri")).toBe(SIBLING_SKIP);
     expect(detailsOf(noAuth, "security-oauth-metadata")).toBe(SIBLING_SKIP);
+  });
+
+  it("security-oauth-metadata: the gate's 403 on the metadata is a finding next to a served credential, and not evaluable next to a refused one", () => {
+    // The credential is the variable, so the 403 is an auth gate -- and it
+    // stands in front of the metadata clients must fetch without one.
+    const served = resultOf(withAuth, "security-oauth-metadata");
+    expect([served.passed, served.details]).toEqual([
+      false,
+      "No Protected Resource Metadata (/.well-known/oauth-protected-resource/mcp -> HTTP 403; /.well-known/oauth-protected-resource -> HTTP 403) and no legacy OAuth metadata",
+    ]);
+    // With a credential the gate refuses too, the same 403s are the one
+    // refusal nothing could attribute. Before: the same FAIL as above.
+    const refused = resultOf(wrongAuth, "security-oauth-metadata");
+    expect([refused.passed, refused.details]).toEqual([
+      true,
+      "Skipped: HTTP 403 without a Bearer challenge on the endpoint and on every well-known metadata location, not attributable to authentication (see security-auth-required)",
+    ]);
   });
 });
 
@@ -670,7 +799,19 @@ describe("SDK v2 over stdio (serveStdio)", () => {
     expect(report.serverInfo.name).toBe("sdk2-stdio-server");
     expect(report.toolNames).toEqual(["echo"]);
     expectFailingSets(report, [], []);
-    expect(report.warnings.filter((w) => w.startsWith("security-oversized-input"))).toEqual([]);
+    // The two negative probes that run over stdio are answered by the SDK
+    // next to a served handshake: attributing their answer changes nothing.
+    expect(resultOf(report, "lifecycle-version-negotiate").details).toBe(
+      "Server negotiated down to 2025-11-25 (correct)",
+    );
+    expect(resultOf(report, "error-unknown-method").details).toBe(
+      "Error code: -32601 (correct: Method not found) — Method not found",
+    );
+    // The SDK completes the 1 MB call, which passes as survived with the
+    // body-limit advice (the 2026-07-28 suite words it the same way).
+    expect(report.warnings.filter((w) => w.startsWith("security-oversized-input"))).toEqual([
+      "security-oversized-input: the server completed a tools/call carrying a 1 MB string argument (echo.data) instead of rejecting it; enforce a request body limit (413) or maxLength in inputSchema.",
+    ]);
   }, 60_000);
 
   it("pinned 2025-11-25, a process that exits on a stdin line over 500 KB: only oversized-input fails, the rest run against a restarted child", async () => {

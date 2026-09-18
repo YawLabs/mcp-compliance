@@ -237,6 +237,9 @@ describe("errors suite: clean fixture over stdio", () => {
     expect(resultOf(report, "error-missing-params").details).toContain("-32602 (correct: Invalid params)");
     expect(resultOf(report, "tools-call-unknown").details).toContain("-32602 (correct: Invalid params)");
     expect(resultOf(report, "error-capability-gated").details).toContain("declares all capabilities");
+    // Nothing undeclared to probe: a skip, where the checks that probed are verdicts.
+    expect(resultOf(report, "error-capability-gated").skipped).toBe(true);
+    expect(report.tests.filter((t) => t.skipped).map((t) => t.id)).toEqual(["error-capability-gated"]);
     expect(resultOf(report, "error-invalid-cursor").details).toContain("tools/list rejected the cursor: -32602");
     expect(warned(report, NOT_FOUND_WARNING)).toBe(false);
   });
@@ -465,6 +468,8 @@ describe("errors suite: canned bad HTTP server", () => {
     ]);
     // Only tools is declared and the undeclared list methods answer a bare 404: a rejection, not a result.
     expectPass(report, "error-capability-gated", "resources/list -> rejected (HTTP 404)");
+    // The undeclared methods were probed: a verdict, not a skip.
+    expect(resultOf(report, "error-capability-gated").skipped).toBeUndefined();
   });
 
   it("fails the raw-body probes on an HTML 200 page and an error that drops the id", async () => {

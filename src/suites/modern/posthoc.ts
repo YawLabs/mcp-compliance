@@ -17,7 +17,12 @@ import type { ModernSuiteContext } from "./context.js";
  * With `--only` filters the recording can be nearly empty; every check
  * then passes with a note saying how little it saw, never fails or
  * throws. The details always name the count scanned so a vacuous pass
- * is visible as one.
+ * is visible as one, and a check whose population is empty (no error
+ * responses for the error checks, no results for the result checks, no
+ * input_required result for the shape check, nothing validatable for
+ * schema-wire-valid) flags its pass as a skip (`TestOutcome.skipped`).
+ * A recording with nothing in it at all fails every check instead (see
+ * the empty-recorder guard in `runPostHoc`).
  */
 
 /**
@@ -575,7 +580,11 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
       };
     }
     if (scanned === 0) {
-      return { passed: true, details: `no error responses to id-bearing requests recorded${exemptNote}` };
+      return {
+        passed: true,
+        details: `no error responses to id-bearing requests recorded${exemptNote}`,
+        skipped: true,
+      };
     }
     return {
       passed: true,
@@ -595,6 +604,7 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
       return {
         passed: true,
         details: `${plural(errors.length, "error response")} scanned; none uses a retired code (${retired})`,
+        ...(errors.length === 0 ? { skipped: true } : {}),
       };
     }
     const first = hits[0] as ReceivedMessage;
@@ -654,7 +664,7 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
         details: `${offenders.length} of ${plural(results.length, "result")} ${offenders.length === 1 ? "lacks" : "lack"} a valid resultType; first: ${methodOf(first.entry, timeline)} (${first.why})${legacyNote}`,
       };
     }
-    if (results.length === 0) return { passed: true, details: `no results recorded${legacyNote}` };
+    if (results.length === 0) return { passed: true, details: `no results recorded${legacyNote}`, skipped: true };
     const accepted =
       extensionValues.size > 0
         ? `complete, input_required, or an extension value (${[...extensionValues.keys()].map(brief).join(", ")}; see warning)`
@@ -673,6 +683,7 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
       return {
         passed: true,
         details: `${plural(results.length, "result")} scanned; no input_required result observed`,
+        ...(results.length === 0 ? { skipped: true } : {}),
       };
     }
     let unattributed = 0;
@@ -702,7 +713,7 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
   await check("schema-input-required-shape", async () => {
     const inputRequired = inputRequiredResults(recorder);
     if (inputRequired.length === 0) {
-      return { passed: true, details: "no input_required results observed (nothing to validate)" };
+      return { passed: true, details: "no input_required results observed (nothing to validate)", skipped: true };
     }
     const capabilities = ctx.client.clientCapabilities;
     const declared = Object.keys(capabilities);
@@ -807,7 +818,7 @@ export async function runPostHoc(ctx: ModernSuiteContext): Promise<void> {
         details: `${violating} of ${plural(scanned, "server message")} violate the 2026-07-28 schema (${plural(distinct.length, "distinct violation")}): ${inline.map(render).join(" | ")}${skippedNote}`,
       };
     }
-    if (scanned === 0) return { passed: true, details: `no server messages to validate${skippedNote}` };
+    if (scanned === 0) return { passed: true, details: `no server messages to validate${skippedNote}`, skipped: true };
     return {
       passed: true,
       details: `${plural(scanned, "server message")} validated against the 2026-07-28 schema; no violations${skippedNote}`,

@@ -1,6 +1,20 @@
-import { describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { hostHeaderValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { computeScore } from "../grader.js";
 import { formatGithub, formatHtml, formatJson, formatMarkdown, formatSarif, formatTerminal } from "../reporter.js";
+import { runComplianceSuite } from "../runner.js";
 import type { ComplianceReport, TestResult } from "../types.js";
+import { type HttpFixture, startHttpFixture } from "./helpers/modern-fixture.js";
 
 function makeReport(overrides: Partial<ComplianceReport> = {}): ComplianceReport {
   return {
@@ -795,5 +809,437 @@ describe("empty run (nothing matched --only/--skip)", () => {
     });
     expect(formatTerminal(allPass)).toContain("All tests passed");
     expect(formatTerminal(allPass)).not.toContain("No tests ran");
+  });
+});
+
+const REPORT_SCHEMA_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "../../schemas/report.v1.json");
+const schemaAjv = new Ajv2020({ strict: true, allErrors: true });
+addFormats(schemaAjv);
+const validateReport = schemaAjv.compile(JSON.parse(readFileSync(REPORT_SCHEMA_PATH, "utf8")));
+
+/** "valid", or the schema errors as JSON so a failing assertion shows them. */
+function schemaCheck(report: unknown): string {
+  return validateReport(report) ? "valid" : JSON.stringify(validateReport.errors);
+}
+
+/** A report whose score and counts are what computeScore gives for its tests. */
+function reportOf(tests: TestResult[]): ComplianceReport {
+  const s = computeScore(tests);
+  return makeReport({
+    score: s.score,
+    grade: s.grade,
+    overall: s.overall,
+    summary: s.summary,
+    categories: s.categories,
+    tests,
+  });
+}
+
+/** The same report as a tool without the skip flag would have written it. */
+function unflagged(report: ComplianceReport): ComplianceReport {
+  const { skipped: _s, ...summary } = report.summary;
+  return {
+    ...report,
+    summary,
+    categories: Object.fromEntries(
+      Object.entries(report.categories).map(([k, { passed, total }]) => [k, { passed, total }]),
+    ),
+    tests: report.tests.map(({ skipped: _t, ...t }) => t),
+  };
+}
+
+/**
+ * An SDK v1 sessionful McpServer behind the SDK's own Host guard
+ * (hostHeaderValidation), allowing only `allowed`. The guard is
+ * Express-shaped; `status` / `json` are the two response methods it calls.
+ */
+async function startSdkBehindHostGuard(allowed: string[]): Promise<{ url: string; stop(): Promise<void> }> {
+  const guard = hostHeaderValidation(allowed);
+  const transports = new Map<string, StreamableHTTPServerTransport>();
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    let passed = false;
+    const expressRes = Object.assign(res, {
+      status(code: number) {
+        res.statusCode = code;
+        return expressRes;
+      },
+      json(body: unknown) {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify(body));
+      },
+    });
+    guard(req as never, expressRes as never, () => {
+      passed = true;
+    });
+    if (!passed) return;
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const known = sessionId ? transports.get(sessionId) : undefined;
+    if (known) {
+      await known.handleRequest(req, res);
+      return;
+    }
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
+    const mcp = new McpServer({ name: "host-guarded", version: "1.0.0" });
+    mcp.tool("echo", "Echoes back the input", async () => ({ content: [{ type: "text", text: "ok" }] }));
+    await mcp.connect(transport);
+    await transport.handleRequest(req, res);
+    if (transport.sessionId) transports.set(transport.sessionId, transport);
+  });
+  const url = await new Promise<string>((done) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      done(`http://127.0.0.1:${addr && typeof addr === "object" ? addr.port : 0}/mcp`);
+    });
+  });
+  return {
+    url,
+    async stop() {
+      for (const t of transports.values()) await t.close().catch(() => {});
+      server.closeAllConnections();
+      await new Promise<void>((done) => server.close(() => done()));
+    },
+  };
+}
+
+/**
+ * Skipped checks: `passed: true` (not failures) that measured nothing.
+ * Before the flag existed a skip was indistinguishable from a pass in
+ * every format -- the terminal listed only failures, so a gated server
+ * whose auth checks could not be evaluated read as if it had satisfied
+ * them. Each format now names them and says they still count as passes.
+ */
+describe("skipped checks", () => {
+  const plain = (s: string) => stripVTControlCharacters(s);
+  const pass: TestResult = {
+    id: "security-auth-required",
+    name: "Server requires authentication",
+    category: "security",
+    passed: true,
+    required: false,
+    details: "HTTP 401 (unauthenticated request rejected)",
+    durationMs: 5,
+  };
+  const fail: TestResult = {
+    id: "security-tls-required",
+    name: "HTTPS required",
+    category: "security",
+    passed: false,
+    required: false,
+    details: "Server uses plain HTTP",
+    durationMs: 1,
+  };
+  const skipA: TestResult = {
+    id: "security-www-authenticate",
+    name: "WWW-Authenticate on 401",
+    category: "security",
+    passed: true,
+    skipped: true,
+    required: false,
+    details: "Skipped: not evaluable (see security-auth-required)",
+    durationMs: 3,
+  };
+  const skipB: TestResult = {
+    id: "security-token-in-uri",
+    name: "Rejects token in URI",
+    category: "security",
+    passed: true,
+    skipped: true,
+    required: true,
+    details: "Skipped: needs a valid credential to place in the URI (pass --auth)",
+    durationMs: 2,
+  };
+
+  const mixed = reportOf([pass, fail, skipA, skipB]);
+
+  describe("terminal", () => {
+    it("counts the skips next to the failures and on the category bar", () => {
+      const out = plain(formatTerminal(mixed));
+      expect(out).toMatch(/Tests {5}3\/4 {2}\(1 failed, 2 skipped\)/);
+      expect(out).toMatch(/Security .* 3\/4 +75% {2}2 skipped$/m);
+    });
+
+    it("names every skipped check with its details, under a caveat that they still score as passes", () => {
+      const out = plain(formatTerminal(mixed));
+      expect(out).toContain("SKIPPED CHECKS (2)");
+      expect(out).toContain("These measured nothing -- counted as passes in the score above.");
+      expect(out).toContain("- WWW-Authenticate on 401  [security-www-authenticate]  optional");
+      expect(out).toContain("      Skipped: not evaluable (see security-auth-required)");
+      expect(out).toContain("- Rejects token in URI  [security-token-in-uri]  required");
+      // Skips are not failures, and a plain pass is in neither list.
+      const failedBlock = out.slice(out.indexOf("FAILED TESTS"), out.indexOf("SKIPPED CHECKS"));
+      expect(failedBlock).toContain("[security-tls-required]");
+      expect(failedBlock).not.toContain("[security-www-authenticate]");
+      expect(out).not.toContain("[security-auth-required]");
+    });
+
+    it("does not say 'All tests passed' when nothing failed but something was skipped", () => {
+      const out = plain(formatTerminal(reportOf([pass, skipA])));
+      expect(out).not.toContain("All tests passed");
+      expect(out).toContain("✓ No test failed -- 1 skipped, see below");
+      expect(out).toContain("SKIPPED CHECKS (1)");
+    });
+
+    it("renders a report without skips exactly as a report without the flag (pinned: clean runs do not change)", () => {
+      const clean = reportOf([pass, fail]);
+      expect(formatTerminal(clean)).toBe(formatTerminal(unflagged(clean)));
+      const out = plain(formatTerminal(clean));
+      expect(out).not.toContain("skipped");
+      expect(out).not.toContain("SKIPPED");
+      expect(plain(formatTerminal(reportOf([pass])))).toContain("✓ All tests passed");
+    });
+
+    it("reads a report from an older tool (no flags, no counts) as having no skips", () => {
+      const out = plain(formatTerminal(unflagged(mixed)));
+      expect(out).not.toContain("SKIPPED CHECKS");
+      expect(out).toMatch(/Tests {5}3\/4 {2}\(1 failed\)/);
+    });
+
+    it("never lists a failure as a skip, even one carrying the flag", () => {
+      const out = plain(formatTerminal(reportOf([{ ...fail, skipped: true }])));
+      expect(out).toContain("FAILED TESTS (1)");
+      expect(out).not.toContain("SKIPPED CHECKS");
+    });
+  });
+
+  describe("json", () => {
+    it("carries the flag on each skip and the counts in summary and categories, and validates against report.v1", () => {
+      const parsed = JSON.parse(formatJson(mixed));
+      expect(parsed.tests.map((t: TestResult) => [t.id, t.passed, t.skipped])).toEqual([
+        ["security-auth-required", true, undefined],
+        ["security-tls-required", false, undefined],
+        ["security-www-authenticate", true, true],
+        ["security-token-in-uri", true, true],
+      ]);
+      expect(parsed.summary).toEqual({ total: 4, passed: 3, failed: 1, required: 1, requiredPassed: 1, skipped: 2 });
+      expect(parsed.categories).toEqual({ security: { passed: 3, total: 4, skipped: 2 } });
+      expect(parsed.schemaVersion).toBe("1");
+      expect(schemaCheck(parsed)).toBe("valid");
+    });
+
+    it("a report without any of the new fields still validates (the schema change is additive)", () => {
+      expect(schemaCheck(JSON.parse(formatJson(unflagged(mixed))))).toBe("valid");
+    });
+
+    it("the schema rejects a failure marked as a skip, a non-boolean flag and a negative count", () => {
+      const bad = JSON.parse(formatJson(mixed));
+      bad.tests[1].skipped = true;
+      expect(schemaCheck(bad)).toMatch(/must be equal to constant/);
+      const notBool = JSON.parse(formatJson(mixed));
+      notBool.tests[2].skipped = "yes";
+      expect(schemaCheck(notBool)).toMatch(/must be boolean/);
+      const negative = JSON.parse(formatJson(mixed));
+      negative.summary.skipped = -1;
+      expect(schemaCheck(negative)).toMatch(/must be >= 0/);
+      // `skipped: false` is legal: absent and false mean the same.
+      const explicitFalse = JSON.parse(formatJson(mixed));
+      explicitFalse.tests[1].skipped = false;
+      expect(schemaCheck(explicitFalse)).toBe("valid");
+    });
+  });
+
+  describe("sarif", () => {
+    it("keeps results failures-only, so Code Scanning opens no alert for a skip", () => {
+      const run = JSON.parse(formatSarif(mixed)).runs[0];
+      expect(run.results.map((r: { ruleId: string }) => r.ruleId)).toEqual(["security-tls-required"]);
+      expect(run.results).toEqual(JSON.parse(formatSarif(unflagged(mixed))).runs[0].results);
+    });
+
+    it("names the skips in the invocation properties", () => {
+      const props = JSON.parse(formatSarif(mixed)).runs[0].invocations[0].properties;
+      expect(props.testsPassed).toBe(3);
+      expect(props.testsTotal).toBe(4);
+      expect(props.testsSkipped).toBe(2);
+      expect(props.skippedTests).toEqual([
+        { id: "security-www-authenticate", details: "Skipped: not evaluable (see security-auth-required)" },
+        { id: "security-token-in-uri", details: "Skipped: needs a valid credential to place in the URI (pass --auth)" },
+      ]);
+    });
+
+    it("an older report reads as zero skips", () => {
+      const props = JSON.parse(formatSarif(unflagged(mixed))).runs[0].invocations[0].properties;
+      expect(props.testsSkipped).toBe(0);
+      expect(props.skippedTests).toEqual([]);
+    });
+  });
+
+  describe("github", () => {
+    it("puts the skip count in the ::notice and adds no annotation per skip", () => {
+      const out = formatGithub(mixed);
+      expect(out).toContain("3/4 passed, 1 failed, 2 skipped (1/1 required)");
+      expect(out).not.toContain("security-www-authenticate");
+      expect(out.split("\n").filter((l) => l.startsWith("::error") || l.startsWith("::warning"))).toHaveLength(1);
+    });
+
+    it("a run without skips keeps the old notice", () => {
+      expect(formatGithub(reportOf([pass, fail]))).toContain("1/2 passed, 1 failed (0/0 required)");
+    });
+  });
+
+  describe("markdown", () => {
+    it("says under the table how many passes measured nothing and lists them in their own section", () => {
+      const out = formatMarkdown(mixed);
+      expect(out).toContain('_2 of those passes measured nothing -- see "Skipped checks" below._');
+      expect(out).toContain("## Skipped checks (2)");
+      expect(out).toContain("These measured nothing -- counted as passes in the score above.");
+      expect(out).toContain("- ⊘ **security-www-authenticate** — Skipped: not evaluable (see security-auth-required)");
+      expect(out).toContain(
+        "- ⊘ **security-token-in-uri** *(required)* — Skipped: needs a valid credential to place in the URI (pass --auth)",
+      );
+      const failedSection = out.slice(out.indexOf("## Failed tests"), out.indexOf("## Skipped checks"));
+      expect(failedSection).toContain("security-tls-required");
+      expect(failedSection).not.toContain("security-www-authenticate");
+    });
+
+    it("a category row says how many of its passes were skips, as the terminal bars and HTML cards do", () => {
+      const lines = formatMarkdown(
+        reportOf([pass, fail, skipA, skipB, { ...pass, id: "transport-post", category: "transport" }]),
+      ).split("\n");
+      expect(lines).toContain("| Security | 3 (2 skipped) | 4 |");
+      // A category without skips, and the Total row, keep their old cells.
+      expect(lines).toContain("| Transport | 1 | 1 |");
+      expect(lines).toContain("| **Total** | **4** | **5** |");
+      // An older report (no flags) reads as having no skips.
+      expect(formatMarkdown(unflagged(mixed)).split("\n")).toContain("| Security | 3 | 4 |");
+    });
+
+    it("a report without skips renders exactly as before", () => {
+      const clean = reportOf([pass, fail]);
+      expect(formatMarkdown(clean)).toBe(formatMarkdown(unflagged(clean)));
+      expect(formatMarkdown(clean)).not.toContain("Skipped");
+      expect(formatMarkdown(clean).split("\n")).toContain("| Security | 1 | 2 |");
+    });
+  });
+
+  describe("html", () => {
+    it("marks a skip SKIP (not PASS) in the per-category table and lists the skips in their own card", () => {
+      const out = formatHtml(mixed);
+      expect(out.match(/<td class="status skip">SKIP<\/td>/g)).toHaveLength(4);
+      expect(out.match(/<td class="status pass">PASS<\/td>/g)).toHaveLength(1);
+      expect(out).toContain("<h2>Skipped checks (2)</h2>");
+      expect(out).toContain("3 / 4 tests passed · 1 / 1 required · 2 skipped");
+      expect(out).toContain('<div class="cat-label">2 skipped</div>');
+    });
+
+    it("a report without skips renders exactly as before", () => {
+      const clean = reportOf([pass, fail]);
+      expect(formatHtml(clean)).toBe(formatHtml(unflagged(clean)));
+      expect(formatHtml(clean)).not.toContain("SKIP");
+    });
+  });
+});
+
+/**
+ * The same thing end to end: real suites against real servers, so the
+ * flag is proven on the details the suites actually write (not on a
+ * hand-built report), and the verdicts are proven not to move.
+ *
+ * - The SDK's own Host guard (hostHeaderValidation, the DNS-rebinding
+ *   middleware createMcpExpressApp installs) in front of an SDK v1
+ *   McpServer, allowing only a hostname the test never uses: every
+ *   request draws a bare 403 "Invalid Host: 127.0.0.1" with no
+ *   WWW-Authenticate. With --auth the 2025-11-25 security-auth-required
+ *   cannot attribute that 403 to authentication, and the four auth checks
+ *   that lean on it skip as not evaluable -- the run the finding measured.
+ * - The modern fixture over HTTP with no --auth: a clean server whose
+ *   credential-dependent checks skip for want of a credential.
+ */
+describe("skipped checks, end to end against real servers", () => {
+  const AUTH_SIBLINGS = [
+    "security-www-authenticate",
+    "security-auth-malformed",
+    "security-session-not-auth",
+    "security-token-in-uri",
+  ];
+  let guarded: { url: string; stop(): Promise<void> };
+  let fixture: HttpFixture;
+  let hostGuarded: ComplianceReport;
+  let clean: ComplianceReport;
+
+  beforeAll(async () => {
+    guarded = await startSdkBehindHostGuard(["mcp.example.com"]);
+    fixture = await startHttpFixture();
+    [hostGuarded, clean] = await Promise.all([
+      runComplianceSuite(guarded.url, {
+        specVersion: "2025-11-25",
+        only: ["security"],
+        headers: { Authorization: "Bearer realtoken" },
+        timeout: 3000,
+      }),
+      runComplianceSuite(fixture.target, {
+        specVersion: "2026-07-28",
+        only: ["security"],
+        timeout: 5000,
+        startupTimeout: 10_000,
+      }),
+    ]);
+  }, 120_000);
+
+  afterAll(async () => {
+    await guarded?.stop();
+    await fixture?.stop();
+  });
+
+  const flagged = (r: ComplianceReport) => r.tests.filter((t) => t.skipped === true).map((t) => t.id);
+  const byId = (r: ComplianceReport, id: string) => {
+    const t = r.tests.find((x) => x.id === id);
+    if (!t) throw new Error(`${id} did not run (ran: ${r.tests.map((x) => x.id).join(", ")})`);
+    return t;
+  };
+
+  it("bare 403: the four auth checks that could not be evaluated are flagged; the check that says why is a failure, unflagged", () => {
+    // The flag is what this file tests. The suite's wording is pinned by
+    // the suite's own tests (and has changed more than once), so only the
+    // pointer to the check that explains the skip is checked here.
+    for (const id of AUTH_SIBLINGS) {
+      expect(byId(hostGuarded, id), id).toMatchObject({
+        passed: true,
+        skipped: true,
+        details: expect.stringContaining("(see security-auth-required)"),
+      });
+    }
+    const authRequired = byId(hostGuarded, "security-auth-required");
+    expect(authRequired.passed).toBe(false);
+    expect(authRequired.details).toMatch(/not evaluable/);
+    expect(Object.hasOwn(authRequired, "skipped")).toBe(false);
+    expect(hostGuarded.summary.skipped).toBe(flagged(hostGuarded).length);
+    expect(hostGuarded.categories.security.skipped).toBe(flagged(hostGuarded).length);
+  });
+
+  it("clean fixture: the credential-dependent checks are flagged, and nothing that failed is", () => {
+    for (const id of ["security-www-authenticate", "security-oauth-metadata", "security-auth-malformed"]) {
+      expect(byId(clean, id).skipped, `${id}: ${byId(clean, id).details}`).toBe(true);
+    }
+    for (const report of [hostGuarded, clean]) {
+      for (const t of report.tests.filter((x) => !x.passed)) expect(Object.hasOwn(t, "skipped"), t.id).toBe(false);
+    }
+  });
+
+  it("the flag moves no verdict: score, grade, overall and every count match the same tests without it", () => {
+    for (const report of [hostGuarded, clean]) {
+      const without = computeScore(report.tests.map(({ skipped: _s, ...t }) => t));
+      expect(report.score).toBe(without.score);
+      expect(report.grade).toBe(without.grade);
+      expect(report.overall).toBe(without.overall);
+      const { skipped: _count, ...summary } = report.summary;
+      const { skipped: _none, ...before } = without.summary;
+      expect(summary).toEqual(before);
+    }
+  });
+
+  it("both reports validate against report.v1", () => {
+    expect(schemaCheck(JSON.parse(formatJson(hostGuarded)))).toBe("valid");
+    expect(schemaCheck(JSON.parse(formatJson(clean)))).toBe("valid");
+  });
+
+  it("the terminal report names every skipped check; before the flag it listed only the failures", () => {
+    for (const report of [hostGuarded, clean]) {
+      const out = stripVTControlCharacters(formatTerminal(report));
+      const ids = flagged(report);
+      expect(ids.length).toBeGreaterThan(0);
+      expect(out).toContain(`SKIPPED CHECKS (${ids.length})`);
+      expect(out).toContain(`${ids.length} skipped`);
+      const block = out.slice(out.indexOf("SKIPPED CHECKS"));
+      for (const id of ids) expect(block, id).toContain(`[${id}]`);
+    }
   });
 });

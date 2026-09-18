@@ -74,12 +74,37 @@ interface Expected {
   kind: "http" | "stdio";
   count: number;
   optionalFailures: string[];
+  /**
+   * Exactly the passes recorded as skips (`TestResult.skipped`): the checks
+   * that measured nothing. Every other pass is a verdict.
+   */
+  skipped: string[];
   overall: "pass" | "partial";
 }
 
+/**
+ * Skips on either transport. The fixture declares tools, resources and
+ * prompts, so error-capability-gated has no undeclared method to probe;
+ * no check of the full run draws an input_required result, so
+ * schema-input-required-shape has none to validate.
+ */
+const BOTH_SKIPPED = ["error-capability-gated", "schema-input-required-shape"];
+
+/**
+ * Plus, over HTTP without --auth against a server that needs none: the
+ * auth checks with no refusal to read or no credential to use.
+ */
+const HTTP_SKIPPED = [
+  ...BOTH_SKIPPED,
+  "security-www-authenticate",
+  "security-auth-malformed",
+  "security-oauth-metadata",
+  "security-token-in-uri",
+];
+
 const EXPECTED: Expected[] = [
-  { kind: "http", count: 99, optionalFailures: LOCALHOST_INHERENT, overall: "partial" },
-  { kind: "stdio", count: 75, optionalFailures: [], overall: "pass" },
+  { kind: "http", count: 99, optionalFailures: LOCALHOST_INHERENT, skipped: HTTP_SKIPPED, overall: "partial" },
+  { kind: "stdio", count: 75, optionalFailures: [], skipped: BOTH_SKIPPED, overall: "pass" },
 ];
 
 for (const ex of EXPECTED) {
@@ -165,7 +190,29 @@ for (const ex of EXPECTED) {
         failed: ex.optionalFailures.length,
         required: report.tests.filter((t) => t.required).length,
         requiredPassed: report.tests.filter((t) => t.required).length,
+        skipped: ex.skipped.length,
       });
+      // The passes that measured nothing, and only those; the score math
+      // does not read the flag (the grade and score above are unchanged).
+      expect(
+        report.tests
+          .filter((t) => t.skipped)
+          .map((t) => t.id)
+          .sort(),
+      ).toEqual([...ex.skipped].sort());
+      for (const t of report.tests.filter((r) => r.skipped)) expect(t.passed, t.id).toBe(true);
+      const perCategory: Record<string, number> = {};
+      for (const id of ex.skipped) {
+        const category = resultOf(report, id).category;
+        perCategory[category] = (perCategory[category] ?? 0) + 1;
+      }
+      expect(
+        Object.fromEntries(
+          Object.entries(report.categories)
+            .filter(([, c]) => (c.skipped ?? 0) > 0)
+            .map(([k, c]) => [k, c.skipped]),
+        ),
+      ).toEqual(perCategory);
       if (ex.kind === "http") {
         // Localhost-inherent because the fixture needs no credential and
         // serves the credential-less server/discover -- not a refusal the
@@ -182,6 +229,9 @@ for (const ex of EXPECTED) {
         expect(resultOf(report, "security-auth-malformed").details).toBe(
           "Skipped: needs a valid credential to compare against (pass --auth)",
         );
+        // The fixture validates Origin and serves the same request without
+        // one, so its 403 is the Origin's doing and is credited.
+        expect(resultOf(report, "security-origin-validation").details).toBe("HTTP 403 (suspicious Origin rejected)");
       }
     });
 

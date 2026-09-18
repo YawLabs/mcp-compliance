@@ -12,7 +12,15 @@ import type { TestOutcome } from "../../harness.js";
 import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
 import { parseSSEMessages } from "../../sse.js";
 import type { StdioTransport } from "../../transport/stdio.js";
-import { ensureTools, hasTools, listUnavailable, type ModernSuiteContext } from "./context.js";
+import {
+  ensureTools,
+  hasPrompts,
+  hasResources,
+  hasTools,
+  listUnavailable,
+  type ModernSuiteContext,
+} from "./context.js";
+import { pickTool } from "./features.js";
 
 /**
  * Security tests of the 2026-07-28 suite (21 in the catalog). Ported from
@@ -34,6 +42,14 @@ import { ensureTools, hasTools, listUnavailable, type ModernSuiteContext } from 
  * go through `listUnavailable`: a skip-pass pointing at tools-list when
  * that test is in the run, a failure naming the recorded reason when the
  * run filtered it out (`--only security`).
+ *
+ * On stdio, a check whose own tools/call kills the server process (an
+ * injection payload, the 1 MB argument, unknown arguments) fails as "server
+ * died" and has the process replaced before it returns
+ * (restartStdioServer) -- on every attempt that kills it, --retries
+ * included -- so the checks after it measure the server. After a
+ * replacement, security-tool-rug-pull compares two lists from the
+ * replacement rather than one from each process (rugPullOnReplacement).
  */
 
 const DISCOVER = "server/discover";
@@ -262,12 +278,66 @@ function unansweredProbe(
 }
 
 /**
- * Whether a drop on a credential-less probe can be pinned on the missing
- * credential: --auth was given and the conformant setup server/discover,
- * which carried it, was served.
+ * Whether the conformant setup server/discover got past whatever stands in
+ * front of the server: answered with a DiscoverResult, or with any other
+ * 2xx. A JSON-RPC error at HTTP 200 (a server that needs a client
+ * capability the suite leaves undeclared answers -32021 that way) is the
+ * application's answer: an auth gate, Host guard or gateway passed the
+ * request through, so a refusal of a probe that differs from it in one
+ * header is that header's doing. A 401, 403, 404, 429, 5xx or no answer at
+ * all is not: a gate may have refused the conformant request too.
+ *
+ * Wider than `ctx.state.discover !== null`, which lifecycle.ts's
+ * notEvaluable reads for the JSON-RPC-level negative probes: there a
+ * JSON-RPC error on the conformant request means the application rejects
+ * everything; here the probes are refused at the HTTP layer, before the
+ * application, and the question is only whether the conformant request
+ * reached it.
+ */
+function conformantDiscoverServed(ctx: ModernSuiteContext): boolean {
+  if (ctx.state.discover !== null) return true;
+  const rejection = ctx.state.discoverRejection;
+  return rejection !== null && is2xx(rejection.statusCode);
+}
+
+/**
+ * Whether a refusal of (or a drop on) a credential-less probe can be pinned
+ * on the missing credential: --auth was given and the conformant setup
+ * server/discover, which carried it, got past the gate (conformantDiscoverServed).
  */
 function credentialedDiscoverServed(ctx: ModernSuiteContext): boolean {
-  return ctx.hasAuth && ctx.state.discover !== null;
+  return ctx.hasAuth && conformantDiscoverServed(ctx);
+}
+
+/**
+ * 401 when --auth was given and the credentialed setup server/discover was
+ * refused with 401 -- "Authorization required or token invalid"
+ * (basic/authorization#error-handling): the server rejected the very
+ * credential the run was given. Next to that, the 401 an invalid token or a
+ * token moved into the query string draws is what the configured one drew
+ * too, so it cannot tell token validation from a server that refuses every
+ * credential. Null otherwise: no --auth, a credentialed discover that got
+ * past the gate, one refused some other way (a 403 may be insufficient
+ * scope on a token the server did validate), or one never answered.
+ */
+function credentialRefusedStatus(ctx: ModernSuiteContext): number | null {
+  if (!ctx.hasAuth) return null;
+  return ctx.state.discoverRejection?.statusCode === 401 ? 401 : null;
+}
+
+/**
+ * The skip for a check whose only evidence is a refusal of a credential when
+ * the configured credential was refused too (credentialRefusedStatus).
+ * `what` names what the refusal would otherwise have shown.
+ */
+function credentialRefusedSkip(status: number, what: string): TestOutcome {
+  return {
+    passed: true,
+    details: clip(
+      `Skipped: the configured credential was refused too (the credentialed server/discover drew HTTP ${status}), so ${what} (check the configured credential)`,
+      220,
+    ),
+  };
 }
 
 /**
@@ -286,10 +356,13 @@ function credentialedDiscoverServed(ctx: ModernSuiteContext): boolean {
  *   ("Authorization required or token invalid"). It counts only when the
  *   credential is the one variable, the rule unansweredProbe applies to a
  *   drop: --auth was given and the conformant setup server/discover, which
- *   carried it, was served (credentialedDiscoverServed). That passes, still
- *   naming the 401 the spec expects. Otherwise the check is not evaluable
- *   and fails, naming the other readings and what the comparison saw -- or,
- *   without --auth, that --auth is what makes the comparison possible.
+ *   carried it, got past the gate -- served, or answered by the application
+ *   at 2xx even with a JSON-RPC error (credentialedDiscoverServed). That
+ *   passes, still naming the 401 the spec expects. Otherwise the check is
+ *   not evaluable and fails, naming the other readings and how the
+ *   credentialed request was answered (its status and JSON-RPC code, the way
+ *   lifecycle.ts's notEvaluable names them) -- or, without --auth, that
+ *   --auth is what makes the comparison possible.
  *
  * The advice depends on what refused. A message naming Host/Origin
  * validation (namesHostOrOriginValidation: the SDK's "Invalid Host: ...")
@@ -328,7 +401,12 @@ function unauthenticatedRefusalVerdict(ctx: ModernSuiteContext, refusal: AuthRef
     tail =
       " may be Host/Origin validation or a gateway; the credentialed request got 403 too: fix the gateway or allowed hosts";
   } else {
-    tail = ` may be Host/Origin validation or a gateway; the credentialed request was not served either${rejection ? ` (HTTP ${rejection.statusCode})` : ""}`;
+    // Never a 2xx here: a credentialed discover answered at 2xx got past the
+    // gate, and credentialedDiscoverServed passed the check above.
+    const seen = rejection
+      ? ` (HTTP ${rejection.statusCode}${rejection.code === null ? "" : `, ${errorWithCode(rejection.rawCode)}`})`
+      : "";
+    tail = ` may be Host/Origin validation or a gateway; the credentialed request was not served either${seen}`;
   }
   // ` ("` and `")` around the message; a message clipped below 16 characters says too little to keep.
   const room = 220 - head.length - tail.length - 5;
@@ -954,9 +1032,8 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
    * branch). Its siblings send a request with no valid credential and
    * credit the 401/403 that answers it -- a Host guard, an Origin check or
    * a gateway answers every request with that same 403, so crediting it
-   * would turn one unattributable refusal into three passes. They skip
-   * instead, pointing at the check that explains it (the 2025-11-25
-   * siblings take the same skip, from a flag security-auth-required sets).
+   * would turn one unattributable refusal into four passes. They skip
+   * instead (the 2025-11-25 siblings take the same skip).
    *
    * Read from the memoized probe rather than from a flag another check
    * sets, so `--only security-www-authenticate` reads it too. False when
@@ -971,9 +1048,16 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
     );
     return attribution;
   };
+  /**
+   * The skip itself says what was seen and why it proves nothing -- only a
+   * 403 reads as "forbidden" -- so it stands on its own in a report that was
+   * filtered (`--only`, `--skip`) to leave security-auth-required out; the
+   * pointer is where the full reading (the quoted message, the advice) is.
+   */
   const AUTH_NOT_EVALUABLE: TestOutcome = {
     passed: true,
-    details: "Skipped: not evaluable (see security-auth-required)",
+    details:
+      "Skipped: HTTP 403 without a Bearer challenge, not attributable to authentication (see security-auth-required)",
   };
 
   await check("security-auth-required", async () => {
@@ -1052,9 +1136,11 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
         ctx,
         "security-www-authenticate: the server closed the connection on the unauthenticated server/discover instead of answering HTTP 401; MCP clients start authorization from the 401 and its WWW-Authenticate challenge, so a dropped connection leaves them nothing to act on. Answer 401 with WWW-Authenticate: Bearer resource_metadata=...",
       );
+      // No response, so no challenge: nothing was checked.
       return {
         passed: true,
         details: `${closedWithoutResponse(err)} -- not a 401 response, no challenge to check (see warning)`,
+        skipped: true,
       };
     }
   });
@@ -1069,7 +1155,17 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
     // attribute to authentication: the malformed credential draws the same
     // 403 from the same guard, which proves nothing about token validation.
     if (await authNotEvaluable()) return AUTH_NOT_EVALUABLE;
-    return checkMalformedAuth(ctx);
+    const outcome = await checkMalformedAuth(ctx);
+    // Nor when the server refused the configured credential too: then the
+    // 401 the invalid ones drew is what every credential draws, the
+    // "rejects everything" the comparison exists to rule out. Only a pass
+    // turns into the skip -- an invalid credential the server ACCEPTED, or a
+    // 5xx on one, is a finding whatever the valid one drew.
+    const refused = credentialRefusedStatus(ctx);
+    if (outcome.passed && refused !== null) {
+      return credentialRefusedSkip(refused, "rejecting invalid tokens cannot be told from rejecting everything");
+    }
+    return outcome;
   });
 
   await check("security-tls-required", async () => {
@@ -1119,7 +1215,13 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
     //   well-known locations are still worth checking; without one there
     //   is no evidence the server is auth-protected at all, so the check
     //   skips instead of reporting a missing PRM document on a server
-    //   that may not be an OAuth resource server (see authNotEvaluable);
+    //   that may not be an OAuth resource server (see authNotEvaluable).
+    //   With --auth, a 403 security-auth-required could not attribute is
+    //   handed to the lookup as the guard's status: a Host guard or gateway
+    //   refusing every request refuses the well-known locations too, and
+    //   when every one of them drew that same status the lookup measured
+    //   the guard, not a missing document, and skips the same way (a
+    //   document it does find, or any other answer, still decides);
     // - any other status is neither a served request nor a refusal: the
     //   2xx says the server needs no credential, and the rest say only
     //   that this run never reached an auth gate.
@@ -1130,13 +1232,17 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
     // unansweredProbe), which leaves an auth-protected server with no
     // challenge, so the well-known locations are what a client has.
     let challenge: string | undefined;
+    let guardStatus: number | undefined;
     try {
       const res = await unauthenticatedDiscover();
       const refusal = readAuthRefusal(res, false);
       if (refusal && refusal.kind !== "forbidden") {
         challenge = headerOf(res.headers, "www-authenticate");
       } else if (refusal) {
-        if (!ctx.hasAuth && (await authNotEvaluable())) return AUTH_NOT_EVALUABLE;
+        if (await authNotEvaluable()) {
+          if (!ctx.hasAuth) return AUTH_NOT_EVALUABLE;
+          guardStatus = refusal.statusCode;
+        }
       } else if (!ctx.hasAuth) {
         return is2xx(res.statusCode)
           ? {
@@ -1152,7 +1258,7 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
       const verdict = unansweredProbe(ctx, "unauthenticated server/discover", err, credentialedDiscoverServed(ctx));
       if (verdict) return verdict;
     }
-    return checkProtectedResourceMetadata(ctx, challenge);
+    return checkProtectedResourceMetadata(ctx, challenge, guardStatus);
   });
 
   await check("security-token-in-uri", async () => {
@@ -1163,6 +1269,20 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
       .replace(/^Bearer\s+/i, "")
       .trim();
     if (!token) return { passed: true, details: "Skipped: could not extract token from auth header" };
+    // The probe is sent whatever the refusals so far say: a server that
+    // accepts the token in the query string fails however it treats the
+    // header. Only a refusal is read against them. A 401/403 is no evidence
+    // when the credential-less server/discover drew a 403 nothing could
+    // attribute to authentication (a Host guard or gateway answers this
+    // probe with the same 403: see authNotEvaluable), and no refusal is when
+    // the server refused the configured credential in the header too
+    // (credentialRefusedStatus): the token was never going to be accepted
+    // anywhere, so where it travelled decided nothing.
+    const refused = credentialRefusedStatus(ctx);
+    const notAccepted = (details: string): TestOutcome =>
+      refused === null
+        ? { passed: true, details }
+        : credentialRefusedSkip(refused, "refusing it in the query string proves nothing");
     const joiner = ctx.backendUrl.includes("?") ? "&" : "?";
     const uriWithToken = `${ctx.backendUrl}${joiner}access_token=${encodeURIComponent(token)}`;
     const probe = discoverProbe(ctx, RAW_ID_TOKEN_IN_URI);
@@ -1178,24 +1298,21 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
       const text = await res.body.text();
       const status = res.statusCode;
       if (status === 401 || status === 403) {
-        return { passed: true, details: `HTTP ${status} (token in query string rejected)` };
+        if (await authNotEvaluable()) return AUTH_NOT_EVALUABLE;
+        return notAccepted(`HTTP ${status} (token in query string rejected)`);
       }
       if (is2xx(status)) {
         const body = rpcBodyOf(text, res.headers["content-type"]);
         const err = errorOf(body);
-        if (err) {
-          return {
-            passed: true,
-            details: `HTTP ${status}, ${errorWithCode(err.rawCode)} (token in query string not accepted)`,
-          };
-        }
+        if (err)
+          return notAccepted(`HTTP ${status}, ${errorWithCode(err.rawCode)} (token in query string not accepted)`);
         const shape = resultOf(body) ? "result" : "non-error body";
         return {
           passed: false,
           details: `HTTP ${status}, ${shape} -- server accepted the auth token in the query string (MUST NOT)`,
         };
       }
-      return { passed: true, details: `HTTP ${status} (token in query string not accepted)` };
+      return notAccepted(`HTTP ${status} (token in query string not accepted)`);
     } catch (err) {
       // The probe differs from the served credentialed discover only in
       // where the token travels, so a drop is pinned on that.
@@ -1217,29 +1334,92 @@ async function runAuthAndTransport(ctx: ModernSuiteContext, unauthenticatedDisco
 
   await check("security-origin-validation", async () => {
     if (ctx.kind !== "http") return notApplicable("no Origin header");
-    try {
-      // A fully valid discover: the Origin is the only defect.
-      const res = await ctx.client.rpc(DISCOVER, {}, { headers: { Origin: REBINDING_ORIGIN } });
-      const status = res.statusCode;
-      if (status === 403 || status === 401) {
-        return { passed: true, details: `HTTP ${status} (suspicious Origin rejected)` };
-      }
-      if (is2xx(status)) {
-        return {
-          passed: false,
-          details: `HTTP ${status}, ${summarize(res)} -- server accepted a request with an untrusted Origin (MUST validate Origin, 403)`,
-        };
-      }
-      if (status >= 400) return { passed: true, details: `HTTP ${status} (suspicious Origin rejected)` };
-      return { passed: false, details: `HTTP ${status}` };
-    } catch (err) {
-      // The probe is the conformant discover plus a foreign Origin, so a
-      // drop is pinned on the Origin when that discover was served.
-      const verdict = unansweredProbe(ctx, "server/discover with a foreign Origin", err, ctx.state.discover !== null);
-      if (verdict) return verdict;
-      return { passed: true, details: `${closedWithoutResponse(err)} (suspicious Origin rejected)` };
-    }
+    return checkOriginValidation(ctx);
   });
+}
+
+/**
+ * security-origin-validation: a fully valid server/discover -- the setup
+ * request, same headers, same credential -- with a foreign Origin, which
+ * streamable-http says MUST draw 403 Forbidden. What the answer shows:
+ *
+ * - a 2xx: the server accepted the request; fails;
+ * - a 401/403: the refusal the spec asks for, when the Origin is the one
+ *   variable -- the conformant setup discover got past whatever stands in
+ *   front of the server (conformantDiscoverServed), or was answered with a
+ *   different status (a server that checks the Origin before auth answers
+ *   the credential-less setup request 401 and the foreign Origin 403). When
+ *   the setup request drew the same status or no answer, that 401/403 is
+ *   what an auth gate, a Host guard or a gateway answers every request
+ *   with, and it says nothing about the Origin: the check skips, as the
+ *   auth siblings skip the refusal security-auth-required could not
+ *   attribute;
+ * - a 429: a rate limiter answered before the server read the request. The
+ *   probe is resent once after the wait it asks for (retryAfterMs), and a
+ *   second 429 is not evaluable -- the Origin was never looked at;
+ * - a 5xx: the server failed on the request rather than refusing it (the
+ *   reading security-auth-required and security-oversized-input give the
+ *   same status); fails;
+ * - any other 4xx (400, 404, ...): refused, and passes as before -- the
+ *   spec's status is 403, but a request rejected for its Origin is rejected;
+ * - anything else (a redirect): fails, naming the status.
+ *
+ * A dropped connection counts as a refusal only when the conformant
+ * discover got past the gate (unansweredProbe); a timeout or a refused
+ * connection measured nothing.
+ */
+async function checkOriginValidation(ctx: ModernSuiteContext): Promise<TestOutcome> {
+  // A fully valid discover: the Origin is the only defect.
+  const send = () => ctx.client.rpc(DISCOVER, {}, { headers: { Origin: REBINDING_ORIGIN } });
+  try {
+    let res = await send();
+    /** "HTTP 429, then after Nms " once a throttled probe was resent. */
+    let throttled = "";
+    if (res.statusCode === 429) {
+      const wait = retryAfterMs(res.headers);
+      await pause(wait, ctx.signal);
+      throttled = `HTTP 429, then after ${wait}ms `;
+      res = await send();
+    }
+    const status = res.statusCode;
+    if (is2xx(status)) {
+      return {
+        passed: false,
+        details: `${throttled}HTTP ${status}, ${summarize(res)} -- server accepted a request with an untrusted Origin (MUST validate Origin, 403)`,
+      };
+    }
+    if (status === 429) {
+      return {
+        passed: false,
+        details: `${throttled}HTTP 429 -- not evaluable: a rate limiter answered before the server read the request, so the Origin was never checked`,
+      };
+    }
+    if (status >= 500) {
+      return {
+        passed: false,
+        details: clip(
+          `${throttled}HTTP ${status}, ${summarize(res)} -- the server failed on the request rather than refusing it (a broken server, or a gateway with no backend); an untrusted Origin MUST draw 403`,
+          220,
+        ),
+      };
+    }
+    const setupStatus = ctx.state.discoverRejection?.statusCode;
+    const originDecided = conformantDiscoverServed(ctx) || (setupStatus !== undefined && setupStatus !== status);
+    if ((status === 401 || status === 403) && !originDecided) {
+      return {
+        passed: true,
+        details: `Skipped: HTTP ${status} to the foreign Origin, but the conformant server/discover was not served either, so the refusal is not attributable to the Origin (see security-auth-required)`,
+      };
+    }
+    if (is4xx(status)) return { passed: true, details: `${throttled}HTTP ${status} (suspicious Origin rejected)` };
+    return { passed: false, details: `${throttled}HTTP ${status}` };
+  } catch (err) {
+    // The probe is the conformant discover plus a foreign Origin, so a
+    // drop is pinned on the Origin when that discover got past the gate.
+    const verdict = unansweredProbe(ctx, "server/discover with a foreign Origin", err, conformantDiscoverServed(ctx));
+    if (verdict) return verdict;
+    return { passed: true, details: `${closedWithoutResponse(err)} (suspicious Origin rejected)` };
+  }
 }
 
 /**
@@ -1430,8 +1610,20 @@ async function fetchProtectedResourceMetadata(url: string, timeout: number): Pro
  * `resource` must be the MCP endpoint (canonical form); a mismatch passes
  * with a warning. A legacy authorization-server document passes with a
  * warning.
+ *
+ * `guardStatus` is the status of a refusal of the endpoint nothing could
+ * attribute to authentication (a bare 403, security-oauth-metadata's
+ * caller). When every well-known location and the legacy document drew that
+ * same status, the lookup only met the guard again -- a Host guard answers
+ * every path of the host alike -- so "no metadata" is not what it found:
+ * the check skips instead of advising a document the guard would never let
+ * through.
  */
-async function checkProtectedResourceMetadata(ctx: ModernSuiteContext, challenge?: string): Promise<TestOutcome> {
+async function checkProtectedResourceMetadata(
+  ctx: ModernSuiteContext,
+  challenge?: string,
+  guardStatus?: number,
+): Promise<TestOutcome> {
   const parsed = new URL(ctx.backendUrl);
   const origin = `${parsed.protocol}//${parsed.host}`;
   const root = `${origin}/.well-known/oauth-protected-resource`;
@@ -1491,10 +1683,13 @@ async function checkProtectedResourceMetadata(ctx: ModernSuiteContext, challenge
   const statuses: string[] = [];
   let malformed: string | null = null;
   let reachable = false;
+  /** Whether every lookup so far drew guardStatus (see the doc comment). */
+  let onlyTheGuard = guardStatus !== undefined;
   for (const url of wellKnown) {
     const label = whereOf(url);
     const doc = await fetchProtectedResourceMetadata(url, ctx.timeout);
     if (doc.ok) return found(label, doc);
+    if (doc.status !== guardStatus) onlyTheGuard = false;
     if (doc.status === null) {
       statuses.push(`${label} -> unreachable`);
       continue;
@@ -1509,6 +1704,7 @@ async function checkProtectedResourceMetadata(ctx: ModernSuiteContext, challenge
   // Legacy fallback: an authorization-server document at the root.
   try {
     const legacy = await getJson(`${origin}/.well-known/oauth-authorization-server`, ctx.timeout);
+    if (legacy.status !== guardStatus) onlyTheGuard = false;
     const doc = legacy.json;
     if (legacy.status === 200 && doc && typeof doc === "object" && doc.issuer && doc.token_endpoint) {
       ctx.harness.warnings.push(
@@ -1519,7 +1715,15 @@ async function checkProtectedResourceMetadata(ctx: ModernSuiteContext, challenge
         details: `Legacy OAuth AS metadata found: issuer=${clip(String(doc.issuer), 60)} (should migrate to PRM)`,
       };
     }
-  } catch {}
+  } catch {
+    onlyTheGuard = false;
+  }
+  if (onlyTheGuard) {
+    return {
+      passed: true,
+      details: `Skipped: HTTP ${guardStatus} without a Bearer challenge on the endpoint and on every well-known metadata location, not attributable to authentication (see security-auth-required)`,
+    };
+  }
   return {
     passed: false,
     details: clip(`No Protected Resource Metadata (${statuses.join("; ")}) and no legacy OAuth metadata`, 220),
@@ -1657,9 +1861,9 @@ async function runInputValidation(ctx: ModernSuiteContext) {
       const { tools, skip } = await toolsOrSkip(ctx);
       if (skip) return skip;
       const target = pickInjectionTarget(tools, prefer);
-      if (!target) return { passed: true, details: "No tools with string parameters to test" };
+      if (!target) return { passed: true, details: "No tools with string parameters to test", skipped: true };
       noteInjectionScope(ctx, target);
-      return runInjectionTest(ctx, target, payloads, detector, label);
+      return runInjectionTest(ctx, id, target, payloads, detector, label);
     });
 
   await injection(
@@ -1747,17 +1951,21 @@ function noteInjectionScope(ctx: ModernSuiteContext, target: InjectionTarget): v
  * that goes away on a payload fails naming that payload: the stdio child
  * exits, or an accepted HTTP connection is closed or reset and a follow-up
  * server/discover is neither served nor refused by a gate still in front of
- * the server (discoverAfterDrop). A drop the server outlives (a WAF or IPS,
- * a keep-alive close, one crashed worker of several) never reached the
- * tool, with a warning. One
- * that was already gone when a payload was sent (a dead child, a refused
- * connection) stops the probe with an unreachable() verdict.
+ * the server (discoverAfterDrop). A stdio child that died on a payload is
+ * restarted for the checks after this one (restartStdioServer, which names
+ * `check`). A drop the server outlives (a WAF or IPS, a keep-alive close,
+ * one crashed worker of several) never reached the tool, with a warning.
+ * One that was already gone when a payload was sent (a dead child, a
+ * refused connection) stops the probe with an unreachable() verdict, and is
+ * not restarted. When no payload reached the tool at all, nothing was
+ * measured: the pass is flagged as a skip, with a warning.
  * `toolInputSchema` keeps `x-mcp-header` arguments callable: their values
  * are mirrored into `Mcp-Param-*` headers so the server does not reject
  * the request as a header mismatch before the tool ever runs.
  */
 async function runInjectionTest(
   ctx: ModernSuiteContext,
+  check: string,
   target: InjectionTarget,
   payloads: string[],
   detector: RegExp,
@@ -1801,9 +2009,11 @@ async function runInjectionTest(
       // The stdio child exited on this payload: the crash the test exists
       // to catch -- the same behaviour security-extra-params fails as
       // "died" -- not a payload that merely never reached the tool. The
-      // exit event makes that conclusive.
+      // exit event makes that conclusive. A new instance takes its place
+      // for the checks after this one.
       if (failure === "dropped" && !alreadyGone && ctx.kind === "stdio") {
         const died = `server died on payload "${clip(payload, 30)}" sent to ${where}: ${reason}`;
+        await restartStdioServer(ctx, check, `an injection payload sent to ${where}`);
         return { passed: false, details: issuesThenCrash(issues, died) };
       }
       // An HTTP connection closed or reset instead of answered says nothing
@@ -1843,9 +2053,9 @@ async function runInjectionTest(
   }
   if (issues.length > 0) return { passed: false, details: clip(issues.join("; "), 200) };
   const counts = `${rejected} rejected, ${benign} returned without evidence of execution, ${unreached} never reached the tool (JSON-RPC or transport error)`;
-  let verdict = "";
-  if (rejected === payloads.length) verdict = " -- server defended";
-  else if (unreached === payloads.length) {
+  const details = `Tested ${payloads.length} payload(s) against ${where}: ${counts}`;
+  if (rejected === payloads.length) return { passed: true, details: `${details} -- server defended` };
+  if (unreached === payloads.length) {
     // Nothing was measured: every call died before the handler. The
     // placeholders may not satisfy the schema, or the target argument is
     // validated away (an enum, a pattern); say so rather than pass quietly.
@@ -1853,9 +2063,9 @@ async function runInjectionTest(
       ctx,
       `security injection tests: no payload sent to ${where} reached the tool (every tools/call drew a JSON-RPC or transport error), so the verdict is inconclusive; check that the placeholder arguments satisfy the tool's schema, or expose a read-only tool with a free-form string argument.`,
     );
-    verdict = " -- inconclusive (see warning)";
+    return { passed: true, details: `${details} -- inconclusive (see warning)`, skipped: true };
   }
-  return { passed: true, details: `Tested ${payloads.length} payload(s) against ${where}: ${counts}${verdict}` };
+  return { passed: true, details };
 }
 
 /**
@@ -1997,11 +2207,110 @@ async function discoverAfterDrop(ctx: ModernSuiteContext): Promise<{ alive: stri
 }
 
 /**
+ * Replace a stdio child that exited on a check's own tools/call -- an
+ * injection payload, security-oversized-input's 1 MB value,
+ * security-extra-params' unknown arguments, the tools/call
+ * security-tool-rug-pull sends a replacement -- with a fresh instance: the
+ * policy the 2025-11-25 suite applies to the same checks (restartStdioServer
+ * in runner.ts). The check already fails as "server died"; left dead, the
+ * child would fail every later check under a diagnosis of its own ("server
+ * unreachable", "Second tools/list call threw"), so one crash would be
+ * counted over and over under the wrong names.
+ *
+ * The new instance is set up the way the suite set up the first one: a
+ * server/discover within the startup budget (the first exchange with a
+ * cold process), then, once that is served, one modern request that is not
+ * a discover -- the list the server declared, else ping -- which pins a
+ * dual-era process (the SDK 2.0 default) to this era before the claim-less
+ * probes of the information-disclosure checks reach it, as the feature
+ * modules pinned the first process. The cached lists and capabilities stay
+ * as they are (they describe the same server); ctx.state.replacement
+ * records that the process changed, with the new instance's tools/list
+ * from that pin, read before any tools/call reached it, for
+ * security-tool-rug-pull (rugPullOnReplacement).
+ *
+ * `check` is the check that killed the child, which the warning names along
+ * with `cause`; the warning also says whether the new instance served
+ * server/discover. Callers restart only a child that died on the check's
+ * own request (one already gone before it was not killed by it: "server
+ * unreachable"), and they restart it every time that happens. Under
+ * --retries a check whose retry kills the new instance too restarts it
+ * again, so the checks after it measure a live server whatever --retries
+ * is; the harness runs a check at most retries+1 times, which bounds the
+ * restarts, and identical warnings from those attempts collapse into one
+ * when the report is assembled. A context with no way to spawn the server
+ * (ctx.replaceStdioProcess undefined) keeps the dead child. A run the
+ * caller aborts is rethrown.
+ */
+async function restartStdioServer(ctx: ModernSuiteContext, check: string, cause: string): Promise<void> {
+  const replace = ctx.replaceStdioProcess;
+  if (ctx.kind !== "stdio" || !replace) return;
+  const exited = `${check}: the server exited on ${cause}`;
+  try {
+    await replace();
+  } catch (err) {
+    if (ctx.signal?.aborted) throw err;
+    ctx.harness.warnings.push(
+      `${exited}, and starting a new instance failed (${clip(firstLine(errorMessage(err)), 90)}); the tests after it ran against the exited process.`,
+    );
+    return;
+  }
+  // From here on the suite talks to a process none of the cached lists
+  // came from, whatever the new instance answers below.
+  const replacement: { after: string; tools: unknown[] | null } = { after: check, tools: null };
+  ctx.state.replacement = replacement;
+  const consequence = "the tests after it ran against the new instance and may fail for that reason";
+  let res: RpcResponse;
+  try {
+    res = await ctx.client.rpc(DISCOVER, {}, { timeout: ctx.startupTimeout });
+  } catch (err) {
+    if (ctx.signal?.aborted) throw err;
+    ctx.harness.warnings.push(
+      `${exited} and was restarted, but the new instance's server/discover got ${noResponse(err, ctx.startupTimeout)}; ${consequence}.`,
+    );
+    return;
+  }
+  if (!resultOf(res.body)) {
+    const err = errorOf(res.body);
+    ctx.harness.warnings.push(
+      `${exited} and was restarted, but the new instance answered server/discover with no result${err ? ` (${errorWithCode(err.rawCode)})` : ""}; ${consequence}.`,
+    );
+    return;
+  }
+  const pin = hasTools(ctx)
+    ? TOOLS_LIST
+    : hasResources(ctx)
+      ? "resources/list"
+      : hasPrompts(ctx)
+        ? "prompts/list"
+        : "ping";
+  try {
+    const pinned = await ctx.client.rpc(pin, {});
+    if (pin === TOOLS_LIST) {
+      const listed = resultOf(pinned.body)?.tools;
+      if (Array.isArray(listed)) replacement.tools = listed;
+    }
+  } catch (err) {
+    if (ctx.signal?.aborted) throw err;
+    ctx.harness.warnings.push(
+      `${exited} and was restarted with a fresh server/discover, but the ${pin} that pins its era got ${noResponse(err, ctx.timeout)}; ${consequence}.`,
+    );
+    return;
+  }
+  ctx.harness.warnings.push(
+    `${exited} and was restarted with a fresh server/discover, so the tests after it ran against the new instance.`,
+  );
+}
+
+/**
  * A ~1 MB string in the first string argument that is NOT header-mirrored
  * (an `x-mcp-header` value would travel in an Mcp-Param-* header too, and
  * the header limit would be measured instead of the body). A mirrored
  * argument is used only when no other string argument exists, and the
- * details say so; any tool's `data` when no tool takes a string at all.
+ * details say so; any tool's `data` when no tool takes a string at all. A
+ * stdio child that dies on the value fails as died and is restarted for the
+ * checks after this one (restartStdioServer); one already gone before the
+ * call is unreachable and is not restarted.
  */
 async function checkOversizedInput(ctx: ModernSuiteContext, tools: any[]): Promise<TestOutcome> {
   const strings = stringParams(tools);
@@ -2103,10 +2412,13 @@ async function checkOversizedInput(ctx: ModernSuiteContext, tools: any[]): Promi
     if (ctx.kind === "stdio") {
       // The exit decides before the overflow does: a child that wrote an
       // over-long line and then exited was rejected by its exit, however
-      // much it wrote first.
+      // much it wrote first. A child this call killed is restarted for
+      // the checks after this one; one already gone is not.
       if (failure === "dropped" || exited()) {
         if (alreadyGone) return withNote(unreachable(ctx, what, err));
-        return withNote({ passed: false, details: `server died on a 1 MB ${where}: ${clip(message, 120)}` });
+        const died = withNote({ passed: false, details: `server died on a 1 MB ${where}: ${clip(message, 120)}` });
+        await restartStdioServer(ctx, "security-oversized-input", `a 1 MB ${where}`);
+        return died;
       }
       if (overflows() > overflowsBefore) {
         // The server answered, but with a single line longer than the
@@ -2173,8 +2485,11 @@ async function checkOversizedInput(ctx: ModernSuiteContext, tools: any[]): Promi
  * it passes with a warning that the verdict is inconclusive, and so does an
  * HTTP connection dropped on the call that the server outlives
  * (discoverAfterDrop) -- the same reading the injection checks give a drop.
- * A server already gone before the call (a refused connection, a child an
- * earlier test killed) is unreachable, not a crash on these arguments.
+ * Both inconclusive passes measured nothing and are flagged as skips. A
+ * stdio child that dies on the call fails as died and is restarted for the
+ * checks after this one (restartStdioServer). A server already gone before
+ * the call (a refused connection, a child an earlier test killed) is
+ * unreachable, not a crash on these arguments, and is not restarted.
  */
 async function checkExtraParams(ctx: ModernSuiteContext, tool: any): Promise<TestOutcome> {
   // Build the arguments via JSON.parse so "__proto__" lands as a real own
@@ -2214,13 +2529,16 @@ async function checkExtraParams(ctx: ModernSuiteContext, tool: any): Promise<Tes
     const failure = classifyTransportError(err);
     // The stdio transport rejects every pending request with its exit
     // diagnostic ("crashed with exit code N", "exited cleanly",
-    // "terminated by signal") the moment the child goes away.
+    // "terminated by signal") the moment the child goes away. A child this
+    // call killed is restarted for the checks after this one.
     if (ctx.kind === "stdio" && (failure === "dropped" || exited())) {
       if (alreadyGone) return unreachable(ctx, what, err);
-      return {
+      const died: TestOutcome = {
         passed: false,
         details: `server died on unknown tool arguments (tools/call ${name}): ${clip(message, 120)}`,
       };
+      await restartStdioServer(ctx, "security-extra-params", `unknown tool arguments (tools/call ${name})`);
+      return died;
     }
     if (ctx.kind === "http") {
       // Refused before anything was sent: an earlier test took the server down.
@@ -2242,6 +2560,7 @@ async function checkExtraParams(ctx: ModernSuiteContext, tool: any): Promise<Tes
         return {
           passed: true,
           details: `tools/call ${name} had its connection closed without a response -- extra-params verdict inconclusive (see warning)`,
+          skipped: true,
         };
       }
     }
@@ -2252,6 +2571,7 @@ async function checkExtraParams(ctx: ModernSuiteContext, tool: any): Promise<Tes
       return {
         passed: true,
         details: `tools/call ${name} did not answer within ${ctx.timeout}ms -- extra-params verdict inconclusive (see warning)`,
+        skipped: true,
       };
     }
     // Neither an answer nor a transport failure the server can be judged
@@ -2263,6 +2583,79 @@ async function checkExtraParams(ctx: ModernSuiteContext, tool: any): Promise<Tes
   }
 }
 
+/**
+ * security-tool-rug-pull once an earlier check killed the stdio server and
+ * restartStdioServer replaced it. The list the suite cached came from the
+ * first process, so a second list read from the replacement would compare
+ * two processes: a server whose tools change after use would pass (its
+ * replacement has not been used yet), and one whose descriptions differ
+ * per process (a pid, a start time) would be accused of a rug-pull. Both
+ * lists come from the replacement instead: the one restartStdioServer read
+ * before any tools/call reached it, then -- after a tools/call, the one the
+ * feature checks send (pickTool, no arguments), so the process has been
+ * used whatever the checks since the restart sent it -- a second one.
+ *
+ * With nothing to compare the check is a skip naming the restart: the
+ * replacement's list before use was not obtained (the restart's warning
+ * says why), or the tools/call killed the replacement too -- which is then
+ * replaced again for the checks after this one, like any check whose own
+ * request killed the server. A caller's abort is rethrown.
+ */
+async function rugPullOnReplacement(
+  ctx: ModernSuiteContext,
+  replacement: { after: string; tools: unknown[] | null },
+): Promise<TestOutcome> {
+  const on = `the server restarted after ${replacement.after}`;
+  const before = replacement.tools;
+  if (!before) {
+    return {
+      passed: true,
+      details: `Skipped: the tools/list of ${on} was not read before use, so there are no two lists from one process to compare (see warning)`,
+      skipped: true,
+    };
+  }
+  const tool = pickTool(before);
+  if (tool) {
+    const exited = () => (ctx.transport as Partial<StdioTransport>).exited === true;
+    const alreadyGone = exited();
+    try {
+      await ctx.client.rpc(TOOLS_CALL, { name: tool.name, arguments: {} }, { toolInputSchema: tool.inputSchema });
+    } catch (err) {
+      if (ctx.signal?.aborted) throw err;
+      if (!alreadyGone && (classifyTransportError(err) === "dropped" || exited())) {
+        await restartStdioServer(ctx, "security-tool-rug-pull", `a tools/call to ${tool.name} with no arguments`);
+        return {
+          passed: true,
+          details: clip(
+            `Skipped: ${on} exited on a tools/call to ${tool.name} with no arguments, before its tools could be listed again (see warning)`,
+            200,
+          ),
+          skipped: true,
+        };
+      }
+      // A timeout or an unreadable reply: the call still reached the
+      // process, and the second list decides.
+    }
+  }
+  const between = tool ? "before and after a tools/call" : "no tool to call between them";
+  try {
+    const res = await ctx.client.rpc(TOOLS_LIST, {});
+    const again = resultOf(res.body)?.tools;
+    if (!Array.isArray(again)) {
+      return { passed: false, details: clip(`Second tools/list call failed (${summarize(res)}) on ${on}`, 200) };
+    }
+    const diff = compareToolLists(before, again);
+    if (diff) return { passed: false, details: clip(`${diff}; both lists from ${on} (${between})`, 200) };
+    return {
+      passed: true,
+      details: clip(`${before.length} tool(s) consistent across 2 calls to ${on} (${between})`, 200),
+    };
+  } catch (err) {
+    if (ctx.signal?.aborted) throw err;
+    return { passed: false, details: `Second tools/list call threw: ${clip(errorMessage(err), 120)}` };
+  }
+}
+
 // ── Tool integrity (4) ───────────────────────────────────────────────
 
 async function runToolIntegrity(ctx: ModernSuiteContext) {
@@ -2271,7 +2664,7 @@ async function runToolIntegrity(ctx: ModernSuiteContext) {
   await check("security-tool-schema-defined", async () => {
     const tools = await ensureTools(ctx);
     if (tools === null) return toolsUnavailable(ctx);
-    if (tools.length === 0) return { passed: true, details: "No tools to validate" };
+    if (tools.length === 0) return { passed: true, details: "No tools to validate", skipped: true };
     const missing = tools.filter((t: any) => t?.inputSchema?.type !== "object");
     if (missing.length > 0) {
       const names = missing.map((t: any) => t?.name).join(", ");
@@ -2283,6 +2676,8 @@ async function runToolIntegrity(ctx: ModernSuiteContext) {
   await check("security-tool-rug-pull", async () => {
     const tools = await ensureTools(ctx);
     if (tools === null) return toolsUnavailable(ctx);
+    // The cached list came from a process an earlier check killed.
+    if (ctx.state.replacement) return rugPullOnReplacement(ctx, ctx.state.replacement);
     try {
       const res = await ctx.client.rpc(TOOLS_LIST, {});
       const again = resultOf(res.body)?.tools;
@@ -2300,7 +2695,7 @@ async function runToolIntegrity(ctx: ModernSuiteContext) {
   await check("security-tool-description-poisoning", async () => {
     const tools = await ensureTools(ctx);
     if (tools === null) return toolsUnavailable(ctx);
-    if (tools.length === 0) return { passed: true, details: "No tools to validate" };
+    if (tools.length === 0) return { passed: true, details: "No tools to validate", skipped: true };
     const issues: string[] = [];
     for (const tool of tools) {
       const prose = [
@@ -2456,6 +2851,9 @@ async function runInformationDisclosure(ctx: ModernSuiteContext, errorProbes: ()
     return { samples: all, silent: null };
   };
 
+  // With no error response at all (every probe answered with a result, or
+  // went unanswered, and the run recorded none) there was nothing to scan:
+  // the pass is flagged as a skip.
   await check("security-error-no-stacktrace", async () => {
     const { samples, silent } = await gather();
     if (silent) return silent;
@@ -2464,6 +2862,7 @@ async function runInformationDisclosure(ctx: ModernSuiteContext, errorProbes: ()
     return {
       passed: true,
       details: `${samples.length} unique error response(s) checked -- no stack traces or sensitive data found`,
+      ...(samples.length === 0 ? { skipped: true } : {}),
     };
   });
 
@@ -2477,6 +2876,7 @@ async function runInformationDisclosure(ctx: ModernSuiteContext, errorProbes: ()
     return {
       passed: true,
       details: `${samples.length} unique error response(s) checked -- no internal IP addresses or hostnames found`,
+      ...(samples.length === 0 ? { skipped: true } : {}),
     };
   });
 }
@@ -2494,7 +2894,9 @@ async function runInformationDisclosure(ctx: ModernSuiteContext, errorProbes: ()
  * above 50 never trips), and failing only the servers that annotate a
  * read-only tool would punish the annotation. A burst that never
  * reached a handler (every answer 401/403, or no answer at all) is
- * inconclusive, not quiet.
+ * inconclusive, not quiet -- and a 403 in it that is no auth refusal
+ * (readAuthRefusal) points at security-auth-required's reading of it, not
+ * at the credential.
  */
 async function runRateLimiting(ctx: ModernSuiteContext) {
   await ctx.harness.check("security-rate-limiting", async () => {
@@ -2507,16 +2909,17 @@ async function runRateLimiting(ctx: ModernSuiteContext) {
         ? ctx.client.rpc(TOOLS_CALL, { name: tool.name, arguments: {} }, { toolInputSchema: tool.inputSchema })
         : ctx.client.rpc(DISCOVER, {});
     let got429 = false;
-    const statuses = await Promise.all(
+    const responses = await Promise.all(
       Array.from({ length: RATE_LIMIT_BURST }, () =>
         fire()
           .then((res) => {
             if (res.statusCode === 429) got429 = true;
-            return res.statusCode;
+            return res;
           })
-          .catch(() => 0),
+          .catch(() => null),
       ),
     );
+    const statuses = responses.map((res) => res?.statusCode ?? 0);
     if (got429) {
       return {
         passed: true,
@@ -2535,6 +2938,21 @@ async function runRateLimiting(ctx: ModernSuiteContext) {
     }
     const observed = [...new Set(statuses)].join(",");
     if (statuses.every((c) => c === 401 || c === 403)) {
+      // Read the way security-auth-required reads a refusal: a 403 that
+      // neither asks for a credential nor refuses the one sent (no Bearer
+      // challenge without --auth, no Bearer error with it) is what a Host
+      // guard, an Origin check or a gateway answers every request with, so
+      // the credential is not what to check.
+      const unattributed = responses.some((res) => res && readAuthRefusal(res, ctx.hasAuth)?.kind === "forbidden");
+      if (unattributed) {
+        return {
+          passed: true,
+          details: clip(
+            `Skipped: all ${RATE_LIMIT_BURST} rapid ${method} requests drew HTTP ${observed} before reaching a handler, not as an auth refusal (Host/Origin validation or a gateway), so rate limiting was not measured (see security-auth-required)`,
+            220,
+          ),
+        };
+      }
       const hint = ctx.hasAuth ? " (check the configured credential)" : "; pass --auth";
       return {
         passed: true,

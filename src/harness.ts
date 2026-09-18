@@ -24,6 +24,12 @@ export interface HarnessOptions {
   retries?: number;
   concurrency?: number;
   signal?: AbortSignal;
+  /**
+   * Legacy minimal callback. It carries no skip flag: a skip arrives as
+   * `passed: true`, indistinguishable from a pass. Anything that prints
+   * or counts results should use `onTestComplete` and read
+   * `result.skipped` (the CLI's --verbose does).
+   */
   onProgress?: (testId: string, passed: boolean, details: string) => void;
   onTestComplete?: (result: TestResult) => void;
 }
@@ -31,6 +37,61 @@ export interface HarnessOptions {
 export interface TestOutcome {
   passed: boolean;
   details: string;
+  /**
+   * The check measured nothing rather than observing compliance (see
+   * `TestResult.skipped`). Omit it and the harness reads the skip markers
+   * the suites already write into details (see `readsAsSkip`); set it
+   * `true` for a skip worded some other way, or `false` for a result that
+   * reads like a skip but is a real verdict.
+   *
+   * A skip must be `passed: true`. On `passed: false` the flag is ignored
+   * -- a failure is a failure however its details are worded, and the
+   * `"Skipped: tools/list failed"` failures in the 2025-11-25 suite must
+   * keep showing up as failures.
+   */
+  skipped?: boolean;
+}
+
+/**
+ * The three ways the suites word a check that measured nothing, as of
+ * this writing:
+ *
+ * - leading `Skipped` (`"Skipped: no --auth provided"`, the modern
+ *   suite's lower-case `"skipped: server lists no tools"`);
+ * - a `(skipped)` marker (`"No tools available to test (skipped)"`,
+ *   `"HTTP 200 -- not a 401 response (skipped)"`);
+ * - `not applicable` (`"not applicable on stdio (...)"`, `"Fewer than 2
+ *   tools -- cross-reference check not applicable"`, `"HTTP 403
+ *   (WWW-Authenticate not applicable for 403)"`).
+ *
+ * Every passing details string in both suites that carries one of these
+ * is a check whose subject was absent; none is a real verdict. A vacuous
+ * pass worded otherwise ("No tools to validate") is NOT inferred -- a
+ * suite that means it as a skip sets `skipped: true`.
+ *
+ * Details can echo server text (a tool name, an error message), so a
+ * server could word a pass into a skip. That only ever moves a check
+ * from "passed" to "passed, measured nothing" -- it cannot turn a
+ * failure into anything else, and a skip never scores higher than the
+ * pass it replaces.
+ */
+const SKIP_MARKERS: readonly RegExp[] = [/^\s*skipped\b/i, /\(skipped\)/i, /\bnot applicable\b/i];
+
+/** Whether passing details carry one of the suites' skip markers. */
+export function readsAsSkip(details: string): boolean {
+  return SKIP_MARKERS.some((re) => re.test(details));
+}
+
+/**
+ * Whether an outcome is a skip: explicit flag first, the details
+ * markers otherwise, and never on a failure.
+ *
+ * @internal Exported for testing.
+ */
+export function isSkipOutcome(outcome: TestOutcome): boolean {
+  if (!outcome.passed) return false;
+  if (outcome.skipped !== undefined) return outcome.skipped;
+  return readsAsSkip(outcome.details);
 }
 
 export interface CheckOptions {
@@ -167,12 +228,17 @@ export function createHarness(opts: HarnessOptions): Harness {
       }
     }
 
+    // A skip is carried as its own flag next to `passed`, so a reader (and
+    // every reporter) can tell "nothing was measured" from "the server did
+    // the right thing". Only set when true: every other result keeps the
+    // exact shape it had before the flag existed.
     const result: TestResult = {
       id,
       name,
       category,
       required,
       passed: lastResult.passed,
+      ...(isSkipOutcome(lastResult) ? { skipped: true } : {}),
       details: lastResult.details,
       durationMs: Date.now() - start,
       specRef: `${opts.specBase}/${specRef}`,

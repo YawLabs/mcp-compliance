@@ -520,6 +520,8 @@ describe("a list call that fails", () => {
       expect(resultOf(report, "tools-list-deterministic-order").details).toBe(
         "0 tool(s); order is trivially deterministic",
       );
+      // No order to compare: a skip, like the "skipped:" consumers around it.
+      expect(resultOf(report, "tools-list-deterministic-order").skipped).toBe(true);
       expect(resultOf(report, "tools-call").details).toBe("skipped: server lists no tools");
       expect(resultOf(report, "tools-content-types").details).toBe("skipped: server lists no tools");
       expect(resultOf(report, "resources-read").details).toBe("skipped: server lists no resources with a uri");
@@ -801,6 +803,13 @@ describe("tools/call answered against a stub", () => {
         required: true,
         details: typesDetails,
       });
+      // A pass that validated no content item is a skip: no content at all,
+      // or an answer the content types do not apply to. A failure never is.
+      const typesSkipped =
+        typesPassed &&
+        (typesDetails.endsWith(": no content items to validate") || typesDetails.includes("not applicable"));
+      expect(resultOf(report, "tools-content-types").skipped === true).toBe(typesSkipped);
+      expect(resultOf(report, "tools-call").skipped === true).toBe(false);
       // One list for both checks; each sends its own call.
       expect(stub.sent.filter((m) => m === "tools/list")).toHaveLength(1);
       expect(stub.sent.filter((m) => m === "tools/call")).toHaveLength(2);
@@ -819,6 +828,8 @@ describe("tools-list-deterministic-order when the repeat calls differ", () => {
     calls: Array<(msg: Record<string, any>) => StubReply>;
     passed: boolean;
     details: string;
+    /** A pass with no order to compare: flagged as a skip. */
+    skipped?: true;
   }
 
   const list =
@@ -834,6 +845,7 @@ describe("tools-list-deterministic-order when the repeat calls differ", () => {
       calls: [list("a", "b"), list("a", "b", "c"), list("a", "b", "c")],
       passed: true,
       details: "tool set changed between calls (2 vs 3 tools); order not comparable",
+      skipped: true,
     },
     {
       // The set comparison runs before the order comparison, so a shrunken
@@ -842,6 +854,22 @@ describe("tools-list-deterministic-order when the repeat calls differ", () => {
       calls: [list("a", "b", "c"), list("a", "b", "c"), list("c", "a")],
       passed: true,
       details: "tool set changed between calls (3 vs 2 tools); order not comparable",
+      skipped: true,
+    },
+    {
+      // One tool has no order: nothing was compared.
+      name: "a single tool",
+      calls: [list("a"), list("a"), list("a")],
+      passed: true,
+      details: "1 tool(s); order is trivially deterministic",
+      skipped: true,
+    },
+    {
+      // The order was compared and held: a verdict, not a skip.
+      name: "the same order on every call",
+      calls: [list("b", "a"), list("b", "a"), list("b", "a")],
+      passed: true,
+      details: "2 tools in the same order across 3 calls",
     },
     {
       name: "a JSON-RPC error on the second call",
@@ -857,7 +885,7 @@ describe("tools-list-deterministic-order when the repeat calls differ", () => {
     },
   ];
 
-  it.each(cases)("$name", async ({ calls, passed, details }) => {
+  it.each(cases)("$name", async ({ calls, passed, details, skipped }) => {
     let served = 0;
     const stub = await startListStub(
       featureRoute({ tools: {} }, (method, msg) => {
@@ -871,6 +899,7 @@ describe("tools-list-deterministic-order when the repeat calls differ", () => {
       // tools-list is not in the run, so the baseline is the on-demand fetch.
       const report = await runModern(stub.url, { only: ["tools-list-deterministic-order"] });
       expect(resultOf(report, "tools-list-deterministic-order")).toMatchObject({ passed, required: false, details });
+      expect(resultOf(report, "tools-list-deterministic-order").skipped === true).toBe(skipped === true);
       // A failing repeat call ends the check: no call after it.
       expect(stub.sent.filter((m) => m === "tools/list")).toHaveLength(calls.length);
     } finally {
@@ -1312,7 +1341,9 @@ describe("the schema checks against a stub listing the definitions", () => {
   }
 
   /** `--only schema` against a stub declaring all three capabilities and serving `lists`. */
-  async function runSchema(lists: Lists): Promise<Record<string, { passed: boolean; details: string }>> {
+  async function runSchema(
+    lists: Lists,
+  ): Promise<Record<string, { passed: boolean; details: string; skipped?: boolean }>> {
     const stub = await startListStub(
       featureRoute({ tools: {}, prompts: {}, resources: {} }, (method, msg) => {
         if (method === "tools/list") return ok(msg.id, { tools: lists.tools });
@@ -1332,8 +1363,8 @@ describe("the schema checks against a stub listing the definitions", () => {
       }
       return Object.fromEntries(
         SCHEMA_IDS.map((id) => {
-          const { passed, details } = resultOf(report, id);
-          return [id, { passed, details }];
+          const { passed, details, skipped } = resultOf(report, id);
+          return [id, { passed, details, ...(skipped ? { skipped } : {}) }];
         }),
       );
     } finally {
@@ -1393,13 +1424,15 @@ describe("the schema checks against a stub listing the definitions", () => {
       prompts: [],
       resources: [],
     });
+    // A tool without a title is a verdict (the field is optional); an empty
+    // list leaves nothing to validate, so those passes are skips.
     expect(untitled["tools-title-field"]).toEqual({ passed: true, details: "No tools have title field (optional)" });
-    expect(untitled["prompts-schema"]).toEqual({ passed: true, details: "No prompts to validate" });
-    expect(untitled["resources-schema"]).toEqual({ passed: true, details: "No resources to validate" });
+    expect(untitled["prompts-schema"]).toEqual({ passed: true, details: "No prompts to validate", skipped: true });
+    expect(untitled["resources-schema"]).toEqual({ passed: true, details: "No resources to validate", skipped: true });
 
     const empty = await runSchema({ tools: [], prompts: [], resources: [] });
     for (const id of ["tools-schema", "tools-annotations", "tools-title-field", "tools-output-schema"]) {
-      expect(empty[id], id).toEqual({ passed: true, details: "No tools to validate" });
+      expect(empty[id], id).toEqual({ passed: true, details: "No tools to validate", skipped: true });
     }
   });
 });

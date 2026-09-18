@@ -133,6 +133,15 @@ function pass(details: string): TestOutcome {
   return { passed: true, details };
 }
 
+/**
+ * A pass that judged nothing, flagged as a skip (see `TestOutcome.skipped`):
+ * the probe drew no answer from the server itself to read -- none at all, a
+ * gate's answer instead, or no probe could be sent.
+ */
+function unanswered(details: string): TestOutcome {
+  return { passed: true, details, skipped: true };
+}
+
 /** The setup `server/discover` exchange, shared by the lifecycle tests. */
 interface DiscoverProbe {
   /** The response, or null when the transport produced none (timeout, crash, connection failure). */
@@ -1368,7 +1377,7 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
           harness.warnings.push(
             `lifecycle-dual-era: a fresh instance exited (${exit}) before answering the legacy initialize, and one spawned with no input exited too (${idleExit}); a server that allows one instance at a time cannot be probed alongside the suite's own process, so its era is undetermined`,
           );
-          return pass(
+          return unanswered(
             `era undetermined: a second instance exits at startup alongside the suite's process (${idleExit}), so the legacy initialize could not be probed (see warning)`,
           );
         }
@@ -1381,12 +1390,16 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
         harness.warnings.push(
           `lifecycle-dual-era: legacy initialize got no response within ${budget}ms${where}; ${shouldName}`,
         );
-        return pass(`No response to legacy initialize${where} within ${budget}ms; era undetermined (see warning)`);
+        return unanswered(
+          `No response to legacy initialize${where} within ${budget}ms; era undetermined (see warning)`,
+        );
       }
       harness.warnings.push(
         `lifecycle-dual-era: legacy initialize got no response${where} (${short(message)}); ${shouldName}`,
       );
-      return pass(`legacy initialize got no response${where} (${short(message)}); era undetermined (see warning)`);
+      return unanswered(
+        `legacy initialize got no response${where} (${short(message)}); era undetermined (see warning)`,
+      );
     } finally {
       await fresh?.close();
     }
@@ -1415,7 +1428,7 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
     const gate = transportLevelRejection(ctx, res);
     if (gate) {
       harness.warnings.push(`lifecycle-dual-era: legacy initialize was answered HTTP ${res.statusCode}; ${gate}`);
-      return pass(
+      return unanswered(
         `era undetermined: initialize answered HTTP ${res.statusCode}, a transport-level rejection (see warning)`,
       );
     }

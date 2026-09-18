@@ -1415,6 +1415,8 @@ describe("rejections answered by a transport-level gate are not evaluable", () =
       expect(expectPassed(report, "lifecycle-dual-era").details).toBe(
         "era undetermined: initialize answered HTTP 429, a transport-level rejection (see warning)",
       );
+      // A gate answered, not the server: nothing to read, so a skip.
+      expect(resultOf(report, "lifecycle-dual-era").skipped).toBe(true);
       expect(lifecycleWarnings(report)).toEqual([
         expect.stringMatching(/^lifecycle-dual-era: legacy initialize was answered HTTP 429; not evaluable: HTTP 429/),
       ]);
@@ -1670,6 +1672,8 @@ describe("lifecycle-dual-era over HTTP: an initialize answer that carries no era
       const report = await runModern(stub.url, { only: ["lifecycle-discover", DUAL_ID] });
       expectPassed(report, "lifecycle-discover");
       expect(expectPassed(report, DUAL_ID).details).toBe(details);
+      // The server answered: whatever it said is the reading, never a skip.
+      expect(resultOf(report, DUAL_ID).skipped).toBeUndefined();
       expect(lifecycleWarnings(report)).toEqual(warnings);
       // None of these served the legacy handshake: no era warning at suite level.
       expect(report.warnings.filter((w) => /^Server is (dual-era|legacy-only)/.test(w))).toEqual([]);
@@ -1688,6 +1692,8 @@ describe("lifecycle-dual-era over HTTP: an initialize answer that carries no era
       const report = await runModern(stub.url, { only: [DUAL_ID], timeout: 1500 });
       const r = expectPassed(report, DUAL_ID);
       expect(r.details).toBe("No response to legacy initialize within 1500ms; era undetermined (see warning)");
+      // No answer to read: a skip.
+      expect(r.skipped).toBe(true);
       expect(r.durationMs).toBeLessThan(10_000);
       expect(lifecycleWarnings(report)).toEqual([
         "lifecycle-dual-era: legacy initialize got no response within 1500ms; a modern-only server SHOULD reject it with an error naming its supported versions",
@@ -2321,6 +2327,7 @@ describe("lifecycle-dual-era on an unreachable server", () => {
     expect(dual.details).toMatch(
       /^legacy initialize got no response \(.*ECONNREFUSED.*\); era undetermined \(see warning\)$/,
     );
+    expect(dual.skipped).toBe(true);
     expect(dual.details).not.toMatch(/within \d+ms/);
     expect(lifecycleWarnings(report)).toEqual([
       expect.stringMatching(/^lifecycle-dual-era: legacy initialize got no response \(.*ECONNREFUSED/),
@@ -2774,6 +2781,8 @@ describe("lifecycle-dual-era: fresh-process initialize on stdio", () => {
     expect(expectPassed(report, "lifecycle-dual-era").details).toBe(
       `era undetermined: a second instance exits at startup alongside the suite's process (${exit}), so the legacy initialize could not be probed (see warning)`,
     );
+    // The probe could not be sent at all: a skip.
+    expect(resultOf(report, "lifecycle-dual-era").skipped).toBe(true);
     expect(lifecycleWarnings(report)).toEqual([
       `lifecycle-dual-era: a fresh instance exited (${exit}) before answering the legacy initialize, and one spawned with no input exited too (${exit}); a server that allows one instance at a time cannot be probed alongside the suite's own process, so its era is undetermined`,
     ]);

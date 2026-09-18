@@ -8,7 +8,15 @@ import { formatBenchmark, runBenchmark } from "./benchmark.js";
 import { type ComplianceConfig, loadConfig, OUTPUT_FORMATS } from "./config.js";
 import { diffReports, formatDiff, hasRegressions } from "./diff.js";
 import { startServer } from "./mcp/server.js";
-import { formatGithub, formatHtml, formatJson, formatMarkdown, formatSarif, formatTerminal } from "./reporter.js";
+import {
+  formatGithub,
+  formatHtml,
+  formatJson,
+  formatMarkdown,
+  formatProgressLine,
+  formatSarif,
+  formatTerminal,
+} from "./reporter.js";
 import { filterWarnings, previewTests, runComplianceSuite } from "./runner.js";
 import { type SpecVersion, type SpecVersionOption, SUPPORTED_SPEC_VERSIONS } from "./spec.js";
 import { splitStdioTarget } from "./stdio-split.js";
@@ -425,14 +433,16 @@ program
             // in terminal mode only; machine-readable formats stay clean.
             onStatus:
               opts.format === "terminal" ? (message) => process.stderr.write(chalk.dim(`  ${message}\n`)) : undefined,
-            onProgress: verbose
-              ? (testId, passed, details) => {
-                  const icon = passed ? chalk.green("PASS") : chalk.red("FAIL");
+            // onTestComplete, not onProgress: only the full result carries
+            // `skipped`, and a skip is a pass on onProgress's `passed`, so
+            // it would print PASS for a check that measured nothing.
+            onTestComplete: verbose
+              ? (result) => {
                   // Progress goes to stderr so `--format=json > out.json` produces
                   // clean JSON on stdout even with --verbose. chalk auto-strips
                   // color when stderr is not a TTY (e.g., piped/captured by CI).
                   const stream = opts.format === "terminal" ? process.stdout : process.stderr;
-                  stream.write(`  ${icon} ${testId} — ${details}\n`);
+                  stream.write(`${formatProgressLine(result)}\n`);
                 }
               : undefined,
           });

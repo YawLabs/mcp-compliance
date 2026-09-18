@@ -163,7 +163,7 @@ Two things to know when you rely on `auto` in CI:
 | `--only <items>` | both | Only run tests matching these categories or test IDs (comma-separated) |
 | `--skip <items>` | both | Skip tests matching these categories or test IDs (comma-separated) |
 | `--concurrency <n>` | both | Max parallel-safe tests in flight (default: `1`; raising reduces wall time but can perturb timing-sensitive servers) |
-| `--verbose` | both | Print each test result as it runs (also forwards stdio stderr) |
+| `--verbose` | both | Print each test result as it runs, as PASS, FAIL or SKIP (also forwards stdio stderr) |
 
 ### CI integration
 
@@ -198,7 +198,9 @@ mcp-compliance test https://my-server.com/mcp --min-grade B
 # Preview which tests will run before connecting (handy for --only/--skip authoring)
 mcp-compliance test --list --transport stdio --skip security --spec-version 2026-07-28
 
-# Diff two runs — exit 1 if anything that was passing is now failing.
+# Diff two runs — exit 1 if anything that was passing (or skipped) is now failing;
+# checks that start or stop skipping are listed as "Newly skipped" / "No longer skipped" and never fail the diff.
+# A baseline from an earlier version works too: its skips are read from their wording.
 # Both reports must grade the same spec revision; pin --spec-version on both runs
 # so a server upgrade cannot flip the suite under the baseline.
 mcp-compliance test https://my-server.com/mcp --format json --spec-version 2026-07-28 > current.json
@@ -421,7 +423,7 @@ stdio-only (3):
 
 ## What the 103 tests check (2026-07-28)
 
-The 2026-07-28 catalog grades the stateless, per-request `_meta` era: `server/discover` instead of `initialize`, no sessions, caching hints on every cacheable result, `resultType` on every result, MRTR `input_required` results instead of server-initiated requests, and `-32602` for missing resources. An id shared with the 2025-11-25 list covers the same feature, but its criteria and required flag may differ between the catalogs (`stdio-framing` and `error-invalid-jsonrpc` are optional here, `error-method-code` is required), so ids are comparable only within one catalog; a check whose verdict flipped carries a new id, and `diff` refuses to compare reports across revisions. Post-hoc tests scan a recording of every message the server sent during the run (and fail, rather than pass vacuously, when nothing was received). The `_meta` and standard-header rejection tests are attributable: a rejection is credited only when the conformant `server/discover` was served, so a legacy-only server pinned to this catalog fails them as "not evaluable". The four injection tests probe a single (tool, argument) target from the safest annotation tier that has a string argument — `readOnlyHint: true`, then `destructiveHint: false`, then unannotated tools (the spec defaults `destructiveHint` to true), then `destructiveHint: true`, with passed-over and live-probed tools named in warnings — fill the other required arguments with schema-honouring placeholders, and report how many payloads were rejected, returned without evidence of execution, or never reached the tool (all never-reached is inconclusive, with a warning). `security-rate-limiting` bursts 50 `tools/call`s at a read-only, no-argument tool when there is one and passes a quiet burst with a warning either way.
+The 2026-07-28 catalog grades the stateless, per-request `_meta` era: `server/discover` instead of `initialize`, no sessions, caching hints on every cacheable result, `resultType` on every result, MRTR `input_required` results instead of server-initiated requests, and `-32602` for missing resources. An id shared with the 2025-11-25 list covers the same feature, but its criteria and required flag may differ between the catalogs (`stdio-framing` and `error-invalid-jsonrpc` are optional here, `error-method-code` is required), so ids are comparable only within one catalog; a check whose verdict flipped carries a new id, and `diff` refuses to compare reports across revisions. Post-hoc tests scan a recording of every message the server sent during the run (and fail, rather than pass vacuously, when nothing was received). The `_meta` and standard-header rejection tests are attributable: a rejection is credited only when the conformant `server/discover` was served, so a legacy-only server pinned to this catalog fails them as "not evaluable". The four injection tests probe a single (tool, argument) target from the safest annotation tier that has a string argument — `readOnlyHint: true`, then `destructiveHint: false`, then unannotated tools (the spec defaults `destructiveHint` to true), then `destructiveHint: true`, with passed-over and live-probed tools named in warnings — fill the other required arguments with schema-honouring placeholders, and report how many payloads were rejected, returned without evidence of execution, or never reached the tool (all never-reached is inconclusive, with a warning, and flagged as a skip). On stdio a check whose own request kills the server (an injection payload, the 1 MB argument, unknown tool arguments) fails as died and the server is restarted for the checks after it, every time that happens, `--retries` included; `security-tool-rug-pull` then compares two lists from the new process. `security-rate-limiting` bursts 50 `tools/call`s at a read-only, no-argument tool when there is one and passes a quiet burst with a warning either way.
 
 <details>
 <summary><strong>Transport (20 tests)</strong></summary>
@@ -589,7 +591,7 @@ stdio-only (4):
 | D     | 40-59  |
 | F     | 0-39   |
 
-Required tests are worth 70% of the score, optional tests 30%. See the [full scoring algorithm](./COMPLIANCE_RUBRIC.md#2-scoring-algorithm) in the methodology doc.
+Required tests are worth 70% of the score, optional tests 30%. A test that measured nothing (a skip) counts as a pass; every report format counts or lists the skips (the terminal lists them under `SKIPPED CHECKS`), `--verbose` prints them as `SKIP`, and `diff` lists checks that start or stop skipping, so a pass total that is partly skips is visible. See the [full scoring algorithm](./COMPLIANCE_RUBRIC.md#2-scoring-algorithm) in the methodology doc.
 
 ## CI integration
 
@@ -669,7 +671,7 @@ Restart your MCP client and approve the server when prompted.
 
 ### Tools
 
-- **mcp_compliance_test** — Run the full compliance suite against an HTTP MCP endpoint (URL). Supports auth, custom headers, timeout, retries, category/test filtering, and `specVersion` (`auto` | `2025-11-25` | `2026-07-28`, default `auto`). Returns grade, score, the resolved `specVersion`, and detailed results. stdio targets are CLI-only.
+- **mcp_compliance_test** — Run the full compliance suite against an HTTP MCP endpoint (URL). Supports auth, custom headers, timeout, retries, category/test filtering, and `specVersion` (`auto` | `2025-11-25` | `2026-07-28`, default `auto`). Returns grade, score, the resolved `specVersion`, and detailed results (each test marked PASS, FAIL or SKIP; the Tests line counts the skips). stdio targets are CLI-only.
 - **mcp_compliance_explain** — Explain what a specific test ID checks and why it matters, with a link to the spec section. Ids are per catalog: pass `specVersion` to read one catalog, or omit it to search both (a shared id is explained once per suite, with a note saying whether the required flag / category also differ, and an id that only exists in the other suite is pointed out).
 
 All tools have [MCP tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#annotations) (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP clients can skip confirmation dialogs for safe operations.
@@ -701,7 +703,9 @@ specBaseFor(report2.specVersion); // base URL for that revision's spec links
 await runComplianceSuite('https://my-server.com/mcp', {
   onTestComplete: (result) => {
     // result has the full TestResult: id, name, category, required,
-    // passed, details, durationMs, specRef. Push it to your client.
+    // passed, skipped (true when the check measured nothing), details,
+    // durationMs, specRef. Push it to your client. (onProgress carries no
+    // skip flag: a skip arrives there as passed.)
     sendToClient(result);
   },
   // Pre-test status lines: the stdio era probe still waiting after ~2 s,
@@ -724,16 +728,23 @@ The JSON output of the test suite is a stable, versioned contract. Every report 
   "timestamp": "...",
   "grade": "A",
   "score": 92.5,
-  "tests": [ ... ],            // ids are only meaningful together with specVersion
+  "summary": { "total": 99, "passed": 97, "failed": 2, "required": 24, "requiredPassed": 24, "skipped": 4 },
+  "tests": [                   // ids are only meaningful together with specVersion
+    { "id": "security-auth-malformed", "passed": true, "skipped": true,
+      "details": "Skipped: needs a valid credential to compare against (pass --auth)", ... },
+    ...
+  ],
   // ...
 }
 ```
+
+A test that ran but measured nothing (no `--auth`, no tools declared, a check that does not apply on the transport, or a refusal an earlier check could not attribute) is recorded as `passed: true` with `skipped: true`; `summary.skipped` and each `categories[*].skipped` count them. Skips still count as passes in the score, so read `skipped` next to `passed` before treating a pass total as evidence. SARIF output keeps its `results` to failures and names the skips in the run's invocation properties (`testsSkipped`, `skippedTests`), so Code Scanning opens no alert for them.
 
 Consumer guidance:
 
 - Pin against `schemaVersion`. Reject reports with an unknown version rather than guessing at the shape.
 - Check `report.specVersion` before interpreting `tests`. Since 0.19 **one tool version produces reports for either revision**, so a dashboard that keyed on `toolVersion` alone will see `2025-11-25` and `2026-07-28` reports from the same version; test ids, the required set and `serverInfo.protocolVersion` all belong to the revision named there. Treat an unknown `specVersion` the way you treat an unknown `schemaVersion`: reject, do not guess.
-- The schema validates with any Draft 2020-12 validator (e.g. `ajv`). It is strict (`additionalProperties: false`), so a new field means a new schema version.
+- The schema validates with any Draft 2020-12 validator (e.g. `ajv`). It is strict (`additionalProperties: false`), so validate a report against the `report.v1.json` shipped with the tool version that wrote it: 0.19 added optional `skipped` fields (on a test, in `summary` and in `categories`) to v1, and an older copy of the schema rejects them.
 - Renames, removals, or type changes bump `schemaVersion`; the report shape is otherwise stable within a major version.
 - Two runs against the same server produce equivalent grade, score, and per-test pass/fail (modulo timings/timestamps) — provided they resolve to the same `specVersion`. Under `auto` that is a property of the server, so pin `--spec-version` where determinism across deploys matters.
 

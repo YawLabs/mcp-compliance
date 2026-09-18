@@ -7,6 +7,7 @@ import {
   validateToolSchemas,
   validateToolTitles,
 } from "../../checks/validators.js";
+import type { TestOutcome } from "../../harness.js";
 import {
   ensurePrompts,
   ensureResources,
@@ -30,16 +31,17 @@ import {
  * that failure and the schema check skip-passes pointing at it; when the
  * run filtered the `-list` test out, the schema check fails with the
  * recorded reason itself (see `listUnavailable`), so `--only schema`
- * cannot grade A on a server whose list call is broken.
+ * cannot grade A on a server whose list call is broken. A list that was
+ * served but is empty leaves nothing to validate: that pass is flagged as
+ * a skip (`TestOutcome.skipped`).
  */
 
-interface Outcome {
-  passed: boolean;
-  details: string;
-}
+type Outcome = TestOutcome;
 
 const pass = (details: string): Outcome => ({ passed: true, details });
 const fail = (details: string): Outcome => ({ passed: false, details });
+/** A pass that validated nothing: the server lists none of what the check validates. */
+const nothingToValidate = (details: string): Outcome => ({ passed: true, details, skipped: true });
 
 function skipped(ctx: ModernSuiteContext, key: ListKey): Outcome {
   return listUnavailable(ctx, key, `no ${key} list to validate`);
@@ -56,7 +58,7 @@ export async function runSchema(ctx: ModernSuiteContext): Promise<void> {
     await harness.check("tools-schema", async () => {
       const tools = await ensureTools(ctx);
       if (!tools) return skipped(ctx, "tools");
-      if (tools.length === 0) return pass("No tools to validate");
+      if (tools.length === 0) return nothingToValidate("No tools to validate");
       const v = validateToolSchemas(tools);
       harness.warnings.push(...v.warnings);
       if (v.issues.length > 0) return fail(summarizeIssues(v.issues));
@@ -66,7 +68,7 @@ export async function runSchema(ctx: ModernSuiteContext): Promise<void> {
     await harness.check("tools-annotations", async () => {
       const tools = await ensureTools(ctx);
       if (!tools) return skipped(ctx, "tools");
-      if (tools.length === 0) return pass("No tools to validate");
+      if (tools.length === 0) return nothingToValidate("No tools to validate");
       const v = validateToolAnnotations(tools);
       if (v.issues.length > 0) return fail(summarizeIssues(v.issues));
       return pass(
@@ -77,7 +79,7 @@ export async function runSchema(ctx: ModernSuiteContext): Promise<void> {
     await harness.check("tools-title-field", async () => {
       const tools = await ensureTools(ctx);
       if (!tools) return skipped(ctx, "tools");
-      if (tools.length === 0) return pass("No tools to validate");
+      if (tools.length === 0) return nothingToValidate("No tools to validate");
       const v = validateToolTitles(tools);
       if (v.issues.length > 0) return fail(summarizeIssues(v.issues));
       if (v.withTitle.length === 0) return pass("No tools have title field (optional)");
@@ -92,7 +94,7 @@ export async function runSchema(ctx: ModernSuiteContext): Promise<void> {
     await harness.check("tools-output-schema", async () => {
       const tools = await ensureTools(ctx);
       if (!tools) return skipped(ctx, "tools");
-      if (tools.length === 0) return pass("No tools to validate");
+      if (tools.length === 0) return nothingToValidate("No tools to validate");
       const v = validateToolOutputSchemas(tools);
       if (v.issues.length > 0) return fail(summarizeIssues(v.issues));
       return pass(
@@ -105,7 +107,7 @@ export async function runSchema(ctx: ModernSuiteContext): Promise<void> {
     await harness.check("prompts-schema", async () => {
       const prompts = await ensurePrompts(ctx);
       if (!prompts) return skipped(ctx, "prompts");
-      if (prompts.length === 0) return pass("No prompts to validate");
+      if (prompts.length === 0) return nothingToValidate("No prompts to validate");
       const v = validatePromptSchemas(prompts);
       harness.warnings.push(...v.warnings);
       if (v.issues.length > 0) return fail(summarizeIssues(v.issues));
@@ -117,7 +119,7 @@ export async function runSchema(ctx: ModernSuiteContext): Promise<void> {
     await harness.check("resources-schema", async () => {
       const resources = await ensureResources(ctx);
       if (!resources) return skipped(ctx, "resources");
-      if (resources.length === 0) return pass("No resources to validate");
+      if (resources.length === 0) return nothingToValidate("No resources to validate");
       const v = validateResourceSchemas(resources);
       harness.warnings.push(...v.warnings);
       if (v.issues.length > 0) return fail(summarizeIssues(v.issues));

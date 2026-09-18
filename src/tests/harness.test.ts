@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createHarness, type HarnessOptions, type TestOutcome } from "../harness.js";
+import { createHarness, type HarnessOptions, isSkipOutcome, readsAsSkip, type TestOutcome } from "../harness.js";
 import type { TestDefinition, TestResult } from "../types.js";
 
 /**
@@ -303,6 +303,16 @@ describe("harness retries (--retries)", () => {
     ]);
   });
 
+  it("a skip is recorded without retrying: it is a pass, and the precondition will not appear on attempt two", async () => {
+    vi.useFakeTimers();
+    const h = harnessWith(defs, { retries: 2 });
+    const body = scripted([{ passed: true, details: "Skipped: no --auth provided" }]);
+    await h.check("flaky", body.fn);
+    expect(body.calls()).toBe(1);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.tests.map((t) => [t.passed, t.skipped])).toEqual([[true, true]]);
+  });
+
   it("the legacy test() signature uses the run-wide retries too", async () => {
     vi.useFakeTimers();
     const h = harnessWith(defs, { retries: 1 });
@@ -315,5 +325,228 @@ describe("harness retries (--retries)", () => {
     await done;
     expect(body.calls()).toBe(2);
     expect(h.tests.map((t) => [t.id, t.required, t.passed, t.details])).toEqual([["flaky", true, true, "second"]]);
+  });
+});
+
+/**
+ * The harness is the only place a TestResult is built, so it is the only
+ * place that can tell a reader a check measured nothing. The suites
+ * already mark such a check in its details and return `passed: true` (a
+ * skip is not a failure); the harness turns those markers into a flag the
+ * reporters and the grader can read, without every call site having to
+ * be touched.
+ */
+describe("harness skip detection", () => {
+  const defs = definitions(def("probe"), def("other"));
+
+  async function record(outcome: TestOutcome, id = "probe"): Promise<TestResult> {
+    const h = harnessWith(defs);
+    await h.check(id, async () => outcome);
+    return h.tests[0];
+  }
+
+  it("a pass whose details lead with `Skipped:` is flagged, on both harness signatures", async () => {
+    const r = await record({ passed: true, details: "Skipped: no --auth provided" });
+    expect(r.skipped).toBe(true);
+    expect(r.passed).toBe(true);
+
+    const h = harnessWith(defs);
+    await h.test("probe", "Probe", "security", false, "basic", async () => ({
+      passed: true,
+      details: "Skipped: not evaluable (see security-auth-required)",
+    }));
+    expect(h.tests.map((t) => [t.passed, t.skipped])).toEqual([[true, true]]);
+  });
+
+  /**
+   * Every passing details string in both suites (src/runner.ts and
+   * src/suites/modern/*.ts) that marks a check whose subject was absent,
+   * verbatim, with template values filled in. A suite that rewords one
+   * of these away from the three markers stops being flagged; this list
+   * is where that shows up.
+   */
+  const SUITE_SKIPS = [
+    // 2025-11-25 (src/runner.ts)
+    "Server does not declare logging capability (skipped)",
+    "Server does not declare completions capability (skipped)",
+    "No capabilities declared — listChanged notifications not applicable",
+    "Server did not issue session ID (test not applicable)",
+    "No session ID — server-initiated messages not applicable",
+    "Server responded with JSON (not SSE) — event field check not applicable",
+    "SSE response empty or no data fields — check not applicable",
+    "Tool returned error (content types not applicable): code -32603",
+    "No tools available for progress token test (skipped)",
+    "No list methods available to test (skipped)",
+    // The auth siblings' not-evaluable skip, the 2026-07-28 AUTH_NOT_EVALUABLE wording too.
+    "Skipped: HTTP 403 without a Bearer challenge, not attributable to authentication (see security-auth-required)",
+    "Skipped: the configured credential was refused too (the credentialed ping drew HTTP 401), so rejecting invalid tokens cannot be told from rejecting everything (check the configured credential)",
+    "Skipped: the configured credential was refused too (the credentialed ping drew HTTP 401), so refusing it in the query string proves nothing (check the configured credential)",
+    "Skipped: HTTP 403 without a Bearer challenge on the endpoint and on every well-known metadata location, not attributable to authentication (see security-auth-required)",
+    "Skipped: the error probes are raw HTTP requests, which a stdio target cannot receive, so no error response was scanned",
+    "Skipped: the error probe is a raw HTTP request, which a stdio target cannot receive, so no error response was scanned",
+    "Skipped: server declares no tools, so there is no tool call to carry the unicode probe",
+    "Skipped: no --auth provided",
+    "HTTP 403 (WWW-Authenticate not applicable for 403)",
+    "Server does not issue session IDs (skipped)",
+    "Skipped: server does not issue session IDs",
+    "Skipped: could not extract token from auth header",
+    "No tools with URL parameters found (skipped)",
+    "No tools available to test (skipped)",
+    "Skipped: tools/list not available",
+    "Fewer than 2 tools — cross-reference check not applicable",
+    // 2026-07-28 (src/suites/modern)
+    "skipped: no tools list available, no tools list to validate",
+    "skipped: tools/list failed, no tools list to validate (see tools-list)",
+    "Skipped: raw-body probe is HTTP-only",
+    "not applicable: resources/templates/list returned -32601 Method not found; no complete result to check caching hints on",
+    "resources/templates/list: not applicable (input_required interim results carry no caching hints)",
+    "skipped: server lists no tools",
+    "echo: tool returned error (content types not applicable): -32603 boom",
+    "echo: input_required result (content types not applicable)",
+    "skipped: server lists no resources with a uri",
+    "skipped: server lists no prompts",
+    "skipped: server declares no tools",
+    "skipped: no listed tool has a name",
+    "not applicable on stdio (no HTTP auth)",
+    "Skipped: server declares no tools",
+    "HTTP 200 -- not a 401 response (skipped)",
+    "Skipped: needs a valid credential to compare against (pass --auth)",
+    "Skipped: server does not require auth (unauthenticated server/discover answered HTTP 200)",
+    "Skipped: needs a valid credential to place in the URI (pass --auth)",
+    "Skipped: all 20 rapid server/discover requests were rejected by auth (HTTP 401) before reaching a handler, so rate limiting could not be measured; pass --auth",
+    "Fewer than 2 tools -- cross-reference check not applicable",
+    "skipped: server declares no resources or prompts",
+  ];
+
+  /**
+   * Passing details from the same suites that are verdicts -- the server
+   * was observed doing something -- including the ones that mention a
+   * skip or an absence without being one.
+   */
+  const SUITE_VERDICTS = [
+    "HTTP 200",
+    "HTTP 401 (unauthenticated request rejected)",
+    "HTTP 403 (unauthenticated request rejected)",
+    "Server does not require auth (no --auth provided and server accepted unauthenticated requests)",
+    'WWW-Authenticate: Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"',
+    "No instructions field (optional)",
+    "No tools have title field (optional)",
+    "No CORS headers returned (server-to-server only, acceptable)",
+    "HTTP 405 (server does not support server-initiated messages)",
+    "Method not supported (acceptable): -32601",
+    "3 tool(s) scanned — no injection patterns found",
+    "12 server messages validated against the 2026-07-28 schema; no violations (3 skipped: raw-probe replies, non-objects, legacy initialize)",
+    // Vacuous, but worded without a marker: the suites flag these with an
+    // explicit `skipped: true`, so the markers must not be what catches them.
+    "No tools to validate",
+    "No content items to validate",
+    "No tools with string parameters to test",
+    "No resources to validate",
+    "No prompts to validate",
+  ];
+
+  it("flags every skip the two suites write, whichever of the three markers it uses", async () => {
+    for (const details of SUITE_SKIPS) {
+      expect(readsAsSkip(details), details).toBe(true);
+      expect((await record({ passed: true, details })).skipped, details).toBe(true);
+    }
+  });
+
+  it("flags no verdict, including one that mentions a skip mid-sentence", async () => {
+    for (const details of SUITE_VERDICTS) {
+      expect(readsAsSkip(details), details).toBe(false);
+      const r = await record({ passed: true, details });
+      expect(Object.hasOwn(r, "skipped"), details).toBe(false);
+    }
+  });
+
+  it("an ordinary pass carries no flag at all, so its shape is unchanged", async () => {
+    const r = await record({ passed: true, details: "HTTP 200" });
+    expect(Object.keys(r)).toEqual([
+      "id",
+      "name",
+      "category",
+      "required",
+      "passed",
+      "details",
+      "durationMs",
+      "specRef",
+    ]);
+  });
+
+  it("a failure is never flagged, even when its details say `Skipped:`", async () => {
+    // src/runner.ts reports several genuine failures that way
+    // ("Skipped: tools/list failed"); they must stay failures.
+    for (const details of ["Skipped: tools/list failed", "HTTP 500 (skipped)", "not applicable on stdio (x)"]) {
+      const r = await record({ passed: false, details });
+      expect(r.passed, details).toBe(false);
+      expect(Object.hasOwn(r, "skipped"), details).toBe(false);
+    }
+  });
+
+  it("an explicit skipped flag on the outcome wins over the details markers, in both directions", async () => {
+    const worded = await record({ passed: true, details: "No tools to validate", skipped: true });
+    expect(worded.skipped).toBe(true);
+
+    const notReally = await record({ passed: true, details: "Skipped: ...", skipped: false });
+    expect(Object.hasOwn(notReally, "skipped")).toBe(false);
+  });
+
+  it("an explicit flag cannot turn a failure into a skip", async () => {
+    const r = await record({ passed: false, details: "HTTP 500", skipped: true });
+    expect(r.passed).toBe(false);
+    expect(Object.hasOwn(r, "skipped")).toBe(false);
+  });
+
+  it("isSkipOutcome is the one rule: explicit flag first, then the markers, never on a failure", () => {
+    expect(isSkipOutcome({ passed: true, details: "Skipped: no --auth provided" })).toBe(true);
+    expect(isSkipOutcome({ passed: true, details: "HTTP 200" })).toBe(false);
+    expect(isSkipOutcome({ passed: false, details: "Skipped: tools/list failed" })).toBe(false);
+    expect(isSkipOutcome({ passed: true, details: "anything", skipped: true })).toBe(true);
+    expect(isSkipOutcome({ passed: true, details: "Skipped: ...", skipped: false })).toBe(false);
+  });
+
+  it("a thrown body is a failure, never a skip", async () => {
+    const h = harnessWith(defs);
+    await h.check("probe", async () => {
+      throw new Error("Skipped: boom");
+    });
+    expect(h.tests.map((t) => [t.passed, Object.hasOwn(t, "skipped"), t.details])).toEqual([
+      [false, false, "Error: Skipped: boom"],
+    ]);
+  });
+
+  it("onTestComplete receives the flag, so a live consumer can tell a skip from a pass", async () => {
+    const seen: Array<[string, boolean, boolean | undefined]> = [];
+    const h = harnessWith(defs, { onTestComplete: (r) => seen.push([r.id, r.passed, r.skipped]) });
+    await h.check("probe", async () => ({ passed: true, details: "Skipped: no --auth provided" }));
+    await h.check("other", async () => ({ passed: true, details: "HTTP 200" }));
+    expect(seen).toEqual([
+      ["probe", true, true],
+      ["other", true, undefined],
+    ]);
+  });
+
+  it("the retry loop keeps the flag from the attempt it recorded", async () => {
+    // A check that fails, is retried, and then skips: the recorded result
+    // is the skip, flag and all.
+    vi.useFakeTimers();
+    try {
+      const h = harnessWith(defs, { retries: 1 });
+      let calls = 0;
+      const done = h.check("probe", async () => {
+        calls++;
+        return calls === 1
+          ? { passed: false, details: "HTTP 503" }
+          : { passed: true, details: "Skipped: no --auth provided" };
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      await done;
+      expect(h.tests.map((t) => [t.passed, t.skipped, t.details])).toEqual([
+        [true, true, "Skipped: no --auth provided"],
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

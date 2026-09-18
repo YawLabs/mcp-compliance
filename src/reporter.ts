@@ -119,6 +119,52 @@ function padLeft(s: string, n: number): string {
 const RULE = "─".repeat(62);
 const HEAVY_RULE = "═".repeat(62);
 
+/**
+ * Checks that measured nothing. A skip is recorded as `passed: true` (it
+ * is not a failure), so without singling it out a reader cannot tell a
+ * check the server satisfied from one that never ran -- which is exactly
+ * how a gated server's whole auth suite could read as clean. Every
+ * formatter names them; the score still counts them as passes, and the
+ * terminal, markdown and HTML reports say so.
+ *
+ * Read from the test list rather than `summary.skipped`, so every count
+ * and list in one report agrees, and a report from an older tool (no
+ * flags, no count) reads as zero skips.
+ */
+export function skippedTestsOf(report: ComplianceReport): TestResult[] {
+  return report.tests.filter((t) => t.passed && t.skipped === true);
+}
+
+/** The one-line caveat that goes with every list of skips. */
+export const SKIP_CAVEAT = "measured nothing -- counted as passes in the score above";
+
+/**
+ * A result's one-word status: a skip is neither PASS nor FAIL. Every
+ * per-test line uses it (the HTML tables, the --verbose progress lines,
+ * the MCP test tool), so a skip never prints as a pass. A failure is
+ * FAIL whatever flag it carries.
+ */
+export function statusLabel(t: Pick<TestResult, "passed" | "skipped">): "PASS" | "FAIL" | "SKIP" {
+  if (!t.passed) return "FAIL";
+  return t.skipped === true ? "SKIP" : "PASS";
+}
+
+/**
+ * One `--verbose` progress line, printed as each test finishes: FAIL red,
+ * SKIP yellow (the report's skip colour), PASS green. A result that is
+ * not a skip prints exactly the line the CLI printed before SKIP existed.
+ */
+export function formatProgressLine(result: TestResult): string {
+  const label = statusLabel(result);
+  const icon = label === "FAIL" ? chalk.red(label) : label === "SKIP" ? chalk.yellow(label) : chalk.green(label);
+  return `  ${icon} ${result.id} — ${result.details}`;
+}
+
+function statusClass(t: TestResult): string {
+  if (!t.passed) return "fail";
+  return t.skipped === true ? "skip" : "pass";
+}
+
 export function formatTerminal(report: ComplianceReport): string {
   const out: string[] = [];
   const color = gradeColor(report.grade);
@@ -142,12 +188,19 @@ export function formatTerminal(report: ComplianceReport): string {
   // Big grade block letter + side-by-side summary. "0/0 required" on an
   // empty run is nothing to attest, not a clean pass, so no check mark.
   const reqOk = report.summary.total > 0 && report.summary.requiredPassed === report.summary.required;
+  const skipped = skippedTestsOf(report);
+  // The pass total is not all evidence: any skip inside it measured
+  // nothing, so the count rides next to "N failed" rather than hiding.
+  const testNotes: string[] = [];
+  if (report.summary.failed > 0) testNotes.push(chalk.red(`${report.summary.failed} failed`));
+  if (skipped.length > 0) testNotes.push(chalk.yellow(`${skipped.length} skipped`));
+  const testNote = testNotes.length > 0 ? chalk.dim("  (") + testNotes.join(chalk.dim(", ")) + chalk.dim(")") : "";
   const infoRows = [
     "",
     "",
     `${chalk.bold("GRADE")}   ${color(report.grade)}       ${chalk.bold(`${report.score}%`)}`,
     `${chalk.dim("Overall   ")}${overallColor(report.overall)}`,
-    `${chalk.dim("Tests     ")}${chalk.green(String(report.summary.passed))}${chalk.dim("/")}${report.summary.total}${report.summary.failed > 0 ? chalk.dim("  (") + chalk.red(`${report.summary.failed} failed`) + chalk.dim(")") : ""}`,
+    `${chalk.dim("Tests     ")}${chalk.green(String(report.summary.passed))}${chalk.dim("/")}${report.summary.total}${testNote}`,
     `${chalk.dim("Required  ")}${reqOk ? chalk.green(`${report.summary.requiredPassed}/${report.summary.required} ✓`) : chalk.red(`${report.summary.requiredPassed}/${report.summary.required}`)}`,
   ];
   for (let i = 0; i < 6; i++) {
@@ -167,8 +220,12 @@ export function formatTerminal(report: ComplianceReport): string {
     const colorFn = barColor(stats.passed, stats.total);
     const pct = stats.total === 0 ? 0 : Math.round((stats.passed / stats.total) * 100);
     const ratio = `${stats.passed}/${stats.total}`;
+    // A bar that reads 18/23 while four of the 18 measured nothing is the
+    // headline version of the same false comfort, so annotate it.
+    const skips = skipped.filter((t) => t.category === cat).length;
+    const skipNote = skips > 0 ? `  ${chalk.yellow(`${skips} skipped`)}` : "";
     out.push(
-      `  ${padRight(label, maxLabel)}  ${colorFn(filled)}${chalk.dim(rest)}  ${padLeft(ratio, 7)}  ${padLeft(`${pct}%`, 4)}`,
+      `  ${padRight(label, maxLabel)}  ${colorFn(filled)}${chalk.dim(rest)}  ${padLeft(ratio, 7)}  ${padLeft(`${pct}%`, 4)}${skipNote}`,
     );
   }
   out.push("");
@@ -203,8 +260,29 @@ export function formatTerminal(report: ComplianceReport): string {
       }
       out.push("");
     }
+  } else if (skipped.length > 0) {
+    // "All tests passed" would be a lie here: nothing failed, but some of
+    // the passes are checks that never got to measure anything.
+    out.push(
+      `  ${chalk.green.bold("✓ No test failed")}${chalk.yellow.bold(` -- ${skipped.length} skipped, see below`)}`,
+    );
+    out.push("");
   } else {
     out.push(`  ${chalk.green.bold("✓ All tests passed")}`);
+    out.push("");
+  }
+
+  // Skipped checks — named, so a reader sees which ones measured nothing
+  // rather than having to trust that a pass total is all evidence.
+  if (skipped.length > 0) {
+    out.push(chalk.bold.yellow(`  SKIPPED CHECKS (${skipped.length})`));
+    out.push(chalk.dim(`  ${RULE}`));
+    out.push(chalk.dim(`  These ${SKIP_CAVEAT}.`));
+    for (const t of skipped) {
+      const req = t.required ? chalk.yellow("required") : chalk.dim("optional");
+      out.push(`  ${chalk.yellow("-")} ${chalk.bold(t.name)}  ${chalk.dim(`[${t.id}]`)}  ${req}`);
+      out.push(`      ${chalk.dim(t.details)}`);
+    }
     out.push("");
   }
 
@@ -311,6 +389,14 @@ export function formatSarif(report: ComplianceReport): string {
       };
     });
 
+  // Skips go in the invocation's property bag, NOT in `results`. SARIF's
+  // own form for them is a result with kind "notApplicable", but GitHub
+  // Code Scanning ignores `kind` and opens an alert for every result it
+  // is given (github.com/orgs/community/discussions/65477), so that form
+  // would raise one alert per skipped check on every upload. `results`
+  // stays failures-only, exactly as before; the skips are named here.
+  const skippedTests = skippedTestsOf(report).map((t) => ({ id: t.id, details: t.details }));
+
   const sarif = {
     $schema: "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
     version: "2.1.0",
@@ -345,6 +431,9 @@ export function formatSarif(report: ComplianceReport): string {
               protocolVersion: report.serverInfo.protocolVersion,
               testsPassed: report.summary.passed,
               testsTotal: report.summary.total,
+              // How many of testsPassed measured nothing, and which.
+              testsSkipped: skippedTests.length,
+              skippedTests,
             },
           },
         ],
@@ -389,10 +478,14 @@ export function formatGithub(report: ComplianceReport): string {
   }
   const summaryTitle = "MCP Compliance";
   const spec = `spec ${report.specVersion || catalogVersionOf(report)}${specNote ? ` (${specNote})` : ""}`;
+  // Skips ride in the counts so a green CI line cannot hide a suite that
+  // measured nothing. Omitted at zero, so a clean run reads as before.
+  const skippedCount = skippedTestsOf(report).length;
+  const skipNote = skippedCount > 0 ? `, ${skippedCount} skipped` : "";
   const summary =
     report.summary.total === 0
       ? `No tests ran -- check --only/--skip${warnings.length > 0 ? " (see warnings)" : ""}; ${spec}`
-      : `Grade ${report.grade} (${report.score}%) — ${report.summary.passed}/${report.summary.total} passed, ${report.summary.failed} failed (${report.summary.requiredPassed}/${report.summary.required} required); ${spec}`;
+      : `Grade ${report.grade} (${report.score}%) — ${report.summary.passed}/${report.summary.total} passed, ${report.summary.failed} failed${skipNote} (${report.summary.requiredPassed}/${report.summary.required} required); ${spec}`;
   lines.push(`::notice title=${ghEscape(summaryTitle)}::${ghEscape(summary)}`);
   return lines.join("\n");
 }
@@ -425,13 +518,25 @@ export function formatMarkdown(report: ComplianceReport): string {
   lines.push("");
   lines.push("| Category | Passed | Total |");
   lines.push("|---|---:|---:|");
+  const mdSkipped = skippedTestsOf(report);
   for (const cat of CATEGORY_ORDER) {
     const stats = report.categories[cat];
     if (!stats || stats.total === 0) continue;
-    lines.push(`| ${CATEGORY_LABELS[cat] || cat} | ${stats.passed} | ${stats.total} |`);
+    // A category's pass count includes its skips; say how many, as the
+    // terminal bars and HTML cards do, so "Security 17 / 23" cannot read
+    // as 17 checks the server satisfied.
+    const skips = mdSkipped.filter((t) => t.category === cat).length;
+    const passedCell = skips > 0 ? `${stats.passed} (${skips} skipped)` : `${stats.passed}`;
+    lines.push(`| ${CATEGORY_LABELS[cat] || cat} | ${passedCell} | ${stats.total} |`);
   }
   lines.push(`| **Total** | **${report.summary.passed}** | **${report.summary.total}** |`);
   lines.push("");
+  // The table is the part people read, so the caveat belongs under it and
+  // not only next to the list further down.
+  if (mdSkipped.length > 0) {
+    lines.push(`_${mdSkipped.length} of those passes measured nothing -- see "Skipped checks" below._`);
+    lines.push("");
+  }
 
   const failed = report.tests.filter((t) => !t.passed);
   if (failed.length > 0) {
@@ -440,6 +545,20 @@ export function formatMarkdown(report: ComplianceReport): string {
     for (const t of failed) {
       const req = t.required ? " *(required)*" : "";
       lines.push(`- ❌ **${t.id}**${req} — ${t.details}`);
+    }
+    lines.push("");
+  }
+
+  // Skipped checks get their own section rather than disappearing into
+  // the Passed column, with the caveat that they still scored as passes.
+  if (mdSkipped.length > 0) {
+    lines.push(`## Skipped checks (${mdSkipped.length})`);
+    lines.push("");
+    lines.push(`These ${SKIP_CAVEAT}.`);
+    lines.push("");
+    for (const t of mdSkipped) {
+      const req = t.required ? " *(required)*" : "";
+      lines.push(`- ⊘ **${t.id}**${req} — ${t.details}`);
     }
     lines.push("");
   }
@@ -475,6 +594,7 @@ export function formatHtml(report: ComplianceReport): string {
   }
 
   const failed = report.tests.filter((t) => !t.passed);
+  const htmlSkippedTests = skippedTestsOf(report);
   const grouped = new Map<string, TestResult[]>();
   for (const cat of CATEGORY_ORDER) grouped.set(cat, []);
   for (const t of report.tests) grouped.get(t.category)?.push(t);
@@ -516,6 +636,7 @@ export function formatHtml(report: ComplianceReport): string {
   td.status { white-space: nowrap; font-weight: 600; }
   td.status.pass { color: #10b981; }
   td.status.fail { color: #ef4444; }
+  td.status.skip { color: #eab308; }
   td.id { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: #9ca3af; }
   .badge-tag { display: inline-block; background: #1f2937; color: #fcd34d; font-size: 10px; padding: 2px 6px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.05em; }
   .warn { background: #78350f; color: #fcd34d; padding: 12px 16px; border-radius: 8px; margin: 8px 0; font-size: 13px; }
@@ -539,7 +660,7 @@ export function formatHtml(report: ComplianceReport): string {
     <div class="grade-letter">${esc(report.grade)}</div>
     <div class="grade-score">${report.score}%</div>
     <div class="grade-overall ${esc(report.overall)}">${esc(report.overall)}</div>
-    <div class="muted" style="margin-top:12px">${report.summary.passed} / ${report.summary.total} tests passed · ${report.summary.requiredPassed} / ${report.summary.required} required</div>
+    <div class="muted" style="margin-top:12px">${report.summary.passed} / ${report.summary.total} tests passed · ${report.summary.requiredPassed} / ${report.summary.required} required${htmlSkippedTests.length > 0 ? ` · ${htmlSkippedTests.length} skipped` : ""}</div>
   </div>
 
   <div class="grid">
@@ -547,7 +668,9 @@ export function formatHtml(report: ComplianceReport): string {
       .map((c) => {
         const s = report.categories[c];
         const cls = s.passed === s.total ? "full" : s.passed > 0 ? "partial" : "empty";
-        return `<div class="cat-card"><div class="cat-stat ${cls}">${s.passed}/${s.total}</div><div class="cat-label">${esc(CATEGORY_LABELS[c] || c)}</div></div>`;
+        const skips = htmlSkippedTests.filter((t) => t.category === c).length;
+        const note = skips > 0 ? `<div class="cat-label">${skips} skipped</div>` : "";
+        return `<div class="cat-card"><div class="cat-stat ${cls}">${s.passed}/${s.total}</div><div class="cat-label">${esc(CATEGORY_LABELS[c] || c)}</div>${note}</div>`;
       })
       .join("")}
   </div>
@@ -571,6 +694,24 @@ export function formatHtml(report: ComplianceReport): string {
       : ""
   }
 
+  ${
+    htmlSkippedTests.length
+      ? `<div class="card"><h2>Skipped checks (${htmlSkippedTests.length})</h2>
+    <p class="muted">These ${esc(SKIP_CAVEAT)}.</p>
+    <table><thead><tr><th>Status</th><th>Test</th><th>Details</th></tr></thead><tbody>
+    ${htmlSkippedTests
+      .map(
+        (t) => `<tr>
+      <td class="status skip">SKIP</td>
+      <td><div>${esc(t.name)} ${t.required ? '<span class="badge-tag">Required</span>' : ""}</div><div class="id">${esc(t.id)}</div></td>
+      <td>${esc(t.details)}</td>
+    </tr>`,
+      )
+      .join("")}
+    </tbody></table></div>`
+      : ""
+  }
+
   ${[...grouped.entries()]
     .filter(([, tests]) => tests.length > 0)
     .map(
@@ -579,7 +720,7 @@ export function formatHtml(report: ComplianceReport): string {
     ${tests
       .map(
         (t) => `<tr>
-      <td class="status ${t.passed ? "pass" : "fail"}">${t.passed ? "PASS" : "FAIL"}</td>
+      <td class="status ${statusClass(t)}">${statusLabel(t)}</td>
       <td><div>${esc(t.name)} ${t.required ? '<span class="badge-tag">Required</span>' : ""}</div><div class="id">${esc(t.id)}</div></td>
       <td>${esc(t.details)}${t.specRef ? ` <a href="${esc(t.specRef)}" class="muted">[spec]</a>` : ""}</td>
       <td class="muted">${t.durationMs}ms</td>

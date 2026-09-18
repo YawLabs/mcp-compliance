@@ -73,7 +73,12 @@
         "passed": { "type": "integer", "minimum": 0 },
         "failed": { "type": "integer", "minimum": 0 },
         "required": { "type": "integer", "minimum": 0 },
-        "requiredPassed": { "type": "integer", "minimum": 0 }
+        "requiredPassed": { "type": "integer", "minimum": 0 },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many of `passed` measured nothing (TestResult.skipped). Optional: reports written before this field existed omit it. Skips are counted in `passed` and in the score denominator."
+        }
       },
       "additionalProperties": false
     },
@@ -85,7 +90,12 @@
         "required": ["passed", "total"],
         "properties": {
           "passed": { "type": "integer", "minimum": 0 },
-          "total": { "type": "integer", "minimum": 0 }
+          "total": { "type": "integer", "minimum": 0 },
+          "skipped": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many of this category's `passed` measured nothing. Optional; older reports omit it."
+          }
         },
         "additionalProperties": false
       }
@@ -97,7 +107,7 @@
     "warnings": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Non-fatal diagnostics from the test run. Capped at 100 entries."
+      "description": "Non-fatal diagnostics from the test run. Exact duplicates are dropped and the list is capped at 50 entries: past that, the first 50 are kept and one final entry, \"... and N more warning(s) suppressed\", says how many were dropped."
     },
     "serverInfo": {
       "type": "object",
@@ -138,18 +148,13 @@
         "name": { "type": "string" },
         "category": {
           "type": "string",
-          "enum": [
-            "transport",
-            "lifecycle",
-            "tools",
-            "resources",
-            "prompts",
-            "errors",
-            "schema",
-            "security"
-          ]
+          "enum": ["transport", "lifecycle", "tools", "resources", "prompts", "errors", "schema", "security"]
         },
         "passed": { "type": "boolean" },
+        "skipped": {
+          "type": "boolean",
+          "description": "True when the check measured nothing: a precondition was absent (no --auth, no tools declared, a check that does not apply on this transport) or an earlier check could not attribute the server's refusal. A skip is still `passed: true` -- it is not a failure, and it counts in summary.passed and the score -- so this flag is the only thing that distinguishes it. Optional: absent means the check produced a verdict, and a result with `passed: false` never carries it."
+        },
         "required": { "type": "boolean" },
         "details": { "type": "string" },
         "durationMs": { "type": "integer", "minimum": 0 },
@@ -159,7 +164,9 @@
           "description": "Deep link to the relevant spec section."
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "if": { "properties": { "skipped": { "const": true } }, "required": ["skipped"] },
+      "then": { "properties": { "passed": { "const": true } } }
     }
   }
 }

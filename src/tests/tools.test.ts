@@ -1,9 +1,10 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { computeScore } from "../grader.js";
 import { registerTools } from "../mcp/tools.js";
 import { runComplianceSuite } from "../runner.js";
 import { SUPPORTED_SPEC_VERSIONS } from "../spec.js";
-import type { ComplianceReport } from "../types.js";
+import type { ComplianceReport, TestResult } from "../types.js";
 
 // The test tool hands its arguments to runComplianceSuite; mock only that
 // export so the handler's wiring (specVersion, headers, filters) can be
@@ -203,6 +204,134 @@ describe("mcp_compliance_test tool", () => {
     const result = await tools.mcp_compliance_test.handler({ url: "https://example.com/mcp" });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("boom");
+  });
+});
+
+/**
+ * A skip is `passed: true` (it is not a failure), so the test tool used to
+ * print it as PASS and fold it silently into the pass total -- an agent
+ * reading the text could not tell a check the server satisfied from one
+ * that measured nothing.
+ */
+describe("mcp_compliance_test tool: skipped checks", () => {
+  const pass: TestResult = {
+    id: "security-auth-required",
+    name: "Server requires authentication",
+    category: "security",
+    passed: true,
+    required: false,
+    details: "HTTP 401 (unauthenticated request rejected)",
+    durationMs: 5,
+  };
+  const fail: TestResult = {
+    id: "security-tls-required",
+    name: "HTTPS required",
+    category: "security",
+    passed: false,
+    required: false,
+    details: "Server uses plain HTTP",
+    durationMs: 1,
+  };
+  const skipA: TestResult = {
+    id: "security-www-authenticate",
+    name: "WWW-Authenticate on 401",
+    category: "security",
+    passed: true,
+    skipped: true,
+    required: false,
+    details: "Skipped: not evaluable (see security-auth-required)",
+    durationMs: 3,
+  };
+  const skipB: TestResult = {
+    id: "security-token-in-uri",
+    name: "Rejects token in URI",
+    category: "security",
+    passed: true,
+    skipped: true,
+    required: true,
+    details: "Skipped: needs a valid credential to place in the URI (pass --auth)",
+    durationMs: 2,
+  };
+
+  /** A report whose score and counts are what computeScore gives for its tests. */
+  function reportOf(tests: TestResult[]): ComplianceReport {
+    const s = computeScore(tests);
+    return {
+      ...fakeReport("2026-07-28"),
+      score: s.score,
+      grade: s.grade,
+      overall: s.overall,
+      summary: s.summary,
+      categories: s.categories,
+      tests,
+    };
+  }
+
+  async function textFor(report: ComplianceReport): Promise<string> {
+    mockedRun.mockResolvedValue(report);
+    const { server, tools } = createMockServer();
+    registerTools(server);
+    const result = await tools.mcp_compliance_test.handler({ url: "https://example.com/mcp" });
+    expect(result.isError).toBeUndefined();
+    return result.content[0].text;
+  }
+
+  it("counts the skips on the Tests line and marks each one SKIP, not PASS", async () => {
+    const text = await textFor(reportOf([pass, fail, skipA, skipB]));
+    const lines = text.split("\n");
+    expect(lines).toContain("Tests: 3/4 passed, 2 skipped (1/1 required)");
+    expect(lines).toContain("Skipped tests measured nothing -- counted as passes in the score above.");
+    expect(lines).toContain("PASS Server requires authentication — HTTP 401 (unauthenticated request rejected)");
+    expect(lines).toContain("FAIL HTTPS required — Server uses plain HTTP");
+    expect(lines).toContain("SKIP WWW-Authenticate on 401 — Skipped: not evaluable (see security-auth-required)");
+    expect(lines).toContain(
+      "SKIP Rejects token in URI (required) — Skipped: needs a valid credential to place in the URI (pass --auth)",
+    );
+    expect(text).not.toContain("PASS WWW-Authenticate");
+    expect(text).not.toContain("PASS Rejects token in URI");
+  });
+
+  it("the full report JSON it returns carries the flags and the count", async () => {
+    mockedRun.mockResolvedValue(reportOf([pass, fail, skipA, skipB]));
+    const { server, tools } = createMockServer();
+    registerTools(server);
+    const result = await tools.mcp_compliance_test.handler({ url: "https://example.com/mcp" });
+    const full = JSON.parse(result.content[1].text.replace(/^\s*Full report:\n/, "")) as ComplianceReport;
+    expect(full.summary.skipped).toBe(2);
+    expect(full.tests.filter((t) => t.skipped).map((t) => t.id)).toEqual([skipA.id, skipB.id]);
+  });
+
+  it("a run without skips reads exactly as it did before skips were tracked (pinned)", async () => {
+    const text = await textFor(fakeReport("2026-07-28"));
+    expect(text).toBe(
+      [
+        "Grade: A (100%)",
+        "Overall: pass",
+        "Spec: 2026-07-28",
+        "Tests: 1/1 passed (1/1 required)",
+        "",
+        "PASS HTTP POST accepted (required) — HTTP 200",
+      ].join("\n"),
+    );
+    const clean = await textFor(reportOf([pass, fail]));
+    expect(clean).toContain("Tests: 1/2 passed (0/0 required)");
+    expect(clean).not.toMatch(/skip/i);
+  });
+
+  it("reads a report from an older tool (no flags, no count) as having no skips", async () => {
+    const report = reportOf([pass, fail, skipA, skipB]);
+    const { skipped: _count, ...summary } = report.summary;
+    const text = await textFor({ ...report, summary, tests: report.tests.map(({ skipped: _s, ...t }) => t) });
+    expect(text).toContain("Tests: 3/4 passed (1/1 required)");
+    expect(text).not.toContain("SKIP");
+    expect(text).toContain("PASS WWW-Authenticate on 401");
+  });
+
+  it("a failure is FAIL even if it carries the flag", async () => {
+    const text = await textFor(reportOf([{ ...fail, skipped: true }]));
+    expect(text).toContain("FAIL HTTPS required — Server uses plain HTTP");
+    expect(text).toContain("Tests: 0/1 passed (0/0 required)");
+    expect(text).not.toContain("SKIP");
   });
 });
 

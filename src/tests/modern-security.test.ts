@@ -125,6 +125,12 @@ const NO_AUTH_DETAILS = "HTTP 200, result -- server accepted unauthenticated req
 /** security-auth-required's pass on a bare 403 that the served credentialed discover pins on the missing credential. */
 const BARE_403_ATTRIBUTED =
   "HTTP 403 without a Bearer challenge (unauthenticated request rejected; the same request with the credential was served) -- the spec expects 401 when authorization is required";
+/** The auth siblings' skip on the bare 403 security-auth-required could not attribute. */
+const SIBLING_NOT_EVALUABLE =
+  "Skipped: HTTP 403 without a Bearer challenge, not attributable to authentication (see security-auth-required)";
+/** The auth-malformed / token-in-uri skip when the configured credential drew a 401 as well. */
+const CREDENTIAL_REFUSED_PREFIX =
+  "Skipped: the configured credential was refused too (the credentialed server/discover drew HTTP 401), so ";
 const UNREACHED = "never reached the tool (JSON-RPC or transport error)";
 
 /** Ids that FAIL on the clean HTTP fixture by design, with the details they must carry. */
@@ -153,6 +159,17 @@ function verdicts(tests: TestResult[], ids: string[]): Record<string, string> {
     const r = tests.find((t) => t.id === id);
     out[id] = !r ? "MISSING" : r.passed ? "pass" : `FAIL: ${r.details}`;
   }
+  return out;
+}
+
+/**
+ * Whether each check's result is flagged as a skip (`TestResult.skipped`):
+ * a pass that measured nothing. False for every verdict, including a
+ * pass the server earned.
+ */
+function skipFlags(tests: TestResult[], ids: string[]): Record<string, boolean> {
+  const out: Record<string, boolean> = {};
+  for (const id of ids) out[id] = tests.find((t) => t.id === id)?.skipped === true;
   return out;
 }
 
@@ -1069,6 +1086,9 @@ describe("modern security suite: direct context on the clean fixture", () => {
     expect(detailsOf(run.tests, "security-error-no-internal-ip")).toMatch(
       /^\d+ unique error response\(s\) checked -- no internal IP addresses or hostnames found$/,
     );
+    // Every one of these measured the server: none is a skip.
+    const measured = [...TOOL_IDS, "security-error-no-stacktrace", "security-error-no-internal-ip"];
+    expect(skipFlags(run.tests, measured)).toEqual(Object.fromEntries(measured.map((id) => [id, false])));
   }
 
   it("over HTTP: every tool-dependent test runs against the 11 fixture tools and passes", () => {
@@ -1347,6 +1367,11 @@ describe("knob tool-no-input-schema: security-tool-schema-defined", () => {
       );
       // The oversized probe falls back to <first tool>.data.
       expect(detailsOf(run.tests, "security-oversized-input"), run.kind).toContain("echo.data");
+      // No target, nothing sent: a skip. The fallback 1 MB call measured the server: a verdict.
+      expect(skipFlags(run.tests, ["security-command-injection", "security-oversized-input"]), run.kind).toEqual({
+        "security-command-injection": true,
+        "security-oversized-input": false,
+      });
     }
   });
 });
@@ -1658,10 +1683,19 @@ interface InlineOptions {
   /**
    * The same for any request carrying an Origin header (the OPTIONS
    * preflight included). "drop-preflight": the OPTIONS preflight is dropped
-   * and the POST left hanging. 400 / 302: answered with that status (a 302
-   * to /login) and no body.
+   * and the POST left hanging. 400 / 302 / 403 / 429 / 500: answered with
+   * that status (a 302 to /login) and no body, before any auth. "429-then-
+   * 403": the first such request 429 (no Retry-After), every later one a
+   * bare 403.
    */
-  foreignOrigin?: "hang" | "drop" | "drop-preflight" | 400 | 302;
+  foreignOrigin?: "hang" | "drop" | "drop-preflight" | 400 | 302 | 403 | 429 | 500 | "429-then-403";
+  /**
+   * The SDK's Host guard refusing the hostname the run uses: EVERY request,
+   * any path (the well-known metadata locations included), answered with a
+   * bare 403 `{"error":{"code":-32000,"message":"Invalid Host: 127.0.0.1"}}`
+   * and no WWW-Authenticate, whatever credential it carries.
+   */
+  hostGuard?: true;
   /**
    * The answer to a request whose query string carries access_token (the
    * security-token-in-uri probe). Default: the token there is ignored and
@@ -1960,6 +1994,8 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
   let throttleNext = 0;
   let posts = 0;
   let unauthenticatedSeen = 0;
+  /** Requests carrying an Origin header, for the "429-then-403" foreignOrigin. */
+  let foreignOriginSeen = 0;
   /** Set once the "429-once" bigBody gate has throttled its one body. */
   let bigBodyThrottled = false;
   let toolCalls = 0;
@@ -2065,6 +2101,12 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
       const prmUrl = headerPrm ? `${base}/oauth/prm` : `${base}/.well-known/oauth-protected-resource`;
       const path = url.pathname;
       urls.push(req.url ?? "/");
+      if (opts.hostGuard) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Invalid Host: 127.0.0.1" }, id: null }),
+        );
+      }
       const validDoc = { resource: `${base}/mcp`, authorization_servers: ["https://as.example.com"] };
       const prmRoot = path === "/.well-known/oauth-protected-resource";
       const prmPath = path === "/.well-known/oauth-protected-resource/mcp";
@@ -2141,6 +2183,11 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
       // of response, which undici reports as "other side closed".
       const silence = (how: "hang" | "drop") => (how === "drop" ? req.socket.destroy() : undefined);
       if (opts.foreignOrigin && typeof origin === "string") {
+        if (opts.foreignOrigin === "429-then-403") {
+          foreignOriginSeen++;
+          res.writeHead(foreignOriginSeen === 1 ? 429 : 403);
+          return res.end();
+        }
         if (typeof opts.foreignOrigin === "number") {
           res.writeHead(opts.foreignOrigin, opts.foreignOrigin === 302 ? { Location: "/login" } : {});
           return res.end();
@@ -2784,6 +2831,14 @@ describe("inline servers: one injection target per test, destructive tools skipp
     expect(detailsOf(run.tests, "security-ssrf-internal")).toBe(
       `Tested 4 payload(s) against fetch.url: 0 rejected, 0 returned without evidence of execution, 4 ${UNREACHED} -- inconclusive (see warning)`,
     );
+    // Only the pass that measured nothing is a skip; a defended or benign
+    // run is a verdict.
+    expect(skipFlags(run.tests, INJECTION_IDS)).toEqual({
+      "security-command-injection": false,
+      "security-sql-injection": false,
+      "security-path-traversal": false,
+      "security-ssrf-internal": true,
+    });
     expectAsciiDetails(run.tests, INJECTION_IDS);
   });
 
@@ -3005,6 +3060,8 @@ describe("inline servers: extra-params tells a slow tool from a dead server", ()
     expect(r?.details).toBe(
       "tools/call sink did not answer within 500ms -- extra-params verdict inconclusive (see warning)",
     );
+    // Nothing was measured: flagged as a skip.
+    expect(r?.skipped).toBe(true);
     const warnings = slow.warnings.filter((w) => w.startsWith("security-extra-params:"));
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain("not a crash");
@@ -3018,6 +3075,8 @@ describe("inline servers: extra-params tells a slow tool from a dead server", ()
     expect(detailsOf(dropped.tests, EXTRA)).toBe(
       "tools/call sink had its connection closed without a response -- extra-params verdict inconclusive (see warning)",
     );
+    // The injection check measured every payload; the extra-params drop measured nothing.
+    expect(skipFlags(dropped.tests, [CMD, EXTRA])).toEqual({ [CMD]: false, [EXTRA]: true });
     expect(dropped.warnings.filter((w) => w.startsWith("security-extra-params:"))).toEqual([
       "security-extra-params: tools/call sink with unknown arguments had its connection closed without a response, but the server still served a follow-up server/discover, so the verdict is inconclusive rather than a crash. The drop may be a WAF or IPS dropping the request, a keep-alive connection closed as it was sent, or a crash of one worker of a multi-process server (Node cluster, PM2, gunicorn) while the others still answer -- a black-box client cannot tell these apart. Reject unknown arguments with a JSON-RPC error or ignore them so a client can tell a refusal from a crash.",
     ]);
@@ -3063,6 +3122,7 @@ describe("inline servers: extra-params tells a slow tool from a dead server", ()
     expect(detailsOf(slowStdio.tests, EXTRA)).toBe(
       "tools/call slow did not answer within 1500ms -- extra-params verdict inconclusive (see warning)",
     );
+    expect(skipFlags(slowStdio.tests, [EXTRA])).toEqual({ [EXTRA]: true });
     expect(slowStdio.warnings.filter((w) => w.startsWith("security-extra-params:"))).toEqual([
       "security-extra-params: tools/call slow with unknown arguments did not answer within 1500ms; the server was still up, so the verdict is inconclusive (not a crash). Re-run with a larger --timeout or a faster first tool.",
     ]);
@@ -3165,6 +3225,13 @@ describe("inline servers: tool-dependent tests over a tools/list that fails, is 
     }
     expect(resultOf(empty, "security-tool-schema-defined").details).toBe("No tools to validate");
     expect(resultOf(empty, "security-tool-description-poisoning").details).toBe("No tools to validate");
+    // An empty list leaves nothing to validate: flagged as skips, like the
+    // "(skipped)" siblings. security-tool-rug-pull compared two lists (both
+    // empty) and is a verdict.
+    expect(skipFlags(empty.tests, TOOL_IDS)).toEqual({
+      ...Object.fromEntries(TOOL_IDS.map((id) => [id, true])),
+      "security-tool-rug-pull": false,
+    });
   });
 
   it("an undeclared tools capability still skip-passes as such", () => {
@@ -3281,6 +3348,12 @@ describe("unanswered probes: a hang or refused connection is unreachable, a drop
     expect(detailsOf(dropped.tests, "security-www-authenticate")).toBe(
       "Connection closed without a response (other side closed) -- not a 401 response, no challenge to check (see warning)",
     );
+    // No response, no challenge: a skip. Its siblings credit the same drop
+    // as a refusal (the served comparison pins it on the defect): verdicts.
+    expect(skipFlags(dropped.tests, PROBE_IDS)).toEqual({
+      ...Object.fromEntries(PROBE_IDS.map((id) => [id, false])),
+      "security-www-authenticate": true,
+    });
     expect(dropped.warnings.filter((w) => w.startsWith("security-www-authenticate:"))).toEqual([DROP_WARNING]);
     expect(detailsOf(dropped.tests, "security-oauth-metadata")).toBe(
       `Protected Resource Metadata found at /.well-known/oauth-protected-resource/mcp: resource=${servers[1].base}/mcp, 1 auth server(s)`,
@@ -4215,11 +4288,13 @@ describe("security-auth-required: a 403 without a Bearer challenge counts only w
   });
 
   it("with --auth the server refuses, a bare 403 is not evaluable either, naming how the credentialed discover was answered", () => {
-    // Before: "HTTP 403 (unauthenticated request rejected)".
+    // Before: "HTTP 403 (unauthenticated request rejected)". The JSON-RPC
+    // code the refusal carried is named too, the way lifecycle's
+    // notEvaluable and the 2025-11-25 twin name it (before: "(HTTP 401)").
     const result = resultOf(bareRefusedCredential, ID);
     expect([result.passed, result.details]).toEqual([
       false,
-      'not evaluable: HTTP 403 without a Bearer challenge ("Unauthorized") may be Host/Origin validation or a gateway; the credentialed request was not served either (HTTP 401)',
+      'not evaluable: HTTP 403 without a Bearer challenge ("Unauthorized") may be Host/Origin validation or a gateway; the credentialed request was not served either (HTTP 401, JSON-RPC error -32600)',
     ]);
     expectAsciiDetails(bareRefusedCredential.tests, [ID]);
   });
@@ -4259,9 +4334,10 @@ describe("security-auth-required: a 403 without a Bearer challenge counts only w
 // The auth siblings send a request with no valid credential and credit the
 // 401/403 that answers it. When that 403 is the bare one security-auth-required
 // could not attribute to authentication, crediting it would turn one
-// unattributable refusal into three passes, so they skip instead -- the skip
-// the 2025-11-25 siblings take (runner.ts: "Skipped: not evaluable (see
-// security-auth-required)"). When the credential IS the one variable, they
+// unattributable refusal into four passes, so they skip instead -- the skip
+// the 2025-11-25 siblings take. The skip says what it saw (a 403 without a
+// Bearer challenge) so it reads on its own in a report filtered to leave
+// security-auth-required out. When the credential IS the one variable, they
 // measure the server exactly as before.
 // ---------------------------------------------------------------------------
 
@@ -4271,7 +4347,7 @@ describe("the auth siblings skip the bare 403 security-auth-required could not a
   const MALFORMED = "security-auth-malformed";
   const OAUTH = "security-oauth-metadata";
   const TOKEN_IN_URI = "security-token-in-uri";
-  const NOT_EVALUABLE = "Skipped: not evaluable (see security-auth-required)";
+  const NOT_EVALUABLE = SIBLING_NOT_EVALUABLE;
   const servers: InlineServer[] = [];
   let noAuth: DirectRun;
   let wrongAuth: ComplianceReport;
@@ -4331,19 +4407,30 @@ describe("the auth siblings skip the bare 403 security-auth-required could not a
     expectAsciiDetails(noAuth.tests, AUTH_IDS);
   });
 
-  it("with a credential the server refuses too: www-authenticate and auth-malformed skip, oauth-metadata still looks for the document", () => {
+  it("with a credential the server refuses too: www-authenticate, auth-malformed and token-in-uri skip, oauth-metadata still looks for the document", () => {
     // Before: www-authenticate PASSED "HTTP 403 (WWW-Authenticate not
     // applicable for 403)" and auth-malformed PASSED on the same 403 the
-    // credential-less request drew.
+    // credential-less request drew; token-in-uri PASSED "HTTP 403 (token in
+    // query string rejected)" on it until the 2026-07-28 check took the skip
+    // its 2025-11-25 twin already took.
     expect(resultOf(wrongAuth, REQUIRED).details).toBe(
-      'not evaluable: HTTP 403 without a Bearer challenge ("Unauthorized") may be Host/Origin validation or a gateway; the credentialed request was not served either (HTTP 401)',
+      'not evaluable: HTTP 403 without a Bearer challenge ("Unauthorized") may be Host/Origin validation or a gateway; the credentialed request was not served either (HTTP 401, JSON-RPC error -32600)',
     );
     expect(resultOf(wrongAuth, WWW).details).toBe(NOT_EVALUABLE);
     expect(resultOf(wrongAuth, MALFORMED).details).toBe(NOT_EVALUABLE);
+    expect(resultOf(wrongAuth, TOKEN_IN_URI).details).toBe(NOT_EVALUABLE);
     // oauth-metadata asks a question the refusal does not decide: --auth
     // says the run is testing a protected resource, and the well-known
-    // document is fetched without a credential anyway.
+    // document is fetched without a credential anyway -- and here it is
+    // served, so the guard on the endpoint does not stand in front of it.
     expect(resultOf(wrongAuth, OAUTH).details).toBe(prmDoc);
+    expect(
+      passedIds(
+        wrongAuth,
+        AUTH_IDS.filter((id) => id !== REQUIRED),
+      ),
+    ).toEqual(allPass(AUTH_IDS.filter((id) => id !== REQUIRED)));
+    expectAsciiDetails(wrongAuth.tests, AUTH_IDS);
   });
 
   it("with the credential the server accepts, the 403 is attributed and every sibling measures the server as before", () => {
@@ -4354,18 +4441,20 @@ describe("the auth siblings skip the bare 403 security-auth-required could not a
       "well-formed invalid token: HTTP 401; malformed credential: HTTP 400 (RFC 6750 invalid_request)",
     );
     expect(detailsOf(goodAuth.tests, OAUTH)).toBe(prmDoc);
-    // Not addressed in this pass: token-in-uri still credits the bare 403
-    // its credential-less probe draws, whatever answered it.
+    // The served credentialed discover pins the bare 403 on the missing
+    // header credential, so the same 403 on the query-string token is
+    // credited: the token is the one variable.
     expect(detailsOf(goodAuth.tests, TOKEN_IN_URI)).toBe("HTTP 403 (token in query string rejected)");
   });
 
   it("the skip survives --only: the sibling reads the refusal itself, not a flag security-auth-required set", () => {
-    // The 2025-11-25 siblings read a flag security-auth-required sets, so a
-    // run without it credits the 403; this one reads the memoized probe, so
-    // `--only security-www-authenticate` skips too. The details still point
-    // at the check that explains the refusal, which is how to get it.
+    // This one reads the memoized probe, so `--only
+    // security-www-authenticate` skips too -- and the details say what was
+    // seen (before: "Skipped: not evaluable (see security-auth-required)",
+    // a pointer to a check this report does not contain).
     expect(verdicts(onlyWww.tests, [WWW])).toEqual({ [WWW]: "pass" });
     expect(detailsOf(onlyWww.tests, WWW)).toBe(NOT_EVALUABLE);
+    expect(onlyWww.tests.map((t) => t.id)).toEqual([WWW]);
   });
 
   it("an `authorization` header counts as a credential exactly like `Authorization`", () => {
@@ -4383,6 +4472,286 @@ describe("the auth siblings skip the bare 403 security-auth-required could not a
     expect(resultOf(lowercaseHeader, MALFORMED).details).toBe(
       "well-formed invalid token: HTTP 401; malformed credential: HTTP 400 (RFC 6750 invalid_request)",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "The credentialed request was served" means it got past the gate, not that
+// the application returned a DiscoverResult. A gate that answers the
+// credential-less request with a bare 403 (or drops it) and passes the
+// credentialed one through to an application that answers server/discover
+// with a JSON-RPC error at HTTP 200 -- a server without server/discover, or
+// one that needs a client capability the suite leaves undeclared (-32021) --
+// has shown the credential is the one variable just as well.
+// ---------------------------------------------------------------------------
+
+describe("a credentialed server/discover the gate passed through counts as served, even when the application answered it with an error", () => {
+  const REQUIRED = "security-auth-required";
+  const WWW = "security-www-authenticate";
+  const MALFORMED = "security-auth-malformed";
+  const OAUTH = "security-oauth-metadata";
+  const TOKEN_IN_URI = "security-token-in-uri";
+  const ORIGIN = "security-origin-validation";
+  const servers: InlineServer[] = [];
+  let gated: ComplianceReport;
+  let dropped: ComplianceReport;
+  let originDropped: ComplianceReport;
+
+  beforeAll(async () => {
+    // A bare 403 on the credential-less discover; `Bearer tok` gets through
+    // to an application that answers server/discover -32601 at HTTP 200.
+    const a = await startInlineServer({
+      auth: "strict",
+      unauthenticatedStatus: 403,
+      discover: "error",
+      prm: "path",
+      tools: "none",
+    });
+    // The same application behind a gate that drops the credential-less
+    // request's connection instead of answering it.
+    const b = await startInlineServer({ auth: "strict", unauthenticated: "drop", discover: "error", tools: "none" });
+    // No auth at all: the application answers discover -32601 and a request
+    // carrying a foreign Origin has its connection dropped.
+    const c = await startInlineServer({ discover: "error", foreignOrigin: "drop", tools: "none" });
+    servers.push(a, b, c);
+    // Through the real dispatcher: the setup discover's rejection is recorded.
+    const auth = { Authorization: "Bearer tok" };
+    gated = await runModern(a.url, { headers: auth, only: AUTH_IDS });
+    dropped = await runModern(b.url, { headers: auth, only: [REQUIRED] });
+    originDropped = await runModern(c.url, { only: [ORIGIN] });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("a bare 403 is attributed, and every sibling measures the server instead of skipping", () => {
+    // Before: security-auth-required FAILED 'not evaluable: HTTP 403 without
+    // a Bearer challenge ("Unauthorized") may be Host/Origin validation or a
+    // gateway; the credentialed request was not served either (HTTP 200)' --
+    // an HTTP 200 called "not served" -- and www-authenticate and
+    // auth-malformed skipped as not evaluable. The gate behaved exactly as
+    // it does in front of an application that returns a DiscoverResult.
+    expect(passedIds(gated, AUTH_IDS)).toEqual(allPass(AUTH_IDS));
+    expect(resultOf(gated, REQUIRED).details).toBe(BARE_403_ATTRIBUTED);
+    expect(resultOf(gated, WWW).details).toBe("HTTP 403 (WWW-Authenticate not applicable for 403)");
+    // A server with no server/discover still has its credential validation
+    // measured: the setup discover's 200 is no credential refusal.
+    expect(resultOf(gated, MALFORMED).details).toBe(
+      "well-formed invalid token: HTTP 401; malformed credential: HTTP 400 (RFC 6750 invalid_request)",
+    );
+    expect(resultOf(gated, TOKEN_IN_URI).details).toBe("HTTP 403 (token in query string rejected)");
+    expect(resultOf(gated, OAUTH).details).toBe(
+      `Protected Resource Metadata found at /.well-known/oauth-protected-resource/mcp: resource=${servers[0].base}/mcp, 1 auth server(s)`,
+    );
+    expectAsciiDetails(gated.tests, AUTH_IDS);
+  });
+
+  it("a dropped credential-less request next to it is a connection-level refusal, not an unreachable server", () => {
+    // Before: FAIL "server unreachable: unauthenticated server/discover got
+    // no response (connection closed: other side closed)".
+    expect(passedIds(dropped, [REQUIRED])).toEqual(allPass([REQUIRED]));
+    expect(resultOf(dropped, REQUIRED).details).toBe(
+      "Connection closed without a response (other side closed); the same request with the credential was served (unauthenticated request rejected)",
+    );
+  });
+
+  it("a dropped foreign-Origin request next to it is pinned on the Origin", () => {
+    // Before: FAIL "server unreachable: server/discover with a foreign
+    // Origin got no response (connection closed: other side closed)".
+    expect(passedIds(originDropped, [ORIGIN])).toEqual(allPass([ORIGIN]));
+    expect(resultOf(originDropped, ORIGIN).details).toBe(
+      "Connection closed without a response (other side closed) (suspicious Origin rejected)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A configured credential the server refuses (a stale or wrong token): the
+// setup server/discover drew 401, so the 401 an invalid token or a token moved
+// into the query string draws is what EVERY credential draws. The comparison
+// security-auth-malformed and security-token-in-uri rest on is gone, so they
+// skip instead of passing -- but a token the server accepts where it must not
+// still fails, whatever the header credential drew.
+// ---------------------------------------------------------------------------
+
+describe("auth-malformed and token-in-uri next to a configured credential the server refuses too", () => {
+  const REQUIRED = "security-auth-required";
+  const WWW = "security-www-authenticate";
+  const MALFORMED = "security-auth-malformed";
+  const TOKEN_IN_URI = "security-token-in-uri";
+  const servers: InlineServer[] = [];
+  let stale: ComplianceReport;
+  let accepted: ComplianceReport;
+  let staleQueryAccepted: ComplianceReport;
+
+  beforeAll(async () => {
+    // `Bearer tok` is served; every other well-formed token draws 401
+    // invalid_token and a credential-less request 401 with a challenge that
+    // advertises the metadata document it serves.
+    const a = await startInlineServer({ auth: "strict", prm: "header", tools: "none" });
+    // Answers any request carrying ?access_token with a result, before any
+    // auth -- behind a bare 403 for the credential-less header request.
+    const b = await startInlineServer({
+      auth: "strict",
+      unauthenticatedStatus: 403,
+      queryToken: "sse-result",
+      tools: "none",
+    });
+    servers.push(a, b);
+    stale = await runModern(a.url, { headers: { Authorization: "Bearer stale" }, only: AUTH_IDS });
+    accepted = await runModern(a.url, { headers: { Authorization: "Bearer tok" }, only: AUTH_IDS });
+    staleQueryAccepted = await runModern(b.url, { headers: { Authorization: "Bearer stale" }, only: [TOKEN_IN_URI] });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("skip rather than pass: the 401s they drew are the 401 the configured credential drew", () => {
+    // Before: auth-malformed PASSED "well-formed invalid token: HTTP 401;
+    // malformed credential: HTTP 400 (RFC 6750 invalid_request)" and
+    // token-in-uri PASSED "HTTP 401 (token in query string rejected)" --
+    // evidence of token validation from a server that validated nothing
+    // the run could compare against.
+    expect(resultOf(stale, MALFORMED).details).toBe(
+      `${CREDENTIAL_REFUSED_PREFIX}rejecting invalid tokens cannot be told from rejecting everything (check the configured credential)`,
+    );
+    expect(resultOf(stale, TOKEN_IN_URI).details).toBe(
+      `${CREDENTIAL_REFUSED_PREFIX}refusing it in the query string proves nothing (check the configured credential)`,
+    );
+    // The two that read only the credential-less request are unchanged.
+    expect(resultOf(stale, REQUIRED).details).toBe("HTTP 401 (unauthenticated request rejected)");
+    expect(resultOf(stale, WWW).details).toBe(
+      `WWW-Authenticate: Bearer resource_metadata="${servers[0].base}/oauth/prm"`,
+    );
+    expect(passedIds(stale, AUTH_IDS)).toEqual(allPass(AUTH_IDS));
+    expectAsciiDetails(stale.tests, AUTH_IDS);
+  });
+
+  it("with the credential the server accepts, both measure the server as before", () => {
+    expect(passedIds(accepted, AUTH_IDS)).toEqual(allPass(AUTH_IDS));
+    expect(resultOf(accepted, MALFORMED).details).toBe(
+      "well-formed invalid token: HTTP 401; malformed credential: HTTP 400 (RFC 6750 invalid_request)",
+    );
+    expect(resultOf(accepted, TOKEN_IN_URI).details).toBe("HTTP 401 (token in query string rejected)");
+  });
+
+  it("a query-string token the server accepts fails whatever the header credential and the credential-less request drew", () => {
+    // Both skips read a refusal against the setup requests; neither is
+    // consulted before the probe, so an acceptance is never hidden.
+    expect(passedIds(staleQueryAccepted, [TOKEN_IN_URI])).toEqual({
+      [TOKEN_IN_URI]: "FAIL: HTTP 200, result -- server accepted the auth token in the query string (MUST NOT)",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The SDK's Host guard refusing the hostname the run uses (a tunnel or proxy
+// name) answers EVERY request with the same bare 403 -- the well-known
+// metadata locations and the foreign-Origin probe included, with or without a
+// credential. None of those 403s says anything about authentication, the
+// Origin or a rate limiter, so no check credits one. (The real SDK guard is
+// exercised in integration-sdk2.test.ts.)
+// ---------------------------------------------------------------------------
+
+describe("a Host guard answering every request and every path with a bare 403", () => {
+  const REQUIRED = "security-auth-required";
+  const WWW = "security-www-authenticate";
+  const MALFORMED = "security-auth-malformed";
+  const OAUTH = "security-oauth-metadata";
+  const TOKEN_IN_URI = "security-token-in-uri";
+  const ORIGIN = "security-origin-validation";
+  const RATE = "security-rate-limiting";
+  const IDS = [...AUTH_IDS, ORIGIN, RATE];
+  const RATE_SKIP =
+    "Skipped: all 50 rapid server/discover requests drew HTTP 403 before reaching a handler, not as an auth refusal (Host/Origin validation or a gateway), so rate limiting was not measured (see security-auth-required)";
+  const ORIGIN_SKIP =
+    "Skipped: HTTP 403 to the foreign Origin, but the conformant server/discover was not served either, so the refusal is not attributable to the Origin (see security-auth-required)";
+  const servers: InlineServer[] = [];
+  let noAuth: ComplianceReport;
+  let withAuth: ComplianceReport;
+  let noMetadata: ComplianceReport;
+
+  beforeAll(async () => {
+    const guard = await startInlineServer({ hostGuard: true });
+    // A bare 403 on /mcp only: the well-known locations answer 404.
+    const endpointOnly = await startInlineServer({
+      auth: "strict",
+      unauthenticatedStatus: 403,
+      prm: "none",
+      tools: "none",
+    });
+    servers.push(guard, endpointOnly);
+    noAuth = await runModern(guard.url, { only: IDS });
+    withAuth = await runModern(guard.url, { headers: { Authorization: "Bearer tok" }, only: IDS });
+    noMetadata = await runModern(endpointOnly.url, { headers: { Authorization: "Bearer wrong" }, only: [OAUTH] });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("without --auth: auth-required explains the 403, and nothing else credits it", () => {
+    expect(resultOf(noAuth, REQUIRED).details).toBe(
+      'not evaluable: HTTP 403 without a Bearer challenge ("Invalid Host: 127.0.0.1") names Host/Origin validation, not authentication: allow the hostname you tested through',
+    );
+    expect(resultOf(noAuth, WWW).details).toBe(SIBLING_NOT_EVALUABLE);
+    expect(resultOf(noAuth, OAUTH).details).toBe(SIBLING_NOT_EVALUABLE);
+    // Before: PASS "HTTP 403 (suspicious Origin rejected)" -- DNS-rebinding
+    // protection credited to a guard that refuses the Origin-less setup
+    // request just the same.
+    expect(resultOf(noAuth, ORIGIN).details).toBe(ORIGIN_SKIP);
+    // Before: "Skipped: all 50 rapid server/discover requests were rejected
+    // by auth (HTTP 403) before reaching a handler, so rate limiting could
+    // not be measured; pass --auth" -- auth advice about a Host guard.
+    expect(resultOf(noAuth, RATE).details).toBe(RATE_SKIP);
+    expect(
+      passedIds(
+        noAuth,
+        IDS.filter((id) => id !== REQUIRED),
+      ),
+    ).toEqual(allPass(IDS.filter((id) => id !== REQUIRED)));
+    expectAsciiDetails(noAuth.tests, IDS);
+  });
+
+  it("with --auth: every sibling skips, oauth-metadata included once the well-known locations drew the same 403", () => {
+    expect(resultOf(withAuth, WWW).details).toBe(SIBLING_NOT_EVALUABLE);
+    expect(resultOf(withAuth, MALFORMED).details).toBe(SIBLING_NOT_EVALUABLE);
+    // Before: PASS "HTTP 403 (token in query string rejected)".
+    expect(resultOf(withAuth, TOKEN_IN_URI).details).toBe(SIBLING_NOT_EVALUABLE);
+    // Before: FAIL "No Protected Resource Metadata
+    // (/.well-known/oauth-protected-resource/mcp -> HTTP 403;
+    // /.well-known/oauth-protected-resource -> HTTP 403) and no legacy OAuth
+    // metadata", advising a document the guard would never serve.
+    expect(resultOf(withAuth, OAUTH).details).toBe(
+      "Skipped: HTTP 403 without a Bearer challenge on the endpoint and on every well-known metadata location, not attributable to authentication (see security-auth-required)",
+    );
+    expect(servers[0].urls).toEqual(
+      expect.arrayContaining([
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-authorization-server",
+      ]),
+    );
+    expect(resultOf(withAuth, ORIGIN).details).toBe(ORIGIN_SKIP);
+    // Before: "... rejected by auth (HTTP 403) ... (check the configured
+    // credential)" -- the credential was never what the guard refused.
+    expect(resultOf(withAuth, RATE).details).toBe(RATE_SKIP);
+    expect(
+      passedIds(
+        withAuth,
+        IDS.filter((id) => id !== REQUIRED),
+      ),
+    ).toEqual(allPass(IDS.filter((id) => id !== REQUIRED)));
+    expectAsciiDetails(withAuth.tests, IDS);
+  });
+
+  it("a bare 403 on the endpoint alone does not excuse missing metadata the well-known locations answer 404 for", () => {
+    expect(passedIds(noMetadata, [OAUTH])).toEqual({
+      [OAUTH]:
+        "FAIL: No Protected Resource Metadata (/.well-known/oauth-protected-resource/mcp -> HTTP 404; /.well-known/oauth-protected-resource -> HTTP 404) and no legacy OAuth metadata",
+    });
   });
 });
 
@@ -4731,6 +5100,56 @@ describe("stdio servers: an oversized reply the runner drops, and a child that d
 });
 
 // ---------------------------------------------------------------------------
+// Information disclosure with no error response at all to scan.
+// ---------------------------------------------------------------------------
+
+describe("stdio server: the leak scans with no error response to read", () => {
+  const IDS = ["security-error-no-stacktrace", "security-error-no-internal-ip"];
+  let dir = "";
+  let run: DirectRun;
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), "mcp-compliance-sec-noerr-"));
+    // Answers every request, the failure probes included, with a result.
+    const script = join(dir, "never-errs.mjs");
+    writeFileSync(
+      script,
+      [
+        'import { createInterface } from "node:readline";',
+        "const rl = createInterface({ input: process.stdin });",
+        'rl.on("line", (line) => {',
+        "  let msg;",
+        "  try { msg = JSON.parse(line); } catch { return; }",
+        "  if (msg.id === undefined) return;",
+        '  const caps = { supportedVersions: ["2026-07-28"], capabilities: { tools: {} }, ttlMs: 0, cacheScope: "public" };',
+        '  const body = msg.method === "server/discover" ? caps : msg.method === "tools/list" ? { tools: [], ttlMs: 0, cacheScope: "public" } : { content: [] };',
+        '  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", ...body } }) + "\\n");',
+        "});",
+        "",
+      ].join("\n"),
+    );
+    run = await runDirect({ command: { command: process.execPath, args: [script] }, only: IDS });
+  }, 30_000);
+
+  afterAll(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("passes with the count it scanned, flagged as a skip: there was nothing to scan", () => {
+    expect(verdicts(run.tests, IDS)).toEqual(allPass(IDS));
+    expect(detailsOf(run.tests, IDS[0])).toBe(
+      "0 unique error response(s) checked -- no stack traces or sensitive data found",
+    );
+    expect(detailsOf(run.tests, IDS[1])).toBe(
+      "0 unique error response(s) checked -- no internal IP addresses or hostnames found",
+    );
+    expect(skipFlags(run.tests, IDS)).toEqual(Object.fromEntries(IDS.map((id) => [id, true])));
+    // Every failure probe was answered, with a result.
+    expect(run.recorder.errors()).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Information disclosure in bodies that are not JSON-RPC at all: the
 // framework error page an unknown method or an unparseable body draws.
 // ---------------------------------------------------------------------------
@@ -5012,17 +5431,22 @@ describe("inline servers: a burst answered with 5xx, and bursts that measure not
   let wrongToken: DirectRun;
   let noDiscover: DirectRun;
   let listFailed: DirectRun;
+  let challenged403: DirectRun;
 
   beforeAll(async () => {
     const a = await startInlineServer({ rateLimit: { after: 10, scope: "tools-call" }, rateLimitStatus: 503 });
     const b = await startInlineServer({ auth: "strict" });
     const c = await startInlineServer({ discover: "error" });
     const d = await startInlineServer({ tools: "list-error" });
-    servers.push(a, b, c, d);
+    // A credential-less request answered 403 WITH a Bearer challenge: an
+    // auth refusal, unlike the Host guard's bare 403.
+    const e = await startInlineServer({ auth: "strict", unauthenticatedStatus: "403-challenge" });
+    servers.push(a, b, c, d, e);
     overloaded = await runDirect({ url: a.url, only: [ID] });
     wrongToken = await runDirect({ url: b.url, headers: { Authorization: "Bearer WRONG" }, only: [ID] });
     noDiscover = await runDirect({ url: c.url, only: [ID] });
     listFailed = await runDirect({ url: d.url, only: [ID] });
+    challenged403 = await runDirect({ url: e.url, only: [ID] });
   }, 30_000);
 
   afterAll(async () => {
@@ -5043,6 +5467,14 @@ describe("inline servers: a burst answered with 5xx, and bursts that measure not
       "Skipped: all 50 rapid server/discover requests were rejected by auth (HTTP 401) before reaching a handler, so rate limiting could not be measured (check the configured credential)",
     );
     expect(wrongToken.warnings.filter((w) => w.startsWith("security-rate-limiting:"))).toEqual([]);
+  });
+
+  it("a burst of 403s carrying a Bearer challenge is an auth refusal too, and keeps the auth wording", () => {
+    // The bare-403 burst (a Host guard) is worded apart: see the Host guard block.
+    expect(verdicts(challenged403.tests, [ID])).toEqual({ [ID]: "pass" });
+    expect(detailsOf(challenged403.tests, ID)).toBe(
+      "Skipped: all 50 rapid server/discover requests were rejected by auth (HTTP 403) before reaching a handler, so rate limiting could not be measured; pass --auth",
+    );
   });
 
   it("names why tool invocations could not be bursted: capabilities unknown, or a tools/list that failed", () => {
@@ -5628,6 +6060,95 @@ describe("inline servers: a fixed CORS grant, a failed preflight, and Origin ans
     expect(verdicts(origin302.tests, [ORIGIN])).toEqual({ [ORIGIN]: "FAIL: HTTP 302" });
     for (const run of [fixed, noPreflight]) expectAsciiDetails(run.tests, [CORS]);
     for (const run of [origin400, origin302]) expectAsciiDetails(run.tests, [ORIGIN]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// security-origin-validation on answers that are no Origin check: a 5xx from
+// a server that serves the Origin-less request (the server failing on the
+// probe, not refusing it), a rate limiter's 429, and an auth gate's 401 that
+// the Origin-less setup request drew as well.
+// ---------------------------------------------------------------------------
+
+describe("security-origin-validation: a 5xx, a 429 and an auth gate's 401 are no Origin rejection", () => {
+  const ORIGIN = "security-origin-validation";
+  const servers: InlineServer[] = [];
+  let origin500: DirectRun;
+  let origin429: DirectRun;
+  let origin429Then403: DirectRun;
+  let gate401: DirectRun;
+  let gate401WithAuth: DirectRun;
+  let gate401Dispatched: ComplianceReport;
+  let originBeforeAuth: ComplianceReport;
+
+  beforeAll(async () => {
+    const a = await startInlineServer({ foreignOrigin: 500 });
+    const b = await startInlineServer({ foreignOrigin: 429, tools: "none" });
+    const c = await startInlineServer({ foreignOrigin: "429-then-403" });
+    const d = await startInlineServer({ auth: "strict" });
+    // Validates the Origin before auth: a credential-less request is 401,
+    // the same request with a foreign Origin 403.
+    const e = await startInlineServer({ auth: "strict", foreignOrigin: 403 });
+    servers.push(a, b, c, d, e);
+    origin500 = await runDirect({ url: a.url, only: [ORIGIN] });
+    origin429 = await runDirect({ url: b.url, only: [ORIGIN] });
+    origin429Then403 = await runDirect({ url: c.url, only: [ORIGIN] });
+    gate401 = await runDirect({ url: d.url, only: [ORIGIN] });
+    gate401WithAuth = await runDirect({ url: d.url, headers: { Authorization: "Bearer tok" }, only: [ORIGIN] });
+    // Through the real dispatcher, which records how the setup discover was refused.
+    gate401Dispatched = await runModern(d.url, { only: [ORIGIN] });
+    originBeforeAuth = await runModern(e.url, { only: [ORIGIN] });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const s of servers) await s.close();
+  });
+
+  it("a 5xx on a server that serves the same request without the Origin fails: it broke, it did not refuse", () => {
+    // Before: PASS "HTTP 500 (suspicious Origin rejected)" -- on a server
+    // that never looked at the Origin.
+    expect(verdicts(origin500.tests, [ORIGIN])).toEqual({
+      [ORIGIN]:
+        "FAIL: HTTP 500, non-JSON-RPC body -- the server failed on the request rather than refusing it (a broken server, or a gateway with no backend); an untrusted Origin MUST draw 403",
+    });
+    expectAsciiDetails(origin500.tests, [ORIGIN]);
+  });
+
+  it("a 429 is resent once after the wait it asks for; a second 429 is not evaluable, and the retry's answer otherwise decides", () => {
+    // Before: PASS "HTTP 429 (suspicious Origin rejected)".
+    expect(verdicts(origin429.tests, [ORIGIN])).toEqual({
+      [ORIGIN]:
+        "FAIL: HTTP 429, then after 1000ms HTTP 429 -- not evaluable: a rate limiter answered before the server read the request, so the Origin was never checked",
+    });
+    expect(servers[1].urls.filter((u) => u === "/mcp")).toHaveLength(3); // setup discover + probe + retry
+    expect(verdicts(origin429Then403.tests, [ORIGIN])).toEqual({ [ORIGIN]: "pass" });
+    expect(detailsOf(origin429Then403.tests, ORIGIN)).toBe(
+      "HTTP 429, then after 1000ms HTTP 403 (suspicious Origin rejected)",
+    );
+    for (const run of [origin429, origin429Then403]) expectAsciiDetails(run.tests, [ORIGIN]);
+  });
+
+  it("an auth gate's 401 the Origin-less setup request drew too is not attributable to the Origin: skipped", () => {
+    // Before: PASS "HTTP 401 (suspicious Origin rejected)".
+    expect(verdicts(gate401.tests, [ORIGIN])).toEqual({ [ORIGIN]: "pass" });
+    expect(detailsOf(gate401.tests, ORIGIN)).toBe(
+      "Skipped: HTTP 401 to the foreign Origin, but the conformant server/discover was not served either, so the refusal is not attributable to the Origin (see security-auth-required)",
+    );
+    expect(resultOf(gate401Dispatched, ORIGIN).details).toBe(detailsOf(gate401.tests, ORIGIN));
+    // With the credential the same server serves the probe: it validates no
+    // Origin, and says so.
+    expect(verdicts(gate401WithAuth.tests, [ORIGIN])).toEqual({
+      [ORIGIN]:
+        "FAIL: HTTP 200, result -- server accepted a request with an untrusted Origin (MUST validate Origin, 403)",
+    });
+  });
+
+  it("a 403 to the foreign Origin next to a 401 for the same request without it is the Origin check: credited without --auth", () => {
+    // The statuses differ, so the Origin is what changed the answer: a
+    // conformant server that checks the Origin before auth keeps its pass
+    // on a run with no credential.
+    expect(passedIds(originBeforeAuth, [ORIGIN])).toEqual(allPass([ORIGIN]));
+    expect(resultOf(originBeforeAuth, ORIGIN).details).toBe("HTTP 403 (suspicious Origin rejected)");
   });
 });
 
