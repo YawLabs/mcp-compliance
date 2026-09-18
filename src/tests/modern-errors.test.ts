@@ -430,7 +430,13 @@ describe("errors suite: canned bad HTTP server", () => {
     );
     expect(resultOf(report, "error-capability-gated").details).toContain("prompts/list returned a result");
     expectPass(report, "error-invalid-jsonrpc", "JSON-RPC error -32601 on HTTP 400");
-    expectFail(report, "error-invalid-json", "HTTP 500 for invalid JSON");
+    // A -32600 is not the parse error's own code, so on a 500 it is no
+    // rejection the server can be credited with (gate.ts).
+    expectFail(
+      report,
+      "error-invalid-json",
+      "JSON-RPC error -32600 on HTTP 500 for invalid JSON; not evaluable: a 5xx that carries no -32700",
+    );
     expectFail(report, "error-parse-code", "Expected -32700 (Parse error) for invalid JSON, got -32600");
     expectFail(
       report,
@@ -527,9 +533,13 @@ describe("errors suite: canned bad HTTP server", () => {
     expect(Object.fromEntries(report.tests.map((t) => [t.id, { passed: t.passed, details: t.details }]))).toEqual({
       "error-unknown-method": { passed: true, details: "JSON-RPC error -32601 on HTTP 404, id echoed" },
       "error-method-code": { passed: true, details: "-32601 (Method not found)" },
+      // A bare 500 is no rejection the server can be credited with: it
+      // carries no -32600, so a crashed handler and a gateway with no backend
+      // read the same (gate.ts). Failed before too, blaming the probe.
       "error-invalid-jsonrpc": {
         passed: false,
-        details: "HTTP 500 for a malformed envelope; expected a JSON-RPC error or 4xx",
+        details:
+          "no JSON-RPC error body on HTTP 500 for a malformed envelope; not evaluable: a 5xx that carries no -32600 is a server failure or a gateway with no backend, so it proves nothing about the malformed envelope",
       },
       "error-invalid-json": { passed: true, details: "JSON-RPC error -32600 on HTTP 400" },
       "error-parse-code": {

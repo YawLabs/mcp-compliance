@@ -18,9 +18,15 @@ import { MODERN_TEST_DEFINITIONS } from "../definitions/index.js";
 
 const SUITE_DIR = fileURLToPath(new URL("../suites/modern/", import.meta.url));
 
-/** Every module in src/suites/modern except the orchestrator itself. */
+/**
+ * The helper modules that register no test: the shared context, and the
+ * gate reader (whose answer a rejection is) that several modules share.
+ */
+const HELPERS = ["context.ts", "gate.ts"];
+
+/** Every module in src/suites/modern except the orchestrator itself and the helpers. */
 const MODULES = readdirSync(SUITE_DIR)
-  .filter((f) => f.endsWith(".ts") && f !== "index.ts" && f !== "context.ts")
+  .filter((f) => f.endsWith(".ts") && f !== "index.ts" && !HELPERS.includes(f))
   .sort();
 
 const INDEX_SRC = readFileSync(join(SUITE_DIR, "index.ts"), "utf8");
@@ -68,7 +74,7 @@ describe("modern suite modules ↔ MODERN_TEST_DEFINITIONS parity", () => {
     // fail safe; printed raw it read "JSON-RPC error NaN". rawCode carries
     // what the server sent.
     const RAW_CODE_RE = /\$\{(?:err\w*|error\w*|errorOf\([^)]*\)\??)\.code\}/g;
-    const offenders = [...MODULES, "context.ts"].flatMap((f) =>
+    const offenders = [...MODULES, ...HELPERS].flatMap((f) =>
       [...readFileSync(join(SUITE_DIR, f), "utf8").matchAll(RAW_CODE_RE)].map((m) => `${f}: ${m[0]}`),
     );
     expect(offenders).toEqual([]);

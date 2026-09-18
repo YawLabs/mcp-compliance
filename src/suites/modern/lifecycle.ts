@@ -29,6 +29,7 @@ import {
   type ModernSuiteContext,
   publishList,
 } from "./context.js";
+import { gateVerdict, httpStatusText, resendOn429 } from "./gate.js";
 
 /**
  * Lifecycle category of the 2026-07-28 suite. There is no handshake in
@@ -87,6 +88,23 @@ export const TRANSPORT_LEVEL_STATUS: Record<number, string> = {
  */
 const IDLE_PROBE_FLOOR_MS = 2000;
 const IDLE_PROBE_POLL_MS = 50;
+
+/**
+ * The JSON-RPC errors that are a server's own refusal of the conformant
+ * server/discover -- one that does not speak 2026-07-28 (-32601), or refuses
+ * the request's envelope, `_meta` or standard headers (-32600, -32602,
+ * -32020, -32021, -32022). A gateway with no backend has not read the
+ * request and cannot produce them, so lifecycle-jsonrpc credits one on a 5xx
+ * (see gateVerdict).
+ */
+const DISCOVER_REFUSAL_CODES: readonly number[] = [
+  JSONRPC_ERROR_CODES.INVALID_REQUEST,
+  JSONRPC_ERROR_CODES.METHOD_NOT_FOUND,
+  JSONRPC_ERROR_CODES.INVALID_PARAMS,
+  MODERN_ERROR_CODES.HEADER_MISMATCH,
+  MODERN_ERROR_CODES.MISSING_REQUIRED_CLIENT_CAPABILITY,
+  MODERN_ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION,
+];
 
 /** Removed in 2026-07-28; each must draw a JSON-RPC error. `initialize` is probed separately (lifecycle-dual-era). */
 const REMOVED_METHOD_PROBES: Array<[string, Record<string, unknown>]> = [
@@ -432,12 +450,52 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
 
   await harness.check("lifecycle-jsonrpc", async () => {
     if (!probe.res) return fail(describeProbeFailure(probe, ctx));
-    const body = probe.res.body;
+    let res = probe.res;
+    /** "; resent once after HTTP 429" when the envelope judged is the resent discover's. */
+    let resent = "";
+    if (ctx.kind === "http" && !resultOf(res.body)) {
+      // A discover answered without a result may not have been answered by
+      // the server at all: an envelope something in front of it wrote (a
+      // gateway's -32001 "Unauthorized" on its 401, echoing the id) is no
+      // evidence of the server's JSON-RPC, however valid. Read the way the
+      // error checks read a rejection (gateVerdict): a 429 is resent once
+      // after Retry-After and the second answer decides; an auth gate, a
+      // 429 again, a 5xx without a server's own refusal of the discover, or
+      // a 403 without a Bearer challenge -- which refused the conformant
+      // request itself, so nothing is left to compare it with -- is not
+      // evaluable. A server's own refusal code on a 5xx is credited, with a
+      // warning about the status.
+      let throttledMs: number | null = null;
+      try {
+        ({ res, throttledMs } = await resendOn429(ctx, res, () => client.rpc("server/discover", {})));
+      } catch (err) {
+        if (ctx.signal?.aborted) throw err;
+        return fail(
+          `server unreachable: server/discover answered HTTP 429, and its resend got no response (${short(messageOf(err))})`,
+        );
+      }
+      if (!resultOf(res.body)) {
+        const reason = await gateVerdict(ctx, res, {
+          check: "lifecycle-jsonrpc",
+          what: "the conformant server/discover",
+          about: "the server's JSON-RPC envelope",
+          ownCodes: DISCOVER_REFUSAL_CODES,
+          twin: "self",
+        });
+        if (reason) {
+          const err = errorOf(res.body);
+          const answer = err ? errorWithCode(err.rawCode) : "no JSON-RPC error body";
+          return fail(`server/discover answered ${answer} (${httpStatusText(res.statusCode, throttledMs)}); ${reason}`);
+        }
+      }
+      if (throttledMs !== null) resent = "; resent once after HTTP 429";
+    }
+    const body = res.body;
     if (!isObject(body)) return fail(`response body is ${describeType(body)}, expected a JSON-RPC object`);
     const problems: string[] = [];
     if (body.jsonrpc !== "2.0") problems.push(`jsonrpc=${JSON.stringify(body.jsonrpc)} (expected "2.0")`);
-    if (body.id !== probe.res.requestId) {
-      problems.push(`id=${JSON.stringify(body.id)} does not echo request id ${JSON.stringify(probe.res.requestId)}`);
+    if (body.id !== res.requestId) {
+      problems.push(`id=${JSON.stringify(body.id)} does not echo request id ${JSON.stringify(res.requestId)}`);
     }
     const hasResult = "result" in body;
     const hasError = "error" in body;
@@ -447,7 +505,7 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
       problems.push(`result is ${describeType(body.result)}, expected an object`);
     if (problems.length > 0) return fail(`Invalid JSON-RPC 2.0 envelope: ${problems.join("; ")}`);
     return pass(
-      `Valid JSON-RPC 2.0 response (id ${JSON.stringify(body.id)} echoed, ${hasResult ? "result" : "error"})`,
+      `Valid JSON-RPC 2.0 response (id ${JSON.stringify(body.id)} echoed, ${hasResult ? "result" : "error"}${resent})`,
     );
   });
 

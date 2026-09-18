@@ -281,6 +281,36 @@ for (const ex of EXPECTED) {
       expect(report.warnings.slice(1)).toHaveLength(expected.length);
     });
 
+    it("the six checks that ask whose answer a rejection is keep the fixture's verdicts, and warn about nothing", () => {
+      // The fixture answers each probe itself (src/suites/modern/gate.ts reads
+      // a gateway's 401 / -32001, a repeated 429 or a 5xx without the check's
+      // own code as not evaluable): nothing it sends is any of those.
+      const verdict = (id: string) => {
+        const t = resultOf(report, id);
+        return `${t.passed ? "PASS" : "FAIL"}${t.skipped ? " (skipped)" : ""}: ${t.details}`;
+      };
+      const http = ex.kind === "http";
+      expect(verdict("lifecycle-jsonrpc")).toMatch(/^PASS: Valid JSON-RPC 2\.0 response \(id \d+ echoed, result\)$/);
+      expect({
+        unknown: verdict("error-unknown-method"),
+        params: verdict("error-missing-params"),
+        gated: verdict("error-capability-gated"),
+        ...(http ? { envelope: verdict("error-invalid-jsonrpc"), parse: verdict("error-invalid-json") } : {}),
+      }).toEqual({
+        unknown: `PASS: JSON-RPC error -32601${http ? " on HTTP 404" : ""}, id echoed`,
+        params: "PASS: JSON-RPC error -32602 (correct: Invalid params) (Unknown tool: undefined)",
+        gated:
+          "PASS (skipped): Server declares all capabilities (tools, resources, prompts); no undeclared methods to test",
+        ...(http
+          ? {
+              envelope: "PASS: JSON-RPC error -32600 (correct: Invalid Request) on HTTP 400",
+              parse: "PASS: JSON-RPC error -32700 (correct: Parse error) on HTTP 400",
+            }
+          : {}),
+      });
+      expect(report.warnings.filter((w) => /^(lifecycle-jsonrpc|error-)|spec requires 404/.test(w))).toEqual([]);
+    });
+
     it("the informational probes describe the fixture as modern-only", () => {
       expect(resultOf(report, "lifecycle-dual-era").details).toMatch(
         /^modern-only: initialize rejected with -32601.*message names supported versions/,
