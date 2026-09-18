@@ -4,7 +4,16 @@ import { errorOf, type JsonRpcErrorInfo, type RpcResponse, resultOf } from "../.
 import { JSONRPC_ERROR_CODES } from "../../modern/meta.js";
 import type { JsonRpcId } from "../../transport/index.js";
 import { hasPrompts, hasResources, hasTools, type ModernSuiteContext } from "./context.js";
-import { discoverTwin, type GateAnswer, type GateSpec, gateVerdict, httpStatusText, resendOn429 } from "./gate.js";
+import {
+  DETAILS_MAX,
+  discoverTwin,
+  type GateAnswer,
+  type GateSpec,
+  gateDetails,
+  gateVerdict,
+  httpStatusText,
+  resendOn429,
+} from "./gate.js";
 import { notEvaluable } from "./lifecycle.js";
 
 /**
@@ -37,14 +46,22 @@ import { notEvaluable } from "./lifecycle.js";
  * error-invalid-cursor) also ask whose answer it is (gate.ts's
  * gateVerdict): a gateway's 401 with a -32001 "Unauthorized" body that
  * echoes the id, a 403 carrying a Bearer challenge, a 403 the conformant
- * twin cannot credit, a 429 that is still a 429 after one resend, or a 5xx
- * without the check's own code (-32601, -32600, -32700, -32602, -32601,
- * -32602) is not the server's, and fails as not evaluable. A 5xx carrying
- * that code is credited, with a warning about the status. The exact-code
- * ids (error-method-code, error-parse-code, error-invalid-request-code)
- * credit only the one right code, which no gate produces, so they read the
- * discover state alone. tools-call-unknown is not read this way yet: a
- * gateway's -32001 on its tools/call still passes it.
+ * twin cannot credit, or a 429 that is still a 429 after one resend is not
+ * the server's, and fails as not evaluable. A 5xx without the check's own
+ * code (-32601, -32600, -32700, -32602, -32601, -32602) is the server
+ * failing on the probe rather than rejecting it, and fails as such; a 5xx
+ * carrying that code is credited, with a warning about the status. The
+ * raw exact-code ids (error-parse-code, error-invalid-request-code) credit
+ * the one right code, and also a 4xx with no JSON-RPC body (with a
+ * warning): that bodiless 4xx is read through gateVerdict too, so a rate
+ * limiter's, an auth gate's or a WAF's bodiless refusal fails as not
+ * evaluable. error-method-code credits only -32601, which no gate
+ * produces, so it reads the discover state alone. tools-call-unknown is not
+ * read this way yet: a gateway's -32001 on its tools/call still passes it.
+ *
+ * A 429 is resent once (after Retry-After) only while the conformant
+ * discover was served: otherwise every rejection is already not evaluable,
+ * and the wait could not change the verdict.
  */
 
 /** The five probes' own rejection codes and what each varies (see gateVerdict); error-invalid-cursor's is below. */
@@ -74,8 +91,26 @@ const MISSING_NAME_GATE = {
   about: "the missing tool name",
   ownCodes: [JSONRPC_ERROR_CODES.INVALID_PARAMS],
 };
+/** The raw exact-code probes' readings of a bodiless 4xx (see exactCode). */
+const PARSE_CODE_GATE = {
+  check: "error-parse-code",
+  what: "invalid JSON",
+  about: "the invalid JSON",
+  ownCodes: [JSONRPC_ERROR_CODES.PARSE_ERROR],
+};
+const REQUEST_CODE_GATE = {
+  check: "error-invalid-request-code",
+  what: "a message with no method",
+  about: "the missing method",
+  ownCodes: [JSONRPC_ERROR_CODES.INVALID_REQUEST],
+};
 /** What error-capability-gated's not-evaluable reasons say it could not measure. */
 const GATED_ABOUT = "whether undeclared methods are rejected";
+/**
+ * The same, shorter, for gateVerdict's reasons: they follow a head naming
+ * every method that drew them and must fit the details budget with it.
+ */
+const GATED_GATE_ABOUT = "the undeclared methods";
 /** error-invalid-cursor's own rejection (pagination: an invalid cursor SHOULD draw -32602); `what` names the list method. */
 const INVALID_CURSOR_GATE = {
   check: "error-invalid-cursor",
@@ -107,7 +142,7 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
 
   await harness.check("error-unknown-method", async () => {
     const method = unknownMethodName();
-    const probe = await rpcOrFailure(ctx, method, undefined, true);
+    const probe = await rpcOrFailure(ctx, method, undefined, measurable(ctx));
     if ("failure" in probe) return { passed: false, details: probe.failure };
     const res = probe.res;
     const unattributable = await rejectionVerdict(ctx, probe, "an unknown method", {
@@ -168,7 +203,7 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
 
   await harness.check("error-invalid-jsonrpc", async () => {
     if (!http) return { passed: true, details: "Skipped: raw-body probe is HTTP-only" };
-    const probe = await rawOrFailure(ctx, JSON.stringify({ not: "a valid jsonrpc message" }), true);
+    const probe = await rawOrFailure(ctx, JSON.stringify({ not: "a valid jsonrpc message" }), measurable(ctx));
     if ("failure" in probe) return { passed: false, details: probe.failure };
     const unattributable = await rejectionVerdict(ctx, probe, "a malformed envelope", {
       ...ENVELOPE_GATE,
@@ -194,7 +229,7 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
 
   await harness.check("error-invalid-json", async () => {
     if (!http) return { passed: true, details: "Skipped: raw-body probe is HTTP-only" };
-    const probe = await rawOrFailure(ctx, "{not json", true);
+    const probe = await rawOrFailure(ctx, "{not json", measurable(ctx));
     if ("failure" in probe) return { passed: false, details: probe.failure };
     const unattributable = await rejectionVerdict(ctx, probe, "invalid JSON", {
       ...PARSE_GATE,
@@ -213,18 +248,20 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
     return { passed: false, details: `HTTP ${statusCode} with no JSON-RPC error; expected -32700 or a 4xx` };
   });
 
+  // A 429 is resent once, as for the gate-read checks: exactCode credits a
+  // bodiless 4xx, and a rate limiter's is not the server's.
   await harness.check("error-parse-code", async () => {
     if (!http) return { passed: true, details: "Skipped: raw-body probe is HTTP-only" };
-    const probe = await rawOrFailure(ctx, "{not json");
+    const probe = await rawOrFailure(ctx, "{not json", measurable(ctx));
     if ("failure" in probe) return { passed: false, details: probe.failure };
-    return exactCode(ctx, probe, JSONRPC_ERROR_CODES.PARSE_ERROR, "Parse error", "invalid JSON");
+    return exactCode(ctx, probe, "Parse error", PARSE_CODE_GATE);
   });
 
   await harness.check("error-invalid-request-code", async () => {
     if (!http) return { passed: true, details: "Skipped: raw-body probe is HTTP-only" };
-    const probe = await rawOrFailure(ctx, JSON.stringify({ jsonrpc: "2.0", id: 99999 }));
+    const probe = await rawOrFailure(ctx, JSON.stringify({ jsonrpc: "2.0", id: 99999 }), measurable(ctx));
     if ("failure" in probe) return { passed: false, details: probe.failure };
-    return exactCode(ctx, probe, JSONRPC_ERROR_CODES.INVALID_REQUEST, "Invalid Request", "a message with no method");
+    return exactCode(ctx, probe, "Invalid Request", REQUEST_CODE_GATE);
   });
 
   if (hasTools(ctx)) {
@@ -291,11 +328,13 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
     // one resend, a 5xx without -32601, or a 403 the conformant twin -- asked
     // once for all the methods -- could not get past either. Each such
     // answer is kept with its reason; a -32601 on a 5xx is credited, with a
-    // warning about the status.
+    // warning about the status. Without a served discover a 429 is not
+    // resent: the verdict is withheld whatever the resend would draw.
     const twin = discoverTwin(ctx);
-    const gated: Array<{ answer: string; reason: string }> = [];
+    const gated: GatedAnswer[] = [];
+    const names = undeclared.map((m) => m.method).join(", ");
     for (const { method, capability } of undeclared) {
-      const probe = await rpcOrFailure(ctx, method, undefined, true);
+      const probe = await rpcOrFailure(ctx, method, undefined, !unattributable);
       if ("failure" in probe) {
         issues.push(`${method}: ${probe.failure}`);
         continue;
@@ -316,19 +355,24 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
         continue;
       }
       if (err || (http && probe.res.statusCode >= 400)) {
-        const reason = await gateVerdict(ctx, probe.res, {
-          check: "error-capability-gated",
-          what: `${method} (undeclared ${capability} capability)`,
-          about: GATED_ABOUT,
-          ownCodes: [JSONRPC_ERROR_CODES.METHOD_NOT_FOUND],
-          twin,
-        });
+        const code = err ? errorCodeText(err.rawCode) : "no JSON-RPC body";
+        const answer = `${code} (${httpStatusText(probe.res.statusCode, probe.throttledMs)})`;
+        // The room a reason gets when every method drew this answer (the
+        // head then reads "<names> -> <answer>", see gatedDetails).
+        const reason = await gateVerdict(
+          ctx,
+          probe.res,
+          {
+            check: "error-capability-gated",
+            what: `${method} (undeclared ${capability} capability)`,
+            about: GATED_GATE_ABOUT,
+            ownCodes: [JSONRPC_ERROR_CODES.METHOD_NOT_FOUND],
+            twin,
+          },
+          DETAILS_MAX - 2 - `${names} -> ${answer}`.length,
+        );
         if (reason) {
-          const code = err ? errorCodeText(err.rawCode) : "no JSON-RPC body";
-          gated.push({
-            answer: `${method} -> ${code} (${httpStatusText(probe.res.statusCode, probe.throttledMs)})`,
-            reason,
-          });
+          gated.push({ method, answer, reason });
           continue;
         }
       }
@@ -341,13 +385,7 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
     }
     if (issues.length > 0) return { passed: false, details: clip(issues.join("; ")) };
     if (unattributable) return { passed: false, details: `${seen.join(", ")}; ${unattributable}` };
-    if (gated.length > 0) {
-      // One reason per group of methods that drew it (a gate answers them alike).
-      const byReason = new Map<string, string[]>();
-      for (const { answer, reason } of gated) byReason.set(reason, [...(byReason.get(reason) ?? []), answer]);
-      const groups = [...byReason].map(([reason, answers]) => `${answers.join(", ")}; ${reason}`);
-      return { passed: false, details: groups.join("; ") };
-    }
+    if (gated.length > 0) return { passed: false, details: gatedDetails(gated) };
     return { passed: true, details: clip(`Undeclared method(s) rejected: ${seen.join(", ")}`) };
   });
 
@@ -359,13 +397,17 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
     if ("failure" in probe) return { passed: false, details: probe.failure };
     // A rejection is credited only when it is the server's own (gateVerdict,
     // as for the five checks above): an auth gate, a 429 still a 429 after
-    // one resend, a 5xx without -32602, or a 403 the conformant twin could
-    // not get past either is not evaluable. A -32602 on a 5xx is credited,
-    // with a warning about the status.
+    // one resend, or a 403 the conformant twin could not get past either is
+    // not evaluable, and a 5xx without -32602 fails as the server failing on
+    // the cursor. A -32602 on a 5xx is credited, with a warning about the
+    // status. The twin is the same list method without the cursor, not a
+    // server/discover: a gateway or ACL that lets server/discover through
+    // but refuses the list method itself with a bare 403 refuses that twin
+    // too, so its 403 is not credited as the server rejecting the cursor.
     const unattributable = await rejectionVerdict(ctx, probe, `${target.method} with an invalid cursor`, {
       ...INVALID_CURSOR_GATE,
       what: `${target.method} with an invalid cursor`,
-      twin: discoverTwin(ctx),
+      twin: discoverTwin(ctx, target.method),
     });
     if (unattributable) return unattributable;
     const res = probe.res;
@@ -406,6 +448,52 @@ function unknownMethodName(): string {
   return `compliance/nonexistent-method-${randomBytes(3).toString("hex")}`;
 }
 
+/**
+ * Whether a rejection can still be credited to a probe's defect: the
+ * conformant setup server/discover was served (`notEvaluable` is null).
+ * When it was not, every rejection is not evaluable whatever it is, so a
+ * probe is not resent after a 429 (the wait could only change the details).
+ */
+function measurable(ctx: ModernSuiteContext): boolean {
+  return notEvaluable(ctx) === null;
+}
+
+/** An undeclared list method error-capability-gated could not credit, with its answer and gateVerdict's reason. */
+interface GatedAnswer {
+  method: string;
+  /** "-32001 (HTTP 401)", "no JSON-RPC body (HTTP 429, then after 0ms HTTP 429)". */
+  answer: string;
+  reason: string;
+}
+
+/**
+ * error-capability-gated's details for the methods it could not credit:
+ * one reason per group of methods that drew it (a gate answers them alike),
+ * the methods with the same answer named together ("resources/list,
+ * prompts/list -> -32001 (HTTP 401)"). Within DETAILS_MAX: each group's
+ * head is shortened before its reason (gateDetails), and when the groups do
+ * not fit together the first is kept and the methods of the others are
+ * named as not evaluable either.
+ */
+function gatedDetails(gated: GatedAnswer[]): string {
+  const byReason = new Map<string, Map<string, string[]>>();
+  for (const { method, answer, reason } of gated) {
+    const answers = byReason.get(reason) ?? new Map<string, string[]>();
+    answers.set(answer, [...(answers.get(answer) ?? []), method]);
+    byReason.set(reason, answers);
+  }
+  const groups = [...byReason].map(([reason, answers]) => ({
+    head: [...answers].map(([answer, methods]) => `${methods.join(", ")} -> ${answer}`).join(", "),
+    methods: [...answers.values()].flat(),
+    reason,
+  }));
+  const whole = groups.map((g) => gateDetails(g.head, "", "", g.reason)).join("; ");
+  if (whole.length <= DETAILS_MAX) return whole;
+  const [first, ...rest] = groups;
+  const others = `; ${rest.flatMap((g) => g.methods).join(", ")} not evaluable either`;
+  return `${gateDetails(first.head, "", "", first.reason, DETAILS_MAX - others.length)}${others}`;
+}
+
 /** A probe's answer, and the wait before its one resend when a rate limiter answered 429 (see resendOn429). */
 type Probe<T> = { res: T; throttledMs: number | null } | { failure: string };
 
@@ -439,23 +527,27 @@ interface RawProbe extends GateAnswer {
 }
 
 /**
- * The not-evaluable failure for a rejection of `what` -- a JSON-RPC error,
- * or on HTTP any 4xx/5xx without one -- that is not the server's answer to
- * the probe's defect, or null when it is:
+ * The failure for a rejection of `what` -- a JSON-RPC error, or on HTTP any
+ * 4xx/5xx without one -- that is not the server's rejection of the probe's
+ * defect, or null when it is:
  *
  * - while the conformant setup `server/discover` was itself rejected or
  *   unanswered (`notEvaluable`): the rejection is the server's answer to
- *   everything, not a verdict on `what`;
- * - with `gate` (the six checks that credit any error or rejection), when
- *   something in front of the server answered in its place (gateVerdict:
- *   an auth gate, a 429 still a 429 after one resend, a 5xx without the
- *   check's own code, a 403 the conformant twin could not get past either).
+ *   everything, not a verdict on `what`, so it is not evaluable;
+ * - with `gate` (the six checks that credit any error or rejection, and the
+ *   exact-code checks' bodiless 4xx), when something in front of the server
+ *   answered in its place (gateVerdict: an auth gate, a 429 still a 429
+ *   after one resend, a 403 the conformant twin could not get past either),
+ *   which is not evaluable, or the server failed on the probe (a 5xx
+ *   without the check's own code), which fails as such.
  *
  * Null for a served probe (a result, or a 2xx/3xx with no JSON-RPC error at
  * all: an HTML page), which the check judges on its own whatever the
  * discover state, as `evaluateHeaderRejection` in transport.ts does. A raw
  * probe (always HTTP) names its status "on HTTP n", an RPC probe
- * " (HTTP n)" on HTTP and nothing on stdio.
+ * " (HTTP n)" on HTTP and nothing on stdio. The details stay within
+ * DETAILS_MAX: " for <what>" is dropped, then the answer clipped, before
+ * the reason is (gateDetails).
  */
 async function rejectionVerdict(
   ctx: ModernSuiteContext,
@@ -469,12 +561,13 @@ async function rejectionVerdict(
   if (resultOf(res.body)) return null;
   // stdio's status is a synthetic 200, so only HTTP reaches a bare rejection.
   if (!err && res.statusCode < 400) return null;
-  const reason = notEvaluable(ctx) ?? (gate ? await gateVerdict(ctx, res, gate) : null);
-  if (!reason) return null;
   const answer = err ? errorWithCode(err.rawCode) : "no JSON-RPC error body";
   const statusText = httpStatusText(res.statusCode, probe.throttledMs);
   const shown = raw ? ` on ${statusText}` : ctx.kind === "http" ? ` (${statusText})` : "";
-  return { passed: false, details: `${answer}${shown} for ${what}; ${reason}` };
+  const room = DETAILS_MAX - 2 - answer.length - shown.length;
+  const reason = notEvaluable(ctx) ?? (gate ? await gateVerdict(ctx, res, gate, room) : null);
+  if (!reason) return null;
+  return { passed: false, details: gateDetails(answer, shown, ` for ${what}`, reason) };
 }
 
 /**
@@ -518,14 +611,25 @@ async function rawOrFailure(
   };
 }
 
-/** The exact-code half of a raw-body probe (error-parse-code, error-invalid-request-code). */
+/**
+ * The exact-code half of a raw-body probe (error-parse-code,
+ * error-invalid-request-code): the one right code (`gate.ownCodes[0]`)
+ * passes, a wrong code or a result fails, and a 4xx with no JSON-RPC body
+ * passes with a warning -- when it is the server's own. That bodiless 4xx
+ * is what a rate limiter, an auth gate or a WAF answers too, so it is read
+ * through gateVerdict (a 429 still a 429 after its one resend, a 401, a
+ * Bearer 403, a 403 the conformant twin could not get past either) and
+ * fails as not evaluable when it is not the server's. A conformant answer
+ * returns before that reading, so it costs no extra request.
+ */
 async function exactCode(
   ctx: ModernSuiteContext,
   probe: RawProbe,
-  code: number,
   name: string,
-  what: string,
+  gate: Omit<GateSpec, "twin">,
 ): Promise<{ passed: boolean; details: string }> {
+  const { what } = gate;
+  const code = gate.ownCodes[0];
   const blanket = await rejectionVerdict(ctx, probe, what);
   if (blanket) return blanket;
   const { statusCode, error, result } = probe;
@@ -539,6 +643,8 @@ async function exactCode(
   if (result)
     return { passed: false, details: `Result instead of ${code} (${name}) for ${what} on HTTP ${statusCode}` };
   if (statusCode >= 400 && statusCode < 500) {
+    const gated = await rejectionVerdict(ctx, probe, what, { ...gate, twin: discoverTwin(ctx) });
+    if (gated) return gated;
     ctx.harness.warnings.push(
       `HTTP ${statusCode} with no JSON-RPC body for ${what}; the spec expects a ${code} (${name}) JSON-RPC error body.`,
     );

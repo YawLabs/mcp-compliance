@@ -423,12 +423,12 @@ describe("errors suite: canned bad HTTP server", () => {
     expectFail(report, "error-missing-params", "produced a result with isError: true");
     expectPass(report, "tools-call-unknown", "isError: true (valid)");
     // A -32603 on a 503 is no rejection of the cursor the server can be
-    // credited with (gate.ts): it fails as not evaluable, as before it failed
+    // credited with (gate.ts): the server failed on it, as before it failed
     // for the status.
     expectFail(
       report,
       "error-invalid-cursor",
-      "JSON-RPC error -32603 (HTTP 503) for tools/list with an invalid cursor; not evaluable: a 5xx that carries no -32602 is a server failure or a gateway with no backend",
+      "JSON-RPC error -32603 (HTTP 503) for tools/list with an invalid cursor; the server failed on the request rather than rejecting it (a broken server, or a gateway with no backend); -32602 on a 4xx is expected",
     );
     expectFail(
       report,
@@ -442,7 +442,7 @@ describe("errors suite: canned bad HTTP server", () => {
     expectFail(
       report,
       "error-invalid-json",
-      "JSON-RPC error -32600 on HTTP 500 for invalid JSON; not evaluable: a 5xx that carries no -32700",
+      "JSON-RPC error -32600 on HTTP 500 for invalid JSON; the server failed on the request rather than rejecting it (a broken server, or a gateway with no backend); -32700 on a 4xx is expected",
     );
     expectFail(report, "error-parse-code", "Expected -32700 (Parse error) for invalid JSON, got -32600");
     expectFail(
@@ -541,12 +541,12 @@ describe("errors suite: canned bad HTTP server", () => {
       "error-unknown-method": { passed: true, details: "JSON-RPC error -32601 on HTTP 404, id echoed" },
       "error-method-code": { passed: true, details: "-32601 (Method not found)" },
       // A bare 500 is no rejection the server can be credited with: it
-      // carries no -32600, so a crashed handler and a gateway with no backend
-      // read the same (gate.ts). Failed before too, blaming the probe.
+      // carries no -32600, so the handler crashed on the malformed envelope
+      // (or a gateway with no backend answered) (gate.ts). Failed before too.
       "error-invalid-jsonrpc": {
         passed: false,
         details:
-          "no JSON-RPC error body on HTTP 500 for a malformed envelope; not evaluable: a 5xx that carries no -32600 is a server failure or a gateway with no backend, so it proves nothing about the malformed envelope",
+          "no JSON-RPC error body on HTTP 500 for a malformed envelope; the server failed on the request rather than rejecting it (a broken server, or a gateway with no backend); -32600 on a 4xx is expected",
       },
       "error-invalid-json": { passed: true, details: "JSON-RPC error -32600 on HTTP 400" },
       "error-parse-code": {
@@ -624,15 +624,17 @@ describe("errors suite: canned bad HTTP server", () => {
     bad.set(({ id }) => ({ status: 400, body: { jsonrpc: "2.0", id: id ?? null, error: { code: "E_INIT" } } }));
     const report = await runModern(bad.url, { only: ["lifecycle-discover", ...ALL] });
     expect(resultOf(report, "lifecycle-discover").passed).toBe(false);
-    const rpc = 'JSON-RPC error with non-integer code "E_INIT" (HTTP 400) for an unknown method; not evaluable';
-    const raw = (what: string) =>
-      `JSON-RPC error with non-integer code "E_INIT" on HTTP 400 for ${what}; not evaluable`;
-    expectFail(report, "error-unknown-method", rpc);
-    expectFail(report, "error-method-code", rpc);
-    expectFail(report, "error-invalid-jsonrpc", raw("a malformed envelope"));
-    expectFail(report, "error-invalid-json", raw("invalid JSON"));
-    expectFail(report, "error-parse-code", raw("invalid JSON"));
-    expectFail(report, "error-invalid-request-code", raw("a message with no method"));
+    // The reason names the code whole; within the 220-character budget the
+    // answer before it is cut (never the reason, never the status).
+    const reason =
+      'not evaluable: the conformant server/discover was itself rejected with non-integer code "E_INIT" (HTTP 400), so this rejection proves nothing about the injected defect';
+    const rpc = `JSON-RPC error with non-integer code... (HTTP 400); ${reason}`;
+    const raw = `JSON-RPC error with non-integer... on HTTP 400; ${reason}`;
+    const rpcIds = ["error-unknown-method", "error-method-code"];
+    const rawIds = ["error-invalid-jsonrpc", "error-invalid-json", "error-parse-code", "error-invalid-request-code"];
+    for (const id of rpcIds) expect(resultOf(report, id).details, id).toBe(rpc);
+    for (const id of rawIds) expect(resultOf(report, id).details, id).toBe(raw);
+    for (const id of [...rpcIds, ...rawIds]) expect(resultOf(report, id).details.length, id).toBeLessThanOrEqual(220);
     expectFail(report, "error-capability-gated", 'tools/list -> non-integer code "E_INIT", resources/list');
   });
 
@@ -829,8 +831,15 @@ describe("errors suite: a server that rejects everything, server/discover includ
     const report = await runModern(bad.url, { only: ["lifecycle-discover", ...ALL] });
     expect(resultOf(report, "lifecycle-discover").passed).toBe(false);
     const reason = notEvaluableReason(shape.rejection);
-    const rpc = (what: string) => `${shape.answer} (HTTP ${shape.status}) for ${what}; ${reason}`;
-    const raw = (what: string) => `${shape.answer} on HTTP ${shape.status} for ${what}; ${reason}`;
+    // Within the 220-character budget " for <what>" gives way to the reason
+    // (the bodiless shapes' longer reason leaves no room for it on the
+    // longer probe names).
+    const withinBudget = (seen: string, what: string) => {
+      const full = `${seen} for ${what}; ${reason}`;
+      return full.length <= 220 ? full : `${seen}; ${reason}`;
+    };
+    const rpc = (what: string) => withinBudget(`${shape.answer} (HTTP ${shape.status})`, what);
+    const raw = (what: string) => withinBudget(`${shape.answer} on HTTP ${shape.status}`, what);
     const lists = ["tools/list", "resources/list", "prompts/list"].map((m) => `${m} -> ${shape.listAnswer}`);
     expect(Object.fromEntries(report.tests.map((t) => [t.id, { passed: t.passed, details: t.details }]))).toEqual({
       "lifecycle-discover": expect.objectContaining({ passed: false }),
