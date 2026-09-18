@@ -20,6 +20,7 @@ import { runModern } from "./helpers/modern-fixture.js";
  */
 
 type Answer =
+  | "rpc-400"
   | "rpc-401"
   | "bearer-403"
   | "host-403"
@@ -32,7 +33,18 @@ type Answer =
   | "custom-500"
   | "hang";
 
-type Probe = "discover" | "unknown" | "malformed" | "badJson" | "missingName" | "list" | "other";
+type Probe =
+  | "discover"
+  | "unknown"
+  | "malformed"
+  | "badJson"
+  | "missingName"
+  | "list"
+  | "cursor"
+  | "listen"
+  | "batch"
+  | "textPlain"
+  | "other";
 
 interface StubOptions {
   /**
@@ -66,6 +78,14 @@ interface StubOptions {
   missingName?: Answer;
   /** resources/list, prompts/list (and tools/list): 404 with -32601 when undeclared, by default. */
   lists?: Answer;
+  /** A list request carrying a cursor (error-invalid-cursor): 400 with -32602 by default. */
+  cursor?: Answer;
+  /** subscriptions/listen: 404 with -32601 by default (nothing advertised). */
+  listen?: Answer;
+  /** A JSON array body (transport-batch-reject): 400 with an id-null -32600 by default. */
+  batch?: Answer;
+  /** A POST with Content-Type text/plain (transport-content-type-reject): a bare 415 by default. */
+  textPlain?: Answer;
   /** Called with each probe as it arrives, before it is answered. */
   onProbe?: (probe: Probe) => void;
 }
@@ -95,21 +115,29 @@ async function startStub(opts: StubOptions): Promise<{ url: string; hits: Probe[
       const one = (msg && typeof msg === "object" && !Array.isArray(msg) ? msg : {}) as {
         id?: unknown;
         method?: string;
-        params?: { name?: unknown };
+        params?: { name?: unknown; cursor?: unknown };
       };
-      const probe: Probe = !json
-        ? "badJson"
-        : one.method === undefined
-          ? "malformed"
-          : one.method === "server/discover"
-            ? "discover"
-            : one.method.startsWith("compliance/nonexistent")
-              ? "unknown"
-              : one.method === "tools/call" && one.params?.name === undefined
-                ? "missingName"
-                : ["tools/list", "resources/list", "prompts/list"].includes(one.method)
-                  ? "list"
-                  : "other";
+      const probe: Probe = String(req.headers["content-type"] ?? "").startsWith("text/plain")
+        ? "textPlain"
+        : Array.isArray(msg)
+          ? "batch"
+          : !json
+            ? "badJson"
+            : one.method === undefined
+              ? "malformed"
+              : one.method === "server/discover"
+                ? "discover"
+                : one.method.startsWith("compliance/nonexistent")
+                  ? "unknown"
+                  : one.method === "tools/call" && one.params?.name === undefined
+                    ? "missingName"
+                    : ["tools/list", "resources/list", "prompts/list"].includes(one.method)
+                      ? one.params?.cursor !== undefined
+                        ? "cursor"
+                        : "list"
+                      : one.method === "subscriptions/listen"
+                        ? "listen"
+                        : "other";
       hits.push(probe);
       if (probe === "discover") discovers++;
       opts.onProbe?.(probe);
@@ -126,6 +154,10 @@ async function startStub(opts: StubOptions): Promise<{ url: string; hits: Probe[
       /** Answer with `answer`; false when it is a "429-once" already spent (answer as the server would). */
       const answerWith = (answer: Answer): boolean => {
         switch (answer) {
+          case "rpc-400":
+            // A status the server itself chose: its own refusal of the request.
+            rpcError(400, -32600, "Invalid Request");
+            return true;
           case "rpc-401":
             // The measured gateway: 401, a -32001 body that echoes the request id.
             rpcError(401, -32001, "Unauthorized", { "www-authenticate": 'Bearer realm="mcp"' });
@@ -157,8 +189,10 @@ async function startStub(opts: StubOptions): Promise<{ url: string; hits: Probe[
             // The server's own JSON-RPC rejection of the probe's defect, on an
             // HTTP 500 (a framework that maps every JSON-RPC error to 500).
             if (probe === "malformed") rpcError(500, -32600, "Invalid Request: not a JSON-RPC message");
+            else if (probe === "batch") rpcError(500, -32600, "Invalid Request: batches are not supported");
             else if (probe === "badJson") rpcError(500, -32700, "Parse error");
             else if (probe === "missingName") rpcError(500, -32602, "Invalid params: name is required");
+            else if (probe === "cursor") rpcError(500, -32602, "Invalid params: invalid cursor");
             else rpcError(500, -32601, "Method not found");
             return true;
           case "custom-500":
@@ -205,6 +239,18 @@ async function startStub(opts: StubOptions): Promise<{ url: string; hits: Probe[
         case "list":
           if (opts.lists !== undefined && answerWith(opts.lists)) return;
           return rpcError(404, -32601, "Method not found");
+        case "cursor":
+          if (opts.cursor !== undefined && answerWith(opts.cursor)) return;
+          return rpcError(400, -32602, "Invalid params: invalid cursor");
+        case "listen":
+          if (opts.listen !== undefined && answerWith(opts.listen)) return;
+          return rpcError(404, -32601, "Method not found");
+        case "batch":
+          if (opts.batch !== undefined && answerWith(opts.batch)) return;
+          return rpcError(400, -32600, "Invalid Request: batches are not supported");
+        case "textPlain":
+          if (opts.textPlain !== undefined && answerWith(opts.textPlain)) return;
+          return send(415, "Unsupported Media Type", { "content-type": "text/plain" });
       }
       if (one.id === undefined) return send(202, "", {});
       return rpcError(404, -32601, "Method not found");
@@ -615,5 +661,226 @@ describe("modern gate reading: a caller's abort", () => {
     } finally {
       await stub.stop();
     }
+  }, 30_000);
+});
+
+describe("modern gate reading: a twin that never reached the server cannot credit a bare 403", () => {
+  // A WAF that let the preflight and the setup server/discover through and
+  // then answers every probe with a bare 403; what the twin (a later
+  // server/discover) draws decides. Before: a twin whose status merely
+  // differed from 403 credited the 403, so a rate-limited or backend-less
+  // twin passed all five checks on the WAF's refusal.
+  const notReached = (twin: string, about: string) =>
+    `not evaluable: a conformant server/discover sent next to it ${twin} too, so the 403 proves nothing about ${about} (see security-auth-required)`;
+  const rpc = "JSON-RPC error -32000";
+  const wafRun = (lateDiscover: Answer, only = ERRORS) =>
+    verdicts({ gate: "bare-403", exempt: ["discover"], discoverThrough: 2, lateDiscover }, { only });
+
+  it("a twin still throttled after its one resend: all five not evaluable (before: five passes)", async () => {
+    // Before: PASS "JSON-RPC error -32000 on HTTP 403 (spec requires 404), id
+    // echoed", PASS "JSON-RPC error -32000 on HTTP 403" twice, PASS
+    // "JSON-RPC error -32000 (Forbidden)" and PASS "Undeclared method(s)
+    // rejected: resources/list -> -32000 (expected -32601), ...".
+    const { byId, hits } = await wafRun(429);
+    const twin = "was not served (HTTP 429, then after 0ms HTTP 429)";
+    expect(byId).toEqual({
+      [UNKNOWN]: `FAIL: ${rpc} (HTTP 403) for an unknown method; ${notReached(twin, "the unknown method")}`,
+      [ENVELOPE]: `FAIL: ${rpc} on HTTP 403 for a malformed envelope; ${notReached(twin, "the malformed envelope")}`,
+      [PARSE]: `FAIL: ${rpc} on HTTP 403 for invalid JSON; ${notReached(twin, "the invalid JSON")}`,
+      [PARAMS]: `FAIL: ${rpc} (HTTP 403) for a tools/call without a name; ${notReached(twin, "the missing tool name")}`,
+      [GATED]: `FAIL: resources/list -> -32000 (HTTP 403), prompts/list -> -32000 (HTTP 403); ${notReached(twin, GATED_ABOUT)}`,
+    });
+    // Preflight + setup discover, then each check's twin sent and resent once.
+    expect(count(hits, "discover")).toBe(2 + 2 * ERRORS.length);
+  }, 30_000);
+
+  it("a twin answered 5xx (a gateway with no backend) or 401 (an auth gate): not evaluable (before: passes)", async () => {
+    const down = await wafRun("bare-503", [UNKNOWN, ENVELOPE]);
+    expect(down.byId).toEqual({
+      [UNKNOWN]: `FAIL: ${rpc} (HTTP 403) for an unknown method; ${notReached("was not served (HTTP 503)", "the unknown method")}`,
+      [ENVELOPE]: `FAIL: ${rpc} on HTTP 403 for a malformed envelope; ${notReached("was not served (HTTP 503)", "the malformed envelope")}`,
+    });
+    const gated = await wafRun("rpc-401", [PARAMS]);
+    expect(gated.byId[PARAMS]).toBe(
+      `FAIL: ${rpc} (HTTP 403) for a tools/call without a name; ${notReached("was refused (HTTP 401, JSON-RPC error -32001)", "the missing tool name")}`,
+    );
+  }, 30_000);
+
+  it("a twin served when resent after one 429, or answered with a status the server chose, still credits the 403", async () => {
+    const resent = await wafRun("429-once", [UNKNOWN]);
+    expect(resent.byId[UNKNOWN]).toBe("PASS: JSON-RPC error -32000 on HTTP 403 (spec requires 404), id echoed");
+    // Preflight + setup discover, the twin throttled, and its resend served.
+    expect(count(resent.hits, "discover")).toBe(4);
+    const own = await wafRun("rpc-400", [UNKNOWN, ENVELOPE]);
+    expect(own.byId).toEqual({
+      [UNKNOWN]: "PASS: JSON-RPC error -32000 on HTTP 403 (spec requires 404), id echoed",
+      [ENVELOPE]: "PASS: JSON-RPC error -32000 on HTTP 403",
+    });
+  }, 30_000);
+});
+
+describe("modern transport-batch-reject and transport-content-type-reject: whose rejection it is", () => {
+  const BATCH = "transport-batch-reject";
+  const CT = "transport-content-type-reject";
+  const TRANSPORT = [BATCH, CT];
+  const transportWarnings = (warnings: string[]) => warnings.filter((w) => w.startsWith("transport-"));
+
+  it("the server's own 400 on the batch and 415 on text/plain keep their PASS, and no twin is asked", async () => {
+    const { byId, hits, warnings } = await verdicts({}, { only: TRANSPORT });
+    expect(byId).toEqual({
+      [BATCH]: "PASS: HTTP 400 (batch rejected)",
+      [CT]: "PASS: HTTP 415 (text/plain rejected)",
+    });
+    expect(count(hits, "discover")).toBe(2);
+    expect(transportWarnings(warnings)).toEqual([]);
+  }, 30_000);
+
+  it("the measured gateway's 401 with a -32001 body, server/discover let through or not: not evaluable (before: two passes, one required)", async () => {
+    // Before: PASS "HTTP 401 (batch rejected)" and PASS "HTTP 401 (text/plain rejected)".
+    const expected = {
+      [BATCH]: `FAIL: HTTP 401, JSON-RPC error -32001 on the batch; ${reason(AUTH, "the batch")}`,
+      [CT]: `FAIL: HTTP 401, JSON-RPC error -32001 on the text/plain POST; ${reason(AUTH, "the Content-Type")}`,
+    };
+    const through = await verdicts({ gate: "rpc-401", exempt: ["discover"] }, { only: TRANSPORT });
+    expect(through.byId).toEqual(expected);
+    const everything = await verdicts({ gate: "rpc-401" }, { only: TRANSPORT });
+    expect(everything.byId).toEqual(expected);
+  }, 30_000);
+
+  it("a 429 is resent once: throttled again is not evaluable, served on the resend is judged as usual", async () => {
+    // Before: PASS "HTTP 429 (batch rejected)" and PASS "HTTP 429 (text/plain rejected)".
+    const twice = "HTTP 429, then after 0ms HTTP 429";
+    const always = await verdicts({ batch: 429, textPlain: 429 }, { only: TRANSPORT });
+    expect(always.byId).toEqual({
+      [BATCH]: `FAIL: ${twice} on the batch; ${reason(RATE, "the batch")}`,
+      [CT]: `FAIL: ${twice} on the text/plain POST; ${reason(RATE, "the Content-Type")}`,
+    });
+    const once = await verdicts({ batch: "429-once", textPlain: "429-once" }, { only: TRANSPORT });
+    expect(once.byId).toEqual({
+      [BATCH]: "PASS: HTTP 400 (batch rejected)",
+      [CT]: "PASS: HTTP 415 (text/plain rejected)",
+    });
+    expect(count(once.hits, "batch")).toBe(2);
+    expect(count(once.hits, "textPlain")).toBe(2);
+  }, 30_000);
+
+  it("a 5xx is not evaluable unless the batch drew the server's own -32600, which is credited with a warning", async () => {
+    // Before: PASS "HTTP 503, JSON-RPC error -32603 (batch rejected)"; the
+    // text/plain 503 failed "(expected 4xx for text/plain)".
+    const down = await verdicts({ batch: "rpc-503", textPlain: "bare-503" }, { only: TRANSPORT });
+    expect(down.byId).toEqual({
+      [BATCH]: `FAIL: HTTP 503, JSON-RPC error -32603 on the batch; ${reason("a 5xx that carries no -32600 is a server failure or a gateway with no backend", "the batch")}`,
+      [CT]: `FAIL: HTTP 503 on the text/plain POST; ${reason("a 5xx is a server failure or a gateway with no backend", "the Content-Type")}`,
+    });
+    const own = await verdicts({ batch: "own-500" }, { only: [BATCH] });
+    expect(own.byId[BATCH]).toBe("PASS: HTTP 500, JSON-RPC error -32600 (batch rejected)");
+    expect(transportWarnings(own.warnings)).toEqual([
+      "transport-batch-reject: the server rejected a batch with JSON-RPC error -32600 on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
+    ]);
+  }, 30_000);
+
+  it("a bare 403: credited next to a served twin, not evaluable next to a twin that was refused too", async () => {
+    const served = await verdicts({ gate: "bare-403", exempt: ["discover"] }, { only: TRANSPORT });
+    expect(served.byId).toEqual({
+      [BATCH]: "PASS: HTTP 403 (batch rejected)",
+      [CT]: "PASS: HTTP 403 (text/plain rejected)",
+    });
+    // One twin per check.
+    expect(count(served.hits, "discover")).toBe(4);
+    const refused = await verdicts({ gate: "bare-403", exempt: ["discover"], discoverThrough: 2 }, { only: TRANSPORT });
+    const twin = (about: string) =>
+      `not evaluable: a conformant server/discover sent next to it was refused (HTTP 403, JSON-RPC error -32000) too, so the 403 proves nothing about ${about} (see security-auth-required)`;
+    expect(refused.byId).toEqual({
+      [BATCH]: `FAIL: HTTP 403, JSON-RPC error -32000 on the batch; ${twin("the batch")}`,
+      [CT]: `FAIL: HTTP 403, JSON-RPC error -32000 on the text/plain POST; ${twin("the Content-Type")}`,
+    });
+  }, 30_000);
+});
+
+describe("modern error-invalid-cursor and lifecycle-subscriptions-listen: whose rejection it is", () => {
+  const CURSOR = "error-invalid-cursor";
+  const LISTEN = "lifecycle-subscriptions-listen";
+  const BOTH = [CURSOR, LISTEN];
+  const CURSOR_ABOUT = "the invalid cursor";
+  const LISTEN_ABOUT = "subscriptions/listen";
+  const ownWarnings = (warnings: string[]) =>
+    warnings.filter((w) => w.startsWith(`${CURSOR}:`) || w.startsWith(`${LISTEN}:`));
+
+  it("the server's own -32602 on the cursor and -32601 on the listen keep their PASS", async () => {
+    const { byId, hits, warnings } = await verdicts({}, { only: BOTH });
+    expect(byId).toEqual({
+      [CURSOR]:
+        "PASS: tools/list rejected the cursor: -32602 (correct: Invalid params) (Invalid params: invalid cursor)",
+      [LISTEN]: "PASS: nothing subscription-related advertised; subscriptions/listen rejected with -32601 (HTTP 404)",
+    });
+    expect(count(hits, "discover")).toBe(2);
+    expect(ownWarnings(warnings)).toEqual([]);
+  }, 30_000);
+
+  it("the measured gateway (server/discover let through, everything else 401 with -32001): both not evaluable (before: two passes)", async () => {
+    // Before: PASS "tools/list rejected the cursor: -32001 (Unauthorized)" and
+    // PASS "nothing subscription-related advertised; subscriptions/listen
+    // rejected with -32001 (HTTP 401)", with a warning about the code.
+    const { byId, warnings } = await verdicts({ gate: "rpc-401", exempt: ["discover"] }, { only: BOTH });
+    expect(byId).toEqual({
+      [CURSOR]: `FAIL: JSON-RPC error -32001 (HTTP 401) for tools/list with an invalid cursor; ${reason(AUTH, CURSOR_ABOUT)}`,
+      [LISTEN]: `FAIL: subscriptions/listen rejected with -32001 (HTTP 401); ${reason(AUTH, LISTEN_ABOUT)}`,
+    });
+    expect(ownWarnings(warnings)).toEqual([]);
+  }, 30_000);
+
+  it("a 429 is resent once: throttled again is not evaluable, answered on the resend is judged as usual", async () => {
+    const twice = "HTTP 429, then after 0ms HTTP 429";
+    const always = await verdicts({ cursor: 429, listen: 429 }, { only: BOTH });
+    expect(always.byId).toEqual({
+      [CURSOR]: `FAIL: no JSON-RPC error body (${twice}) for tools/list with an invalid cursor; ${reason(RATE, CURSOR_ABOUT)}`,
+      [LISTEN]: `FAIL: subscriptions/listen rejected (${twice}); ${reason(RATE, LISTEN_ABOUT)}`,
+    });
+    const once = await verdicts({ cursor: "429-once", listen: "429-once" }, { only: BOTH });
+    expect(once.byId).toEqual({
+      [CURSOR]:
+        "PASS: tools/list rejected the cursor: -32602 (correct: Invalid params) (Invalid params: invalid cursor)",
+      [LISTEN]:
+        "PASS: nothing subscription-related advertised; subscriptions/listen rejected with -32601 (HTTP 429, then after 0ms HTTP 404)",
+    });
+    expect(count(once.hits, "cursor")).toBe(2);
+    expect(count(once.hits, "listen")).toBe(2);
+  }, 30_000);
+
+  it("a 5xx is not evaluable unless it carries the check's own code, which is credited with a warning", async () => {
+    // Before: FAIL "tools/list with an invalid cursor answered HTTP 503" and
+    // PASS "...; subscriptions/listen rejected with -32603 (HTTP 503)".
+    const down = await verdicts({ cursor: "rpc-503", listen: "rpc-503" }, { only: BOTH });
+    expect(down.byId).toEqual({
+      [CURSOR]: `FAIL: JSON-RPC error -32603 (HTTP 503) for tools/list with an invalid cursor; ${reason("a 5xx that carries no -32602 is a server failure or a gateway with no backend", CURSOR_ABOUT)}`,
+      [LISTEN]: `FAIL: subscriptions/listen rejected with -32603 (HTTP 503); ${reason("a 5xx that carries no -32601 is a server failure or a gateway with no backend", LISTEN_ABOUT)}`,
+    });
+    const own = await verdicts({ cursor: "own-500", listen: "own-500" }, { only: BOTH });
+    expect(own.byId).toEqual({
+      [CURSOR]:
+        "PASS: tools/list rejected the cursor: -32602 (correct: Invalid params) (Invalid params: invalid cursor)",
+      [LISTEN]: "PASS: nothing subscription-related advertised; subscriptions/listen rejected with -32601 (HTTP 500)",
+    });
+    const credited = (check: string, what: string, code: number) =>
+      `${check}: the server rejected ${what} with JSON-RPC error ${code} on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).`;
+    expect(ownWarnings(own.warnings)).toEqual([
+      credited(LISTEN, "subscriptions/listen", -32601),
+      credited(CURSOR, "tools/list with an invalid cursor", -32602),
+    ]);
+  }, 30_000);
+
+  it("a bare 403: credited next to a served twin, not evaluable next to a twin that was refused too", async () => {
+    const served = await verdicts({ gate: "bare-403", exempt: ["discover"] }, { only: BOTH });
+    expect(served.byId).toEqual({
+      [CURSOR]: "PASS: tools/list rejected the cursor: -32000 (Forbidden)",
+      [LISTEN]: "PASS: nothing subscription-related advertised; subscriptions/listen rejected with -32000 (HTTP 403)",
+    });
+    const refused = await verdicts({ gate: "bare-403", exempt: ["discover"], discoverThrough: 2 }, { only: BOTH });
+    const twin = (about: string) =>
+      `not evaluable: a conformant server/discover sent next to it was refused (HTTP 403, JSON-RPC error -32000) too, so the 403 proves nothing about ${about} (see security-auth-required)`;
+    expect(refused.byId).toEqual({
+      [CURSOR]: `FAIL: JSON-RPC error -32000 (HTTP 403) for tools/list with an invalid cursor; ${twin(CURSOR_ABOUT)}`,
+      [LISTEN]: `FAIL: subscriptions/listen rejected with -32000 (HTTP 403); ${twin(LISTEN_ABOUT)}`,
+    });
   }, 30_000);
 });

@@ -45,6 +45,7 @@ import {
   specBaseFor,
 } from "./spec.js";
 import { pickTool } from "./suites/modern/features.js";
+import { twinReachedServer } from "./suites/modern/gate.js";
 import { runModernSuite } from "./suites/modern/index.js";
 import { evaluateProgress } from "./suites/modern/lifecycle.js";
 import {
@@ -276,16 +277,24 @@ interface TwinAnswer {
   statusCode?: number;
 }
 
-/** Read a twin's answer (see TwinAnswer). */
-function twinAnswer(res: { statusCode: number; body: unknown }): TwinAnswer {
+/**
+ * Read a twin's answer (see TwinAnswer). `throttled` is "HTTP 429, then
+ * after Nms " when the twin was resent once after a 429 (credentialedPing,
+ * preInitPing), so its outcome names both answers.
+ */
+function twinAnswer(res: { statusCode: number; body: unknown }, throttled = ""): TwinAnswer {
   const body = res.body as { result?: unknown } | null | undefined;
   if (res.statusCode >= 200 && res.statusCode < 300 && body?.result !== undefined) {
-    return { served: true, outcome: "was served", statusCode: res.statusCode };
+    return {
+      served: true,
+      outcome: throttled ? "was served when resent after HTTP 429" : "was served",
+      statusCode: res.statusCode,
+    };
   }
   const refused = res.statusCode === 401 || res.statusCode === 403;
   return {
     served: false,
-    outcome: `${refused ? "was refused" : "was not served"} (HTTP ${res.statusCode}${rpcErrorSuffix(res.body)})`,
+    outcome: `${refused ? "was refused" : "was not served"} (${throttled}HTTP ${res.statusCode}${rpcErrorSuffix(res.body)})`,
     statusCode: res.statusCode,
   };
 }
@@ -416,14 +425,16 @@ function gateRefusal(
  * that may be either: a gate refusing every request, or the server (or a
  * WAF) refusing the defect. `twin` -- the conformant request the probe
  * differs from in nothing but the defect, with the same headers (Host and
- * Origin included) -- tells them apart: when it was served, or drew a
- * different status, the defect is what drew the 403, and the refusal is
- * credited (null here), whatever its message says. When it drew the same
- * 403, or no answer, the 403 is not attributable and the probe fails as not
- * evaluable, security-origin-validation's reading of the same 403: quoting
- * the message when the twin drew the same 403 and the message names Host
- * or Origin validation (a guard that refuses a request whatever it
- * carries), naming the twin's answer otherwise. `twinName` names the twin
+ * Origin included), a 429 on it resent once -- tells them apart: when it
+ * was served, or drew a status the server itself chose (twinReachedServer:
+ * a 2xx, or a 4xx other than 401, 403 or 429), the defect is what drew the
+ * 403, and the refusal is credited (null here), whatever its message says.
+ * When it drew the same 403, a 401, a 429 again, a 5xx or no answer, it
+ * never reached the server either, so the 403 is not attributable and the
+ * probe fails as not evaluable, security-origin-validation's reading of the
+ * same 403: quoting the message when the twin drew the same 403 and the
+ * message names Host or Origin validation (a guard that refuses a request
+ * whatever it carries), naming the twin's answer otherwise. `twinName` names the twin
  * ("the same request for ping"). Only asked for a 403, so a server that
  * answers otherwise is sent nothing more. A caller's abort (while the twin
  * is sent) is rethrown by `twin`.
@@ -438,7 +449,7 @@ async function bare403Verdict(
 ): Promise<LegacyOutcome | null> {
   if (res.statusCode !== 403) return null;
   const answer = await twin();
-  if (answer.served || (answer.statusCode !== undefined && answer.statusCode !== res.statusCode)) return null;
+  if (answer.served || twinReachedServer(answer.statusCode)) return null;
   const message = readAuthRefusal(res, authorizationSent)?.message;
   if (answer.statusCode === res.statusCode && namesHostOrOriginValidation(message)) {
     return {
@@ -1600,13 +1611,14 @@ export async function runComplianceSuite(
      * transport-post's request. The handshake cannot be the twin of these
      * two: they run before it. Sent at most once per run, and only when one
      * of them drew a 403 without a Bearer challenge -- one whose message
-     * names Host/Origin validation included (see bare403Verdict). A
-     * caller's abort is rethrown.
+     * names Host/Origin validation included (see bare403Verdict). A 429 is
+     * resent once after Retry-After, as the probes' are, and the second
+     * answer is the twin's. A caller's abort is rethrown.
      */
     let preInitPingOnce: Promise<TwinAnswer> | null = null;
     const preInitPing = (): Promise<TwinAnswer> => {
       preInitPingOnce ??= (async () => {
-        try {
+        const send = async () => {
           const res = await request(backendUrl, {
             method: "POST",
             headers: {
@@ -1620,10 +1632,26 @@ export async function runComplianceSuite(
               : AbortSignal.timeout(timeout),
           });
           const text = await res.body.text();
-          return twinAnswer({ statusCode: res.statusCode, body: parseRawBody(text, res.headers["content-type"]) });
+          return {
+            statusCode: res.statusCode,
+            headers: flatHeaders(res.headers),
+            body: parseRawBody(text, res.headers["content-type"]),
+          };
+        };
+        let throttled = "";
+        try {
+          let res = await send();
+          if (res.statusCode === 429) {
+            const wait = retryAfterMs(res.headers);
+            await pause(wait, options.signal);
+            throttled = `HTTP 429, then after ${wait}ms `;
+            res = await send();
+          }
+          return twinAnswer(res, throttled);
         } catch (err: unknown) {
           if (options.signal?.aborted) throw err;
-          return { served: false, outcome: `got ${noResponse(err, timeout)}` };
+          const resent = throttled ? "answered HTTP 429, and its resend " : "";
+          return { served: false, outcome: `${resent}got ${noResponse(err, timeout)}` };
         }
       })();
       return preInitPingOnce;
@@ -2107,15 +2135,21 @@ export async function runComplianceSuite(
      * missing credential, a served twin pins a bare 403 or a dropped
      * connection on that credential; next to error-unknown-method's probe,
      * which differs from it only in the method, it pins a bare 403 on the
-     * method. `statusCode` is the twin's status, when it got one. A caller's
-     * abort is rethrown.
+     * method. `statusCode` is the twin's status, when it got one. A 429 is
+     * resent once after Retry-After (rpcResending429), as the probes' are,
+     * and the second answer is the twin's. A caller's abort is rethrown.
      */
     const credentialedPing = async (): Promise<TwinAnswer> => {
+      let throttledFirst = false;
       try {
-        return twinAnswer(await rpc("ping"));
+        const { res, throttled } = await rpcResending429("ping", undefined, () => {
+          throttledFirst = true;
+        });
+        return twinAnswer(res, throttled);
       } catch (err: unknown) {
         if (options.signal?.aborted) throw err;
-        return { served: false, outcome: `got ${noResponse(err, timeout)}` };
+        const resent = throttledFirst ? "answered HTTP 429, and its resend " : "";
+        return { served: false, outcome: `${resent}got ${noResponse(err, timeout)}` };
       }
     };
 
@@ -2156,12 +2190,15 @@ export async function runComplianceSuite(
      * Retry-After (capped at 2 s, retryAfterMs) when a rate limiter
      * answered 429, as lifecycle-reinit-reject does; the second answer
      * decides. `throttled` is "HTTP 429, then after Nms " once it was
-     * resent. A caller's abort is rethrown.
+     * resent; `onThrottled` is told before the wait, so a caller whose
+     * resend gets no answer can still say the first was a 429. A caller's
+     * abort is rethrown.
      */
-    const rpcResending429 = async (method: string, params?: unknown) => {
+    const rpcResending429 = async (method: string, params?: unknown, onThrottled?: () => void) => {
       let res = await rpc(method, params);
       let throttled = "";
       if (res.statusCode === 429) {
+        onThrottled?.();
         const wait = retryAfterMs(res.headers);
         await pause(wait, options.signal);
         throttled = `HTTP 429, then after ${wait}ms `;
@@ -6296,9 +6333,11 @@ export async function runComplianceSuite(
       // it in its clientInfo name), which the server parsing and answering
       // is the round-trip verified. With no tool to call -- none declared,
       // none listed, or a tools/list that failed -- the envelope decides
-      // alone. A request that gets no reply fails; a child that exited on
-      // it is restarted (restartStdioServer) so the tests after it measure
-      // the server, and one already gone before it is "server unreachable".
+      // alone. A request that gets no reply fails, and so does one answered
+      // by a child that exits right after (a plain ping sent after each
+      // answered probe finds it gone); a child that exited on it is
+      // restarted (restartStdioServer) so the tests after it measure the
+      // server, and one already gone before it is "server unreachable".
       // A caller's abort is rethrown.
       const stdio = transport as StdioTransport;
       /**
@@ -6314,7 +6353,26 @@ export async function runComplianceSuite(
       ): Promise<{ body: any } | { verdict: LegacyOutcome }> => {
         const alreadyGone = stdio.exited === true;
         try {
-          return { body: (await rpc(method, params)).body };
+          const body = (await rpc(method, params)).body;
+          if (alreadyGone) return { body };
+          // A child can answer the probe and exit right after writing the
+          // reply: one plain ping tells a live process from one the probe
+          // killed (the 2026-07-28 check sends a server/discover). An answer,
+          // or anything short of the child being gone, is a live process.
+          try {
+            await rpc("ping");
+          } catch (err: unknown) {
+            if (options.signal?.aborted) throw err;
+            if (stdio.exited) {
+              const verdict = {
+                passed: false,
+                details: `${what} was answered, but the server exited right after (server exited (code ${stdio.exitCode ?? "unknown"}))`,
+              };
+              await restartStdioServer("stdio-unicode", cause);
+              return { verdict };
+            }
+          }
+          return { body };
         } catch (err: unknown) {
           if (options.signal?.aborted) throw err;
           if (alreadyGone) return { verdict: unreachable(what, err, timeout) };

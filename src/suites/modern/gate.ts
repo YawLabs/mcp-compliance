@@ -6,13 +6,15 @@ import { classifyTransportError, retryAfterMs } from "./security.js";
 
 /**
  * Whose answer a rejection is: the one reader the 2026-07-28 checks that
- * credit a JSON-RPC error (lifecycle-jsonrpc, error-unknown-method,
+ * credit a JSON-RPC error or a rejecting status (lifecycle-jsonrpc,
+ * lifecycle-subscriptions-listen, error-unknown-method,
  * error-invalid-jsonrpc, error-invalid-json, error-missing-params,
- * error-capability-gated) share -- the 2025-11-25 suite's gateRefusal /
- * bare403Verdict / ownRejectionCode / rpcResending429 (runner.ts) applied to
- * the modern suite. A gateway in front of a server answers 401 with a
- * -32001 "Unauthorized" body that echoes the request id; read as the
- * server's own answer, that envelope passed all six.
+ * error-capability-gated, error-invalid-cursor, transport-batch-reject,
+ * transport-content-type-reject) share -- the 2025-11-25 suite's
+ * gateRefusal / bare403Verdict / ownRejectionCode / rpcResending429
+ * (runner.ts) applied to the modern suite. A gateway in front of a server
+ * answers 401 with a -32001 "Unauthorized" body that echoes the request id;
+ * read as the server's own answer, that envelope passed all of them.
  *
  * Only an HTTP status can say something stood in front of the server, so
  * everything here is HTTP-only: over stdio nothing sits between the suite
@@ -79,13 +81,29 @@ function codeList(codes: readonly number[]): string {
   return `${codes.slice(0, -1).join(", ")} or ${codes[codes.length - 1]}`;
 }
 
+/**
+ * Whether the conformant twin's status is one the server itself chose, so
+ * the twin got past whatever stands in front of the server and a 403 on the
+ * probe next to it is the probe's own: a 2xx (served, or the application's
+ * JSON-RPC error on it), or a 4xx other than an auth gate's 401 / 403 or a
+ * rate limiter's 429. A 5xx (a server failure, or a gateway with no
+ * backend), a 401, a 403, a 429 (still a 429 after its one resend) or a
+ * redirect is no evidence the twin reached the server, so it credits
+ * nothing. Shared with the 2025-11-25 suite (bare403Verdict in runner.ts).
+ */
+export function twinReachedServer(statusCode: number | undefined): boolean {
+  if (statusCode === undefined) return false;
+  if (statusCode >= 200 && statusCode < 300) return true;
+  return statusCode >= 400 && statusCode < 500 && statusCode !== 401 && statusCode !== 403 && statusCode !== 429;
+}
+
 /** A server-chosen message for a details string: quoted, anything outside printable ASCII replaced by "?". */
 function quoteMessage(message: string): string {
   return JSON.stringify(message.replace(/[^\x20-\x7e]/g, "?"));
 }
 
 /** ", JSON-RPC error <code>" when a body carries a JSON-RPC error, "" otherwise. */
-function rpcErrorSuffix(body: unknown): string {
+export function rpcErrorSuffix(body: unknown): string {
   const error = (body as { error?: unknown } | null | undefined)?.error;
   if (!error || typeof error !== "object") return "";
   return `, ${errorWithCode((error as { code?: unknown }).code)}`;
@@ -130,10 +148,13 @@ function rejectionOn5xxWarning(spec: GateSpec, statusCode: number, code: number)
  * - any other 403 is the one refusal that may be either: a gate refusing
  *   every request, or the server (or a WAF) refusing the defect. The twin --
  *   a conformant server/discover sent next to the probe with the same
- *   headers -- tells them apart: when it was served, or drew a different
- *   status, the defect is what drew the 403, and it is credited whatever its
- *   message says. When it drew the same 403, or no answer, the 403 is not
- *   attributable, quoting the message when it names Host or Origin
+ *   headers, a 429 on it resent once -- tells them apart: when it was
+ *   served, or drew a status the server itself chose (twinReachedServer: a
+ *   2xx, or a 4xx other than 401, 403 or 429), the defect is what drew the
+ *   403, and it is credited whatever its message says. When it drew the
+ *   same 403, a 401, a 429 again, a 5xx or no answer, it never reached the
+ *   server either and the 403 is not attributable, quoting the message when
+ *   the twin drew the same 403 and the message names Host or Origin
  *   validation (a guard that refuses a request whatever it carries). With
  *   `twin: "self"` the probe is the conformant request itself, so no such
  *   403 is attributable.
@@ -152,7 +173,8 @@ export async function gateVerdict(ctx: ModernSuiteContext, res: GateAnswer, spec
   if (status >= 500) {
     const own = ownRejectionCode(res.body, spec.ownCodes);
     if (own === undefined) {
-      return `not evaluable: a 5xx that carries no ${codeList(spec.ownCodes)} is a server failure or a gateway with no backend, ${provesNothing}`;
+      const which = spec.ownCodes.length > 0 ? `a 5xx that carries no ${codeList(spec.ownCodes)}` : "a 5xx";
+      return `not evaluable: ${which} is a server failure or a gateway with no backend, ${provesNothing}`;
     }
     ctx.harness.warnings.push(rejectionOn5xxWarning(spec, status, own));
     return null;
@@ -172,7 +194,7 @@ export async function gateVerdict(ctx: ModernSuiteContext, res: GateAnswer, spec
     );
   }
   const twin = await spec.twin();
-  if (twin.served || (twin.statusCode !== undefined && twin.statusCode !== status)) return null;
+  if (twin.served || twinReachedServer(twin.statusCode)) return null;
   if (twin.statusCode === status && hostOrOrigin) return hostOrOrigin;
   return `not evaluable: a conformant server/discover sent next to it ${twin.outcome} too, so the 403 proves nothing about ${spec.about} (see security-auth-required)`;
 }
@@ -182,28 +204,38 @@ export async function gateVerdict(ctx: ModernSuiteContext, res: GateAnswer, spec
  * through the suite's client (the same headers, credential included), at
  * most once however many probes the check reads against it (see
  * `gateVerdict`). Sent only when a probe drew a 403 without a Bearer
- * challenge, so a server that answers otherwise is sent nothing more. A
- * caller's abort is rethrown.
+ * challenge, so a server that answers otherwise is sent nothing more. A 429
+ * on it is resent once after Retry-After, as the probes' are (resendOn429),
+ * and the second answer is the twin's. A caller's abort is rethrown.
  */
 export function discoverTwin(ctx: ModernSuiteContext): () => Promise<TwinAnswer> {
   let once: Promise<TwinAnswer> | null = null;
   return () => {
     once ??= (async (): Promise<TwinAnswer> => {
+      /** "answered HTTP 429, and its resend " once the first answer was a 429. */
+      let throttled = "";
       try {
-        const res = await ctx.client.rpc("server/discover", {});
+        const send = () => ctx.client.rpc("server/discover", {});
+        const first = await send();
+        if (ctx.kind === "http" && first.statusCode === 429) throttled = "answered HTTP 429, and its resend ";
+        const { res, throttledMs } = await resendOn429(ctx, first, send);
         const status = res.statusCode;
         if (status >= 200 && status < 300 && resultOf(res.body)) {
-          return { served: true, outcome: "was served", statusCode: status };
+          return {
+            served: true,
+            outcome: throttledMs === null ? "was served" : "was served when resent after HTTP 429",
+            statusCode: status,
+          };
         }
         const refused = status === 401 || status === 403;
         return {
           served: false,
-          outcome: `${refused ? "was refused" : "was not served"} (HTTP ${status}${rpcErrorSuffix(res.body)})`,
+          outcome: `${refused ? "was refused" : "was not served"} (${httpStatusText(status, throttledMs)}${rpcErrorSuffix(res.body)})`,
           statusCode: status,
         };
       } catch (err) {
         if (ctx.signal?.aborted) throw err;
-        return { served: false, outcome: `got ${noResponse(err, ctx.timeout)}` };
+        return { served: false, outcome: `${throttled}got ${noResponse(err, ctx.timeout)}` };
       }
     })();
     return once;

@@ -14,11 +14,11 @@ import { restartStdioServer, unreachable } from "./security.js";
  * must stay a clean stream of newline-delimited JSON no matter what the
  * client writes to stdin.
  *
- * A child that exits on stdio-unicode's own probe is replaced before the
- * check returns (security.ts's restartStdioServer, the same policy the
- * security checks follow), so the checks after it -- the rest of this
- * module, the late lifecycle block, security, post-hoc -- measure a live
- * server. Every check therefore sends through `ctx.client`, read at send
+ * A child that exits on stdio-unicode's own probe -- before answering it,
+ * or right after -- is replaced before the check returns (security.ts's
+ * restartStdioServer, the same policy the security checks follow), so the
+ * checks after it -- the rest of this module, the late lifecycle block,
+ * security, post-hoc -- measure a live server. Every check therefore sends through `ctx.client`, read at send
  * time, never a client captured before a restart.
  */
 
@@ -252,7 +252,9 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
   //
   // A crash or a hang on non-ASCII stdin is the likeliest real failure
   // here. A request that gets no reply fails with a one-line reason (never
-  // the transport's multi-line stderr tail, which can echo the probe). A
+  // the transport's multi-line stderr tail, which can echo the probe), and
+  // so does one answered by a child that exits right after (a plain
+  // server/discover sent after each answered probe finds it gone). A
   // child that exited on it is replaced (restartStdioServer, whose warning
   // names this check) so the checks after it measure the server instead
   // of a dead process -- on every attempt that kills it, --retries
@@ -273,7 +275,28 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
     ): Promise<{ res: RpcResponse } | { verdict: TestOutcome }> => {
       const alreadyGone = exitState(ctx).exited;
       try {
-        return { res: await ctx.client.rpc(method, params, opts) };
+        const res = await ctx.client.rpc(method, params, opts);
+        if (alreadyGone) return { res };
+        // A child can answer the probe and exit right after writing the
+        // reply (a logger that chokes on the non-ASCII line it just echoed):
+        // one plain server/discover tells a live process from one the probe
+        // killed. An answer, or anything short of the child being gone, is
+        // a live process; the probe's reply is judged as usual.
+        try {
+          await ctx.client.rpc("server/discover");
+        } catch (err: unknown) {
+          if (ctx.signal?.aborted) throw err;
+          if (exitState(ctx).exited) {
+            // Read before the restart replaces ctx.transport.
+            const verdict = {
+              passed: false,
+              details: `${what} was answered, but the server exited right after (${explainFailure(ctx, err)})`,
+            };
+            await restartStdioServer(ctx, "stdio-unicode", cause);
+            return { verdict };
+          }
+        }
+        return { res };
       } catch (err: unknown) {
         if (ctx.signal?.aborted) throw err;
         if (alreadyGone) return { verdict: unreachable(ctx, what, err) };

@@ -1015,17 +1015,21 @@ describe("legacy security-oauth-metadata against the SDK v1's own resource-serve
  * the non-ASCII characters -- "latin1" (UTF-8 bytes decoded as Latin-1),
  * "fffd", "question", "strip", "tokenize" (the words joined by "|") --
  * "parse-error" (every tools/call answered -32700), "exit-on-unicode" (the
- * process exits with code 7 on any line carrying a non-ASCII character), or
- * "ping-meta-reject" (a ping carrying _meta answered -32602).
+ * process exits with code 7 on any line carrying a non-ASCII character),
+ * "exit-after-unicode" (such a line is answered, and the process exits with
+ * code 7 right after writing the answer), or "ping-meta-reject" (a ping
+ * carrying _meta answered -32602).
  */
 const UNICODE_SERVER = `
 import { createInterface } from "node:readline";
 const tool = process.env.TOOL ?? "echo";
 const mode = process.env.MODE ?? "";
-const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+let exitAfterReply = false;
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n", () => { if (exitAfterReply) process.exit(7); });
 createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY }).on("line", (line) => {
   if (!line.trim()) return;
   if (mode === "exit-on-unicode" && /[^\\x00-\\x7f]/.test(line)) process.exit(7);
+  if (mode === "exit-after-unicode" && /[^\\x00-\\x7f]/.test(line)) exitAfterReply = true;
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
   if (msg.id === undefined) return;
@@ -1179,6 +1183,37 @@ describe("legacy stdio-unicode judges the round trip as the 2026-07-28 check doe
     expect(bare.warnings.filter((w) => w.startsWith(UNICODE))).toEqual([
       "stdio-unicode: the server exited on ping with a CJK/emoji _meta value and was restarted with a fresh initialize handshake, so the tests after it ran against the new instance.",
     ]);
+  }, 60_000);
+
+  it("a child that answers the probe and exits right after it FAILS and is restarted too (before: PASS, left dead)", async () => {
+    // Before: PASS "tools/call echo reproduced the CJK/emoji probe
+    // byte-for-byte", and stdio-unknown-method-recovers failed against the
+    // dead child.
+    const { byId, warnings } = await overStdio({ TOOL: "echo", MODE: "exit-after-unicode" }, [
+      "tools-list",
+      UNICODE,
+      "stdio-unknown-method-recovers",
+    ]);
+    expect(byId[UNICODE]).toBe(
+      "FAIL: tools/call echo with a CJK/emoji argument was answered, but the server exited right after (server exited (code 7))",
+    );
+    expect(byId["stdio-unknown-method-recovers"]).toBe(
+      "PASS: Unknown method returned JSON-RPC error; subsequent ping succeeded",
+    );
+    expect(warnings.filter((w) => w.startsWith(UNICODE))).toEqual([
+      "stdio-unicode: the server exited on tools/call echo with a CJK/emoji argument and was restarted with a fresh initialize handshake, so the tests after it ran against the new instance.",
+    ]);
+    // The same through the ping, when there is no tool to call.
+    const bare = await overStdio({ TOOL: "none", MODE: "exit-after-unicode" }, [
+      UNICODE,
+      "stdio-unknown-method-recovers",
+    ]);
+    expect(bare.byId[UNICODE]).toBe(
+      "FAIL: ping with a CJK/emoji _meta value was answered, but the server exited right after (server exited (code 7))",
+    );
+    expect(bare.byId["stdio-unknown-method-recovers"]).toBe(
+      "PASS: Unknown method returned JSON-RPC error; subsequent ping succeeded",
+    );
   }, 60_000);
 });
 

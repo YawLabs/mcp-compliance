@@ -422,7 +422,14 @@ describe("errors suite: canned bad HTTP server", () => {
     expectFail(report, "error-method-code", "Expected -32601 (Method not found), got -32000");
     expectFail(report, "error-missing-params", "produced a result with isError: true");
     expectPass(report, "tools-call-unknown", "isError: true (valid)");
-    expectFail(report, "error-invalid-cursor", "tools/list with an invalid cursor answered HTTP 503");
+    // A -32603 on a 503 is no rejection of the cursor the server can be
+    // credited with (gate.ts): it fails as not evaluable, as before it failed
+    // for the status.
+    expectFail(
+      report,
+      "error-invalid-cursor",
+      "JSON-RPC error -32603 (HTTP 503) for tools/list with an invalid cursor; not evaluable: a 5xx that carries no -32602 is a server failure or a gateway with no backend",
+    );
     expectFail(
       report,
       "error-capability-gated",

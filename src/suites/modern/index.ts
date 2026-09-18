@@ -49,7 +49,8 @@ export interface ModernSuiteInput {
  *
  * On stdio a check whose own request kills the server process (a security
  * check's injection payload, 1 MB argument or unknown tool arguments;
- * stdio-unicode's CJK/emoji probe) has it replaced (ctx.replaceStdioProcess,
+ * stdio-unicode's CJK/emoji probe; lifecycle-progress-token's tools/call)
+ * has it replaced (ctx.replaceStdioProcess,
  * driven by security.ts's restartStdioServer) every time it does, --retries
  * included, so the checks after it measure the server rather than a dead
  * process. The replacement's messages go to the same recorder, and the

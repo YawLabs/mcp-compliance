@@ -30,8 +30,8 @@ import {
   type ModernSuiteContext,
   publishList,
 } from "./context.js";
-import { gateVerdict, httpStatusText, resendOn429 } from "./gate.js";
-import { classifyTransportError } from "./security.js";
+import { discoverTwin, gateVerdict, httpStatusText, resendOn429 } from "./gate.js";
+import { classifyTransportError, restartStdioServer } from "./security.js";
 
 /**
  * Lifecycle category of the 2026-07-28 suite. There is no handshake in
@@ -840,9 +840,26 @@ async function checkSubscriptionsListen(ctx: ModernSuiteContext): Promise<TestOu
     ? `${advertised.join(", ")} advertised`
     : "nothing subscription-related advertised";
 
+  // A 429 is resent once after Retry-After, and the second answer decides
+  // (resendOn429), as for the error checks.
+  const open = async () => {
+    const opened = await ctx.client.stream(
+      "subscriptions/listen",
+      { notifications: filter },
+      { timeout: listenTimeout },
+    );
+    return { statusCode: opened.statusCode ?? 0, headers: opened.headers ?? {}, stream: opened };
+  };
   let stream: TransportStream;
+  let throttledMs: number | null = null;
   try {
-    stream = await ctx.client.stream("subscriptions/listen", { notifications: filter }, { timeout: listenTimeout });
+    const first = await open();
+    // The 429's status and headers are all that is read of it.
+    if (ctx.kind === "http" && first.statusCode === 429) await first.stream.close();
+    ({
+      res: { stream },
+      throttledMs,
+    } = await resendOn429(ctx, first, open));
   } catch (err) {
     // An aborted run is not a verdict: let the harness see the abort.
     if (ctx.signal?.aborted) throw err;
@@ -872,12 +889,40 @@ async function checkSubscriptionsListen(ctx: ModernSuiteContext): Promise<TestOu
   // the run, not by a server that never acknowledged. Not a verdict.
   if (!first && !response && ctx.signal?.aborted) throw ctx.signal.reason ?? new Error("Aborted");
 
-  const httpStatus = ctx.kind === "http" && stream.statusCode !== undefined ? ` (HTTP ${stream.statusCode})` : "";
+  const httpStatus =
+    ctx.kind === "http" && stream.statusCode !== undefined
+      ? ` (${httpStatusText(stream.statusCode, throttledMs)})`
+      : "";
   const err = response ? errorOf(response) : undefined;
   // A rejection counts as "unsupported, and said so" only when the
   // conformant discover was served (see notEvaluable): a server that
   // rejects everything proves nothing by rejecting the listen too.
   const unattributable = notEvaluable(ctx);
+  // Nor when something in front of the server answered in its place
+  // (gateVerdict, as for the error checks): an auth gate (a gateway's 401
+  // with a -32001 body that echoes the id), a 429 still a 429 after one
+  // resend, a 5xx without -32601, or a 403 the conformant twin could not get
+  // past either. Read for a JSON-RPC error and for a bare status >= 400
+  // alike. With listChanged advertised no rejection is the server's right
+  // answer, so no 5xx is credited there.
+  const rejected = !!err || (!first && !response && stream.statusCode !== undefined && stream.statusCode >= 400);
+  if (rejected && !unattributable && ctx.kind === "http" && stream.statusCode !== undefined) {
+    const reason = await gateVerdict(
+      ctx,
+      { statusCode: stream.statusCode, headers: stream.headers ?? {}, body: response },
+      {
+        check: "lifecycle-subscriptions-listen",
+        what: "subscriptions/listen",
+        about: "subscriptions/listen",
+        ownCodes: isAdvertised ? [] : [JSONRPC_ERROR_CODES.METHOD_NOT_FOUND],
+        twin: discoverTwin(ctx),
+      },
+    );
+    if (reason) {
+      const answer = err ? `rejected with ${errorCodeText(err.rawCode)}` : "rejected";
+      return fail(`subscriptions/listen ${answer}${httpStatus}; ${reason}`);
+    }
+  }
   if (err) {
     if (isAdvertised) {
       return fail(
@@ -1068,31 +1113,62 @@ interface ProgressCall {
   /** The transport error when `res` is null. */
   err?: unknown;
   notifications: unknown[];
+  /** The wait before the call's one resend when a rate limiter answered it 429 over HTTP (resendOn429); null when it was not resent. */
+  throttledMs: number | null;
+  /** The call was answered 429 and its resend got no answer (`err` is the resend's). */
+  resendLost: boolean;
+  /** stdio: the child was gone before the call was sent, so the call measured nothing (and nothing is restarted). */
+  alreadyGone: boolean;
+  /**
+   * stdio: the child exited on this call, not before it -- "exit code 3:
+   * <stderr summary>" (describeExit). It has been replaced since
+   * (restartStdioServer), so the calls and checks after it reach a live
+   * process.
+   */
+  exit?: string;
 }
 
 /**
  * The tools/call lifecycle-progress-token sends: `name` with no arguments,
  * carrying `_meta.progressToken` next to the conformant envelope when
  * `withToken`, and otherwise identical (the same envelope, the same
- * standard headers). The notifications/progress it drew are collected from
- * the response (HTTP: they ride its stream) and from the recording (stdio:
- * only the recorder sees them), unioned by identity so the HTTP copies are
- * not counted twice. A caller's abort is rethrown; any other transport
- * error comes back as `err`.
+ * standard headers). A 429 over HTTP is resent once after Retry-After
+ * (resendOn429), and the second answer is the call's. The
+ * notifications/progress it drew are collected from the response (HTTP:
+ * they ride its stream) and from the recording (stdio: only the recorder
+ * sees them), unioned by identity so the HTTP copies are not counted twice.
+ *
+ * On stdio a child that exits on the call (alive when it was sent) is
+ * replaced before this returns (restartStdioServer, whose warning names the
+ * call as `call` carrying or without the token), as the security checks and
+ * stdio-unicode replace one their own request killed, so the next call and
+ * the checks after this one reach a live process; with no way to spawn one,
+ * a warning says the rest ran against the exited process. A child already
+ * gone before the call is left as it is. A caller's abort is rethrown; any
+ * other transport error comes back as `err`.
  */
 async function sendProgressCall(
   ctx: ModernSuiteContext,
   name: string,
   inputSchema: unknown,
   withToken: boolean,
+  call: string,
 ): Promise<ProgressCall> {
   const seqStart = ctx.recorder.received.length;
   const params: Record<string, unknown> = { name, arguments: {} };
   if (withToken) params._meta = { progressToken: PROGRESS_TOKEN };
+  const child = ctx.kind === "stdio" ? (ctx.transport as StdioTransport) : undefined;
+  const alreadyGone = child?.exited === true;
   let res: RpcResponse | null = null;
   let err: unknown;
+  let throttledMs: number | null = null;
+  let resendLost = false;
   try {
-    res = await ctx.client.rpc("tools/call", params, { toolInputSchema: inputSchema });
+    const rpc = () => ctx.client.rpc("tools/call", params, { toolInputSchema: inputSchema });
+    const first = await rpc();
+    resendLost = ctx.kind === "http" && first.statusCode === 429;
+    ({ res, throttledMs } = await resendOn429(ctx, first, rpc));
+    resendLost = false;
   } catch (e) {
     if (ctx.signal?.aborted) throw e;
     err = e;
@@ -1107,7 +1183,21 @@ async function sendProgressCall(
   };
   for (const m of res?.messages ?? []) consider(m);
   for (const r of ctx.recorder.received.slice(seqStart)) consider(r.message);
-  return res ? { res, notifications } : { res: null, err, notifications };
+  const sent: ProgressCall = { res, notifications, throttledMs, resendLost, alreadyGone };
+  if (!res) sent.err = err;
+  if (!res && child && !alreadyGone && child.exited) {
+    // Read before the restart replaces ctx.transport.
+    sent.exit = await describeExit(child);
+    const cause = `${call} ${withToken ? "carrying" : "without"} _meta.progressToken`;
+    if (ctx.replaceStdioProcess) {
+      await restartStdioServer(ctx, "lifecycle-progress-token", cause);
+    } else {
+      ctx.harness.warnings.push(
+        `lifecycle-progress-token: the server exited on ${cause} (${sent.exit}); the tests after it ran against the exited process.`,
+      );
+    }
+  }
+  return sent;
 }
 
 /** Whether the call was served: a result (on HTTP, on a 2xx). */
@@ -1118,10 +1208,10 @@ function servedCall(ctx: ModernSuiteContext, res: RpcResponse): boolean {
 
 /**
  * What answered the call in the server's place, or undefined: on HTTP a
- * 429 (a rate limiter), or a 401 / a 403 carrying a Bearer challenge (an
- * auth gate, read the way readAuthRefusal reads one). A 403 without a
- * challenge is not a gate here: whether it refused the token is for the
- * same call without it to say.
+ * 429 (a rate limiter; the call has already been resent once), or a 401 / a
+ * 403 carrying a Bearer challenge (an auth gate, read the way
+ * readAuthRefusal reads one). A 403 without a challenge is not a gate here:
+ * whether it refused the token is for the same call without it to say.
  */
 function gateOnCall(ctx: ModernSuiteContext, res: RpcResponse): string | undefined {
   if (ctx.kind !== "http") return undefined;
@@ -1136,27 +1226,59 @@ function failedCall(ctx: ModernSuiteContext, res: RpcResponse): boolean {
   return errorOf(res.body) !== undefined || (ctx.kind === "http" && res.statusCode >= 400);
 }
 
-/** "JSON-RPC error -32602 (Invalid params) (HTTP 400)", "a result (HTTP 200)", "HTTP 502 with no JSON-RPC response". */
-function callShape(ctx: ModernSuiteContext, res: RpcResponse): string {
-  const status = statusOf(ctx, res);
+/**
+ * Whether the server went away on the call instead of answering it: the
+ * connection it had accepted was closed or reset (classifyTransportError's
+ * "dropped"), or the stdio child exited on it. A child already gone before
+ * the call was sent is not this call's doing, and a timeout or a connection
+ * never established is no answer at all.
+ */
+function droppedCall(c: ProgressCall): boolean {
+  if (c.res || c.alreadyGone) return false;
+  return c.exit !== undefined || classifyTransportError(c.err) === "dropped";
+}
+
+/**
+ * Whether the call failed on the server's side: a server error in its
+ * answer (failedCall), or the server going away on it (droppedCall) -- a
+ * closed connection counts as a refusal only next to a served twin, which
+ * the check asks for before it blames the token.
+ */
+function callFailed(ctx: ModernSuiteContext, c: ProgressCall): boolean {
+  return c.res ? failedCall(ctx, c.res) : droppedCall(c);
+}
+
+/**
+ * "JSON-RPC error -32602 (Invalid params) (HTTP 400)", "a result (HTTP 200)",
+ * "HTTP 502 with no JSON-RPC response"; the status as "HTTP 429, then after
+ * 0ms HTTP 400" when the call was resent after a 429.
+ */
+function callShape(ctx: ModernSuiteContext, res: RpcResponse, throttledMs: number | null = null): string {
+  const statusText = httpStatusText(res.statusCode, throttledMs);
+  const status = ctx.kind === "http" ? ` (${statusText})` : "";
   const err = errorOf(res.body);
   if (err) {
     const code = clipDetail(errorWithCode(err.rawCode), 80);
     return `${code}${err.message ? ` (${clipDetail(err.message, 60)})` : ""}${status}`;
   }
   if (resultOf(res.body)) return `a result${status}`;
-  return ctx.kind === "http"
-    ? `HTTP ${res.statusCode} with no JSON-RPC response`
-    : "a message with neither result nor error";
+  return ctx.kind === "http" ? `${statusText} with no JSON-RPC response` : "a message with neither result nor error";
 }
 
-/** How a call was answered, for a details string: "succeeded", "returned <error>", "answered <shape>", "got no response ...". */
+/**
+ * How a call was answered, for a details string: "succeeded", "returned
+ * <error>", "answered <shape>", "answered HTTP 401 (an auth gate)", "made
+ * the server exit (exit code 3: ...)", "got no response ...".
+ */
 function callOutcome(ctx: ModernSuiteContext, c: ProgressCall): string {
-  if (!c.res) return `got ${noResponseTo(ctx, c.err)}`;
-  if (servedCall(ctx, c.res)) return "succeeded";
+  if (!c.res) {
+    if (c.exit !== undefined) return `made the server exit (${c.exit})`;
+    return `${c.resendLost ? "answered HTTP 429, and its resend " : ""}got ${noResponseTo(ctx, c.err)}`;
+  }
+  if (servedCall(ctx, c.res)) return c.throttledMs === null ? "succeeded" : "succeeded when resent after HTTP 429";
   const gate = gateOnCall(ctx, c.res);
-  if (gate) return `answered HTTP ${c.res.statusCode} (${gate})`;
-  return `${failedCall(ctx, c.res) ? "returned" : "answered"} ${callShape(ctx, c.res)}`;
+  if (gate) return `answered ${httpStatusText(c.res.statusCode, c.throttledMs)} (${gate})`;
+  return `${failedCall(ctx, c.res) ? "returned" : "answered"} ${callShape(ctx, c.res, c.throttledMs)}`;
 }
 
 /**
@@ -1362,7 +1484,7 @@ function listsUnavailable(ctx: ModernSuiteContext, failed: ListKey[], what: stri
 }
 
 export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
-  const { harness, client } = ctx;
+  const { harness } = ctx;
 
   if (hasCompletions(ctx)) {
     await harness.check(
@@ -1428,7 +1550,7 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
         }
         let res: RpcResponse;
         try {
-          res = await client.rpc("completion/complete", { ref, argument });
+          res = await ctx.client.rpc("completion/complete", { ref, argument });
         } catch (err) {
           return fail(`completion/complete for ${source}: no response (${short(messageOf(err), 60)})`);
         }
@@ -1463,56 +1585,70 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
     // carry its token and a progress value that increases with each one.
     //
     // With no notification, the call's own answer is read. Served (or
-    // answered in some other way that is no server error) passes. A server
-    // error -- a JSON-RPC error, or on HTTP a status >= 400 other than a
-    // rate limiter's 429 or an auth gate's refusal (gateOnCall) -- is blamed
-    // on the token only once it is reproduced: the same call without the
-    // token, sent right after, is served, and the call carrying the token,
-    // resent after that, fails again. A tool whose first call fails
-    // whatever it carries (a cold backend) is served by then, and passes on
-    // the resent call; a failure the call without the token shares, or that
-    // the resent call does not repeat, stays an observation. A call nothing
-    // answered measured nothing about the token: a skip, never a verdict.
+    // answered in some other way that is no server error) passes. A 429 on
+    // any of the calls below is resent once after Retry-After first
+    // (sendProgressCall). The call failing on the server's side -- a
+    // JSON-RPC error, or on HTTP a status >= 400 other than a rate limiter's
+    // 429 or an auth gate's refusal (gateOnCall); or the server going away on
+    // it, a closed connection or a stdio child that exits on it (droppedCall,
+    // the child replaced before the next call) -- is blamed on the token only
+    // once it is reproduced: the same call without the token, sent right
+    // after, is served, and the call carrying the token, resent after that,
+    // fails again. A tool whose first call fails whatever it carries (a cold
+    // backend) is served by then, and passes on the resent call; a failure
+    // the server's own answer to the call without the token shares, or that
+    // the resent call answers without repeating, stays an observation. Only
+    // the server's own answer attributes anything: a gate's answer (a 429
+    // again, a 401 or a Bearer 403) or no answer at all -- on the first
+    // call, on the call without the token, or on the resent call -- measured
+    // nothing about the token: a skip, never a pass that claims a verdict.
     const name = String(tool.name);
     const call = `tools/call ${clipDetail(name, 60)}`;
     const none = `no ${PROGRESS_METHOD} observed (optional)`;
-    const send = (withToken: boolean) => sendProgressCall(ctx, name, tool.inputSchema, withToken);
+    const gated = "it was answered before the server read the request, so it proves nothing about the progress token";
+    const send = (withToken: boolean) => sendProgressCall(ctx, name, tool.inputSchema, withToken, call);
     const first = await send(true);
     const judged = judgeProgress(ctx, first, call);
     if (judged) return judged;
-    if (!first.res) {
-      if (ctx.kind === "stdio" && (ctx.transport as StdioTransport).exited) {
-        harness.warnings.push(
-          `lifecycle-progress-token: the server exited on ${call}, which carried _meta.progressToken (${await describeExit(ctx.transport as StdioTransport)}); the tests after it ran against the exited process.`,
-        );
-      }
+    if (first.res && gateOnCall(ctx, first.res)) {
+      return unanswered(`${call} with progressToken ${callOutcome(ctx, first)}; not evaluable: ${gated}; ${none}`);
+    }
+    if (!callFailed(ctx, first)) {
+      if (first.res) return pass(`${call} ${callOutcome(ctx, first)}; ${none}`);
       return unanswered(`${call} with progressToken ${callOutcome(ctx, first)}; ${none}`);
     }
-    if (!failedCall(ctx, first.res)) return pass(`${call} ${callOutcome(ctx, first)}; ${none}`);
-    const firstShape = callShape(ctx, first.res);
     const twin = await send(false);
-    if (!twin.res || !servedCall(ctx, twin.res)) {
-      const twinOutcome = twin.res ? `was not served either (${callShape(ctx, twin.res)})` : callOutcome(ctx, twin);
+    if (!twin.res || gateOnCall(ctx, twin.res)) {
+      return unanswered(
+        `${call} ${callOutcome(ctx, first)}, but the same call without the token ${callOutcome(ctx, twin)}, so no answer of the server's own tells whether the progress token is what failed it (not evaluable); ${none}`,
+      );
+    }
+    if (!servedCall(ctx, twin.res)) {
       return pass(
-        `${call} returned ${firstShape}, and the same call without the token ${twinOutcome}, so the progress token is not what failed it; ${none}`,
+        `${call} ${callOutcome(ctx, first)}, and the same call without the token was not served either (${callShape(ctx, twin.res, twin.throttledMs)}), so the progress token is not what failed it; ${none}`,
       );
     }
     const again = await send(true);
     const judgedAgain = judgeProgress(ctx, again, call, " when resent");
     if (judgedAgain) return judgedAgain;
-    if (again.res && failedCall(ctx, again.res)) {
+    if (callFailed(ctx, again)) {
+      const repeated = again.res ? callShape(ctx, again.res, again.throttledMs) : callOutcome(ctx, again);
       return fail(
-        `${call} carrying _meta.progressToken returned ${firstShape}, and ${callShape(ctx, again.res)} when it was resent, while the same call without it, sent in between, was served -- the server failed the request because of its progress token (basic/patterns/progress lets a server ignore the token and send no notifications, not fail the request)`,
+        `${call} carrying _meta.progressToken ${callOutcome(ctx, first)}, and ${repeated} when it was resent, while the same call without it, sent in between, was served -- the server failed the request because of its progress token (basic/patterns/progress lets a server ignore the token and send no notifications, not fail the request)`,
       );
     }
     if (again.res && servedCall(ctx, again.res)) {
       return pass(
-        `${call} succeeded when resent: it first returned ${firstShape}, then the same call without the token and the resent one were served; ${none}`,
+        `${call} succeeded when resent: it first ${callOutcome(ctx, first)}, then the same call without the token and the resent one were served; ${none}`,
       );
     }
-    return pass(
-      `${call} returned ${firstShape}; the same call without the token was served, but resent, the call carrying it ${callOutcome(ctx, again)}, so the failure was not reproduced; ${none}`,
-    );
+    const resent = `the same call without the token was served, but resent, the call carrying it ${callOutcome(ctx, again)}`;
+    if (!again.res || gateOnCall(ctx, again.res)) {
+      return unanswered(
+        `${call} ${callOutcome(ctx, first)}; ${resent}, so the failure could not be reproduced (not evaluable); ${none}`,
+      );
+    }
+    return pass(`${call} ${callOutcome(ctx, first)}; ${resent}, so the failure was not reproduced; ${none}`);
   });
 
   // The claim-less probes: a request with no protocolVersion claim is
@@ -1536,7 +1672,7 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
       "lifecycle-meta-required",
       "server/discover without _meta",
       JSONRPC_ERROR_CODES.INVALID_PARAMS,
-      () => client.rpc("server/discover", {}, { meta: false }),
+      () => ctx.client.rpc("server/discover", {}, { meta: false }),
     ),
   );
 
@@ -1546,7 +1682,7 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
       "lifecycle-meta-protocol-version-required",
       "server/discover without _meta protocolVersion",
       JSONRPC_ERROR_CODES.INVALID_PARAMS,
-      () => client.rpc("server/discover", {}, { meta: { [META.protocolVersion]: undefined } }),
+      () => ctx.client.rpc("server/discover", {}, { meta: { [META.protocolVersion]: undefined } }),
     ),
   );
 
@@ -1558,7 +1694,7 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
     const legacyParams = {
       protocolVersion: LEGACY_SPEC_VERSION,
       capabilities: {},
-      clientInfo: client.clientInfo,
+      clientInfo: ctx.client.clientInfo,
     };
     // Exactly what a 2025-11-25 client sends: no modern _meta, no Mcp-Method,
     // and the legacy protocol version in the header.
@@ -1575,7 +1711,7 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
     try {
       res = fresh
         ? await initializeOnFresh(ctx, fresh, legacyParams, opts, budget)
-        : await client.rpc("initialize", legacyParams, { ...opts, timeout: budget });
+        : await ctx.client.rpc("initialize", legacyParams, { ...opts, timeout: budget });
     } catch (err) {
       // An aborted run is not a verdict: let the harness see the abort.
       if (ctx.signal?.aborted) throw err;

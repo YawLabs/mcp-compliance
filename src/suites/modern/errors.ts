@@ -31,21 +31,23 @@ import { notEvaluable } from "./lifecycle.js";
  * error-capability-gated sees it as "nothing declared" and fails as not
  * evaluable rather than call a served list method undeclared.
  *
- * Next to a served discover, the five checks that credit ANY JSON-RPC
+ * Next to a served discover, the six checks that credit ANY JSON-RPC
  * error or rejection (error-unknown-method, error-invalid-jsonrpc,
- * error-invalid-json, error-missing-params, error-capability-gated) also
- * ask whose answer it is (gate.ts's gateVerdict): a gateway's 401 with a
- * -32001 "Unauthorized" body that echoes the id, a 403 carrying a Bearer
- * challenge, a 403 the conformant twin cannot credit, a 429 that is still a
- * 429 after one resend, or a 5xx without the check's own code (-32601,
- * -32600, -32700, -32602, -32601) is not the server's, and fails as not
- * evaluable. A 5xx carrying that code is credited, with a warning about the
- * status. The exact-code ids (error-method-code, error-parse-code,
- * error-invalid-request-code) credit only the one right code, which no gate
- * produces, so they read the discover state alone.
+ * error-invalid-json, error-missing-params, error-capability-gated,
+ * error-invalid-cursor) also ask whose answer it is (gate.ts's
+ * gateVerdict): a gateway's 401 with a -32001 "Unauthorized" body that
+ * echoes the id, a 403 carrying a Bearer challenge, a 403 the conformant
+ * twin cannot credit, a 429 that is still a 429 after one resend, or a 5xx
+ * without the check's own code (-32601, -32600, -32700, -32602, -32601,
+ * -32602) is not the server's, and fails as not evaluable. A 5xx carrying
+ * that code is credited, with a warning about the status. The exact-code
+ * ids (error-method-code, error-parse-code, error-invalid-request-code)
+ * credit only the one right code, which no gate produces, so they read the
+ * discover state alone. tools-call-unknown is not read this way yet: a
+ * gateway's -32001 on its tools/call still passes it.
  */
 
-/** The five probes' own rejection codes and what each varies (see gateVerdict). */
+/** The five probes' own rejection codes and what each varies (see gateVerdict); error-invalid-cursor's is below. */
 const UNKNOWN_METHOD_GATE = {
   check: "error-unknown-method",
   what: "an unknown method",
@@ -74,6 +76,12 @@ const MISSING_NAME_GATE = {
 };
 /** What error-capability-gated's not-evaluable reasons say it could not measure. */
 const GATED_ABOUT = "whether undeclared methods are rejected";
+/** error-invalid-cursor's own rejection (pagination: an invalid cursor SHOULD draw -32602); `what` names the list method. */
+const INVALID_CURSOR_GATE = {
+  check: "error-invalid-cursor",
+  about: "the invalid cursor",
+  ownCodes: [JSONRPC_ERROR_CODES.INVALID_PARAMS],
+};
 
 const UNKNOWN_TOOL = "__nonexistent_tool_compliance_test__";
 
@@ -347,10 +355,23 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
     const target = LIST_METHODS.find((m) => m.declared(ctx));
     if (!target) return { passed: true, details: "No list methods available to test (skipped)" };
     const cursor = `compliance-invalid-cursor-${randomBytes(4).toString("hex")}`;
-    const probe = await rpcOrFailure(ctx, target.method, { cursor });
+    const probe = await rpcOrFailure(ctx, target.method, { cursor }, true);
     if ("failure" in probe) return { passed: false, details: probe.failure };
+    // A rejection is credited only when it is the server's own (gateVerdict,
+    // as for the five checks above): an auth gate, a 429 still a 429 after
+    // one resend, a 5xx without -32602, or a 403 the conformant twin could
+    // not get past either is not evaluable. A -32602 on a 5xx is credited,
+    // with a warning about the status.
+    const unattributable = await rejectionVerdict(ctx, probe, `${target.method} with an invalid cursor`, {
+      ...INVALID_CURSOR_GATE,
+      what: `${target.method} with an invalid cursor`,
+      twin: discoverTwin(ctx),
+    });
+    if (unattributable) return unattributable;
     const res = probe.res;
-    if (http && res.statusCode >= 500) {
+    // Past the gate reading a 5xx either carried -32602 (credited) or came
+    // with a result, which fails for the status.
+    if (http && res.statusCode >= 500 && resultOf(res.body)) {
       return { passed: false, details: `${target.method} with an invalid cursor answered HTTP ${res.statusCode}` };
     }
     const err = errorOf(res.body);
@@ -392,7 +413,7 @@ type Probe<T> = { res: T; throttledMs: number | null } | { failure: string };
  * Send a request; a transport failure (timeout, closed pipe) becomes a
  * failing outcome, never a throw -- except a caller's abort, which is
  * rethrown. With `resend429` a 429 is resent once after Retry-After and the
- * second answer decides (the five gate-read checks, see gateVerdict).
+ * second answer decides (the six gate-read checks, see gateVerdict).
  */
 async function rpcOrFailure(
   ctx: ModernSuiteContext,
@@ -425,7 +446,7 @@ interface RawProbe extends GateAnswer {
  * - while the conformant setup `server/discover` was itself rejected or
  *   unanswered (`notEvaluable`): the rejection is the server's answer to
  *   everything, not a verdict on `what`;
- * - with `gate` (the five checks that credit any error or rejection), when
+ * - with `gate` (the six checks that credit any error or rejection), when
  *   something in front of the server answered in its place (gateVerdict:
  *   an auth gate, a 429 still a 429 after one resend, a 5xx without the
  *   check's own code, a 403 the conformant twin could not get past either).

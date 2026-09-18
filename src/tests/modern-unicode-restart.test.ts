@@ -23,9 +23,12 @@ import { MODERN_FIXTURE, resultOf, runModern } from "./helpers/modern-fixture.js
  * The killers are real servers -- the SDK v2 stdio fixture, the modern
  * fixture, and a hand-rolled child with no tools (so the probe rides the
  * server/discover envelope) -- with a preload (`node --import data:...`)
- * that exits the process with code 3 on the first stdin byte outside ASCII.
- * Only stdio-unicode sends one. The preload runs in every instance the
- * suite spawns, so a replacement dies on the same probe too.
+ * that exits the process with code 3 on the first stdin byte outside ASCII,
+ * or right after the server writes a reply carrying one (EXIT_AFTER_ECHO:
+ * the probe is answered, then the child dies -- caught by the plain
+ * server/discover the check sends after an answered probe). Only
+ * stdio-unicode sends one. The preload runs in every instance the suite
+ * spawns, so a replacement dies on the same probe too.
  */
 
 const SDK2_STDIO_FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "sdk2-stdio-server.mjs");
@@ -36,6 +39,20 @@ const EXIT_ON_NON_ASCII = [
   '  const b = typeof c === "string" ? Buffer.from(c, "utf8") : c;',
   "  if (b.some((x) => x > 0x7f)) process.exit(3);",
   "});",
+].join("\n");
+
+/**
+ * Exits (code 3) right after writing a stdout line that carries non-ASCII:
+ * the server answers the probe, echo and all, and then dies (a logger that
+ * chokes on the line it just wrote).
+ */
+const EXIT_AFTER_ECHO = [
+  "const w = process.stdout.write.bind(process.stdout);",
+  "process.stdout.write = (chunk, enc, cb) => {",
+  '  const s = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");',
+  "  if (/[^\\x00-\\x7f]/.test(s)) return w(chunk, () => process.exit(3));",
+  "  return w(chunk, enc, cb);",
+  "};",
 ].join("\n");
 
 /**
@@ -189,6 +206,45 @@ describe("2026-07-28 stdio-unicode: a child that exits on the probe is restarted
     expect(warned[0]).toBe(restartWarning(TOOL_PROBE));
   }, 60_000);
 
+  it("a child that answers the probe and exits right after it FAILS and is restarted (before: PASS, left dead)", async () => {
+    // Before: PASS "tools/call echo reproduced the CJK/emoji probe
+    // byte-for-byte", no warning, and stdio-unknown-method-recovers,
+    // stdio-cancellation, security-extra-params and security-tool-rug-pull
+    // all failed against the dead child.
+    const report = await runModern(target(MODERN_FIXTURE, EXIT_AFTER_ECHO), {
+      only: [...STDIO_IDS, "security-extra-params", "security-tool-rug-pull"],
+    });
+    expect(failing(report)).toEqual(["stdio-unicode"]);
+    expect(resultOf(report, "stdio-unicode").details).toBe(
+      `${TOOL_PROBE} was answered, but the server exited right after (server exited (code 3))`,
+    );
+    expect(resultOf(report, "stdio-unknown-method-recovers").details).toBe(RECOVERS);
+    expect(resultOf(report, "stdio-cancellation").details).toBe(CANCELLATION);
+    expect(resultOf(report, "security-extra-params").details).toBe(
+      "Server processed request (extra params likely ignored)",
+    );
+    expect(resultOf(report, "security-tool-rug-pull").details).toBe(
+      "11 tool(s) consistent across 2 calls to the server restarted after stdio-unicode (before and after a tools/call)",
+    );
+    expect(restartWarnings(report)).toEqual([restartWarning(TOOL_PROBE)]);
+  }, 90_000);
+
+  it("SDK v2, full auto run, a child that exits right after answering the probe: only stdio-unicode fails (before: grade B, 11 failing)", async () => {
+    const report = await runComplianceSuite(target(SDK2_STDIO_FIXTURE, EXIT_AFTER_ECHO), {
+      timeout: 5000,
+      startupTimeout: 15_000,
+    });
+    expect(report.specVersion).toBe(MODERN_SPEC_VERSION);
+    expect(failing(report)).toEqual(["stdio-unicode"]);
+    expect(resultOf(report, "stdio-unicode").details).toBe(
+      `${TOOL_PROBE} was answered, but the server exited right after (server exited (code 3))`,
+    );
+    expect(unicodeWarnings(report)).toEqual([restartWarning(TOOL_PROBE)]);
+    // No later check blames its own request for the exit.
+    expect(report.warnings.filter((w) => /exited process/.test(w))).toEqual([]);
+    expect(report.grade).toBe("A");
+  }, 120_000);
+
   it("a conformant server is never restarted: the probe round-trips and no warning mentions a restart", async () => {
     const report = await runModern(target(MODERN_FIXTURE), { only: [...STDIO_IDS, "security-tool-rug-pull"] });
     expect(failing(report)).toEqual([]);
@@ -206,11 +262,13 @@ describe("2026-07-28 stdio-unicode: a child that exits on the probe is restarted
  * the server/discover envelope: it answers server/discover with a
  * DiscoverResult and every other request -32601, never answers a
  * notification, and, with EXIT set, exits with code 3 on any stdin line
- * carrying a non-ASCII character.
+ * carrying a non-ASCII character; with EXIT_AFTER set, it answers such a
+ * line and exits with code 3 right after writing the answer.
  */
 const NO_TOOLS_SERVER = `
 import { createInterface } from "node:readline";
-const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+let exitAfterReply = false;
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n", () => { if (exitAfterReply) process.exit(3); });
 const discover = {
   resultType: "complete",
   supportedVersions: [${JSON.stringify(MODERN_SPEC_VERSION)}],
@@ -222,6 +280,7 @@ const discover = {
 const rl = createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY });
 rl.on("line", (line) => {
   if (process.env.EXIT && /[^\\x00-\\x7f]/.test(line)) process.exit(3);
+  if (process.env.EXIT_AFTER && /[^\\x00-\\x7f]/.test(line)) exitAfterReply = true;
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
   if (msg.id === undefined) return;
@@ -254,6 +313,19 @@ describe("2026-07-28 stdio-unicode: a child that exits on the envelope probe is 
     expect(failing(report)).toEqual(["stdio-unicode"]);
     // Before: "unknown method drew no response (server exited (code 3))"
     // and "could not write notifications/cancelled (...)".
+    expect(resultOf(report, "stdio-unknown-method-recovers").details).toBe(RECOVERS);
+    expect(resultOf(report, "stdio-cancellation").details).toBe(CANCELLATION);
+    expect(unicodeWarnings(report)).toEqual([restartWarning(ENVELOPE_PROBE)]);
+  }, 60_000);
+
+  it("the discover carrying the probe is answered, then the child exits: stdio-unicode fails, the checks after it pass on the replacement (before: PASS, left dead)", async () => {
+    // Before: PASS "envelope round-trip verified: ...", and the two checks
+    // after it failed against the dead child.
+    const report = await run({ EXIT_AFTER: "1" });
+    expect(resultOf(report, "stdio-unicode").details).toBe(
+      `${ENVELOPE_PROBE} was answered, but the server exited right after (server exited (code 3))`,
+    );
+    expect(failing(report)).toEqual(["stdio-unicode"]);
     expect(resultOf(report, "stdio-unknown-method-recovers").details).toBe(RECOVERS);
     expect(resultOf(report, "stdio-cancellation").details).toBe(CANCELLATION);
     expect(unicodeWarnings(report)).toEqual([restartWarning(ENVELOPE_PROBE)]);

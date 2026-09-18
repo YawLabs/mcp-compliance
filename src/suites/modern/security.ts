@@ -2212,9 +2212,10 @@ async function discoverAfterDrop(ctx: ModernSuiteContext): Promise<{ alive: stri
  * injection payload, security-oversized-input's 1 MB value,
  * security-extra-params' unknown arguments, the tools/call
  * security-tool-rug-pull sends a replacement, stdio-unicode's CJK/emoji
- * tools/call or server/discover (stdio.ts) -- with a fresh instance: the
- * policy the 2025-11-25 suite applies to the same checks (restartStdioServer
- * in runner.ts). The check already fails as "server died"; left dead, the
+ * tools/call or server/discover (stdio.ts), lifecycle-progress-token's
+ * tools/call with or without its token (lifecycle.ts) -- with a fresh
+ * instance: the policy the 2025-11-25 suite applies to the same checks
+ * (restartStdioServer in runner.ts). The check already fails as "server died"; left dead, the
  * child would fail every later check under a diagnosis of its own ("server
  * unreachable", "Second tools/list call threw"), so one crash would be
  * counted over and over under the wrong names.
@@ -2224,10 +2225,10 @@ async function discoverAfterDrop(ctx: ModernSuiteContext): Promise<{ alive: stri
  * cold process), then, once that is served, one modern request that is not
  * a discover -- the list the server declared, else ping -- which pins a
  * dual-era process (the SDK 2.0 default) to this era before the claim-less
- * probes reach it (the late lifecycle block's, after a stdio-unicode
- * restart; the information-disclosure checks'), as the feature modules
- * pinned the first process. The cached lists and capabilities stay
- * as they are (they describe the same server); ctx.state.replacement
+ * probes reach it (the late lifecycle block's, after a stdio-unicode or
+ * lifecycle-progress-token restart; the information-disclosure checks'), as
+ * the feature modules pinned the first process. The cached lists and
+ * capabilities stay as they are (they describe the same server); ctx.state.replacement
  * records that the process changed, with the new instance's tools/list
  * from that pin, read before any tools/call reached it, for
  * security-tool-rug-pull (rugPullOnReplacement).
