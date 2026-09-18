@@ -980,6 +980,19 @@ describe("modern transport-batch-reject and transport-content-type-reject: whose
     expect(everything.byId).toEqual(expected);
   }, 30_000);
 
+  it("a server that rejected the conformant server/discover too: its own 400 and 415 are not evaluable (before: two passes)", async () => {
+    // Before: PASS "HTTP 400 (batch rejected)" and PASS "HTTP 415 (text/plain rejected)".
+    const { byId, hits } = await verdicts({ discover: "legacy-400" }, { only: TRANSPORT });
+    const setup = (about: string) =>
+      `not evaluable: the conformant server/discover was itself rejected with -32601 (HTTP 400), so this rejection proves nothing about ${about}`;
+    expect(byId).toEqual({
+      [BATCH]: `FAIL: HTTP 400, JSON-RPC error -32600 on the batch; ${setup("the batch")}`,
+      [CT]: `FAIL: HTTP 415 on the text/plain POST; ${setup("the Content-Type")}`,
+    });
+    // No twin: neither answer is a 403.
+    expect(count(hits, "discover")).toBe(2);
+  }, 30_000);
+
   it("a 429 is resent once: throttled again is not evaluable, served on the resend is judged as usual", async () => {
     // Before: PASS "HTTP 429 (batch rejected)" and PASS "HTTP 429 (text/plain rejected)".
     const twice = "HTTP 429, then after 0ms HTTP 429";
@@ -1022,10 +1035,15 @@ describe("modern transport-batch-reject and transport-content-type-reject: whose
     const refused = await verdicts({ gate: "bare-403", exempt: ["discover"], discoverThrough: 2 }, { only: TRANSPORT });
     const twin = (about: string) =>
       twinFailed("server/discover", "was refused (HTTP 403, JSON-RPC error -32000)", about);
+    // Within the 220-character details budget the reason is kept whole: the
+    // probe's JSON-RPC code gives way first, then the probe's name.
     expect(refused.byId).toEqual({
-      [BATCH]: `FAIL: HTTP 403, JSON-RPC error -32000 on the batch; ${twin("the batch")}`,
-      [CT]: `FAIL: HTTP 403, JSON-RPC error -32000 on the text/plain POST; ${twin("the Content-Type")}`,
+      [BATCH]: `FAIL: HTTP 403 on the batch; ${twin("the batch")}`,
+      [CT]: `FAIL: HTTP 403; ${twin("the Content-Type")}`,
     });
+    for (const verdict of Object.values(refused.byId)) {
+      expect(verdict.replace(/^FAIL: /, "").length).toBeLessThanOrEqual(220);
+    }
   }, 30_000);
 });
 

@@ -16,8 +16,17 @@ import {
   listUnavailable,
   type ModernSuiteContext,
 } from "./context.js";
-import { discoverTwin, type GateAnswer, gateVerdict, httpStatusText, resendOn429, rpcErrorSuffix } from "./gate.js";
+import {
+  discoverTwin,
+  type GateAnswer,
+  gateVerdict,
+  httpStatusText,
+  resendOn429,
+  rpcErrorSuffix,
+  type Twin,
+} from "./gate.js";
 import { notEvaluable, transportLevelRejection } from "./lifecycle.js";
+import { unreachable } from "./security.js";
 
 /**
  * Streamable HTTP transport tests of the 2026-07-28 suite (16 in the
@@ -118,31 +127,108 @@ function rawRpcBody(res: { body: string; headers: Record<string, string> }): unk
   }
 }
 
+type RawAnswer = Awaited<ReturnType<ModernSuiteContext["client"]["raw"]>>;
+
+const DETAILS_MAX = 220;
+
 /**
- * Why a rejecting status (>= 400) on a raw negative probe -- the text/plain
- * POST, the batch -- is not the server's answer to its defect, or null when
- * it is: the 2025-11-25 checks' gateRefusal / bare403Verdict reading
- * (gateVerdict). A 401, a 403 carrying a Bearer challenge, a 429 still a
- * 429 after its one resend, a 5xx without the probe's own code, or a 403
- * the conformant server/discover sent next to it (the twin) could not get
- * past either, is something in front of the server answering in its place.
+ * Send a raw negative probe, resent once after Retry-After when a rate
+ * limiter answered it 429 (resendOn429). A probe that got no answer at all
+ * -- on the first send, or on the resend after a 429 -- is "server
+ * unreachable" (`unreachable`: a timeout, a closed or a refused connection),
+ * naming the 429 when it was the resend that went unanswered. A caller's
+ * abort is rethrown.
+ */
+async function sendRawProbe(
+  ctx: ModernSuiteContext,
+  what: string,
+  send: () => Promise<RawAnswer>,
+): Promise<{ res: RawAnswer; throttledMs: number | null } | { outcome: TestOutcome }> {
+  let throttled = false;
+  try {
+    const first = await send();
+    throttled = ctx.kind === "http" && first.statusCode === 429;
+    return await resendOn429(ctx, first, send);
+  } catch (err) {
+    if (ctx.signal?.aborted) throw err;
+    return { outcome: unreachable(ctx, throttled ? `${what} answered HTTP 429, and its resend` : what, err) };
+  }
+}
+
+/**
+ * The conformant twin a 403 without a Bearer challenge on a probe is read
+ * against (gateVerdict). When the setup server/discover -- the same
+ * conformant request, with the same headers -- was itself refused with the
+ * probe's status, its answer is the twin's: a fresh server/discover would
+ * be refused the same way, and whatever it drew the rejection could not be
+ * credited (rawProbeGate reads the rejected setup discover as not
+ * evaluable). Otherwise a fresh one is sent (discoverTwin).
+ */
+function twinFor(ctx: ModernSuiteContext, statusCode: number): Twin {
+  const setup = ctx.state.discoverRejection;
+  if (ctx.state.discover || !setup || setup.statusCode !== statusCode) return discoverTwin(ctx);
+  const refused = statusCode === 401 || statusCode === 403;
+  const code = setup.code === null ? "" : `, ${errorWithCode(setup.rawCode)}`;
+  return async () => ({
+    served: false,
+    outcome: `${refused ? "was refused" : "was not served"} (HTTP ${statusCode}${code})`,
+    statusCode,
+  });
+}
+
+/**
+ * "<status seen>, <JSON-RPC code> on <probe>; <reason>" within DETAILS_MAX.
+ * The reason is the conclusion and is kept whole, so the head gives way:
+ * first the probe's JSON-RPC code, then the probe's name (the reason names
+ * what the probe varied), leaving the status. A reason too long to fit even
+ * then is gateVerdict's own and is not cut.
+ */
+function gatedDetails(seen: string, rpcSuffix: string, on: string, reason: string): string {
+  const heads = [`${seen}${rpcSuffix} on ${on}`, `${seen} on ${on}`, seen];
+  const head = heads.find((h) => h.length + 2 + reason.length <= DETAILS_MAX) ?? seen;
+  return `${head}; ${reason}`;
+}
+
+/**
+ * Why a rejection of a raw negative probe -- the text/plain POST, the batch
+ * -- is not the server's answer to its defect, or null when it is. A
+ * rejection is a status >= 400, or a JSON-RPC error on any status (a
+ * gateway's -32001 on HTTP 200); an answer below 400 without one (a
+ * result, a processed batch, an HTML page) is judged by the check itself.
+ *
+ * - Something in front of the server answered in its place: the 2025-11-25
+ *   checks' gateRefusal / bare403Verdict reading (gateVerdict). A 401, a
+ *   403 carrying a Bearer challenge, a 429 still a 429 after its one
+ *   resend, a 5xx without the probe's own code, or a 403 the conformant
+ *   server/discover (the twin) could not get past either.
+ * - The conformant setup server/discover was itself rejected or never
+ *   answered (notEvaluable): a server that rejects everything proves
+ *   nothing by rejecting the probe too. The gate's reason is preferred when
+ *   it has one (it names the gate); a 5xx is not read by the gate then, so
+ *   its own code is never credited with a warning next to this failure.
+ *
  * The details open with what was seen ("HTTP 401, JSON-RPC error -32001 on
  * the batch"). A caller's abort (while the twin is sent) is rethrown.
  */
 async function rawProbeGate(
   ctx: ModernSuiteContext,
-  res: { statusCode: number; body: string; headers: Record<string, string> },
+  res: RawAnswer,
   throttledMs: number | null,
   on: string,
   spec: typeof BATCH_GATE | typeof TEXT_PLAIN_GATE,
 ): Promise<TestOutcome | null> {
-  if (res.statusCode < 400) return null;
   const answer: GateAnswer = { statusCode: res.statusCode, headers: res.headers, body: rawRpcBody(res) };
-  const reason = await gateVerdict(ctx, answer, { ...spec, twin: discoverTwin(ctx) });
+  if (res.statusCode < 400 && !errorOf(answer.body)) return null;
+  const setup = notEvaluable(ctx, spec.about);
+  const gated =
+    res.statusCode >= 400 && !(setup && res.statusCode >= 500)
+      ? await gateVerdict(ctx, answer, { ...spec, twin: twinFor(ctx, res.statusCode) })
+      : null;
+  const reason = gated ?? setup;
   if (!reason) return null;
   return {
     passed: false,
-    details: `${httpStatusText(res.statusCode, throttledMs)}${rpcErrorSuffix(answer.body)} on ${on}; ${reason}`,
+    details: gatedDetails(httpStatusText(res.statusCode, throttledMs), rpcErrorSuffix(answer.body), on, reason),
   };
 }
 
@@ -225,13 +311,17 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
     // A fully conformant discover (headers + _meta) so the only defect is
     // the Content-Type; a 400 for a missing _meta could otherwise pass this.
     // A rejection is the server's only when nothing in front of it answered
-    // in its place (rawProbeGate): a 429 is resent once, and an auth gate, a
-    // 429 again, a 5xx, or a 403 the conformant discover drew too is not
-    // evaluable. A 415 (or any other 4xx the server chose) is credited.
+    // in its place and the conformant setup discover was served
+    // (rawProbeGate): a 429 is resent once, and an auth gate, a 429 again, a
+    // 5xx, a 403 the conformant discover drew too, or any rejection of a
+    // server that rejected the conformant discover as well is not evaluable.
+    // A 415 (or any other 4xx the server chose) is credited.
     const params = client.paramsFor({});
     const body = JSON.stringify({ jsonrpc: "2.0", id: 99905, method: DISCOVER, params });
     const send = () => client.raw(body, { method: DISCOVER, params, headers: { "Content-Type": "text/plain" } });
-    const { res, throttledMs } = await resendOn429(ctx, await send(), send);
+    const sent = await sendRawProbe(ctx, "the text/plain POST", send);
+    if ("outcome" in sent) return sent.outcome;
+    const { res, throttledMs } = sent;
     const gated = await rawProbeGate(ctx, res, throttledMs, "the text/plain POST", TEXT_PLAIN_GATE);
     if (gated) return gated;
     if (is4xx(res.statusCode)) return { passed: true, details: `HTTP ${res.statusCode} (text/plain rejected)` };
@@ -248,13 +338,18 @@ export async function runTransport(ctx: ModernSuiteContext): Promise<void> {
       { jsonrpc: "2.0", id: 99903, method: DISCOVER, params },
       { jsonrpc: "2.0", id: 99904, method: DISCOVER, params },
     ]);
-    // A rejecting status is the server's only when nothing in front of it
-    // answered in its place (rawProbeGate): a 429 is resent once, and an
-    // auth gate, a 429 again, a 5xx without the server's own -32600, or a
-    // 403 the conformant discover drew too is not evaluable. A -32600 on a
-    // 5xx is credited, with a warning about the status.
+    // A rejection -- a status >= 400, or a JSON-RPC error on a 2xx -- is the
+    // server's only when nothing in front of it answered in its place and
+    // the conformant setup discover was served (rawProbeGate): a 429 is
+    // resent once, and an auth gate, a 429 again, a 5xx without the
+    // server's own -32600, a 403 the conformant discover drew too, or any
+    // rejection of a server that rejected the conformant discover as well is
+    // not evaluable. A -32600 on a 5xx is credited, with a warning about the
+    // status.
     const send = () => client.raw(body, { method: DISCOVER, params });
-    const { res, throttledMs } = await resendOn429(ctx, await send(), send);
+    const sent = await sendRawProbe(ctx, "the batch", send);
+    if ("outcome" in sent) return sent.outcome;
+    const { res, throttledMs } = sent;
     const gated = await rawProbeGate(ctx, res, throttledMs, "the batch", BATCH_GATE);
     if (gated) return gated;
     if (is4xx(res.statusCode)) return { passed: true, details: `HTTP ${res.statusCode} (batch rejected)` };
