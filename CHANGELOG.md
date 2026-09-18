@@ -9,6 +9,8 @@ out explicitly here.
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-09-18
+
 ### Changed
 - **A skipped check no longer counts in the score, so grades can move.** A
   check that measured nothing (`skipped: true`: no `--auth`, no tools
