@@ -30,8 +30,8 @@ import {
   type ModernSuiteContext,
   publishList,
 } from "./context.js";
-import { discoverTwin, gateVerdict, httpStatusText, resendOn429 } from "./gate.js";
-import { checkLiveness, warnUnresponsive } from "./liveness.js";
+import { DETAILS_MAX, discoverTwin, gateDetails, gateVerdict, httpStatusText, resendOn429 } from "./gate.js";
+import { checkLiveness, EXIT_GRACE_MS, exitsWithin, warnUnresponsive } from "./liveness.js";
 import { classifyTransportError, restartStdioServer } from "./security.js";
 
 /**
@@ -489,21 +489,26 @@ export async function runLifecycle(ctx: ModernSuiteContext): Promise<void> {
       // refusal of the discover, or a 403 without a Bearer challenge -- which
       // refused the conformant request itself, so nothing is left to compare
       // it with -- is not evaluable. A server's own refusal code on a 5xx is
-      // credited, with a warning about the status.
-      const reason = await gateVerdict(ctx, res, {
-        check: "lifecycle-jsonrpc",
-        what: "the conformant server/discover",
-        about: "the server's JSON-RPC envelope",
-        ownCodes: DISCOVER_REFUSAL_CODES,
-        twin: "self",
-      });
-      if (reason) {
-        const err = errorOf(res.body);
-        const answer = err ? errorWithCode(err.rawCode) : "no JSON-RPC error body";
-        return fail(
-          `server/discover answered ${answer} (${httpStatusText(res.statusCode, probe.throttledMs)}); ${reason}`,
-        );
-      }
+      // credited, with a warning about the status. The details keep to
+      // DETAILS_MAX: the reason gets the room the head leaves (a quoted
+      // Host/Origin message is clipped to it), and the answer gives way
+      // before the reason does (gateDetails).
+      const err = errorOf(res.body);
+      const answer = `server/discover answered ${err ? errorWithCode(err.rawCode) : "no JSON-RPC error body"}`;
+      const status = ` (${httpStatusText(res.statusCode, probe.throttledMs)})`;
+      const reason = await gateVerdict(
+        ctx,
+        res,
+        {
+          check: "lifecycle-jsonrpc",
+          what: "the conformant server/discover",
+          about: "the server's JSON-RPC envelope",
+          ownCodes: DISCOVER_REFUSAL_CODES,
+          twin: "self",
+        },
+        DETAILS_MAX - 2 - answer.length - status.length,
+      );
+      if (reason) return fail(gateDetails(answer, status, "", reason));
     }
     /** "; resent once after HTTP 429" when the envelope judged is the resent discover's. */
     const resent = probe.throttledMs !== null ? "; resent once after HTTP 429" : "";
@@ -928,6 +933,10 @@ async function checkSubscriptionsListen(ctx: ModernSuiteContext): Promise<TestOu
   const ownRefusalOn5xx =
     isAdvertised && err?.code === JSONRPC_ERROR_CODES.METHOD_NOT_FOUND && (stream.statusCode ?? 0) >= 500;
   if (rejected && !unattributable && !ownRefusalOn5xx && ctx.kind === "http" && stream.statusCode !== undefined) {
+    // Within DETAILS_MAX: the reason gets the room the head leaves (a twin's
+    // outcome or a quoted Host/Origin message is clipped to it), and the
+    // answer gives way before the reason does (gateDetails).
+    const answer = `subscriptions/listen ${err ? `rejected with ${errorCodeText(err.rawCode)}` : "rejected"}`;
     const reason = await gateVerdict(
       ctx,
       { statusCode: stream.statusCode, headers: stream.headers ?? {}, body: response },
@@ -938,11 +947,9 @@ async function checkSubscriptionsListen(ctx: ModernSuiteContext): Promise<TestOu
         ownCodes: isAdvertised ? [] : [JSONRPC_ERROR_CODES.METHOD_NOT_FOUND],
         twin: discoverTwin(ctx),
       },
+      DETAILS_MAX - 2 - answer.length - httpStatus.length,
     );
-    if (reason) {
-      const answer = err ? `rejected with ${errorCodeText(err.rawCode)}` : "rejected";
-      return fail(`subscriptions/listen ${answer}${httpStatus}; ${reason}`);
-    }
+    if (reason) return fail(gateDetails(answer, httpStatus, "", reason));
   }
   if (err) {
     if (isAdvertised) {
@@ -1167,11 +1174,15 @@ interface ProgressCall {
  * the checks after this one reach a live process; with no way to spawn one,
  * a warning says the rest ran against the exited process. That includes a
  * child that answers the call and exits right after: an answered call is
- * followed by one short server/discover (checkLiveness, as stdio-unicode
- * does after its probe), and a child found gone makes the call a dropped
- * one (`res` null, `exit` "after answering it, ..."), so the exit is
- * charged to this call, never to the next one. A child that answers and
- * then stops answering is named in a warning and left running. A child
+ * followed by one server/discover (checkLiveness, as stdio-unicode does
+ * after its probe), and a call the server FAILED (a JSON-RPC error) by a
+ * bounded wait for the child's exit before it (exitsWithin, EXIT_GRACE_MS:
+ * a crash a moment after a failure answer, which the discover alone would
+ * miss); a child found gone makes the call a dropped one (`res` null,
+ * `exit` "after answering it, ..."), so the exit is charged to this call,
+ * never to the next one. A served call pays no wait: a child that serves
+ * the call and exits a moment later is not seen here. A child that answers
+ * and then stops answering is named in a warning and left running. A child
  * already gone before the call is left as it is. A caller's abort is
  * rethrown; any other transport error comes back as `err`.
  */
@@ -1217,10 +1228,11 @@ async function sendProgressCall(
   const cause = `${call} ${withToken ? "carrying" : "without"} _meta.progressToken`;
   // An answered call: make sure the child that answered it is still
   // serving before the next call, or the next check, is written to it and
-  // takes the blame for its exit (checkLiveness, one short server/discover).
-  // One that stopped answering is still running: a warning names this call,
-  // and the answer stands.
-  if (res && !child.exited) {
+  // takes the blame for its exit. After a failure answer the child gets a
+  // bounded wait to exit first (a crash a moment after the answer); then
+  // one server/discover (checkLiveness). One that stopped answering is
+  // still running: a warning names this call, and the answer stands.
+  if (res && !child.exited && !(failedCall(ctx, res) && (await exitsWithin(ctx, EXIT_GRACE_MS)))) {
     const live = await checkLiveness(ctx);
     if (live.state === "unresponsive") warnUnresponsive(ctx, "lifecycle-progress-token", cause, live);
     if (live.state === "exited") sent.err = live.err;
@@ -1342,9 +1354,6 @@ function failureKey(ctx: ModernSuiteContext, c: ProgressCall): string | null {
   return ctx.kind === "http" ? `${answer} on HTTP ${c.res.statusCode}` : answer;
 }
 
-/** The details budget every check keeps to. */
-const DETAILS_MAX = 220;
-
 /**
  * `render(...parts)` within the details budget: the text around the parts
  * -- the conclusion -- is kept whole, and the parts (the answers quoted)
@@ -1397,6 +1406,15 @@ function judgeProgress(ctx: ModernSuiteContext, c: ProgressCall, call: string, w
 const NO_PROGRESS = `no ${PROGRESS_METHOD} observed (optional)`;
 
 /**
+ * The progress note of a lifecycle-progress-token details string for a call
+ * that drew valid notifications/progress but failed (judgeProgress's pass
+ * names every value; next to a failure the count is all the budget spares).
+ */
+function validProgress(c: ProgressCall): string {
+  return `${c.notifications.length} valid ${PROGRESS_METHOD} observed`;
+}
+
+/**
  * lifecycle-progress-token, once the call without the token failed too, but
  * not the way the call carrying it did (failureKey): a tool whose required
  * arguments the empty call lacks answers -32602 without the token, and exits,
@@ -1406,67 +1424,74 @@ const NO_PROGRESS = `no ${PROGRESS_METHOD} observed (optional)`;
  * the token is what failed it: FAIL. Served, or answered the way the call
  * without the token was, the first failure was not the token's: a pass.
  * Anything else -- a gate's answer, no answer, a third kind of failure --
- * reproduced nothing: a skip. `judged` is the first call's passing progress
- * verdict, when it drew valid notifications. The details keep to the
- * budget (fitDetails): the answers quoted are clipped, the conclusion kept.
+ * reproduced nothing: a skip. `firstProgress` is the first call's progress
+ * note (validProgress) when it drew valid notifications. The details keep
+ * to the budget (fitAnswers): the answers quoted give way, the conclusion
+ * is kept.
  */
 async function resendAfterUnlikeTwin(
   ctx: ModernSuiteContext,
   call: string,
   first: ProgressCall,
   twin: ProgressCall,
-  judged: TestOutcome | null,
+  firstProgress: string | null,
   sendAgain: () => Promise<ProgressCall>,
 ): Promise<TestOutcome> {
   const again = await sendAgain();
   const judgedAgain = judgeProgress(ctx, again, call, " when resent");
   if (judgedAgain && (!judgedAgain.passed || !callFailed(ctx, again))) return judgedAgain;
-  const observed = judged?.details ?? judgedAgain?.details ?? NO_PROGRESS;
-  const withToken = answerText(ctx, first);
-  const without = answerText(ctx, twin);
+  const observed = firstProgress ?? (judgedAgain ? validProgress(again) : NO_PROGRESS);
   if (callFailed(ctx, again) && failureKey(ctx, again) === failureKey(ctx, first)) {
     return fail(
-      fitDetails(
-        (a, b) =>
-          `${call} with _meta.progressToken: ${a}, and again when resent; without it: ${b} -- so the token is what failed it`,
-        withToken,
-        without,
+      fitAnswers(
+        ctx,
+        (c, a, b) =>
+          `${c} with _meta.progressToken: ${a}, and again when resent; without it: ${b} -- so the token is what failed it`,
+        call,
+        first,
+        twin,
       ),
     );
   }
   if (again.res && servedCall(ctx, again.res)) {
     return pass(
-      fitDetails(
-        (a, b) => `${call} succeeded when resent with _meta.progressToken (first: ${a}; without it: ${b}); ${observed}`,
-        withToken,
-        without,
+      fitAnswers(
+        ctx,
+        (c, a, b) => `${c} succeeded when resent with _meta.progressToken (first: ${a}; without it: ${b}); ${observed}`,
+        call,
+        first,
+        twin,
       ),
     );
   }
   if (again.res && !gateOnCall(ctx, again.res) && failureKey(ctx, again) === failureKey(ctx, twin)) {
     return pass(
-      fitDetails(
-        (a, c) =>
-          `${call} with _meta.progressToken: ${a}; resent: ${c}, as without it, so the token is not what failed it; ${observed}`,
-        briefAnswer(ctx, first),
-        briefAnswer(ctx, again),
+      fitAnswers(
+        ctx,
+        (c, a, b) =>
+          `${c} with _meta.progressToken: ${a}; resent: ${b}, as without it, so the token is not what failed it; ${observed}`,
+        call,
+        first,
+        again,
       ),
     );
   }
   return unanswered(
-    fitDetails(
-      (a, b, c) =>
-        `${call} with _meta.progressToken: ${a}; without it: ${b}; resent: ${c}; no failure reproduced (not evaluable); ${observed}`,
-      briefAnswer(ctx, first),
-      briefAnswer(ctx, twin),
-      briefAnswer(ctx, again),
+    fitAnswers(
+      ctx,
+      (c, a, b, d) =>
+        `${c} with _meta.progressToken: ${a}; without it: ${b}; resent: ${d}; no failure reproduced (not evaluable); ${observed}`,
+      call,
+      first,
+      twin,
+      again,
     ),
   );
 }
 
 /**
- * A call's answer without a verb, for the compact details of
- * resendAfterUnlikeTwin: "JSON-RPC error -32602 (Invalid params) (HTTP
+ * A call's answer without a verb, for lifecycle-progress-token's details
+ * (fitAnswers): "JSON-RPC error -32602 (Invalid params) (HTTP
  * 400)", "server exited (exit code 3: ...)", "no response within 5000ms",
  * "HTTP 429, then after 0ms HTTP 429 (rate limiting)".
  */
@@ -1481,8 +1506,8 @@ function answerText(ctx: ModernSuiteContext, c: ProgressCall): string {
 }
 
 /**
- * `answerText` without the parts a details string can spare when it quotes
- * three answers: the stderr of an exit, the message of a JSON-RPC error.
+ * `answerText` without the parts a details string can spare when it runs
+ * long (fitAnswers): the stderr of an exit, the message of a JSON-RPC error.
  */
 function briefAnswer(ctx: ModernSuiteContext, c: ProgressCall): string {
   if (c.exit !== undefined) return "server exited";
@@ -1491,6 +1516,35 @@ function briefAnswer(ctx: ModernSuiteContext, c: ProgressCall): string {
   if (!c.res || !err) return answerText(ctx, c);
   const status = ctx.kind === "http" ? ` (${httpStatusText(c.res.statusCode, c.throttledMs)})` : "";
   return `${clipDetail(errorWithCode(err.rawCode), 40)}${status}`;
+}
+
+/**
+ * `render(call, ...answers)` for lifecycle-progress-token's calls within the
+ * details budget, the text around the parts -- the conclusion -- kept whole:
+ * each call's answer as answerText, the longest of them given way to its
+ * briefAnswer (without an exit's stderr or an error's message) one at a
+ * time while the whole does not fit, and only then the parts clipped
+ * (fitDetails). A clipped answer tells less than a whole brief one.
+ */
+function fitAnswers(
+  ctx: ModernSuiteContext,
+  render: (...parts: string[]) => string,
+  call: string,
+  ...calls: ProgressCall[]
+): string {
+  const answers = calls.map((c) => answerText(ctx, c));
+  const briefs = calls.map((c) => briefAnswer(ctx, c));
+  while (render(call, ...answers).length > DETAILS_MAX) {
+    let longest = -1;
+    for (let i = 0; i < answers.length; i++) {
+      if (briefs[i].length < answers[i].length && (longest < 0 || answers[i].length > answers[longest].length)) {
+        longest = i;
+      }
+    }
+    if (longest < 0) break;
+    answers[longest] = briefs[longest];
+  }
+  return fitDetails(render, call, ...answers);
 }
 
 /**
@@ -1804,60 +1858,109 @@ export async function runLifecycleLate(ctx: ModernSuiteContext): Promise<void> {
     // answer (a 429 again, a 401 or a Bearer 403) or no answer at all -- on
     // the first call, on the call without the token, or on the resent call --
     // measured nothing about the token: a skip, never a pass that claims a
-    // verdict. Valid notifications settle the check only on a call the server
-    // did not fail; next to a failure they are named in the details, and the
-    // failure is read as above.
+    // verdict. Valid notifications settle the check only on a call the
+    // server did not fail; next to a failure they are named in the details
+    // ("N valid notifications/progress observed"), and the failure is read
+    // as above. Every details string keeps to the budget (fitDetails): the
+    // call's name and the answers it quotes are clipped, the conclusion kept
+    // whole.
     const name = String(tool.name);
     const call = `tools/call ${clipDetail(name, 60)}`;
-    const gated = "it was answered before the server read the request, so it proves nothing about the progress token";
     const send = (withToken: boolean) => sendProgressCall(ctx, name, tool.inputSchema, withToken, call);
     const first = await send(true);
     const judged = judgeProgress(ctx, first, call);
     if (judged && (!judged.passed || !callFailed(ctx, first))) return judged;
     /** What the progress notifications showed: the first call's valid ones, else none. */
-    const observed = judged?.details ?? NO_PROGRESS;
+    const observed = judged ? validProgress(first) : NO_PROGRESS;
     if (first.res && gateOnCall(ctx, first.res)) {
-      return unanswered(`${call} with progressToken ${callOutcome(ctx, first)}; not evaluable: ${gated}; ${observed}`);
+      return unanswered(
+        fitDetails(
+          (c, a) =>
+            `${c} with progressToken ${a}; not evaluable: answered before the server read the request; ${observed}`,
+          call,
+          callOutcome(ctx, first),
+        ),
+      );
     }
     if (!callFailed(ctx, first)) {
-      if (first.res) return pass(`${call} ${callOutcome(ctx, first)}; ${observed}`);
-      return unanswered(`${call} with progressToken ${callOutcome(ctx, first)}; ${observed}`);
+      const outcome = callOutcome(ctx, first);
+      if (first.res) return pass(fitDetails((c, a) => `${c} ${a}; ${observed}`, call, outcome));
+      return unanswered(fitDetails((c, a) => `${c} with progressToken ${a}; ${observed}`, call, outcome));
     }
     const twin = await send(false);
     if (!twin.res || gateOnCall(ctx, twin.res)) {
       return unanswered(
-        `${call} ${callOutcome(ctx, first)}, but the same call without the token ${callOutcome(ctx, twin)}, so no answer of the server's own tells whether the progress token is what failed it (not evaluable); ${observed}`,
+        fitAnswers(
+          ctx,
+          (c, a, b) => `${c} with _meta.progressToken: ${a}; without it: ${b} -- not evaluable; ${observed}`,
+          call,
+          first,
+          twin,
+        ),
       );
     }
     if (!servedCall(ctx, twin.res)) {
       if (failureKey(ctx, first) === failureKey(ctx, twin)) {
         return pass(
-          `${call} ${callOutcome(ctx, first)}, and the same call without the token was not served either (${callShape(ctx, twin.res, twin.throttledMs)}), so the progress token is not what failed it; ${observed}`,
+          fitAnswers(
+            ctx,
+            (c, a, b) =>
+              `${c} with _meta.progressToken: ${a}; without it: ${b}, so the token is not what failed it; ${observed}`,
+            call,
+            first,
+            twin,
+          ),
         );
       }
-      return resendAfterUnlikeTwin(ctx, call, first, twin, judged, () => send(true));
+      return resendAfterUnlikeTwin(ctx, call, first, twin, judged ? observed : null, () => send(true));
     }
     const again = await send(true);
     const judgedAgain = judgeProgress(ctx, again, call, " when resent");
     if (judgedAgain && (!judgedAgain.passed || !callFailed(ctx, again))) return judgedAgain;
+    /** The progress note once the call has been resent: the first call's valid ones, else the resent call's, else none. */
+    const seen = judged ? observed : judgedAgain ? validProgress(again) : NO_PROGRESS;
     if (callFailed(ctx, again)) {
-      const repeated = again.res ? callShape(ctx, again.res, again.throttledMs) : callOutcome(ctx, again);
+      const blamed = "without it: served -- so the token is what failed it";
+      if (answerText(ctx, again) === answerText(ctx, first)) {
+        return fail(
+          fitAnswers(
+            ctx,
+            (c, a) => `${c} with _meta.progressToken: ${a}, and again when resent; ${blamed}`,
+            call,
+            first,
+          ),
+        );
+      }
       return fail(
-        `${call} carrying _meta.progressToken ${callOutcome(ctx, first)}, and ${repeated} when it was resent, while the same call without it, sent in between, was served -- the server failed the request because of its progress token (basic/patterns/progress lets a server ignore the token and send no notifications, not fail the request)`,
+        fitAnswers(
+          ctx,
+          (c, a, b) => `${c} with _meta.progressToken: ${a}; resent: ${b}; ${blamed}`,
+          call,
+          first,
+          again,
+        ),
       );
     }
     if (again.res && servedCall(ctx, again.res)) {
       return pass(
-        `${call} succeeded when resent: it first ${callOutcome(ctx, first)}, then the same call without the token and the resent one were served; ${observed}`,
+        fitAnswers(
+          ctx,
+          (c, a) => `${c} succeeded when resent with _meta.progressToken (first: ${a}; without it: served); ${seen}`,
+          call,
+          first,
+        ),
       );
     }
-    const resent = `the same call without the token was served, but resent, the call carrying it ${callOutcome(ctx, again)}`;
-    if (!again.res || gateOnCall(ctx, again.res)) {
-      return unanswered(
-        `${call} ${callOutcome(ctx, first)}; ${resent}, so the failure could not be reproduced (not evaluable); ${observed}`,
-      );
-    }
-    return pass(`${call} ${callOutcome(ctx, first)}; ${resent}, so the failure was not reproduced; ${observed}`);
+    const unreproduced = !again.res || gateOnCall(ctx, again.res);
+    const conclusion = unreproduced ? "not evaluable" : "the failure was not reproduced";
+    const outcome = fitAnswers(
+      ctx,
+      (c, a, b) => `${c} with _meta.progressToken: ${a}; without it: served; resent: ${b} -- ${conclusion}; ${seen}`,
+      call,
+      first,
+      again,
+    );
+    return unreproduced ? unanswered(outcome) : pass(outcome);
   });
 
   // The claim-less probes: a request with no protocolVersion claim is

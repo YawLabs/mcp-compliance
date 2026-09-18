@@ -83,6 +83,8 @@ interface StubOptions {
   missingName?: Answer;
   /** tools/list, resources/list, prompts/list without a cursor: served when declared, 404 with -32601 when not, by default. */
   lists?: Answer;
+  /** One list method's answer (without a cursor), overriding `lists` for it. */
+  listAnswers?: Record<string, Answer>;
   /** A list request carrying a cursor (error-invalid-cursor): 400 with -32602 by default. */
   cursor?: Answer;
   /** subscriptions/listen: 404 with -32601 by default (nothing advertised). */
@@ -260,6 +262,8 @@ async function startStub(opts: StubOptions): Promise<{ url: string; hits: Probe[
           if (opts.missingName !== undefined && answerWith(opts.missingName)) return;
           return rpcError(400, -32602, "Invalid params: name is required");
         case "list": {
+          const own = opts.listAnswers?.[String(one.method)];
+          if (own !== undefined && answerWith(own)) return;
           if (opts.lists !== undefined && answerWith(opts.lists)) return;
           const key = String(one.method).split("/")[0];
           if (key in (opts.capabilities ?? { tools: {} })) return result({ [key]: [] });
@@ -776,16 +780,24 @@ describe("modern lifecycle-jsonrpc: whose envelope a server/discover answered wi
 
   it("a 403 without a Bearer challenge refused the conformant request itself: not evaluable", async () => {
     const host = await verdicts({ discover: "host-403" }, { only: [JSONRPC] });
+    // Within the 220-character budget the quoted message, which names the
+    // refused host, outranks the explanation (review 82a: before, "...,
+    // which refuses a request whatever it carries, ..." with the message
+    // quoted whole, 343 characters for a long Host header).
     expect(host.byId[JSONRPC]).toBe(
       `FAIL: server/discover answered JSON-RPC error -32000 (HTTP 403); ${reason(
-        'its message ("Invalid Host: mcp.internal.example") names Host/Origin validation, which refuses a request whatever it carries',
+        'its message ("Invalid Host: mcp.internal.example") names Host/Origin validation',
         ABOUT,
       )}`,
     );
+    expectWithinBudget(host.details, [JSONRPC]);
     const bare = await verdicts({ discover: "bare-403" }, { only: [JSONRPC] });
+    // The explanation and the pointer give way within the budget (review
+    // 82a: 272 characters with both).
     expect(bare.byId[JSONRPC]).toBe(
-      `FAIL: server/discover answered JSON-RPC error -32000 (HTTP 403); not evaluable: a 403 without a Bearer challenge refused the conformant request itself (Host/Origin validation or a gateway), so it proves nothing about ${ABOUT} (see security-auth-required)`,
+      `FAIL: server/discover answered JSON-RPC error -32000 (HTTP 403); not evaluable: a 403 without a Bearer challenge refused the conformant request itself, so it proves nothing about ${ABOUT}`,
     );
+    expectWithinBudget(bare.details, [JSONRPC]);
   }, 30_000);
 
   it("a 5xx: not evaluable unless it carries a server's own refusal of server/discover, credited with a warning", async () => {
@@ -1150,7 +1162,109 @@ describe("modern error-invalid-cursor and lifecycle-subscriptions-listen: whose 
     const refused = await verdicts({ gate: "bare-403", exempt: ["discover"], discoverThrough: 2 }, { only: BOTH });
     expect(refused.byId).toEqual({
       [CURSOR]: `FAIL: JSON-RPC error -32000 (HTTP 403); ${twinFailed("tools/list", "was refused (HTTP 403, JSON-RPC error -32000)", CURSOR_ABOUT)}`,
-      [LISTEN]: `FAIL: subscriptions/listen rejected with -32000 (HTTP 403); ${twinFailed("server/discover", "was refused (HTTP 403, JSON-RPC error -32000)", LISTEN_ABOUT)}`,
+      // The pointer gives way within the budget (review 82a: 224 characters with it).
+      [LISTEN]: `FAIL: subscriptions/listen rejected with -32000 (HTTP 403); ${twinFailed("server/discover", "was refused (HTTP 403, JSON-RPC error -32000)", LISTEN_ABOUT, false)}`,
     });
+    expectWithinBudget(refused.details, BOTH);
+  }, 30_000);
+});
+
+describe("review 82a: every gate-read check keeps to 220 characters, and names what each method drew", () => {
+  const CURSOR = "error-invalid-cursor";
+  const LISTEN = "lifecycle-subscriptions-listen";
+  const BATCH = "transport-batch-reject";
+  const CT = "transport-content-type-reject";
+  /** Every check that reads a rejection through gateVerdict, but lifecycle-jsonrpc (the setup discover's own). */
+  const GATE_READ = [...ERRORS, CURSOR, LISTEN, BATCH, CT];
+  const HOST_REASON =
+    /; not evaluable: its message \("Invalid Host header: very-long-internal-hostname\.[^"]*"\) names Host\/Origin validation, so it proves nothing about [A-Za-z/ -]+$/;
+
+  it("a long Host message on everything but server/discover: each check within 220, the message clipped, the conclusion whole (before: listen 328, content-type 280, batch 273)", async () => {
+    const { details } = await verdicts(
+      { gate: "longhost-403", exempt: ["discover"], discoverThrough: 2 },
+      { only: GATE_READ },
+    );
+    expectWithinBudget(details, GATE_READ);
+    for (const id of GATE_READ) expect(details[id], id).toMatch(HOST_REASON);
+  }, 30_000);
+
+  it("a long Host message on server/discover too: lifecycle-jsonrpc within 220 (before: 343)", async () => {
+    const { byId, details } = await verdicts({ gate: "longhost-403" }, { only: [JSONRPC] });
+    expectWithinBudget(details, [JSONRPC]);
+    expect(byId[JSONRPC]).toBe(
+      'FAIL: server/discover answered JSON-RPC error -32000 (HTTP 403); not evaluable: its message ("Invalid Host header: very-long-internal...") names Host/Origin validation, so it proves nothing about the server\'s JSON-RPC envelope',
+    );
+  }, 30_000);
+
+  it("a twin that got no answer, or a 429 and then none: listen, batch and content-type within 220 (before: 239 and 273 for the listen)", async () => {
+    for (const lateDiscover of ["reset", [429, "reset"]] as (Answer | Answer[])[]) {
+      const { details } = await verdicts(
+        { gate: "bare-403", exempt: ["discover"], discoverThrough: 2, lateDiscover },
+        { only: [LISTEN, BATCH, CT], timeout: 2000 },
+      );
+      expectWithinBudget(details, [LISTEN, BATCH, CT]);
+      for (const id of [LISTEN, BATCH, CT]) {
+        expect(details[id], id).toMatch(
+          /; not evaluable: a conformant server\/discover .* too, so the 403 proves nothing about [A-Za-z/ -]+( \(see security-auth-required\))?$/,
+        );
+      }
+    }
+  }, 30_000);
+
+  it("error-capability-gated with one method behind a bare 403 and one behind a 401: within 220, the method named whole (before: 222, 'resources/lis...')", async () => {
+    // The 403's twin was throttled and then reset: the longest reason there is.
+    const two = await verdicts(
+      {
+        listAnswers: { "resources/list": "bare-403", "prompts/list": "bare-401" },
+        discoverThrough: 2,
+        lateDiscover: [429, "reset"],
+      },
+      { only: [GATED], timeout: 2000 },
+    );
+    expectWithinBudget(two.details, [GATED]);
+    expect(two.details[GATED]).toMatch(
+      /^resources\/list: not evaluable: a conformant server\/discover answered HTTP 429, and its resend got no response .* too, so the 403 proves nothing about the undeclared methods; prompts\/list not evaluable either$/,
+    );
+    // Nothing declared, three answers (before: 223, "tools/list...; ...").
+    const three = await verdicts(
+      {
+        capabilities: {},
+        listAnswers: { "tools/list": "bare-403", "resources/list": 429, "prompts/list": "bare-401" },
+        discoverThrough: 2,
+        lateDiscover: [429, "reset"],
+      },
+      { only: [GATED], timeout: 2000 },
+    );
+    expectWithinBudget(three.details, [GATED]);
+    expect(three.details[GATED]).toMatch(
+      /^tools\/list: not evaluable: .* too, so the 403 proves nothing about the undeclared methods; resources\/list, prompts\/list not evaluable either$/,
+    );
+  }, 30_000);
+
+  it("a 5xx on one undeclared method next to a gate on another: the server failure leads, and is never called not evaluable (before: 'prompts/list not evaluable either')", async () => {
+    // Before: "resources/list -> no JSON-RPC body (HTTP 401); not evaluable: an
+    // auth gate ...; prompts/list not evaluable either" -- prompts/list drew
+    // a 503, the server failing on it, which the check's own wording (when it
+    // fits) never calls not evaluable. Whichever method comes first.
+    const failed = failedOn("-32601");
+    const cases: [Record<string, Answer>, string][] = [
+      [
+        { "resources/list": "bare-401", "prompts/list": "bare-503" },
+        `prompts/list -> no JSON-RPC body (HTTP 503); ${failed}; resources/list not evaluable`,
+      ],
+      [
+        { "resources/list": 429, "prompts/list": "rpc-503" },
+        `prompts/list -> -32603 (HTTP 503); ${failed}; resources/list not evaluable`,
+      ],
+      [
+        { "resources/list": "bare-503", "prompts/list": "bare-401" },
+        `resources/list -> no JSON-RPC body (HTTP 503); ${failed}; prompts/list not evaluable`,
+      ],
+    ];
+    for (const [listAnswers, expected] of cases) {
+      const { details } = await verdicts({ listAnswers }, { only: [GATED] });
+      expect(details[GATED]).toBe(expected);
+      expectWithinBudget(details, [GATED]);
+    }
   }, 30_000);
 });

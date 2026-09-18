@@ -17,6 +17,7 @@ import {
   type ModernSuiteContext,
 } from "./context.js";
 import {
+  DETAILS_MAX,
   discoverTwin,
   type GateAnswer,
   gateVerdict,
@@ -129,8 +130,6 @@ function rawRpcBody(res: { body: string; headers: Record<string, string> }): unk
 
 type RawAnswer = Awaited<ReturnType<ModernSuiteContext["client"]["raw"]>>;
 
-const DETAILS_MAX = 220;
-
 /**
  * Send a raw negative probe, resent once after Retry-After when a rate
  * limiter answered it 429 (resendOn429). A probe that got no answer at all
@@ -181,13 +180,15 @@ function twinFor(ctx: ModernSuiteContext, statusCode: number): Twin {
  * "<status seen>, <JSON-RPC code> on <probe>; <reason>" within DETAILS_MAX.
  * The reason is the conclusion and is kept whole, so the head gives way:
  * first the probe's JSON-RPC code, then the probe's name (the reason names
- * what the probe varied), leaving the status. A reason too long to fit even
- * then is gateVerdict's own and is not cut.
+ * what the probe varied), leaving the status. rawProbeGate sizes the
+ * reason for that shortest head (gateVerdict's `room`), and the head is the
+ * longest one that fits next to it. Printable ASCII only (the reason may
+ * quote a server's message, already made ASCII).
  */
 function gatedDetails(seen: string, rpcSuffix: string, on: string, reason: string): string {
   const heads = [`${seen}${rpcSuffix} on ${on}`, `${seen} on ${on}`, seen];
   const head = heads.find((h) => h.length + 2 + reason.length <= DETAILS_MAX) ?? seen;
-  return `${head}; ${reason}`;
+  return clip(`${head}; ${reason}`, Number.POSITIVE_INFINITY);
 }
 
 /**
@@ -222,16 +223,16 @@ async function rawProbeGate(
   const answer: GateAnswer = { statusCode: res.statusCode, headers: res.headers, body: rawRpcBody(res) };
   if (res.statusCode < 400 && !errorOf(answer.body)) return null;
   const setup = notEvaluable(ctx, spec.about);
+  const seen = httpStatusText(res.statusCode, throttledMs);
+  // The reason's room is what the shortest head (the status alone) leaves:
+  // gatedDetails then keeps as much of the head as fits next to it.
   const gated =
     res.statusCode >= 400 && !(setup && res.statusCode >= 500)
-      ? await gateVerdict(ctx, answer, { ...spec, twin: twinFor(ctx, res.statusCode) })
+      ? await gateVerdict(ctx, answer, { ...spec, twin: twinFor(ctx, res.statusCode) }, DETAILS_MAX - 2 - seen.length)
       : null;
   const reason = gated ?? setup;
   if (!reason) return null;
-  return {
-    passed: false,
-    details: gatedDetails(httpStatusText(res.statusCode, throttledMs), rpcErrorSuffix(answer.body), on, reason),
-  };
+  return { passed: false, details: gatedDetails(seen, rpcErrorSuffix(answer.body), on, reason) };
 }
 
 /**

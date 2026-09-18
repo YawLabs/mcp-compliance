@@ -5,6 +5,7 @@ import { JSONRPC_ERROR_CODES } from "../../modern/meta.js";
 import type { JsonRpcId } from "../../transport/index.js";
 import { hasPrompts, hasResources, hasTools, type ModernSuiteContext } from "./context.js";
 import {
+  clipAscii,
   DETAILS_MAX,
   discoverTwin,
   type GateAnswer,
@@ -357,8 +358,10 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
       if (err || (http && probe.res.statusCode >= 400)) {
         const code = err ? errorCodeText(err.rawCode) : "no JSON-RPC body";
         const answer = `${code} (${httpStatusText(probe.res.statusCode, probe.throttledMs)})`;
-        // The room a reason gets when every method drew this answer (the
-        // head then reads "<names> -> <answer>", see gatedDetails).
+        // The room a reason gets: what is left when every method drew this
+        // answer (the head then reads "<names> -> <answer>"), and no more
+        // than gatedDetails' shortest form leaves ("<method>: <reason>;
+        // <the other methods> not evaluable either").
         const reason = await gateVerdict(
           ctx,
           probe.res,
@@ -369,10 +372,13 @@ export async function runErrors(ctx: ModernSuiteContext): Promise<void> {
             ownCodes: [JSONRPC_ERROR_CODES.METHOD_NOT_FOUND],
             twin,
           },
-          DETAILS_MAX - 2 - `${names} -> ${answer}`.length,
+          Math.min(
+            DETAILS_MAX - 2 - `${names} -> ${answer}`.length,
+            DETAILS_MAX - `${names}: ; ${NOT_EVALUABLE_EITHER}`.length,
+          ),
         );
         if (reason) {
-          gated.push({ method, answer, reason });
+          gated.push({ method, answer, reason, statusCode: probe.res.statusCode });
           continue;
         }
       }
@@ -464,34 +470,64 @@ interface GatedAnswer {
   /** "-32001 (HTTP 401)", "no JSON-RPC body (HTTP 429, then after 0ms HTTP 429)". */
   answer: string;
   reason: string;
+  /** The status the answer settled on (the resend's, after a 429). */
+  statusCode: number;
 }
+
+/** How error-capability-gated's shortest details name the methods after the first group, when every group is not evaluable. */
+const NOT_EVALUABLE_EITHER = "not evaluable either";
 
 /**
  * error-capability-gated's details for the methods it could not credit:
  * one reason per group of methods that drew it (a gate answers them alike),
  * the methods with the same answer named together ("resources/list,
  * prompts/list -> -32001 (HTTP 401)"). Within DETAILS_MAX: each group's
- * head is shortened before its reason (gateDetails), and when the groups do
- * not fit together the first is kept and the methods of the others are
- * named as not evaluable either.
+ * head is shortened before its reason (gateDetails). When the groups do not
+ * fit together, one group leads with its reason -- the server failing on a
+ * method (a 5xx without -32601) first, a definite failure, else the first
+ * group -- its head cut at a word boundary only while its methods stay
+ * whole, else its method names alone; the other groups follow as their
+ * methods and what each reason says: "not evaluable" ("either" after a
+ * not-evaluable lead), or "failed on the request (HTTP 503)" -- never a
+ * server failure called not evaluable.
  */
 function gatedDetails(gated: GatedAnswer[]): string {
-  const byReason = new Map<string, Map<string, string[]>>();
-  for (const { method, answer, reason } of gated) {
-    const answers = byReason.get(reason) ?? new Map<string, string[]>();
-    answers.set(answer, [...(answers.get(answer) ?? []), method]);
-    byReason.set(reason, answers);
+  const byReason = new Map<string, { answers: Map<string, string[]>; statuses: Set<number> }>();
+  for (const { method, answer, reason, statusCode } of gated) {
+    const group = byReason.get(reason) ?? { answers: new Map<string, string[]>(), statuses: new Set<number>() };
+    group.answers.set(answer, [...(group.answers.get(answer) ?? []), method]);
+    group.statuses.add(statusCode);
+    byReason.set(reason, group);
   }
-  const groups = [...byReason].map(([reason, answers]) => ({
+  const groups = [...byReason].map(([reason, { answers, statuses }]) => ({
     head: [...answers].map(([answer, methods]) => `${methods.join(", ")} -> ${answer}`).join(", "),
     methods: [...answers.values()].flat(),
     reason,
+    notEvaluable: reason.startsWith("not evaluable"),
+    statuses: [...statuses].map((s) => `HTTP ${s}`).join(", "),
   }));
   const whole = groups.map((g) => gateDetails(g.head, "", "", g.reason)).join("; ");
   if (whole.length <= DETAILS_MAX) return whole;
-  const [first, ...rest] = groups;
-  const others = `; ${rest.flatMap((g) => g.methods).join(", ")} not evaluable either`;
-  return `${gateDetails(first.head, "", "", first.reason, DETAILS_MAX - others.length)}${others}`;
+  const lead = groups.find((g) => !g.notEvaluable) ?? groups[0];
+  const rest = groups.filter((g) => g !== lead);
+  const failed = rest.filter((g) => !g.notEvaluable);
+  const unmeasured = rest.filter((g) => g.notEvaluable).flatMap((g) => g.methods);
+  const others = [
+    ...failed.map(
+      (g) => `; ${g.methods.join(", ")} failed on the request${lead.notEvaluable ? "" : " too"} (${g.statuses})`,
+    ),
+    unmeasured.length > 0
+      ? `; ${unmeasured.join(", ")} ${lead.notEvaluable ? NOT_EVALUABLE_EITHER : "not evaluable"}`
+      : "",
+  ].join("");
+  const room = DETAILS_MAX - others.length;
+  const fitted = gateDetails(lead.head, "", "", lead.reason, room);
+  // The cut keeps at least the first answer's methods and its arrow.
+  const arrow = lead.head.indexOf(" -> ");
+  if (fitted.length <= room && fitted.startsWith(lead.head.slice(0, arrow + 4))) return `${fitted}${others}`;
+  const named = `${lead.methods.join(", ")}: ${lead.reason}`;
+  if (named.length <= room) return `${named}${others}`;
+  return clipAscii(`${named}${others}`, DETAILS_MAX);
 }
 
 /** A probe's answer, and the wait before its one resend when a rate limiter answered 429 (see resendOn429). */

@@ -700,8 +700,11 @@ describe("SDK v2 behind its Host guard, pinned 2026-07-28: lifecycle-jsonrpc rea
       `not evaluable: the conformant server/discover was itself rejected with -32000 (HTTP 403), so this rejection proves nothing about ${about}`;
     const lists = ["tools/list", "resources/list", "prompts/list"].map((m) => `${m} -> -32000`).join(", ");
     expect(gateReadVerdicts(report)).toEqual({
+      // Within the details budget the quoted message outranks the explanation
+      // (review 82a: before, "..., which refuses a request whatever it
+      // carries, ...", 246 characters).
       "lifecycle-jsonrpc":
-        'FAIL: server/discover answered JSON-RPC error -32000 (HTTP 403); not evaluable: its message ("Invalid Host: 127.0.0.1") names Host/Origin validation, which refuses a request whatever it carries, so it proves nothing about the server\'s JSON-RPC envelope',
+        'FAIL: server/discover answered JSON-RPC error -32000 (HTTP 403); not evaluable: its message ("Invalid Host: 127.0.0.1") names Host/Origin validation, so it proves nothing about the server\'s JSON-RPC envelope',
       "error-unknown-method": `FAIL: JSON-RPC error -32000 (HTTP 403) for an unknown method; ${rejected("the injected defect")}`,
       "error-invalid-jsonrpc": `FAIL: JSON-RPC error -32000 on HTTP 403 for a malformed envelope; ${rejected("the injected defect")}`,
       "error-invalid-json": `FAIL: JSON-RPC error -32000 on HTTP 403 for invalid JSON; ${rejected("the injected defect")}`,

@@ -37,9 +37,15 @@ const LISTEN = "lifecycle-subscriptions-listen";
 const TOKEN = "compliance-progress-1";
 const NONE = "no notifications/progress observed (optional)";
 const ONE_PROGRESS = `1 notifications/progress echoed token "${TOKEN}" with increasing progress (1)`;
-/** The tail of the failure once the token is blamed next to a served call without it (unchanged). */
-const BLAMED =
-  "while the same call without it, sent in between, was served -- the server failed the request because of its progress token (basic/patterns/progress lets a server ignore the token and send no notifications, not fail the request)";
+/**
+ * The failure once the token is blamed next to a served call without it.
+ * Before (review 82a): "... carrying _meta.progressToken <answer>, and
+ * <answer> when it was resent, while the same call without it, sent in
+ * between, was served -- the server failed the request because of its
+ * progress token (basic/patterns/progress lets ...)", past the budget.
+ */
+const blamedAgain = (answer: string) =>
+  `FAIL: tools/call count with _meta.progressToken: ${answer}, and again when resent; without it: served -- so the token is what failed it`;
 const BLAMED_UNLIKE = " -- so the token is what failed it";
 
 /** "PASS: ..." / "FAIL: ..." with " (skipped)" when the pass measured nothing. */
@@ -311,9 +317,8 @@ async function runStdio(
   };
 }
 
-const EXITED = "made the server exit (exit code 3: TypeError: progress reporter crashed)";
+const EXITED = "server exited (exit code 3: TypeError: progress reporter crashed)";
 const Q_REQUIRED = "JSON-RPC error -32602 (Invalid params: q is required)";
-const MISSING_Q = `returned ${Q_REQUIRED}`;
 const restarted = (cause: string) =>
   `${PROGRESS}: the server exited on tools/call count ${cause} and was restarted with a fresh server/discover, so the tests after it ran against the new instance.`;
 
@@ -331,8 +336,10 @@ describe("r82 lifecycle-progress-token: the call without the token clears it onl
       requiredArgs: true,
       only: [PROGRESS, "lifecycle-meta-required"],
     });
+    // The exit without its stderr, so the answer without the token is whole
+    // (before: "server exited (exit code 3: TypeError: progress re...").
     expect(verdict).toBe(
-      `FAIL: tools/call count with _meta.progressToken: server exited (exit code 3: TypeError: progress re..., and again when resent; without it: ${Q_REQUIRED}${BLAMED_UNLIKE}`,
+      `FAIL: tools/call count with _meta.progressToken: server exited, and again when resent; without it: ${Q_REQUIRED}${BLAMED_UNLIKE}`,
     );
     expectBudget(report, PROGRESS);
     // The call carrying the token, the call without it, the call carrying it resent.
@@ -361,7 +368,7 @@ describe("r82 lifecycle-progress-token: the call without the token clears it onl
     );
     const verdict = verdictOf(report, PROGRESS);
     expect(verdict).toMatch(
-      /^FAIL: tools\/call count with _meta\.progressToken: no response \(connection closed: .*\), and again when resent; without it: JSON-RPC error -32602 \(Invalid params: q is required\).* -- so the token is what failed it$/,
+      /^FAIL: tools\/call count with _meta\.progressToken: no response \(connection closed: .*\), and again when resent; without it: JSON-RPC error -32602 \(HTTP 400\) -- so the token is what failed it$/,
     );
     expectBudget(report, PROGRESS);
     expect(seen.tokens).toEqual([TOKEN, undefined, TOKEN]);
@@ -408,7 +415,7 @@ describe("r82 lifecycle-progress-token: the call without the token clears it onl
       [PROGRESS],
     );
     expect(verdictOf(report, PROGRESS)).toBe(
-      `PASS: tools/call count succeeded when resent with _meta.progressToken (first: JSON-RPC error -32603 (cold) (HTTP 200); without it: JSON-RPC error -32602 (Invalid params: q is ...); ${NONE}`,
+      `PASS: tools/call count succeeded when resent with _meta.progressToken (first: JSON-RPC error -32603 (cold) (HTTP 200); without it: JSON-RPC error -32602 (HTTP 400)); ${NONE}`,
     );
     expectBudget(report, PROGRESS);
     expect(seen.tokens).toEqual([TOKEN, undefined, TOKEN]);
@@ -431,15 +438,18 @@ describe("r82 lifecycle-progress-token: the call without the token clears it onl
       },
       [PROGRESS],
     );
+    // Before: 253 characters, both answers with their message.
     expect(verdictOf(sse.report, PROGRESS)).toBe(
-      `PASS: tools/call count ${MISSING_Q} (HTTP 200), and the same call without the token was not served either (JSON-RPC error -32602 (Invalid params: q is required) (HTTP 400)), so the progress token is not what failed it; ${NONE}`,
+      `PASS: tools/call count with _meta.progressToken: JSON-RPC error -32602 (HTTP 200); without it: JSON-RPC error -32602 (HTTP 400), so the token is not what failed it; ${NONE}`,
     );
+    expectBudget(sse.report, PROGRESS);
     expect(sse.seen.tokens).toEqual([TOKEN, undefined]);
     // The same over stdio, where both calls answer the missing argument alike.
     const same = await runStdio("serve", { requiredArgs: true });
     expect(same.verdict).toBe(
-      `PASS: tools/call count ${MISSING_Q}, and the same call without the token was not served either (JSON-RPC error -32602 (Invalid params: q is required)), so the progress token is not what failed it; ${NONE}`,
+      `PASS: tools/call count with _meta.progressToken: JSON-RPC error -32602; without it: ${Q_REQUIRED}, so the token is not what failed it; ${NONE}`,
     );
+    expectBudget(same.report, PROGRESS);
     expect(same.calls).toEqual([TOKEN, "-"]);
   }, 40_000);
 });
@@ -453,19 +463,17 @@ describe("r82 lifecycle-progress-token: valid progress settles the check only on
     // Before: PASS "1 notifications/progress echoed token ... (1)", one call,
     // and a restart warning next to it.
     const { report, verdict, calls, warnings } = await runStdio("progress-exit");
-    expect(verdict).toBe(
-      `FAIL: tools/call count carrying _meta.progressToken ${EXITED}, and ${EXITED} when it was resent, ${BLAMED}`,
-    );
+    expect(verdict).toBe(blamedAgain(EXITED));
+    expectBudget(report, PROGRESS);
     expect(calls).toEqual([TOKEN, "-", TOKEN]);
     expect(warnings).toEqual([restarted("carrying _meta.progressToken")]);
     expect(resultOf(report, PROGRESS).passed).toBe(false);
   }, 60_000);
 
   it("stdio: one progress frame, then -32603 on every call carrying the token, FAILS once reproduced (before: PASS)", async () => {
-    const { verdict, calls } = await runStdio("progress-internal");
-    expect(verdict).toBe(
-      `FAIL: tools/call count carrying _meta.progressToken returned JSON-RPC error -32603 (Internal error), and JSON-RPC error -32603 (Internal error) when it was resent, ${BLAMED}`,
-    );
+    const { report, verdict, calls } = await runStdio("progress-internal");
+    expect(verdict).toBe(blamedAgain("JSON-RPC error -32603 (Internal error)"));
+    expectBudget(report, PROGRESS);
     expect(calls).toEqual([TOKEN, "-", TOKEN]);
   }, 30_000);
 
@@ -484,23 +492,25 @@ describe("r82 lifecycle-progress-token: valid progress settles the check only on
       },
       [PROGRESS],
     );
-    expect(verdictOf(report, PROGRESS)).toBe(
-      `FAIL: tools/call count carrying _meta.progressToken returned JSON-RPC error -32603 (Internal error) (HTTP 200), and JSON-RPC error -32603 (Internal error) (HTTP 200) when it was resent, ${BLAMED}`,
-    );
+    expect(verdictOf(report, PROGRESS)).toBe(blamedAgain("JSON-RPC error -32603 (Internal error) (HTTP 200)"));
+    expectBudget(report, PROGRESS);
     expect(seen.tokens).toEqual([TOKEN, undefined, TOKEN]);
   }, 30_000);
 
   it("stdio: progress, then an exit, next to a -32602 without the token, FAILS through the unlike-twin resend", async () => {
     const { report, verdict, calls } = await runStdio("progress-exit", { requiredArgs: true });
-    expect(verdict).toMatch(
-      /^FAIL: tools\/call count with _meta\.progressToken: server exited \(exit code 3: .*, and again when resent; without it: JSON-RPC error -32602 \(Invalid params: q is required\) -- so the token is what failed it$/,
+    expect(verdict).toBe(
+      `FAIL: tools/call count with _meta.progressToken: server exited, and again when resent; without it: ${Q_REQUIRED}${BLAMED_UNLIKE}`,
     );
     expectBudget(report, PROGRESS);
     expect(calls).toEqual([TOKEN, "-", TOKEN]);
   }, 60_000);
 
   it("a failure the call without the token shares keeps its passing observation, now naming the progress observed", async () => {
-    // Before: PASS "1 notifications/progress echoed token ... (1)" after one call.
+    // Before: PASS "1 notifications/progress echoed token ... (1)" after one
+    // call; then (review 82a) the same pass at 323 characters, the progress
+    // note in full next to both answers. The note is compact next to a
+    // failure, and the longer answer gives way to its brief form.
     const { report, seen } = await runStub(
       {
         route: (msg) => {
@@ -512,8 +522,9 @@ describe("r82 lifecycle-progress-token: valid progress settles the check only on
       [PROGRESS],
     );
     expect(verdictOf(report, PROGRESS)).toBe(
-      `PASS: tools/call count returned JSON-RPC error -32603 (Internal error) (HTTP 200), and the same call without the token was not served either (JSON-RPC error -32603 (Internal error) (HTTP 200)), so the progress token is not what failed it; ${ONE_PROGRESS}`,
+      "PASS: tools/call count with _meta.progressToken: JSON-RPC error -32603 (HTTP 200); without it: JSON-RPC error -32603 (Internal error) (HTTP 200), so the token is not what failed it; 1 valid notifications/progress observed",
     );
+    expectBudget(report, PROGRESS);
     expect(seen.tokens).toEqual([TOKEN, undefined]);
   }, 30_000);
 

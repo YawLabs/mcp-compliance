@@ -8,7 +8,7 @@ import { createModernClient } from "../modern/client.js";
 import { createRecorder } from "../recorder.js";
 import { MODERN_SPEC_VERSION, specBaseFor } from "../spec.js";
 import { createModernState, type ModernState, type ModernSuiteContext } from "../suites/modern/context.js";
-import { checkLiveness, LIVENESS_BUDGET_MS, unresponsiveReason } from "../suites/modern/liveness.js";
+import { checkLiveness, unresponsiveReason } from "../suites/modern/liveness.js";
 import { runStdio } from "../suites/modern/stdio.js";
 import type {
   MessageListener,
@@ -29,9 +29,14 @@ import { MODERN_FIXTURE, resultOf, runModern } from "./helpers/modern-fixture.js
  *   follow-up server/discover waited the full --timeout, its failure was
  *   thrown away, and the check PASSED ("reproduced the CJK/emoji probe
  *   byte-for-byte") while the next check took the blame for the hang.
- * - That follow-up discover waits at most LIVENESS_BUDGET_MS (2000 ms, less
- *   when --timeout is shorter), never a full --timeout; over HTTP it is not
- *   sent at all, and a healthy stdio server pays one quick round trip.
+ * - That follow-up discover gets the per-request timeout like any request
+ *   (review 82a: a 2000 ms cap failed a live server slower than that, and
+ *   read a child that exited later than that as hung, leaving it dead for
+ *   the checks after it); over HTTP it is not sent at all. After the last
+ *   answered probe a bounded wait for the child's exit (EXIT_GRACE_MS,
+ *   250 ms, the 2025-11-25 check's window) comes first, so a child that
+ *   crashes a moment after answering is charged here, not to the next
+ *   check: a healthy stdio server pays that wait and one quick round trip.
  * - Every stdio-unicode details string keeps to the 220-character budget
  *   by clipping its head (the note on a rejected tools/call, then the
  *   request's name), never its conclusion. Before: 233-260 characters with
@@ -42,10 +47,12 @@ import { MODERN_FIXTURE, resultOf, runModern } from "./helpers/modern-fixture.js
 const PROBE = "héllo 世界 🚀";
 const TOOL_PROBE = "tools/call echo with a CJK/emoji argument";
 const ENVELOPE_PROBE = "server/discover with a CJK/emoji clientInfo name";
-const NO_REPLY = `no reply to server/discover within ${LIVENESS_BUDGET_MS}ms`;
-const STOPPED = (what: string) => `${what} was answered, but the server stopped answering right after (${NO_REPLY})`;
-const STOPPED_WARNING = (cause: string) =>
-  `stdio-unicode: the server stopped answering right after ${cause} was answered (${NO_REPLY}); it was not restarted, so the tests after it may fail on the same hang.`;
+const NO_REPLY = (timeout: number) => `no reply to server/discover within ${timeout}ms`;
+const STOPPED = (what: string, timeout = 5000) =>
+  `${what} was answered, but the server stopped answering right after (${NO_REPLY(timeout)})`;
+const STOPPED_WARNING = (cause: string, timeout = 5000) =>
+  `stdio-unicode: the server stopped answering right after ${cause} was answered (${NO_REPLY(timeout)}); it was not restarted, so the tests after it may fail on the same hang.`;
+const EXITED = (what: string) => `${what} was answered, but the server exited right after (server exited (code 3))`;
 const ENVELOPE_PASS =
   "envelope round-trip verified: server/discover accepted a request whose clientInfo name carries CJK/emoji (no echo path to compare byte-for-byte)";
 
@@ -203,17 +210,14 @@ function livenessCalls(fake: FakeStdio) {
 describe("checkLiveness (liveness.ts)", () => {
   const discover = () => ({ result: DISCOVER_RESULT });
 
-  it("a live child: one server/discover, sent with the short budget, not the per-request timeout", async () => {
+  it("a live child: one server/discover, sent with the per-request timeout (before: capped at 2000 ms)", async () => {
     const fake = fakeStdio(discover);
     const ctx = makeContext(fake, {}, 15_000);
     expect(await checkLiveness(ctx)).toEqual({ state: "alive" });
-    expect(fake.calls.map((c) => [c.method, c.timeout])).toEqual([["server/discover", LIVENESS_BUDGET_MS]]);
-  });
-
-  it("a per-request timeout shorter than the budget wins", async () => {
-    const fake = fakeStdio(discover);
-    await checkLiveness(makeContext(fake, {}, 1500));
-    expect(fake.calls.map((c) => c.timeout)).toEqual([1500]);
+    expect(fake.calls.map((c) => [c.method, c.timeout])).toEqual([["server/discover", 15_000]]);
+    const short = fakeStdio(discover);
+    await checkLiveness(makeContext(short, {}, 1500));
+    expect(short.calls.map((c) => c.timeout)).toEqual([1500]);
   });
 
   it("an answer that is a JSON-RPC error still means the process is serving", async () => {
@@ -240,8 +244,8 @@ describe("checkLiveness (liveness.ts)", () => {
     );
     expect(silent.state).toBe("unresponsive");
     if (silent.state !== "unresponsive") throw new Error("unreachable");
-    expect(silent.budgetMs).toBe(LIVENESS_BUDGET_MS);
-    expect(unresponsiveReason(silent)).toBe(NO_REPLY);
+    expect(silent.budgetMs).toBe(15_000);
+    expect(unresponsiveReason(silent)).toBe(NO_REPLY(15_000));
 
     const closed = await checkLiveness(makeContext(fakeStdio(() => "stdin-closed")));
     expect(closed.state).toBe("unresponsive");
@@ -322,18 +326,18 @@ describe("2026-07-28 stdio-unicode: a child that stops answering right after the
     await runStdio(ctx);
     const unicode = outcome(ctx, "stdio-unicode");
     expect(unicode.passed).toBe(false);
-    expect(unicode.details).toBe(STOPPED(TOOL_PROBE));
-    expect(ctx.harness.warnings).toContain(STOPPED_WARNING(TOOL_PROBE));
-    // The follow-up discover waited the short budget, not the 15 s timeout.
-    expect(livenessCalls(fake).map((c) => c.timeout)).toEqual([LIVENESS_BUDGET_MS]);
+    expect(unicode.details).toBe(STOPPED(TOOL_PROBE, 15_000));
+    expect(ctx.harness.warnings).toContain(STOPPED_WARNING(TOOL_PROBE, 15_000));
+    // The follow-up discover got the per-request budget: silent for all of it is a hang.
+    expect(livenessCalls(fake).map((c) => c.timeout)).toEqual([15_000]);
   });
 
   it("the envelope discover answered, then nothing: the same FAIL, on the envelope path", async () => {
     const fake = unicodeChild({ probeMethod: "server/discover", afterProbe: "silent" });
     const ctx = makeContext(fake, {}, 15_000);
     await runStdio(ctx);
-    expect(outcome(ctx, "stdio-unicode").details).toBe(STOPPED(ENVELOPE_PROBE));
-    expect(ctx.harness.warnings).toContain(STOPPED_WARNING(ENVELOPE_PROBE));
+    expect(outcome(ctx, "stdio-unicode").details).toBe(STOPPED(ENVELOPE_PROBE, 15_000));
+    expect(ctx.harness.warnings).toContain(STOPPED_WARNING(ENVELOPE_PROBE, 15_000));
   });
 
   it("a child that closed its stdin after answering is a hang too, with the transport's reason", async () => {
@@ -425,10 +429,12 @@ describe("2026-07-28 stdio-unicode: details keep to 220 characters and keep the 
     );
   });
 
-  it("'server unreachable' on the envelope keeps its reason (before: cut off the end at 220)", async () => {
+  it("a child gone right after the discover between the probes: the tools/call is charged, the envelope is not sent", async () => {
     // The tools/call probe is rejected and the follow-up discover is
-    // answered; the child exits right after that answer, so the envelope
-    // probe finds it gone.
+    // answered; the child exits right after that answer. Before (review
+    // 82a): the envelope probe found it gone and read "server unreachable",
+    // no restart; the 2025-11-25 check charges the probe the child answered
+    // last, as this one now does, and restarts it.
     let livenessAnswered = false;
     const fake = fakeStdio(
       (method) => {
@@ -451,7 +457,22 @@ describe("2026-07-28 stdio-unicode: details keep to 220 characters and keep the 
     const details = outcome(ctx, "stdio-unicode").details;
     check(
       details,
-      `${ENVELOPE_PROBE} got no response (connection closed: stdio transport: server crashed with exit code 3 before completing the request)`,
+      " with a CJK/emoji argument was answered, but the server exited right after (server exited (code 3))",
+    );
+    expect(details).toBe(EXITED(`${clipped} with a CJK/emoji argument`));
+    expect(fake.calls.filter((c) => carriesProbe(c.params)).map((c) => c.method)).toEqual(["tools/call"]);
+  });
+
+  it("'server unreachable' on the tools/call keeps its reason (a child gone before the check)", async () => {
+    const fake = unicodeChild({ probeMethod: "tools/call", toolReply: rejectTool });
+    fake.exited = true;
+    fake.exitCode = 3;
+    const ctx = makeContext(fake, LONG_STATE);
+    await runStdio(ctx);
+    const details = outcome(ctx, "stdio-unicode").details;
+    check(
+      details,
+      " got no response (connection closed: stdio transport: server crashed with exit code 3 before completing the request)",
     );
     expect(details.startsWith(`server unreachable: ${clipped.slice(0, 20)}`), details).toBe(true);
   });
@@ -503,29 +524,28 @@ const stoppedWarnings = (report: ComplianceReport) => report.warnings.filter((w)
 const restartWarnings = (report: ComplianceReport) => report.warnings.filter((w) => w.includes("and was restarted"));
 
 describe("2026-07-28 stdio-unicode over real children that stop answering after the probe", () => {
-  it("the modern fixture, wedged after echoing the probe: FAIL within the short budget, not a full --timeout (before: PASS after 8 s)", async () => {
+  it("the modern fixture, wedged after echoing the probe: FAIL once silent for the whole --timeout (before: PASS)", async () => {
     const report = await runModern(preloaded(MODERN_FIXTURE, WEDGE_AFTER_ECHO), {
       only: ["stdio-framing", "stdio-unicode"],
-      timeout: 8000,
+      timeout: 3000,
     });
     expect(resultOf(report, "stdio-framing").passed).toBe(true);
     const unicode = resultOf(report, "stdio-unicode");
     expect(unicode.passed).toBe(false);
-    expect(unicode.details).toBe(STOPPED(TOOL_PROBE));
-    // Before: the follow-up discover waited the whole 8000 ms --timeout.
-    expect(unicode.durationMs).toBeLessThan(6000);
-    expect(stoppedWarnings(report)).toEqual([STOPPED_WARNING(TOOL_PROBE)]);
+    expect(unicode.details).toBe(STOPPED(TOOL_PROBE, 3000));
+    expect(unicode.durationMs).toBeGreaterThanOrEqual(2900);
+    expect(stoppedWarnings(report)).toEqual([STOPPED_WARNING(TOOL_PROBE, 3000)]);
     expect(restartWarnings(report)).toEqual([]);
   }, 60_000);
 
-  it("the same fixture without the preload: PASS, no warning, and no wait", async () => {
+  it("the same fixture without the preload: PASS, no warning, and only the bounded exit wait", async () => {
     const report = await runModern(preloaded(MODERN_FIXTURE), {
       only: ["stdio-framing", "stdio-unicode"],
       timeout: 8000,
     });
     const unicode = resultOf(report, "stdio-unicode");
     expect(unicode.details).toBe("tools/call echo reproduced the CJK/emoji probe byte-for-byte");
-    expect(unicode.durationMs).toBeLessThan(LIVENESS_BUDGET_MS);
+    expect(unicode.durationMs).toBeLessThan(2000);
     expect(stoppedWarnings(report)).toEqual([]);
     expect(restartWarnings(report)).toEqual([]);
   }, 60_000);
@@ -576,12 +596,12 @@ rl.on("close", () => process.exit(0));
     it("answered, then silent: FAIL naming the hang, with a warning (before: PASS 'envelope round-trip verified')", async () => {
       const report = await runModern(
         { type: "stdio", command: process.execPath, args: [script], env: { WEDGE_AFTER: "1" } },
-        { only: ["stdio-framing", "stdio-unicode"], timeout: 8000 },
+        { only: ["stdio-framing", "stdio-unicode"], timeout: 3000 },
       );
       const unicode = resultOf(report, "stdio-unicode");
-      expect(unicode.details).toBe(STOPPED(ENVELOPE_PROBE));
-      expect(unicode.durationMs).toBeLessThan(6000);
-      expect(stoppedWarnings(report)).toEqual([STOPPED_WARNING(ENVELOPE_PROBE)]);
+      expect(unicode.details).toBe(STOPPED(ENVELOPE_PROBE, 3000));
+      expect(unicode.durationMs).toBeGreaterThanOrEqual(2900);
+      expect(stoppedWarnings(report)).toEqual([STOPPED_WARNING(ENVELOPE_PROBE, 3000)]);
     }, 60_000);
 
     it("the same server without the hang: PASS as before", async () => {
@@ -594,4 +614,83 @@ rl.on("close", () => process.exit(0));
       expect(stoppedWarnings(report)).toEqual([]);
     }, 60_000);
   });
+});
+
+/**
+ * Preloads for the modern fixture (review 82a), each armed by the first
+ * stdout line that carries non-ASCII (the echo of the probe):
+ * - SLOW_AFTER_ECHO: every later line is written `ms` later (a live server
+ *   slower than the old 2000 ms liveness cap, faster than --timeout);
+ * - EXIT_LATER_AFTER_ECHO: every later line is dropped, and the process
+ *   exits with code 3 `ms` later (an exit before --timeout runs out);
+ * - CRASH_SOON_AFTER_ECHO: the process exits with code 3 `ms` later (an
+ *   async crash a moment after answering).
+ */
+const armedAfterEcho = (body: string) =>
+  [
+    "const w = process.stdout.write.bind(process.stdout);",
+    "let armed = false;",
+    "process.stdout.write = (chunk, enc, cb) => {",
+    '  const s = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");',
+    "  if (!armed) {",
+    "    if (/[^\\x00-\\x7f]/.test(s)) { armed = true; onArm(); }",
+    "    return w(chunk, enc, cb);",
+    "  }",
+    "  return later(chunk, enc, cb);",
+    "};",
+    body,
+  ].join("\n");
+const SLOW_AFTER_ECHO = (ms: number) =>
+  armedAfterEcho(
+    `const onArm = () => {};\nconst later = (chunk, enc, cb) => { setTimeout(() => w(chunk, enc, cb), ${ms}); return true; };`,
+  );
+const EXIT_LATER_AFTER_ECHO = (ms: number) =>
+  armedAfterEcho(
+    `const onArm = () => setTimeout(() => process.exit(3), ${ms});\nconst later = (chunk, enc, cb) => { const done = typeof enc === "function" ? enc : cb; if (done) process.nextTick(done); return true; };`,
+  );
+const CRASH_SOON_AFTER_ECHO = (ms: number) =>
+  armedAfterEcho(
+    `const onArm = () => setTimeout(() => process.exit(3), ${ms});\nconst later = (chunk, enc, cb) => w(chunk, enc, cb);`,
+  );
+
+describe("2026-07-28 stdio-unicode: the liveness reading after an answered probe (review 82a)", () => {
+  const ONLY = ["stdio-framing", "stdio-unicode", "stdio-unknown-method-recovers"];
+  const RECOVERS = "unknown method -> JSON-RPC error -32601; server/discover answered afterwards on the same process";
+
+  it("a live server that answers every request within --timeout, slower than 2 s: PASS, no warning (before: FAIL 'stopped answering')", async () => {
+    // Before: FAIL "tools/call echo with a CJK/emoji argument was answered,
+    // but the server stopped answering right after (no reply to
+    // server/discover within 2000ms)", and a "stopped answering" warning.
+    const report = await runModern(preloaded(MODERN_FIXTURE, SLOW_AFTER_ECHO(2500)), { only: ONLY, timeout: 8000 });
+    const unicode = resultOf(report, "stdio-unicode");
+    expect(unicode.details).toBe("tools/call echo reproduced the CJK/emoji probe byte-for-byte");
+    expect(unicode.passed).toBe(true);
+    expect(stoppedWarnings(report)).toEqual([]);
+    expect(restartWarnings(report)).toEqual([]);
+    expect(resultOf(report, "stdio-unknown-method-recovers").passed).toBe(true);
+  }, 60_000);
+
+  it("a child that answers, goes silent and exits 3 s later: charged with the exit and restarted (before: 'stopped answering', left dead)", async () => {
+    // Before: FAIL "... stopped answering right after (no reply to
+    // server/discover within 2000ms)", no restart, and
+    // stdio-unknown-method-recovers FAILED on the exit that came after.
+    const report = await runModern(preloaded(MODERN_FIXTURE, EXIT_LATER_AFTER_ECHO(3000)), {
+      only: ONLY,
+      timeout: 8000,
+    });
+    expect(resultOf(report, "stdio-unicode").details).toBe(EXITED(TOOL_PROBE));
+    expect(restartWarnings(report)).toHaveLength(1);
+    expect(stoppedWarnings(report)).toEqual([]);
+    expect(resultOf(report, "stdio-unknown-method-recovers").details).toBe(RECOVERS);
+  }, 60_000);
+
+  it("a child that answers and crashes 30 ms later: charged with the exit and restarted, as the 2025-11-25 check does (before: PASS, the next check blamed)", async () => {
+    // Before: PASS "tools/call echo reproduced the CJK/emoji probe
+    // byte-for-byte" -- the follow-up discover came back before the crash --
+    // and the check after it failed on the dead process.
+    const report = await runModern(preloaded(MODERN_FIXTURE, CRASH_SOON_AFTER_ECHO(30)), { only: ONLY });
+    expect(resultOf(report, "stdio-unicode").details).toBe(EXITED(TOOL_PROBE));
+    expect(restartWarnings(report)).toHaveLength(1);
+    expect(resultOf(report, "stdio-unknown-method-recovers").details).toBe(RECOVERS);
+  }, 60_000);
 });

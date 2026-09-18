@@ -266,12 +266,16 @@ describe("transport-batch-reject / -content-type-reject: the twin a bare 403 is 
     // Before: the same two verdicts, and a fresh server/discover sent per
     // check to learn what the setup discover already showed (4 in all).
     const { byId, hits } = await verdicts({ all: rpcError(403, -32000, "Invalid Host: mcp.internal.example") });
+    // The reason is sized for the details budget (review 82a), so the quoted
+    // message, which names the refused host, outranks the explanation, and
+    // the probe's JSON-RPC code fits next to it (before: "HTTP 403 on the
+    // batch; ... names Host/Origin validation, which refuses a request
+    // whatever it carries, so ...").
     const guard = (about: string) =>
-      `not evaluable: its message ("Invalid Host: mcp.internal.example") names Host/Origin validation, which refuses a request whatever it carries, so it proves nothing about ${about}`;
+      `not evaluable: its message ("Invalid Host: mcp.internal.example") names Host/Origin validation, so it proves nothing about ${about}`;
     expect(byId).toEqual({
-      // Within 220 characters the probe's JSON-RPC code gives way to the reason.
-      [BATCH]: `FAIL: HTTP 403 on the batch; ${guard("the batch")}`,
-      [CT]: `FAIL: HTTP 403 on the text/plain POST; ${guard("the Content-Type")}`,
+      [BATCH]: `FAIL: HTTP 403, JSON-RPC error -32000 on the batch; ${guard("the batch")}`,
+      [CT]: `FAIL: HTTP 403, JSON-RPC error -32000 on the text/plain POST; ${guard("the Content-Type")}`,
     });
     expect(count(hits, "discover")).toBe(2);
   }, 30_000);
@@ -296,6 +300,54 @@ describe("transport-batch-reject / -content-type-reject: the twin a bare 403 is 
       [CT]: "PASS: HTTP 403 (text/plain rejected)",
     });
     expect(count(hits, "discover")).toBe(4);
+  }, 30_000);
+});
+
+describe("transport-batch-reject / -content-type-reject: details within 220 characters whatever the refusal quotes (review 82a)", () => {
+  // `verdicts` asserts every check's details are ASCII and within 220
+  // characters. Before, rawProbeGate never gave gateVerdict the room its
+  // head left: any reason over 210 characters overflowed -- a Host/Origin
+  // message over about 60 characters, or a twin refused with a string code
+  // (223 to 239 characters on these inputs).
+  const AZURE_HOST = "Invalid Host header: mcp-server.politebay-12345678.eastus.azurecontainerapps.io";
+  const HOST_REASON = (about: string) =>
+    new RegExp(
+      `^FAIL: HTTP 403[^;]*; not evaluable: its message \\("Invalid Host header: mcp-server\\.politebay[^"]*"\\) names Host/Origin validation, so it proves nothing about ${about}$`,
+    );
+
+  it("a Host guard quoting an 80-character message on every request: the message clipped, the conclusion whole", async () => {
+    const { byId } = await verdicts({ all: rpcError(403, -32000, AZURE_HOST) });
+    expect(byId[BATCH]).toMatch(HOST_REASON("the batch"));
+    expect(byId[CT]).toMatch(HOST_REASON("the Content-Type"));
+  }, 30_000);
+
+  it("the same guard only after the setup discover was served (a WAF partway through the run)", async () => {
+    const host = rpcError(403, -32000, AZURE_HOST);
+    const { byId, hits } = await verdicts({ discover: [served, served, host], batch: host, textPlain: host });
+    expect(byId[BATCH]).toMatch(HOST_REASON("the batch"));
+    expect(byId[CT]).toMatch(HOST_REASON("the Content-Type"));
+    // Each check asked its own conformant twin, refused the same way.
+    expect(count(hits, "discover")).toBe(4);
+  }, 30_000);
+
+  it("a bare 403 with a string code on every request: the twin's outcome clipped, the conclusion whole", async () => {
+    const waf: Reply = (id, res) => {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: id ?? null,
+          error: { code: "WAF_RULE_942100_SQL_INJECTION_ATTEMPT_BLOCKED", message: "Forbidden" },
+        }),
+      );
+    };
+    const { byId } = await verdicts({ all: waf });
+    expect(byId[BATCH]).toMatch(
+      /; not evaluable: a conformant server\/discover was refused \(.* too, so the 403 proves nothing about the batch( \(see security-auth-required\))?$/,
+    );
+    expect(byId[CT]).toMatch(
+      /; not evaluable: a conformant server\/discover was refused \(.* too, so the 403 proves nothing about the Content-Type( \(see security-auth-required\))?$/,
+    );
   }, 30_000);
 });
 

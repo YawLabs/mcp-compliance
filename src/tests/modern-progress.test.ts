@@ -33,9 +33,25 @@ import { resultOf, runModern } from "./helpers/modern-fixture.js";
 const PROGRESS = "lifecycle-progress-token";
 const TOKEN = "compliance-progress-1";
 const NONE = "no notifications/progress observed (optional)";
-/** The tail of the failure once the token is blamed. */
-const BLAMED =
-  "while the same call without it, sent in between, was served -- the server failed the request because of its progress token (basic/patterns/progress lets a server ignore the token and send no notifications, not fail the request)";
+/**
+ * The tail of the failure once the token is blamed. Before (review 82a):
+ * "... when it was resent, while the same call without it, sent in between,
+ * was served -- the server failed the request because of its progress token
+ * (basic/patterns/progress lets a server ignore the token and send no
+ * notifications, not fail the request)", 211 characters of tail alone, so
+ * every such failure ran past the 220-character details budget.
+ */
+const BLAMED = "without it: served -- so the token is what failed it";
+/** The failure once the token is blamed, the resent call answering as the first did. */
+const blamedAgain = (answer: string) =>
+  `FAIL: tools/call count with _meta.progressToken: ${answer}, and again when resent; ${BLAMED}`;
+
+/** lifecycle-progress-token's details keep to the 220-character budget, in printable ASCII. */
+function expectBudget(report: ComplianceReport): void {
+  const details = resultOf(report, PROGRESS).details;
+  expect(details, details).toMatch(/^[\x20-\x7e]+$/);
+  expect(details.length, details).toBeLessThanOrEqual(220);
+}
 
 /** "PASS: ..." / "FAIL: ..." with " (skipped)" when the pass measured nothing. */
 function verdictOf(report: ComplianceReport, id: string): string {
@@ -238,6 +254,7 @@ async function runStub(
   const stub = await startStub(opts);
   try {
     const report = await runModern(stub.url, { only: [PROGRESS], ...runOpts });
+    expectBudget(report);
     return { verdict: verdictOf(report, PROGRESS), calls: [...stub.calls], warnings: report.warnings };
   } finally {
     await stub.close();
@@ -250,7 +267,7 @@ describe("2026-07-28 lifecycle-progress-token over HTTP: a server error is blame
     // params: ...); no notifications/progress observed (optional)", one call.
     const { verdict, calls } = await runStub({ call: "own-error-with-token" });
     expect(verdict).toBe(
-      `FAIL: tools/call count carrying _meta.progressToken returned JSON-RPC error -32602 (Invalid params: unrecognized key 'progressToken' in _meta) (HTTP 200), and JSON-RPC error -32602 (Invalid params: unrecognized key 'progressToken' in _meta) (HTTP 200) when it was resent, ${BLAMED}`,
+      blamedAgain("JSON-RPC error -32602 (Invalid params: unrecognized key 'progressToken' in _meta) (HTTP 200)"),
     );
     // The call with the token, the same call without it, then the call with
     // the token once more: the failure is reproduced before it is blamed.
@@ -261,16 +278,12 @@ describe("2026-07-28 lifecycle-progress-token over HTTP: a server error is blame
     // Before: PASS "tools/call count returned JSON-RPC error -32603 (Internal
     // error); ..." and "... returned JSON-RPC error -32000 (Forbidden); ...".
     const on500 = await runStub({ call: "500-with-token" });
-    expect(on500.verdict).toBe(
-      `FAIL: tools/call count carrying _meta.progressToken returned JSON-RPC error -32603 (Internal error) (HTTP 500), and JSON-RPC error -32603 (Internal error) (HTTP 500) when it was resent, ${BLAMED}`,
-    );
+    expect(on500.verdict).toBe(blamedAgain("JSON-RPC error -32603 (Internal error) (HTTP 500)"));
     expect(on500.calls).toEqual([TOKEN, undefined, TOKEN]);
     // A 403 without a Bearer challenge is no auth gate: the call without the
     // token, with the same headers, got past whatever answered it.
     const on403 = await runStub({ call: "bare-403-with-token" });
-    expect(on403.verdict).toBe(
-      `FAIL: tools/call count carrying _meta.progressToken returned JSON-RPC error -32000 (Forbidden) (HTTP 403), and JSON-RPC error -32000 (Forbidden) (HTTP 403) when it was resent, ${BLAMED}`,
-    );
+    expect(on403.verdict).toBe(blamedAgain("JSON-RPC error -32000 (Forbidden) (HTTP 403)"));
     expect(on403.calls).toEqual([TOKEN, undefined, TOKEN]);
   }, 30_000);
 
@@ -279,7 +292,7 @@ describe("2026-07-28 lifecycle-progress-token over HTTP: a server error is blame
     // warming up, retry); no notifications/progress observed (optional)", one call.
     const { verdict, calls } = await runStub({ call: "cold" });
     expect(verdict).toBe(
-      `PASS: tools/call count succeeded when resent: it first returned JSON-RPC error -32603 (backend warming up, retry) (HTTP 200), then the same call without the token and the resent one were served; ${NONE}`,
+      `PASS: tools/call count succeeded when resent with _meta.progressToken (first: JSON-RPC error -32603 (backend warming up, retry) (HTTP 200); without it: served); ${NONE}`,
     );
     expect(calls).toEqual([TOKEN, undefined, TOKEN]);
   }, 20_000);
@@ -301,7 +314,8 @@ describe("2026-07-28 lifecycle-progress-token over HTTP: a server error is blame
     // error); no notifications/progress observed (optional)", one call.
     const always = await runStub({ call: "500-always" });
     expect(always.verdict).toBe(
-      `PASS: tools/call count returned JSON-RPC error -32603 (Internal error) (HTTP 500), and the same call without the token was not served either (JSON-RPC error -32603 (Internal error) (HTTP 500)), so the progress token is not what failed it; ${NONE}`,
+      // Both answers without their message: with it the details ran to 252 characters.
+      `PASS: tools/call count with _meta.progressToken: JSON-RPC error -32603 (HTTP 500); without it: JSON-RPC error -32603 (HTTP 500), so the token is not what failed it; ${NONE}`,
     );
     expect(always.calls).toEqual([TOKEN, undefined]);
   }, 30_000);
@@ -312,12 +326,12 @@ describe("2026-07-28 lifecycle-progress-token over HTTP: a server error is blame
     // scored, and the 429 never resent.
     const throttled = await runStub({ call: 429 });
     expect(throttled.verdict).toBe(
-      `PASS (skipped): tools/call count with progressToken answered HTTP 429, then after 0ms HTTP 429 (rate limiting); not evaluable: it was answered before the server read the request, so it proves nothing about the progress token; ${NONE}`,
+      `PASS (skipped): tools/call count with progressToken answered HTTP 429, then after 0ms HTTP 429 (rate limiting); not evaluable: answered before the server read the request; ${NONE}`,
     );
     expect(throttled.calls).toEqual([TOKEN, TOKEN]);
     const gated = await runStub({ call: 401 });
     expect(gated.verdict).toBe(
-      `PASS (skipped): tools/call count with progressToken answered HTTP 401 (an auth gate); not evaluable: it was answered before the server read the request, so it proves nothing about the progress token; ${NONE}`,
+      `PASS (skipped): tools/call count with progressToken answered HTTP 401 (an auth gate); not evaluable: answered before the server read the request; ${NONE}`,
     );
     expect(gated.calls).toEqual([TOKEN]);
   }, 30_000);
@@ -328,7 +342,7 @@ describe("2026-07-28 lifecycle-progress-token over HTTP: a server error is blame
     // failed.
     const { verdict, calls } = await runStub({ call: "429-once-then-reject-token" });
     expect(verdict).toBe(
-      `FAIL: tools/call count carrying _meta.progressToken returned JSON-RPC error -32602 (Invalid params: unrecognized key 'progressToken' in _meta) (HTTP 429, then after 0ms HTTP 200), and JSON-RPC error -32602 (Invalid params: unrecognized key 'progressToken' in _meta) (HTTP 200) when it was resent, ${BLAMED}`,
+      `FAIL: tools/call count with _meta.progressToken: JSON-RPC error -32602 (HTTP 429, then after 0ms HTTP 200); resent: JSON-RPC error -32602 (HTTP 200); ${BLAMED}`,
     );
     expect(calls).toEqual([TOKEN, TOKEN, undefined, TOKEN]);
   }, 20_000);
@@ -338,24 +352,21 @@ describe("2026-07-28 lifecycle-progress-token over HTTP: a server error is blame
     // either (HTTP 429 with no JSON-RPC response), so the progress token is
     // not what failed it; ..." and PASS "... got no response within 1500ms,
     // so the progress token is not what failed it; ...".
-    const rejected =
-      "returned JSON-RPC error -32602 (Invalid params: unrecognized key 'progressToken' in _meta) (HTTP 200)";
-    const unclear =
-      "so no answer of the server's own tells whether the progress token is what failed it (not evaluable)";
+    const rejected = "JSON-RPC error -32602 (HTTP 200)";
     const limited = await runStub({ call: "reject-token-429-twin" });
     expect(limited.verdict).toBe(
-      `PASS (skipped): tools/call count ${rejected}, but the same call without the token answered HTTP 429, then after 0ms HTTP 429 (rate limiting), ${unclear}; ${NONE}`,
+      `PASS (skipped): tools/call count with _meta.progressToken: ${rejected}; without it: HTTP 429, then after 0ms HTTP 429 (rate limiting) -- not evaluable; ${NONE}`,
     );
     expect(limited.calls).toEqual([TOKEN, undefined, undefined]);
     const hung = await runStub({ call: "reject-token-hang-twin" }, { timeout: 1500 });
     expect(hung.verdict).toBe(
-      `PASS (skipped): tools/call count ${rejected}, but the same call without the token got no response within 1500ms, ${unclear}; ${NONE}`,
+      `PASS (skipped): tools/call count with _meta.progressToken: ${rejected}; without it: no response within 1500ms -- not evaluable; ${NONE}`,
     );
     expect(hung.calls).toEqual([TOKEN, undefined]);
     // A 429 once on the call without the token: resent, served, and the token blamed.
     const once = await runStub({ call: "reject-token-429-twin-once" });
     expect(once.verdict).toBe(
-      `FAIL: tools/call count carrying _meta.progressToken ${rejected}, and JSON-RPC error -32602 (Invalid params: unrecognized key 'progressToken' in _meta) (HTTP 200) when it was resent, ${BLAMED}`,
+      blamedAgain("JSON-RPC error -32602 (Invalid params: unrecognized key 'progressToken' in _meta) (HTTP 200)"),
     );
     expect(once.calls).toEqual([TOKEN, undefined, undefined, TOKEN]);
   }, 30_000);
@@ -366,12 +377,12 @@ describe("2026-07-28 lifecycle-progress-token over HTTP: a server error is blame
     // got no response within 1500ms, so the failure was not reproduced; ...".
     const limited = await runStub({ call: "reject-token-429-resend" });
     expect(limited.verdict).toBe(
-      `PASS (skipped): tools/call count returned JSON-RPC error -32602 (Invalid params: unrecognized key 'progressToken' in _meta) (HTTP 200); the same call without the token was served, but resent, the call carrying it answered HTTP 429, then after 0ms HTTP 429 (rate limiting), so the failure could not be reproduced (not evaluable); ${NONE}`,
+      `PASS (skipped): tools/call count with _meta.progressToken: JSON-RPC error -32602 (HTTP 200); without it: served; resent: HTTP 429, then after 0ms HTTP 429 (rate limiting) -- not evaluable; ${NONE}`,
     );
     expect(limited.calls).toEqual([TOKEN, undefined, TOKEN, TOKEN]);
     const flaky = await runStub({ call: "cold-then-hang" }, { timeout: 1500 });
     expect(flaky.verdict).toBe(
-      `PASS (skipped): tools/call count returned JSON-RPC error -32603 (backend warming up, retry) (HTTP 200); the same call without the token was served, but resent, the call carrying it got no response within 1500ms, so the failure could not be reproduced (not evaluable); ${NONE}`,
+      `PASS (skipped): tools/call count with _meta.progressToken: JSON-RPC error -32603 (HTTP 200); without it: served; resent: no response within 1500ms -- not evaluable; ${NONE}`,
     );
     expect(flaky.calls).toEqual([TOKEN, undefined, TOKEN]);
   }, 30_000);
@@ -391,7 +402,7 @@ describe("2026-07-28 lifecycle-progress-token over HTTP: a server error is blame
     // token was never sent.
     const dropped = await runStub({ call: "drop-with-token" });
     expect(dropped.verdict).toMatch(
-      /^FAIL: tools\/call count carrying _meta\.progressToken got no response \(connection closed: [^)]+\), and got no response \(connection closed: [^)]+\) when it was resent, while the same call without it, sent in between, was served -- the server failed the request because of its progress token /,
+      /^FAIL: tools\/call count with _meta\.progressToken: no response \(connection closed: [^)]+\), and again when resent; without it: served -- so the token is what failed it$/,
     );
     expect(dropped.calls).toEqual([TOKEN, undefined, TOKEN]);
   }, 30_000);
@@ -513,6 +524,7 @@ async function runStdio(
     env: { PROGRESS_MODE: mode, PROGRESS_LOG: log },
   };
   const report = await runModern(target, { only });
+  expectBudget(report);
   const calls = readFileSync(log, "utf8").split("\n").filter(Boolean);
   return { verdict: verdictOf(report, PROGRESS), calls, warnings: report.warnings, report };
 }
@@ -522,26 +534,24 @@ describe("2026-07-28 lifecycle-progress-token over stdio", () => {
     // Before: PASS "tools/call count returned JSON-RPC error -32602 (Invalid
     // params: ...); no notifications/progress observed (optional)".
     const { verdict, calls } = await runStdio("error-with-token");
-    expect(verdict).toBe(
-      `FAIL: tools/call count carrying _meta.progressToken returned JSON-RPC error -32602 (Invalid params: unrecognized key 'progressToken'), and JSON-RPC error -32602 (Invalid params: unrecognized key 'progressToken') when it was resent, ${BLAMED}`,
-    );
+    expect(verdict).toBe(blamedAgain("JSON-RPC error -32602 (Invalid params: unrecognized key 'progressToken')"));
     expect(calls).toEqual([TOKEN, "-", TOKEN]);
   }, 30_000);
 
   it("a cold first call passes on the resent call; a failure shared by the call without the token is an observation", async () => {
     const cold = await runStdio("cold");
     expect(cold.verdict).toBe(
-      `PASS: tools/call count succeeded when resent: it first returned JSON-RPC error -32603 (backend warming up, retry), then the same call without the token and the resent one were served; ${NONE}`,
+      `PASS: tools/call count succeeded when resent with _meta.progressToken (first: JSON-RPC error -32603 (backend warming up, retry); without it: served); ${NONE}`,
     );
     expect(cold.calls).toEqual([TOKEN, "-", TOKEN]);
     const always = await runStdio("error-always");
     expect(always.verdict).toBe(
-      `PASS: tools/call count returned JSON-RPC error -32603 (Internal error), and the same call without the token was not served either (JSON-RPC error -32603 (Internal error)), so the progress token is not what failed it; ${NONE}`,
+      `PASS: tools/call count with _meta.progressToken: JSON-RPC error -32603 (Internal error); without it: JSON-RPC error -32603 (Internal error), so the token is not what failed it; ${NONE}`,
     );
     expect(always.calls).toEqual([TOKEN, "-"]);
   }, 40_000);
 
-  const EXITED = "made the server exit (exit code 3: Error: cannot handle a progress token)";
+  const EXITED = "server exited (exit code 3: Error: cannot handle a progress token)";
   const restarted = (cause: string) =>
     `${PROGRESS}: the server exited on tools/call count ${cause} and was restarted with a fresh server/discover, so the tests after it ran against the new instance.`;
 
@@ -553,9 +563,7 @@ describe("2026-07-28 lifecycle-progress-token over stdio", () => {
       PROGRESS,
       "lifecycle-meta-required",
     ]);
-    expect(verdict).toBe(
-      `FAIL: tools/call count carrying _meta.progressToken ${EXITED}, and ${EXITED} when it was resent, ${BLAMED}`,
-    );
+    expect(verdict).toBe(blamedAgain(EXITED));
     // The call without the token and the resent call each reached a new instance.
     expect(calls).toEqual([TOKEN, "-", TOKEN]);
     // Both exits restarted the child (the two identical warnings collapse into one).
@@ -574,7 +582,7 @@ describe("2026-07-28 lifecycle-progress-token over stdio", () => {
     // failure was not reproduced; ...", with no warning.
     const { verdict, calls, warnings } = await runStdio("cold-then-exit");
     expect(verdict).toBe(
-      `FAIL: tools/call count carrying _meta.progressToken returned JSON-RPC error -32603 (backend warming up, retry), and ${EXITED} when it was resent, ${BLAMED}`,
+      `FAIL: tools/call count with _meta.progressToken: JSON-RPC error -32603 (backend warming up, retry); resent: server exited; ${BLAMED}`,
     );
     expect(calls).toEqual([TOKEN, "-", TOKEN]);
     expect(warnings.filter((w) => w.startsWith(`${PROGRESS}:`))).toEqual([restarted("carrying _meta.progressToken")]);

@@ -16,42 +16,74 @@ import { classifyTransportError } from "./security.js";
  * The probe is one plain server/discover: a request any live 2026-07-28
  * server answers at once (the setup and stdio-framing have just shown this
  * process answering discovers). On a healthy server it is one quick round
- * trip and no wait. Its budget is short -- LIVENESS_BUDGET_MS, never more
- * than the per-request timeout -- so a child that stopped answering costs
- * that, not a full --timeout on top of the hang every later request will
- * meet.
+ * trip and no wait. It gets the per-request timeout like any request, so a
+ * server that answers every request within --timeout is never read as
+ * hung, and a child that exits at any point before its answer is read as
+ * exited (the transport fails the pending request the moment the child's
+ * exit is reported), not as silent. Only a child that is still running and
+ * silent for the whole per-request budget is "unresponsive".
  *
- * It cannot see an exit that lands after the probe is answered; nothing
- * short of a fixed wait could, and a healthy server must not pay one.
+ * A child that exits a moment after the probe is answered is seen only by a
+ * wait: `exitsWithin`, EXIT_GRACE_MS, which the callers spend only where
+ * they accept its cost (stdio-unicode once, after its last answered probe;
+ * lifecycle-progress-token after a call the server failed, never after a
+ * served one).
  */
 
-/** The most the liveness server/discover waits (capped at the per-request timeout). */
-export const LIVENESS_BUDGET_MS = 2000;
+/**
+ * How long a caller waits for a stdio child to exit after it answered, before
+ * the liveness server/discover: the 2025-11-25 stdio-unicode's
+ * UNICODE_EXIT_GRACE_MS (runner.ts), so the two suites see the same window.
+ */
+export const EXIT_GRACE_MS = 250;
+
+/** How often that wait looks at the child: the transport reports the exit as a flag. */
+const EXIT_POLL_MS = 10;
 
 /** What the liveness server/discover found. */
 export type Liveness =
   /** Answered (a result or an error: either way the process is serving), or not stdio. */
   | { state: "alive" }
-  /** The child is gone; `err` is the probe's transport error. */
+  /** The child is gone; `err` is the probe's transport error (none when the exit was seen before it was sent). */
   | { state: "exited"; err: unknown }
   /**
    * The child is still running but the probe got no answer: none within
-   * `budgetMs`, or its stdin refused the write (the server stopped reading
-   * its input). `err` is the probe's transport error.
+   * `budgetMs` (the per-request timeout), or its stdin refused the write
+   * (the server stopped reading its input). `err` is the probe's transport
+   * error.
    */
   | { state: "unresponsive"; err: unknown; budgetMs: number };
 
-/** The liveness probe's budget: LIVENESS_BUDGET_MS, or the per-request timeout when that is shorter. */
-export function livenessBudget(ctx: ModernSuiteContext): number {
-  return Math.min(ctx.timeout, LIVENESS_BUDGET_MS);
+/** Whether the suite's stdio child has exited (false over HTTP). */
+function childExited(ctx: ModernSuiteContext): boolean {
+  return ctx.kind === "stdio" && (ctx.transport as Partial<StdioTransport>).exited === true;
 }
 
 /**
- * stdio only: send one plain server/discover (budget: livenessBudget) and
- * read what came back. Any answer is "alive"; a failure with the child gone
- * is "exited"; any other failure is "unresponsive". Over HTTP there is no
- * child to lose, so nothing is sent and the answer is "alive". A caller's
- * abort is rethrown.
+ * stdio only: whether the child exits within `ms` -- true as soon as it has
+ * (at once when it already had), false when the time runs out first, and
+ * false at once over HTTP, where there is no child and nothing is waited
+ * for. Polled, since the transport reports the exit as a flag. A caller's
+ * abort rejects at once with its reason.
+ */
+export async function exitsWithin(ctx: ModernSuiteContext, ms: number): Promise<boolean> {
+  if (ctx.kind !== "stdio") return false;
+  const deadline = Date.now() + ms;
+  while (!childExited(ctx)) {
+    if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error("Aborted");
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(EXIT_POLL_MS, left)));
+  }
+  return true;
+}
+
+/**
+ * stdio only: send one plain server/discover (budget: the per-request
+ * timeout) and read what came back. Any answer is "alive"; a failure with
+ * the child gone is "exited"; any other failure is "unresponsive". Over HTTP
+ * there is no child to lose, so nothing is sent and the answer is "alive". A
+ * caller's abort is rethrown.
  *
  * The caller probes only a child that was alive when its request was sent
  * (one already gone did not die on that request), and reads the exit
@@ -60,20 +92,21 @@ export function livenessBudget(ctx: ModernSuiteContext): number {
  */
 export async function checkLiveness(ctx: ModernSuiteContext): Promise<Liveness> {
   if (ctx.kind !== "stdio") return { state: "alive" };
-  const budgetMs = livenessBudget(ctx);
+  if (childExited(ctx)) return { state: "exited", err: undefined };
+  const budgetMs = ctx.timeout;
   try {
     await ctx.client.rpc("server/discover", undefined, { timeout: budgetMs });
     return { state: "alive" };
   } catch (err: unknown) {
     if (ctx.signal?.aborted) throw err;
-    if ((ctx.transport as Partial<StdioTransport>).exited === true) return { state: "exited", err };
+    if (childExited(ctx)) return { state: "exited", err };
     return { state: "unresponsive", err, budgetMs };
   }
 }
 
 /**
  * Why an unresponsive child counts as one, ASCII and one line: "no reply to
- * server/discover within 2000ms", else "server/discover failed: <the
+ * server/discover within <timeout>ms", else "server/discover failed: <the
  * transport's first line, without its 'stdio transport: ' prefix, at most
  * 80 characters>" (a stdin that refused the write).
  */

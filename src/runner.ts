@@ -723,24 +723,32 @@ const ECHO_ARGUMENT_NAMES = ["message", "text", "input", "query"] as const;
 const UNICODE_META_KEY = "com.example.compliance/unicode-probe";
 /**
  * How long stdio-unicode waits, once its last probe is answered, for the
- * child to exit before the liveness ping after it (LIVENESS_PING_MS). A
- * child that answers and crashes a moment later (an async logger or
- * callback throwing on the non-ASCII input) is caught here, not by the
- * check after it. Paid once per run by a healthy stdio server.
+ * child to exit before the liveness ping after it. A child that answers and
+ * crashes a moment later (an async logger or callback throwing on the
+ * non-ASCII input) is caught here, not by the check after it. Paid once per
+ * run by a healthy stdio server. The 2026-07-28 check waits the same
+ * (EXIT_GRACE_MS, src/suites/modern/liveness.ts).
  */
 const UNICODE_EXIT_GRACE_MS = 250;
 /** How often that wait looks at the child: the transport reports the exit as a flag. */
 const EXIT_POLL_MS = 10;
+/** The length a check's details keep within (the 2026-07-28 suite's DETAILS_MAX). */
+const DETAILS_MAX = 220;
+
 /**
- * The budget, capped by --timeout, of the plain ping stdio-unicode sends to
- * tell a live child from one its probe killed: between its two probes, and
- * after the bounded wait that follows the last one. A child that has exited
- * but whose exit is not reported yet (a loaded machine is slow to reap it)
- * never answers it, and the transport fails it the moment the exit is
- * reported, so a longer wait could tell nothing more; a ping still
- * unanswered when it runs out means a live child.
+ * stdio-unicode's details head within `room`: `note` (what the tools/call
+ * drew, "tools/call x rejected the probe (...); ") then `request` (the probe
+ * whose fate the details report). The note gives way first, keeping its
+ * closing "; " so it still reads as a clause of its own, and is dropped when
+ * too little room is left for it; the request is clipped only after that.
+ * Printable ASCII (the note carries a clipped server-chosen tool name).
  */
-const LIVENESS_PING_MS = 2000;
+function fitUnicodeHead(note: string, request: string, room: number): string {
+  if (note.length + request.length <= room) return `${note}${request}`;
+  const noteRoom = room - request.length;
+  if (note === "" || noteRoom < 12) return clipAscii(request, Math.max(room, 3));
+  return `${clipAscii(note.replace(/;\s*$/, ""), noteRoom - 2)}; ${request}`;
+}
 
 /**
  * Whether a stdio child exits within `ms`: true as soon as it has (at once
@@ -6374,76 +6382,120 @@ export async function runComplianceSuite(
       // is the round-trip verified. With no tool to call -- none declared,
       // none listed, or a tools/list that failed -- the envelope decides
       // alone. A request that gets no reply fails, and so does one answered
-      // by a child that exits right after it: a plain ping between the two
-      // probes finds a child the tools/call killed, and after the last
-      // answered probe one bounded wait (UNICODE_EXIT_GRACE_MS) and then a
-      // plain ping find one that crashes a moment after answering, the ping
-      // also one whose exit a loaded machine reports late (each ping's
-      // budget capped at LIVENESS_PING_MS). A child that exited on the
-      // check's probes is restarted (restartStdioServer) so the tests after
-      // it measure the server, and one already gone before them is "server
-      // unreachable". A caller's abort is rethrown.
+      // by a child that exits or stops answering right after it, read as
+      // the 2026-07-28 check reads it: a plain ping between the two probes
+      // finds a child the tools/call killed, and after the last answered
+      // probe one bounded wait (UNICODE_EXIT_GRACE_MS) and then a plain ping
+      // find one that crashes a moment after answering. Each ping gets the
+      // per-request timeout, so a child that exits before --timeout runs out
+      // is charged here and a slow server is not read as hung; one still
+      // running and silent for the whole budget fails as a hang on the
+      // probe, with a warning naming it (it is not replaced). A child that
+      // exited on the check's probes is restarted (restartStdioServer) so
+      // the tests after it measure the server, and one already gone before
+      // them is "server unreachable". Every details string keeps to
+      // DETAILS_MAX by clipping its head -- the note on the tools/call
+      // first, then the request -- never the conclusion. A caller's abort is
+      // rethrown.
       const stdio = transport as StdioTransport;
+      /** A probe: `note` (what an earlier probe drew, "tools/call x rejected the probe (...); "), `request`, and `cause` for the restart's warning. */
+      type UnicodeProbe = { note: string; request: string; cause: string };
       /** The probe the child answered last, until a verdict that needs no liveness reading is reached. */
-      let answered = null as { what: string; cause: string } | null;
+      let answered = null as UnicodeProbe | null;
+      /** `note` + `request` + `tail` within DETAILS_MAX: the note gives way first, then the request (fitUnicodeHead). */
+      const fitted = (probe: UnicodeProbe, tail: string): string =>
+        `${fitUnicodeHead(probe.note, probe.request, DETAILS_MAX - tail.length)}${tail}`;
       /** The verdict for a child gone after answering `probe`, which is restarted. */
-      const exitedAfter = async (probe: { what: string; cause: string }): Promise<LegacyOutcome> => {
+      const exitedAfter = async (probe: UnicodeProbe): Promise<LegacyOutcome> => {
         answered = null;
         const verdict = {
           passed: false,
-          details: `${probe.what} was answered, but the server exited right after (server exited (code ${stdio.exitCode ?? "unknown"}))`,
+          details: fitted(
+            probe,
+            ` was answered, but the server exited right after (server exited (code ${stdio.exitCode ?? "unknown"}))`,
+          ),
         };
         await restartStdioServer("stdio-unicode", probe.cause);
         return verdict;
       };
       /**
        * Send one request carrying the probe: its answer, or the verdict for
-       * none. `what` opens the details; `cause` names the request in the
-       * restart's warning.
+       * none. An answer from a child that was alive when the request was
+       * sent is `answered`, for settle to read.
        */
       const send = async (
-        what: string,
-        cause: string,
+        probe: UnicodeProbe,
         method: string,
         params: unknown,
       ): Promise<{ body: any } | { verdict: LegacyOutcome }> => {
         // Gone after answering an earlier probe of this check: that probe killed it.
         if (stdio.exited && answered) return { verdict: await exitedAfter(answered) };
         const alreadyGone = stdio.exited === true;
+        answered = null;
         try {
           const body = (await rpc(method, params)).body;
-          answered = { what, cause };
+          if (!alreadyGone) answered = probe;
           return { body };
         } catch (err: unknown) {
           if (options.signal?.aborted) throw err;
-          answered = null;
-          if (alreadyGone) return { verdict: unreachable(what, err, timeout) };
+          if (alreadyGone) {
+            const overhead = unreachable("x", err, timeout).details.length - 1;
+            return {
+              verdict: unreachable(fitUnicodeHead(probe.note, probe.request, DETAILS_MAX - overhead), err, timeout),
+            };
+          }
           if (!stdio.exited) {
             return {
-              verdict: { passed: false, details: `${what} got no reply (${clipAscii(errorLine(err, 200), 100)})` },
+              verdict: {
+                passed: false,
+                details: fitted(probe, ` got no reply (${clipAscii(errorLine(err, 200), 100)})`),
+              },
             };
           }
           const verdict = {
             passed: false,
-            details: `${what} got no reply (server exited (code ${stdio.exitCode ?? "unknown"}))`,
+            details: fitted(probe, ` got no reply (server exited (code ${stdio.exitCode ?? "unknown"}))`),
           };
-          await restartStdioServer("stdio-unicode", cause);
+          await restartStdioServer("stdio-unicode", probe.cause);
           return { verdict };
         }
       };
       /**
-       * Whether the child is gone after answering a probe: one plain ping
-       * (the 2026-07-28 check sends a server/discover). An answer, an
-       * error, or no answer within its capped budget is a live child; the
-       * transport fails the ping the moment the child's exit is reported.
+       * The verdict for a child that stopped serving after answering the
+       * `answered` probe, or null when it still serves (or nothing is left
+       * to read): with `grace` (after the last answered probe) a bounded wait
+       * for its exit first, then one plain ping with the per-request budget
+       * -- the transport fails it the moment the child's exit is reported,
+       * and a ping still unanswered when the budget runs out is a hang. A
+       * child gone is restarted; one still running and silent is named in a
+       * warning.
        */
-      const goneAfterPing = async (): Promise<boolean> => {
-        try {
-          await mcpRequest(backendUrl, "ping", undefined, nextId, buildHeaders(), Math.min(timeout, LIVENESS_PING_MS));
-        } catch (err: unknown) {
-          if (options.signal?.aborted) throw err;
+      const settle = async (grace: boolean): Promise<LegacyOutcome | null> => {
+        const probe = answered;
+        if (!probe) return null;
+        let silent: unknown = null;
+        if (!(grace && (await exitsWithin(stdio, UNICODE_EXIT_GRACE_MS, options.signal)))) {
+          try {
+            await mcpRequest(backendUrl, "ping", undefined, nextId, buildHeaders(), timeout);
+          } catch (err: unknown) {
+            if (options.signal?.aborted) throw err;
+            silent = err;
+          }
         }
-        return stdio.exited;
+        if (stdio.exited) return exitedAfter(probe);
+        if (silent === null) return null;
+        answered = null;
+        const why =
+          classifyTransportError(silent) === "timeout"
+            ? `no reply to ping within ${timeout}ms`
+            : `ping failed: ${clipAscii(errorLine(silent, 200).replace(/^stdio transport:\s*/, ""), 80)}`;
+        warnings.push(
+          `stdio-unicode: the server stopped answering right after ${probe.cause} was answered (${why}); it was not restarted, so the tests after it may fail on the same hang.`,
+        );
+        return {
+          passed: false,
+          details: fitted(probe, ` was answered, but the server stopped answering right after (${why})`),
+        };
       };
       const judge = async (): Promise<LegacyOutcome> => {
         let tools: unknown[] | null = cachedToolsList;
@@ -6461,7 +6513,7 @@ export async function runComplianceSuite(
         if (tool) {
           const name = clipAscii(tool.name, 60);
           const what = `tools/call ${name} with a CJK/emoji argument`;
-          const sent = await send(what, what, "tools/call", {
+          const sent = await send({ note: "", request: what, cause: what }, "tools/call", {
             name: tool.name,
             arguments: Object.fromEntries(tool.args.map((arg) => [arg, UNICODE_PROBE])),
           });
@@ -6491,45 +6543,44 @@ export async function runComplianceSuite(
           // without reflecting its arguments: nothing to compare, so the
           // envelope probe decides -- sent to a child the tools/call did
           // not kill.
-          if (await goneAfterPing()) return exitedAfter({ what, cause: what });
+          const between = await settle(false);
+          if (between) return between;
           note = error
             ? `tools/call ${name} rejected the probe (${errorWithCode(error.code)}); `
             : `tools/call ${name} did not echo the probe; `;
         }
         const envelope = "ping with a CJK/emoji _meta value";
-        const sent = await send(`${note}${envelope}`, envelope, "ping", {
+        const probe = { note, request: envelope, cause: envelope };
+        const sent = await send(probe, "ping", {
           _meta: { [UNICODE_META_KEY]: UNICODE_PROBE },
         });
         if ("verdict" in sent) return sent.verdict;
         const error = sent.body?.error;
-        if (error) return { passed: false, details: `${note}${envelope} -> ${errorWithCode(error.code)}` };
+        if (error) return { passed: false, details: fitted(probe, ` -> ${errorWithCode(error.code)}`) };
         if (sent.body?.result === undefined) {
-          return { passed: false, details: `${note}${envelope} -> non-JSON-RPC reply` };
+          return { passed: false, details: fitted(probe, " -> non-JSON-RPC reply") };
         }
         const serialized = JSON.stringify(sent.body) ?? "";
+        const settled = { ...probe, request: "" };
         if (serialized.includes(UNICODE_PROBE)) {
-          return { passed: true, details: `${note}ping reproduced the CJK/emoji _meta value byte-for-byte` };
+          return { passed: true, details: fitted(settled, "ping reproduced the CJK/emoji _meta value byte-for-byte") };
         }
         const mangled = unicodeManglingEvidence(serialized);
-        if (mangled) return { passed: false, details: `${note}ping mangled the CJK/emoji _meta value: ${mangled}` };
+        if (mangled)
+          return { passed: false, details: fitted(settled, `ping mangled the CJK/emoji _meta value: ${mangled}`) };
         return {
           passed: true,
-          details: `${note}envelope round-trip verified: ping answered a request whose _meta carries CJK/emoji (no echo path to compare byte-for-byte)`,
+          details: fitted(
+            settled,
+            "envelope round-trip verified: ping answered a request whose _meta carries CJK/emoji (no echo path to compare byte-for-byte)",
+          ),
         };
       };
       const verdict = await judge();
-      if (answered === null) return verdict;
-      // The verdict read an answer. A child that answered and exited a
-      // moment later is the verdict instead, so the check after this one is
-      // not blamed for the crash: one bounded wait finds the exit, and a
-      // plain ping after it an exit the child made in that window but a
-      // loaded machine has not reported yet (the ping is never answered,
-      // and fails once it is).
-      const probe = answered;
-      if ((await exitsWithin(stdio, UNICODE_EXIT_GRACE_MS, options.signal)) || (await goneAfterPing())) {
-        return exitedAfter(probe);
-      }
-      return verdict;
+      // The verdict read an answer: a child that answered it and then exited
+      // or stopped answering is the verdict instead, so the check after this
+      // one is not blamed for it.
+      return (await settle(true)) ?? verdict;
     });
 
     await test(

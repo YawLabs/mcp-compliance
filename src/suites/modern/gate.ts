@@ -91,8 +91,11 @@ export function clipAscii(text: string, max: number): string {
  * (what it was for: " for an unknown method") when there is room, then the
  * reason. The reason is the conclusion and is kept whole, and so is the
  * status; only the answer side is shortened -- `detail` dropped first,
- * `answer` clipped after -- so the details never end mid-reason. Printable
- * ASCII only.
+ * `answer` clipped after -- so the details never end mid-reason. An answer
+ * with less than MIN_ANSWER characters of room left is dropped rather than
+ * cut to a stub, leaving the status (without its " (" / " on " framing)
+ * before the reason, or the reason alone, so the result never runs past
+ * `max` while the reason fits it. Printable ASCII only.
  */
 export function gateDetails(answer: string, status: string, detail: string, reason: string, max = DETAILS_MAX): string {
   const all = (text: string) => clipAscii(text, Number.POSITIVE_INFINITY);
@@ -100,11 +103,21 @@ export function gateDetails(answer: string, status: string, detail: string, reas
   if (full.length <= max) return full;
   const short = all(`${answer}${status}; ${reason}`);
   if (short.length <= max) return short;
-  // Cut the answer at a word boundary when there is one in its second half.
-  const cut = all(answer).slice(0, Math.max(max - 2 - reason.length - status.length - 3, 13));
-  const space = cut.lastIndexOf(" ");
-  return `${space >= cut.length / 2 ? cut.slice(0, space) : cut}...${all(status)}; ${all(reason)}`;
+  const keep = max - 2 - reason.length - status.length - 3;
+  if (keep >= MIN_ANSWER) {
+    // Cut the answer at a word boundary when there is one in its second half.
+    const cut = all(answer).slice(0, keep);
+    const space = cut.lastIndexOf(" ");
+    return `${space >= cut.length / 2 ? cut.slice(0, space) : cut}...${all(status)}; ${all(reason)}`;
+  }
+  const bare = status.replace(/^\s*(?:on\s+|\()?/, "").replace(/\)\s*$/, "");
+  const statusOnly = all(`${bare}; ${reason}`);
+  if (bare !== "" && statusOnly.length <= max) return statusOnly;
+  return all(reason);
 }
+
+/** The shortest cut of an answer gateDetails keeps: below it the answer is dropped. */
+const MIN_ANSWER = 13;
 
 /** The JSON-RPC error code a body carries, when it is one of `codes`. */
 function ownRejectionCode(body: unknown, codes: readonly number[]): number | undefined {
@@ -212,7 +225,9 @@ const MIN_QUOTE = 16;
  * within DETAILS_MAX (see `gateDetails`): the quoted message is clipped to
  * it (and left out below MIN_QUOTE characters), a twin's outcome is clipped
  * to it, and the "(see security-auth-required)" pointer is added only when
- * it fits. Unbounded when not given.
+ * it fits. Every caller passes one (the reasons for a 429, an auth gate or
+ * a 5xx are fixed text well within any room a caller leaves); unbounded
+ * when not given.
  *
  * Null for every other answer (a 4xx the server chose: a 400, 404, 413,
  * 415 ...) and always over stdio. A caller's abort while the twin is sent

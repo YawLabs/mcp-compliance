@@ -4,7 +4,7 @@ import { errorOf, type RpcOptions, type RpcResponse, resultOf } from "../../mode
 import { JSONRPC_ERROR_CODES, META } from "../../modern/meta.js";
 import type { StdioTransport } from "../../transport/stdio.js";
 import { ensureTools, type ModernSuiteContext } from "./context.js";
-import { checkLiveness, unresponsiveReason, warnUnresponsive } from "./liveness.js";
+import { checkLiveness, EXIT_GRACE_MS, exitsWithin, unresponsiveReason, warnUnresponsive } from "./liveness.js";
 import { restartStdioServer, unreachable } from "./security.js";
 
 /**
@@ -333,24 +333,46 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
   // here. A request that gets no reply fails with a one-line reason (never
   // the transport's multi-line stderr tail, which can echo the probe). So
   // does one the child answers and then exits or stops answering right
-  // after: a plain server/discover sent after each answered probe
-  // (checkLiveness, liveness.ts, with a short budget of its own) finds it
-  // gone, or gets no reply from a process that has just answered
-  // discovers -- a hang on the probe, with a warning naming it (the child
-  // is still running and is not replaced). A child that exited on it is
-  // replaced (restartStdioServer, whose warning names this check) so the
-  // checks after it measure the server instead of a dead process -- on
-  // every attempt that kills it, --retries included; one already gone
+  // after, read the way the 2025-11-25 check reads it: a plain
+  // server/discover (checkLiveness, liveness.ts) between the two probes
+  // finds a child the tools/call killed, and after the last answered probe
+  // one bounded wait (EXIT_GRACE_MS) and then a plain server/discover find
+  // one that crashes a moment after answering. That discover gets the
+  // per-request timeout, so a child that exits before --timeout runs out is
+  // charged here and a slow server is not read as hung; one still running
+  // and silent for the whole budget fails as a hang on the probe, with a
+  // warning naming it (it is not replaced). A child that exited on the
+  // probe is replaced (restartStdioServer, whose warning names this check)
+  // so the checks after it measure the server instead of a dead process --
+  // on every attempt that kills it, --retries included; one already gone
   // before the request was not killed by it: "server unreachable", and no
-  // restart. A caller's abort is rethrown. Every details string keeps to
-  // the details budget by clipping its head -- the note on a rejected
-  // tools/call first, then the request's name -- never the conclusion.
+  // restart. A caller's abort is rethrown. Every details string keeps to the
+  // details budget by clipping its head -- the note on a rejected tools/call
+  // first, then the request's name -- never the conclusion.
   await harness.check("stdio-unicode", async () => {
+    /** The probe the child answered last, until a verdict that needs no liveness reading is reached. */
+    let answered: { note: Clause | null; what: Clause } | null = null;
+    /** The verdict for a child gone after answering `probe` (`err`: the request that found it gone), which is restarted. */
+    const exitedAfter = async (probe: { note: Clause | null; what: Clause }, err: unknown): Promise<TestOutcome> => {
+      answered = null;
+      // Read before the restart replaces ctx.transport.
+      const verdict = {
+        passed: false,
+        details: fitDetails(
+          probe.note,
+          probe.what,
+          ` was answered, but the server exited right after (${explainFailure(ctx, err)})`,
+        ),
+      };
+      await restartStdioServer(ctx, "stdio-unicode", render(probe.what));
+      return verdict;
+    };
     /**
      * Send one request carrying the probe: its reply, or the verdict for
      * none. The details of a verdict open with `note` then `what` (the
      * request), both fitted to the budget (fitDetails); a warning names
-     * the request as `what` reads in full.
+     * the request as `what` reads in full. An answer from a child that was
+     * alive when the request was sent is `answered`, for settle to read.
      */
     const send = async (
       note: Clause | null,
@@ -359,8 +381,11 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
       params: unknown,
       opts: RpcOptions,
     ): Promise<{ res: RpcResponse } | { verdict: TestOutcome }> => {
+      // Gone after answering an earlier probe of this check: that probe killed it.
+      if (answered && exitState(ctx).exited) return { verdict: await exitedAfter(answered, undefined) };
       const cause = render(what);
       const alreadyGone = exitState(ctx).exited;
+      answered = null;
       let res: RpcResponse;
       try {
         res = await ctx.client.rpc(method, params, opts);
@@ -375,112 +400,127 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
         if (exitState(ctx).exited) await restartStdioServer(ctx, "stdio-unicode", cause);
         return { verdict };
       }
-      if (alreadyGone) return { res };
-      const live = await checkLiveness(ctx);
-      if (live.state === "exited") {
-        // Read before the restart replaces ctx.transport.
-        const verdict = {
-          passed: false,
-          details: fitDetails(
-            note,
-            what,
-            ` was answered, but the server exited right after (${explainFailure(ctx, live.err)})`,
-          ),
-        };
-        await restartStdioServer(ctx, "stdio-unicode", cause);
-        return { verdict };
-      }
-      if (live.state === "unresponsive") {
-        warnUnresponsive(ctx, "stdio-unicode", cause, live);
-        return {
-          verdict: {
-            passed: false,
-            details: fitDetails(
-              note,
-              what,
-              ` was answered, but the server stopped answering right after (${unresponsiveReason(live)})`,
-            ),
-          },
-        };
-      }
+      if (!alreadyGone) answered = { note, what };
       return { res };
     };
-
-    let note: Clause | null = null;
-    const tool = await pickUnicodeTool(ctx);
-    if (tool) {
-      const call: Clause = { before: "tools/call ", name: tool.name, after: "" };
-      const what: Clause = { ...call, after: " with a CJK/emoji argument" };
-      const sent = await send(
-        null,
-        what,
-        "tools/call",
-        { name: tool.name, arguments: Object.fromEntries(tool.args.map((arg) => [arg, UNICODE_PROBE])) },
-        { toolInputSchema: tool.inputSchema },
-      );
-      if ("verdict" in sent) return sent.verdict;
-      const res = sent.res;
-      const serialized = JSON.stringify(res.body);
-      if (serialized.includes(UNICODE_PROBE)) {
-        return { passed: true, details: `${render(call)} reproduced the CJK/emoji probe byte-for-byte` };
-      }
-      if (reproducesEveryPiece(serialized)) {
+    /**
+     * The verdict for a child that stopped serving after answering the
+     * `answered` probe, or null when it still serves (or nothing is left to
+     * read): with `grace` (after the last answered probe) a bounded wait for
+     * its exit first, then one plain server/discover. A child gone is
+     * restarted; one still running and silent is named in a warning. A
+     * child that still serves stays `answered`: the next probe's send finds
+     * it if it exits before that probe is written.
+     */
+    const settle = async (grace: boolean): Promise<TestOutcome | null> => {
+      const probe = answered;
+      if (!probe) return null;
+      const live = grace && (await exitsWithin(ctx, EXIT_GRACE_MS)) ? null : await checkLiveness(ctx);
+      if (live === null || live.state === "exited") return exitedAfter(probe, live?.err);
+      if (live.state === "unresponsive") {
+        answered = null;
+        warnUnresponsive(ctx, "stdio-unicode", render(probe.what), live);
         return {
-          passed: true,
-          details: `${render(call)} reproduced every non-ASCII piece of the CJK/emoji probe (split across the reply, not byte-for-byte)`,
+          passed: false,
+          details: fitDetails(
+            probe.note,
+            probe.what,
+            ` was answered, but the server stopped answering right after (${unresponsiveReason(live)})`,
+          ),
         };
       }
+      return null;
+    };
+
+    const judge = async (): Promise<TestOutcome> => {
+      let note: Clause | null = null;
+      const tool = await pickUnicodeTool(ctx);
+      if (tool) {
+        const call: Clause = { before: "tools/call ", name: tool.name, after: "" };
+        const what: Clause = { ...call, after: " with a CJK/emoji argument" };
+        const sent = await send(
+          null,
+          what,
+          "tools/call",
+          { name: tool.name, arguments: Object.fromEntries(tool.args.map((arg) => [arg, UNICODE_PROBE])) },
+          { toolInputSchema: tool.inputSchema },
+        );
+        if ("verdict" in sent) return sent.verdict;
+        const res = sent.res;
+        const serialized = JSON.stringify(res.body);
+        if (serialized.includes(UNICODE_PROBE)) {
+          return { passed: true, details: `${render(call)} reproduced the CJK/emoji probe byte-for-byte` };
+        }
+        if (reproducesEveryPiece(serialized)) {
+          return {
+            passed: true,
+            details: `${render(call)} reproduced every non-ASCII piece of the CJK/emoji probe (split across the reply, not byte-for-byte)`,
+          };
+        }
+        const err = errorOf(res.body);
+        if (err?.code === JSONRPC_ERROR_CODES.PARSE_ERROR) {
+          return { passed: false, details: `${render(what)} -> -32700 parse error` };
+        }
+        const mangled = manglingEvidence(serialized);
+        if (mangled) {
+          return {
+            passed: false,
+            details: fitDetails(null, call, ` mangled the CJK/emoji probe: ${mangled} (got ${firstText(res)})`),
+          };
+        }
+        // Rejected (unknown args, schema mismatch) or answered without
+        // reflecting its arguments: nothing to compare, so the envelope
+        // probe decides -- sent to a child the tools/call did not kill.
+        const between = await settle(false);
+        if (between) return between;
+        note = {
+          ...call,
+          after: err ? ` rejected the probe (${errorWithCode(err.rawCode)}); ` : " did not echo the probe; ",
+        };
+      }
+
+      const envelope = plain("server/discover with a CJK/emoji clientInfo name");
+      const sent = await send(note, envelope, "server/discover", undefined, {
+        meta: { [META.clientInfo]: { name: UNICODE_PROBE, version: "1.0.0" } },
+      });
+      if ("verdict" in sent) return sent.verdict;
+      const res = sent.res;
       const err = errorOf(res.body);
-      if (err?.code === JSONRPC_ERROR_CODES.PARSE_ERROR) {
-        return { passed: false, details: `${render(what)} -> -32700 parse error` };
+      if (err) return { passed: false, details: fitDetails(note, envelope, ` -> ${errorWithCode(err.rawCode)}`) };
+      if (!resultOf(res.body)) return { passed: false, details: fitDetails(note, envelope, " -> non-JSON-RPC reply") };
+      const serialized = JSON.stringify(res.body);
+      if (serialized.includes(UNICODE_PROBE)) {
+        return {
+          passed: true,
+          details: fitDetails(
+            note,
+            plain(""),
+            "server/discover reproduced the CJK/emoji clientInfo name byte-for-byte",
+          ),
+        };
       }
       const mangled = manglingEvidence(serialized);
       if (mangled) {
         return {
           passed: false,
-          details: fitDetails(null, call, ` mangled the CJK/emoji probe: ${mangled} (got ${firstText(res)})`),
+          details: fitDetails(note, plain(""), `server/discover mangled the CJK/emoji clientInfo name: ${mangled}`),
         };
       }
-      // Rejected (unknown args, schema mismatch) or answered without
-      // reflecting its arguments: nothing to compare, so the envelope
-      // probe decides.
-      note = {
-        ...call,
-        after: err ? ` rejected the probe (${errorWithCode(err.rawCode)}); ` : " did not echo the probe; ",
-      };
-    }
-
-    const envelope = plain("server/discover with a CJK/emoji clientInfo name");
-    const sent = await send(note, envelope, "server/discover", undefined, {
-      meta: { [META.clientInfo]: { name: UNICODE_PROBE, version: "1.0.0" } },
-    });
-    if ("verdict" in sent) return sent.verdict;
-    const res = sent.res;
-    const err = errorOf(res.body);
-    if (err) return { passed: false, details: fitDetails(note, envelope, ` -> ${errorWithCode(err.rawCode)}`) };
-    if (!resultOf(res.body)) return { passed: false, details: fitDetails(note, envelope, " -> non-JSON-RPC reply") };
-    const serialized = JSON.stringify(res.body);
-    if (serialized.includes(UNICODE_PROBE)) {
       return {
         passed: true,
-        details: fitDetails(note, plain(""), "server/discover reproduced the CJK/emoji clientInfo name byte-for-byte"),
+        details: fitDetails(
+          note,
+          plain(""),
+          "envelope round-trip verified: server/discover accepted a request whose clientInfo name carries CJK/emoji (no echo path to compare byte-for-byte)",
+        ),
       };
-    }
-    const mangled = manglingEvidence(serialized);
-    if (mangled) {
-      return {
-        passed: false,
-        details: fitDetails(note, plain(""), `server/discover mangled the CJK/emoji clientInfo name: ${mangled}`),
-      };
-    }
-    return {
-      passed: true,
-      details: fitDetails(
-        note,
-        plain(""),
-        "envelope round-trip verified: server/discover accepted a request whose clientInfo name carries CJK/emoji (no echo path to compare byte-for-byte)",
-      ),
     };
+
+    const verdict = await judge();
+    // The verdict read an answer: a child that answered it and then exited or
+    // stopped answering is the verdict instead, so the check after this one
+    // is not blamed for it.
+    return (await settle(true)) ?? verdict;
   });
 
   // ── stdio-unknown-method-recovers ──────────────────────────────
