@@ -334,6 +334,77 @@ describe("2026-07-28 stdio tests: scripted misbehaviour (no fixture knob exists 
     expect(r.details).toMatch(/got no reply \(server exited \(code 2\)\)/);
   });
 
+  /**
+   * Point `ctx` at `next` the way runModernSuite's replaceStdioProcess
+   * does: a new client on the same recorder, everything `next` writes
+   * recorded. Returns how many times it ran.
+   */
+  function wireReplacement(ctx: ModernSuiteContext, next: FakeStdio): { count: number } {
+    const replaced = { count: 0 };
+    let id = 5000;
+    ctx.replaceStdioProcess = async () => {
+      replaced.count++;
+      next.onMessage((m) => ctx.recorder.recordReceived(m));
+      ctx.transport = next;
+      ctx.client = createModernClient({
+        transport: next,
+        recorder: ctx.recorder,
+        nextId: () => id++,
+        timeout: TIMEOUT,
+        protocolVersion: MODERN_SPEC_VERSION,
+        clientCapabilities: { elicitation: {} },
+        clientInfo: { name: "mcp-compliance-test", version: "0.0.0" },
+      });
+    };
+    return replaced;
+  }
+
+  it("stdio-unicode: a child that exits on the envelope probe is replaced, and the two checks after it measure the replacement", async () => {
+    const first = fakeStdio({
+      answer: (method, id, n, params) =>
+        method === "server/discover" && JSON.stringify(params ?? {}).includes(UNICODE_PROBE)
+          ? "crash"
+          : conformant.answer(method, id, n),
+    });
+    const second = fakeStdio(conformant);
+    const ctx = makeContext(first);
+    const replaced = wireReplacement(ctx, second);
+    await runStdio(ctx);
+    const unicode = outcome(ctx, "stdio-unicode");
+    expect(unicode.passed).toBe(false);
+    expect(unicode.details).toBe(
+      "server/discover with a CJK/emoji clientInfo name got no reply (server exited (code 1))",
+    );
+    // Before: never replaced, so both later checks failed against the dead child.
+    expect(replaced.count).toBe(1);
+    for (const id of ["stdio-unknown-method-recovers", "stdio-cancellation"]) {
+      expect(outcome(ctx, id).passed, `${id}: ${outcome(ctx, id).details}`).toBe(true);
+    }
+    // They measured the replacement, not the dead child.
+    expect(first.calls.map(([m]) => m)).not.toContain(BOGUS_METHOD);
+    expect(second.calls.map(([m]) => m)).toContain(BOGUS_METHOD);
+    expect(ctx.harness.warnings).toEqual([
+      "stdio-unicode: the server exited on server/discover with a CJK/emoji clientInfo name and was restarted with a fresh server/discover, so the tests after it ran against the new instance.",
+    ]);
+  });
+
+  it("stdio-unicode: a child already gone before the probe is 'server unreachable' there, and is not replaced", async () => {
+    // The framing burst's first discover kills the child; the probe finds it gone.
+    const fake = fakeStdio({ answer: (method, id, n) => (n === 0 ? "crash" : conformant.answer(method, id, n)) });
+    const ctx = makeContext(fake);
+    const replaced = wireReplacement(ctx, fakeStdio(conformant));
+    await runStdio(ctx);
+    const unicode = outcome(ctx, "stdio-unicode");
+    expect(unicode.passed).toBe(false);
+    // Before: "server/discover with a CJK/emoji clientInfo name got no reply
+    // (server exited (code 1))" -- a crash on a probe that never reached it.
+    expect(unicode.details).toBe(
+      "server unreachable: server/discover with a CJK/emoji clientInfo name got no response (connection closed: stdio transport: server crashed with exit code 1)",
+    );
+    expect(replaced.count).toBe(0);
+    expect(ctx.harness.warnings).toEqual([]);
+  });
+
   /** The clock-server shape from the review: one no-arg tool that answers "12:00" whatever it is sent. */
   const CLOCK_TOOLS: Record<string, unknown>[] = [
     { name: "get_time", inputSchema: { type: "object", properties: {}, additionalProperties: true } },

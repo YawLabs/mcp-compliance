@@ -1,8 +1,10 @@
 import { errorWithCode } from "../../checks/validators.js";
-import { errorOf, type RpcResponse, resultOf } from "../../modern/client.js";
+import type { TestOutcome } from "../../harness.js";
+import { errorOf, type RpcOptions, type RpcResponse, resultOf } from "../../modern/client.js";
 import { JSONRPC_ERROR_CODES, META } from "../../modern/meta.js";
 import type { StdioTransport } from "../../transport/stdio.js";
 import { ensureTools, type ModernSuiteContext } from "./context.js";
+import { restartStdioServer, unreachable } from "./security.js";
 
 /**
  * Stdio-only tests of the 2026-07-28 suite. The catalog gates every id
@@ -11,6 +13,13 @@ import { ensureTools, type ModernSuiteContext } from "./context.js";
  * from the connection model: a single long-lived process whose stdout
  * must stay a clean stream of newline-delimited JSON no matter what the
  * client writes to stdin.
+ *
+ * A child that exits on stdio-unicode's own probe is replaced before the
+ * check returns (security.ts's restartStdioServer, the same policy the
+ * security checks follow), so the checks after it -- the rest of this
+ * module, the late lifecycle block, security, post-hoc -- measure a live
+ * server. Every check therefore sends through `ctx.client`, read at send
+ * time, never a client captured before a restart.
  */
 
 /** Same probe the 2025-11-25 suite uses: Latin-1 accent, CJK, an astral-plane emoji. */
@@ -69,6 +78,12 @@ function explainFailure(ctx: ModernSuiteContext, err: unknown): string {
 /** Keep details ASCII: a server's text can carry anything. */
 function ascii(text: string): string {
   return text.replace(/[^\x20-\x7e]/g, "?");
+}
+
+/** A server-chosen name for details and warnings: ASCII, clipped to `max`. */
+function clipName(text: string, max = 60): string {
+  const safe = ascii(text.replace(/\s+/g, " "));
+  return safe.length > max ? `${safe.slice(0, max - 3)}...` : safe;
 }
 
 /** Short ASCII rendering of a value for "got X" clauses. */
@@ -181,7 +196,7 @@ function escapeNonAscii(text: string): string {
 }
 
 export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
-  const { client, harness } = ctx;
+  const { harness } = ctx;
 
   // ── stdio-framing ──────────────────────────────────────────────
   // Five discovers written without awaiting between them. A server that
@@ -191,7 +206,7 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
   await harness.check("stdio-framing", async () => {
     const settled = await Promise.all(
       Array.from({ length: RAPID_DISCOVERS }, () =>
-        client.rpc("server/discover").then(
+        ctx.client.rpc("server/discover").then(
           (res) => ({ res, err: undefined }),
           (err: unknown) => ({ res: undefined, err }),
         ),
@@ -234,79 +249,93 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
   // an arbitrary first tool rarely does -- so the verdict then rests on
   // the discover envelope: the probe rides in clientInfo.name, and the
   // server parsing and answering that request is the round-trip verified.
+  //
+  // A crash or a hang on non-ASCII stdin is the likeliest real failure
+  // here. A request that gets no reply fails with a one-line reason (never
+  // the transport's multi-line stderr tail, which can echo the probe). A
+  // child that exited on it is replaced (restartStdioServer, whose warning
+  // names this check) so the checks after it measure the server instead
+  // of a dead process -- on every attempt that kills it, --retries
+  // included; one already gone before the request was not killed by it:
+  // "server unreachable", and no restart. A caller's abort is rethrown.
   await harness.check("stdio-unicode", async () => {
+    /**
+     * Send one request carrying the probe: its reply, or the verdict for
+     * none. `what` opens the details; `cause` names the request in the
+     * restart's warning.
+     */
+    const send = async (
+      what: string,
+      cause: string,
+      method: string,
+      params: unknown,
+      opts: RpcOptions,
+    ): Promise<{ res: RpcResponse } | { verdict: TestOutcome }> => {
+      const alreadyGone = exitState(ctx).exited;
+      try {
+        return { res: await ctx.client.rpc(method, params, opts) };
+      } catch (err: unknown) {
+        if (ctx.signal?.aborted) throw err;
+        if (alreadyGone) return { verdict: unreachable(ctx, what, err) };
+        // Read before the restart replaces ctx.transport.
+        const verdict = { passed: false, details: `${what} got no reply (${explainFailure(ctx, err)})` };
+        if (exitState(ctx).exited) await restartStdioServer(ctx, "stdio-unicode", cause);
+        return { verdict };
+      }
+    };
+
     let note = "";
     const tool = await pickUnicodeTool(ctx);
     if (tool) {
-      // A crash or a hang on non-ASCII stdin is the likeliest real failure
-      // here; shape it like the other stdio checks do, so the details never
-      // carry the transport's multi-line stderr tail (which can echo the probe).
-      let res: RpcResponse;
-      try {
-        res = await client.rpc(
-          "tools/call",
-          { name: tool.name, arguments: Object.fromEntries(tool.args.map((arg) => [arg, UNICODE_PROBE])) },
-          { toolInputSchema: tool.inputSchema },
-        );
-      } catch (e: unknown) {
-        return {
-          passed: false,
-          details: `tools/call ${tool.name} with a CJK/emoji argument got no reply (${explainFailure(ctx, e)})`,
-        };
-      }
+      const name = clipName(tool.name);
+      const what = `tools/call ${name} with a CJK/emoji argument`;
+      const sent = await send(
+        what,
+        what,
+        "tools/call",
+        { name: tool.name, arguments: Object.fromEntries(tool.args.map((arg) => [arg, UNICODE_PROBE])) },
+        { toolInputSchema: tool.inputSchema },
+      );
+      if ("verdict" in sent) return sent.verdict;
+      const res = sent.res;
       const serialized = JSON.stringify(res.body);
       if (serialized.includes(UNICODE_PROBE)) {
-        return { passed: true, details: `tools/call ${tool.name} reproduced the CJK/emoji probe byte-for-byte` };
+        return { passed: true, details: `tools/call ${name} reproduced the CJK/emoji probe byte-for-byte` };
       }
       if (reproducesEveryPiece(serialized)) {
         return {
           passed: true,
-          details: `tools/call ${tool.name} reproduced every non-ASCII piece of the CJK/emoji probe (split across the reply, not byte-for-byte)`,
+          details: `tools/call ${name} reproduced every non-ASCII piece of the CJK/emoji probe (split across the reply, not byte-for-byte)`,
         };
       }
       const err = errorOf(res.body);
       if (err?.code === JSONRPC_ERROR_CODES.PARSE_ERROR) {
-        return { passed: false, details: `tools/call ${tool.name} with a CJK/emoji argument -> -32700 parse error` };
+        return { passed: false, details: `tools/call ${name} with a CJK/emoji argument -> -32700 parse error` };
       }
       const mangled = manglingEvidence(serialized);
       if (mangled) {
         return {
           passed: false,
-          details: `tools/call ${tool.name} mangled the CJK/emoji probe: ${mangled} (got ${firstText(res)})`,
+          details: `tools/call ${name} mangled the CJK/emoji probe: ${mangled} (got ${firstText(res)})`,
         };
       }
       // Rejected (unknown args, schema mismatch) or answered without
       // reflecting its arguments: nothing to compare, so the envelope
       // probe decides.
       note = err
-        ? `tools/call ${tool.name} rejected the probe (${errorWithCode(err.rawCode)}); `
-        : `tools/call ${tool.name} did not echo the probe; `;
+        ? `tools/call ${name} rejected the probe (${errorWithCode(err.rawCode)}); `
+        : `tools/call ${name} did not echo the probe; `;
     }
 
-    let res: RpcResponse;
-    try {
-      res = await client.rpc("server/discover", undefined, {
-        meta: { [META.clientInfo]: { name: UNICODE_PROBE, version: "1.0.0" } },
-      });
-    } catch (e: unknown) {
-      return {
-        passed: false,
-        details: `${note}server/discover with a CJK/emoji clientInfo name got no reply (${explainFailure(ctx, e)})`,
-      };
-    }
+    const envelope = "server/discover with a CJK/emoji clientInfo name";
+    const sent = await send(`${note}${envelope}`, envelope, "server/discover", undefined, {
+      meta: { [META.clientInfo]: { name: UNICODE_PROBE, version: "1.0.0" } },
+    });
+    if ("verdict" in sent) return sent.verdict;
+    const res = sent.res;
     const err = errorOf(res.body);
-    if (err) {
-      return {
-        passed: false,
-        details: `${note}server/discover with a CJK/emoji clientInfo name -> ${errorWithCode(err.rawCode)}`,
-      };
-    }
-    if (!resultOf(res.body)) {
-      return {
-        passed: false,
-        details: `${note}server/discover with a CJK/emoji clientInfo name -> non-JSON-RPC reply`,
-      };
-    }
+    if (err) return { passed: false, details: `${note}${envelope} -> ${errorWithCode(err.rawCode)}` };
+    if (!resultOf(res.body)) return { passed: false, details: `${note}${envelope} -> non-JSON-RPC reply` };
     const serialized = JSON.stringify(res.body);
     if (serialized.includes(UNICODE_PROBE)) {
       return { passed: true, details: `${note}server/discover reproduced the CJK/emoji clientInfo name byte-for-byte` };
@@ -328,7 +357,7 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
   await harness.check("stdio-unknown-method-recovers", async () => {
     let first: RpcResponse;
     try {
-      first = await client.rpc(BOGUS_METHOD);
+      first = await ctx.client.rpc(BOGUS_METHOD);
     } catch (err: unknown) {
       return { passed: false, details: `unknown method drew no response (${explainFailure(ctx, err)})` };
     }
@@ -344,7 +373,7 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
     }
     let second: RpcResponse;
     try {
-      second = await client.rpc("server/discover");
+      second = await ctx.client.rpc("server/discover");
     } catch (e: unknown) {
       return {
         passed: false,
@@ -377,7 +406,7 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
   await harness.check("stdio-cancellation", async () => {
     const before = ctx.recorder.received.length;
     try {
-      await client.notify("notifications/cancelled", {
+      await ctx.client.notify("notifications/cancelled", {
         requestId: UNKNOWN_CANCEL_ID,
         reason: "mcp-compliance: cancellation of a request that was never issued",
       });
@@ -386,7 +415,7 @@ export async function runStdio(ctx: ModernSuiteContext): Promise<void> {
     }
     let res: RpcResponse;
     try {
-      res = await client.rpc("server/discover");
+      res = await ctx.client.rpc("server/discover");
     } catch (err: unknown) {
       return {
         passed: false,

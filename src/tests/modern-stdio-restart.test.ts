@@ -233,12 +233,15 @@ describe("2026-07-28 over stdio: a check whose own request kills the server has 
   }, 120_000);
 
   it("a server already gone before a check's own request is unreachable there, not restarted", async () => {
-    // stdio-unicode's tools/call kills the process; the two security checks
-    // after it find it gone. Unchanged by the restart: neither request killed it.
-    const report = await runModern(target(MODERN_FIXTURE, exitOnMarker(ANY_TOOLS_CALL)), {
-      only: ["stdio-unicode", "security-oversized-input", "security-extra-params"],
+    // tools-call-unknown's tools/call kills the process, and that check
+    // restarts nothing; the two security checks after it find it gone.
+    // Unchanged by the restart: neither request killed it. (This used
+    // stdio-unicode as the killer until that check restarted the child too:
+    // modern-unicode-restart.test.ts.)
+    const report = await runModern(target(MODERN_FIXTURE, exitOnMarker("__nonexistent_tool_compliance_test__")), {
+      only: ["tools-list", "tools-call-unknown", "security-oversized-input", "security-extra-params"],
     });
-    expect(resultOf(report, "stdio-unicode").details).toMatch(/got no reply \(server exited \(code 3\)\)$/);
+    expect(resultOf(report, "tools-call-unknown").passed).toBe(false);
     expect(resultOf(report, "security-oversized-input").details).toMatch(
       /^server unreachable: tools\/call echo\.message with a 1 MB value got no response \(connection closed: /,
     );
