@@ -400,6 +400,88 @@ describe("SDK v2 over HTTP, pinned --spec-version 2025-11-25", () => {
       unknown: "PASS: Error code: -32601 (correct: Method not found) — Method not found",
     });
   });
+
+  it("the error checks and lifecycle-jsonrpc, which now read a gate's answer as not evaluable, keep their verdicts", () => {
+    // The SDK answers each of them itself next to a served handshake, so
+    // attributing the answer changes nothing and nothing is warned about.
+    const verdict = (id: string) => {
+      const t = resultOf(report, id);
+      return `${t.passed ? "PASS" : "FAIL"}${t.skipped ? " (skipped)" : ""}: ${t.details}`;
+    };
+    // The SDK's -32602 carries its zod error, a multi-line message.
+    expect(verdict("error-missing-params")).toMatch(
+      /^PASS: Error code: -32602 \(correct: Invalid params\) — Invalid tools\/call request: \[/,
+    );
+    expect({
+      jsonrpc: verdict("lifecycle-jsonrpc"),
+      envelope: verdict("error-invalid-jsonrpc"),
+      parse: verdict("error-invalid-json"),
+      gated: verdict("error-capability-gated"),
+    }).toEqual({
+      jsonrpc: "PASS: Valid JSON-RPC 2.0 response",
+      envelope:
+        "PASS: Error code: -32600 (correct: Invalid Request) — Bad Request: the request body is not a valid JSON-RPC message",
+      parse: "PASS: Error code: -32700 — Parse error: Invalid JSON",
+      gated:
+        "PASS (skipped): Server declares all capabilities (tools, resources, prompts) — no undeclared methods to test",
+    });
+    expect(report.warnings.filter((w) => /^(lifecycle-jsonrpc|error-)/.test(w))).toEqual([]);
+  });
+
+  it("security-cors-headers and lifecycle-progress-token, which now read a missing answer and the progress they get, keep their verdicts", () => {
+    const verdict = (id: string) => {
+      const t = resultOf(report, id);
+      return `${t.passed ? "PASS" : "FAIL"}${t.skipped ? " (skipped)" : ""}: ${t.details}`;
+    };
+    expect({ cors: verdict("security-cors-headers"), progress: verdict("lifecycle-progress-token") }).toEqual({
+      // SDK v2's Origin guard refuses both probes (they carry a foreign
+      // Origin) with no CORS headers.
+      cors: "PASS: No CORS headers returned (OPTIONS HTTP 403, POST HTTP 403; server-to-server only, acceptable)",
+      progress: "PASS: Server accepted request with progressToken (no progress events observed — optional)",
+    });
+    expect(report.warnings.filter((w) => /^(security-cors-headers|lifecycle-progress-token)/.test(w))).toEqual([]);
+  });
+});
+
+describe("SDK v2 behind its Host guard, pinned --spec-version 2025-11-25: the error checks and lifecycle-jsonrpc do not credit the guard", () => {
+  let mounted: Mounted;
+  let report: ComplianceReport;
+
+  beforeAll(async () => {
+    mounted = await mount("stateless", { allowedHosts: ["mcp.example.com"] });
+    report = await runComplianceSuite(mounted.url, {
+      timeout: 5000,
+      specVersion: "2025-11-25",
+      only: [
+        "lifecycle-jsonrpc",
+        "error-invalid-jsonrpc",
+        "error-invalid-json",
+        "error-missing-params",
+        "error-capability-gated",
+      ],
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    await unmount(mounted);
+  });
+
+  it("every request drew the guard's 403, so each fails as not evaluable (before: five passes)", () => {
+    // Before: PASS "Valid JSON-RPC 2.0 response" on the guard's envelope, PASS
+    // "Error code: -32000 — Invalid Host: 127.0.0.1" three times, and PASS
+    // "Tested 3 undeclared method(s) ... all returned errors".
+    const byId = Object.fromEntries(report.tests.map((t) => [t.id, `${t.passed ? "PASS" : "FAIL"}: ${t.details}`]));
+    const rpc403 = "HTTP 403, JSON-RPC error -32000";
+    const handshake = (what: string) =>
+      `not evaluable: the initialize handshake was not served either (${rpc403}), so this rejection proves nothing about ${what} (see lifecycle-init)`;
+    expect(byId).toEqual({
+      "lifecycle-jsonrpc": `FAIL: ${rpc403} on the initialize handshake ("Invalid Host: 127.0.0.1") -- not evaluable: the message names Host/Origin validation, which refuses a request whatever it carries`,
+      "error-invalid-jsonrpc": `FAIL: ${rpc403} on the malformed JSON-RPC message -- ${handshake("the malformed JSON-RPC message")}`,
+      "error-invalid-json": `FAIL: ${rpc403} on the invalid JSON body -- ${handshake("the invalid JSON body")}`,
+      "error-missing-params": `FAIL: ${rpc403} on tools/call without a name -- ${handshake("the missing tool name")}`,
+      "error-capability-gated": `FAIL: tools/list -> ${rpc403}, resources/list -> ${rpc403}, prompts/list -> ${rpc403} -- not evaluable: the initialize handshake was not served (${rpc403}), so the suite never saw which capabilities the server declares, and these answers prove nothing about undeclared methods (see lifecycle-init)`,
+    });
+  });
 });
 
 describe("SDK v2 behind its Host guard, pinned --spec-version 2025-11-25: the negative probes do not credit the guard", () => {
@@ -807,6 +889,20 @@ describe("SDK v2 over stdio (serveStdio)", () => {
     expect(resultOf(report, "error-unknown-method").details).toBe(
       "Error code: -32601 (correct: Method not found) — Method not found",
     );
+    // So are the error checks that run over stdio, and the handshake's
+    // envelope is the SDK's own: reading whose answer each is changes nothing.
+    expect(resultOf(report, "lifecycle-jsonrpc").details).toBe("Valid JSON-RPC 2.0 response");
+    expect(resultOf(report, "error-missing-params").details).toMatch(
+      /^Error code: -32602 \(correct: Invalid params\) — Invalid tools\/call request: \[/,
+    );
+    expect(resultOf(report, "error-capability-gated").details).toBe(
+      "Server declares all capabilities (tools, resources, prompts) — no undeclared methods to test",
+    );
+    // The echo tool reflects the unicode probe intact, judged the 2026-07-28
+    // way now. Before: "Unicode string round-tripped through tool call".
+    expect(resultOf(report, "stdio-unicode").details).toBe(
+      "tools/call echo reproduced the CJK/emoji probe byte-for-byte",
+    );
     // The SDK completes the 1 MB call, which passes as survived with the
     // body-limit advice (the 2026-07-28 suite words it the same way).
     expect(report.warnings.filter((w) => w.startsWith("security-oversized-input"))).toEqual([
@@ -848,6 +944,12 @@ describe("SDK v2 over stdio (serveStdio)", () => {
     expect(resultOf(report, "stdio-framing").details).toBe("5/5 rapid pings returned cleanly");
     expect(resultOf(report, "security-extra-params").details).toBe(
       "Server processed request (extra params likely ignored)",
+    );
+    // Both of rug-pull's lists come from the restarted child: the one read at
+    // the restart, before any tools/call, and one after a tools/call.
+    // Before: the first child's list against the new one's.
+    expect(resultOf(report, "security-tool-rug-pull").details).toBe(
+      "1 tool(s) consistent across 2 calls to the server restarted after security-oversized-input (before and after a tools/call)",
     );
     expect(report.warnings.filter((w) => w.startsWith("security-oversized-input"))).toEqual([
       "security-oversized-input: the server exited on a 1 MB echo.data and was restarted with a fresh initialize handshake, so the tests after it ran against the new instance.",

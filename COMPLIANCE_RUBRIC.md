@@ -127,7 +127,7 @@ The reference tool supports configurable retry behavior:
 - **Retry count** is configurable (default: 0, meaning no retries).
 - **Backoff** is linear: 1 second after the first failure, 2 seconds after the second, 3 seconds after the third, and so on.
 - On retry, only the **test function** re-executes. Session state and prior test results are preserved.
-- On stdio, a check whose own request kills the server (an injection payload, the 1 MB argument of `security-oversized-input`, the unknown arguments of `security-extra-params`, and on 2025-11-25 the second `initialize` of `lifecycle-version-negotiate`, which the details blame rather than its version) fails as died and restarts the server before it returns, with a warning naming the check. Every attempt that kills it restarts it again, so a retry never leaves the tests after it running against a dead process.
+- On stdio, a check whose own request kills the server (an injection payload, the 1 MB argument of `security-oversized-input`, the unknown arguments of `security-extra-params`, and on 2025-11-25 the second `initialize` of `lifecycle-version-negotiate`, which the details blame rather than its version, and the unicode probe of `stdio-unicode`) fails as died and restarts the server before it returns, with a warning naming the check. Every attempt that kills it restarts it again, so a retry never leaves the tests after it running against a dead process. `security-tool-rug-pull` restarts it the same way when its own `tools/call` between the two lists of an already restarted process kills it, and then skips.
 - If **any attempt passes**, the test is marked as passed.
 - The reported `durationMs` covers the entire span from first attempt to final result.
 
@@ -387,9 +387,9 @@ Only tests for the transport under test run; transport-gated rules that do not a
 - **Default required:** No (stdio transport only)
 - **Spec reference:** [basic/transports#stdio](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#stdio)
 - **Transports:** `stdio`
-- **Description:** Sends a request containing non-ASCII characters (CJK + emoji) in its parameters and verifies the response preserves the characters byte-for-byte. Catches encoding mistakes that surface most often on Windows stdio — platform-default code pages, `latin-1` decoding, or byte-swapped UTF-16.
-- **Pass criteria:** The `tools/call` to the first listed tool carrying the non-ASCII payload is answered. A reply that echoes the payload passes, and so does one that does not: the check cannot tell a tool that ignores its input from one that mangled it. **Skipped** when the server declares no tools (`Skipped: server declares no tools, so there is no tool call to carry the unicode probe`); a server that declares tools but lists none passes on a served `tools/list`, recorded as a skip, since no unicode was sent.
-- **Fail criteria:** The `tools/call` carrying the payload gets no answer (a crash, a timeout), or the `tools/list` fallback returns an error. Mojibake or `?` substitution in a reply is **not** detected by this suite (the 2026-07-28 `stdio-unicode` does detect it).
+- **Description:** Sends non-ASCII characters (a Latin-1 accent, CJK and an emoji) through a tool when one is available and verifies they come back intact, judged as the 2026-07-28 rule judges them. Catches encoding mistakes that surface most often on Windows stdio — platform-default code pages, `latin-1` decoding, `?` substitution. The tool is one named `echo`, else the first with a string property named `message`/`text`/`input`/`query`, else the first listed tool (`tools/list` is read on demand when `tools-list` did not run); the probe goes into those echo arguments, or into all four names when the tool declares none.
+- **Pass criteria:** The tool reproduces the probe byte-for-byte, or reproduces every non-ASCII piece of it somewhere in the reply (a tool that tokenizes its input). When the tool does not echo its input or rejects the arguments, or there is no tool to call (none declared, none listed, or no list), a `ping` whose `_meta` carries the probe decides: answered with a result, it passes as the envelope round-trip verified (the 2026-07-28 rule carries the probe in the `clientInfo` name of a `server/discover` instead).
+- **Fail criteria:** The tool reply or the `ping` reply shows mangling: U+FFFD replacement characters, a Latin-1 mis-decode, the non-ASCII characters replaced by `?`, or the non-ASCII characters dropped (the probe's first word, or its ASCII skeleton, with neither the CJK word nor the emoji anywhere in the reply). Also fails when the tool call draws a `-32700` parse error, when the `ping` carrying the probe is answered with an error or a non-JSON-RPC reply, or when a probe that is sent gets no reply (a one-line reason). A child that exits on the probe is restarted with a fresh `initialize` handshake, with a warning naming the check, so the checks after it measure the server; a child already gone before it fails as server unreachable.
 
 ---
 
@@ -461,8 +461,8 @@ Lifecycle tests validate the MCP initialization handshake and post-initializatio
 - **Default required:** Yes
 - **Spec reference:** [basic](https://modelcontextprotocol.io/specification/2025-11-25/basic)
 - **Description:** Validates that the initialize response conforms to JSON-RPC 2.0 message structure. All MCP messages must be valid JSON-RPC 2.0.
-- **Pass criteria:** Response has `jsonrpc` equal to `"2.0"`, an `id` field, and either a `result` or `error` field.
-- **Fail criteria:** Any of the three required JSON-RPC 2.0 fields is missing.
+- **Pass criteria:** Response has `jsonrpc` equal to `"2.0"`, an `id` field, and either a `result` or `error` field. An `error` envelope counts only when it is the server's own; a 403 that the same ping sent on its own as `application/json` did not draw is. A server's own `-32600`, `-32601` or `-32602` refusal of the `initialize` on a 5xx is read as its envelope too, with a warning that a rejected request should get a 4xx.
+- **Fail criteria:** Any of the three required JSON-RPC 2.0 fields is missing. An `initialize` that something in front of the server answered without a result fails as not evaluable, however valid the envelope (a gateway's `-32001` "Unauthorized" on its 401): a 401 or an auth-gate 403 (pass or fix `--auth`); a 429 (a rate limiter); a 5xx without the server's own refusal (a broken server, or a gateway with no backend); or any other 403 when the same ping sent on its own as `application/json` drew the same 403 or got no answer (a guard refusing every request; a message naming Host/Origin validation is quoted). That ping is sent only for such a 403, at most once per run.
 
 ---
 
@@ -567,8 +567,8 @@ Lifecycle tests validate the MCP initialization handshake and post-initializatio
 - **Default required:** No
 - **Spec reference:** [basic/lifecycle#initialization](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#initialization)
 - **Description:** Sends a second `initialize` request within an already-initialized session. Per spec, the client MUST NOT send `initialize` more than once per session; the server SHOULD reject the duplicate rather than reset its state.
-- **Pass criteria:** The server's own rejection: a JSON-RPC error or another HTTP 4xx for the second `initialize` (a 429 is resent once after `Retry-After`, capped at 2 s, and the second answer decides). A connection closed without an answer counts as a rejection next to the served handshake.
-- **Fail criteria:** Server accepts the duplicate `initialize` and returns a 2xx without an error (session state may now be inconsistent). Not evaluable when the first `initialize` was not served (the second is then no duplicate), or when something answered in the server's place: a 401 or an auth-gate 403, a 403 whose message names Host/Origin validation, a 429 on the retry as well, or a 5xx. A 3xx fails as neither a rejection nor a served duplicate; a timeout or a connection never established fails as server unreachable.
+- **Pass criteria:** The server's own rejection: a JSON-RPC error or another HTTP 4xx for the second `initialize` (a 429 is resent once after `Retry-After`, capped at 2 s, and the second answer decides). A 403 without a Bearer challenge is the server's whatever its message names, Host/Origin validation included: the handshake was served with the same Host and Origin (the reading `lifecycle-version-negotiate` gives the same 403). A 5xx carrying the server's own `-32600` passes, with a warning that a rejected request should get a 4xx. A connection closed without an answer counts as a rejection next to the served handshake.
+- **Fail criteria:** Server accepts the duplicate `initialize` and returns a 2xx without an error (session state may now be inconsistent). Not evaluable when the first `initialize` was not served (the second is then no duplicate), or when something answered in the server's place: a 401 or an auth-gate 403, or a 429 on the retry as well. A 5xx without the server's own `-32600` fails as the server failing on the request rather than rejecting the duplicate. A 3xx fails as neither a rejection nor a served duplicate; a timeout or a connection never established fails as server unreachable.
 
 ---
 
@@ -588,9 +588,9 @@ Lifecycle tests validate the MCP initialization handshake and post-initializatio
 - **Category:** lifecycle
 - **Default required:** No
 - **Spec reference:** [basic/utilities#progress](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities#progress)
-- **Description:** Sends a `tools/call` request with `_meta.progressToken` set and observes whether the server emits `notifications/progress` events carrying that token. Progress support is optional but strongly recommended for long-running tool invocations. **Auto-pass** if the server does not declare `tools` capability.
-- **Pass criteria:** Server either emits at least one progress notification that references the supplied `progressToken`, or completes the request normally and ignores the token without error. A `tools/call` that gets no answer measured nothing: it passes, recorded as a skip. One answered with a non-2xx passes as an observation, not a skip.
-- **Fail criteria:** None of its own: progress support is optional, so every answer passes.
+- **Description:** Calls a tool with `_meta.progressToken` set and reads every message on its response. The tool is the first listed without required arguments, preferring one whose name or description mentions progress, else the first listed tool (the 2026-07-28 rule's choice). Progress support is optional but strongly recommended for long-running tool invocations. **Auto-pass** if the server does not declare `tools` capability.
+- **Pass criteria:** Every `notifications/progress` observed carries the request's token and a progress number that increases with each one; no notification at all also passes. With no notification, a served call passes, and so does a 2xx without a JSON-RPC response on it. A server error on the call passes as an observation, not a skip, unless it is reproduced (see below), and so does a 429, a 401 or an auth-gate 403. When the call carrying the token is resent after a served call without it and is served, it passes (a tool whose first call fails whatever it carries, such as a cold backend); progress on the resent call is judged as on the first. A `tools/call` that gets no answer measured nothing: it passes, recorded as a skip.
+- **Fail criteria:** A progress notification carrying a foreign token, without params, or with a non-numeric or non-increasing progress value, whatever the call's own answer. Also fails on a server error (a JSON-RPC error, or an HTTP status >= 400 other than a 429, a 401 or an auth-gate 403) that the token is shown to cause: the same call without the token, sent right after with the same headers, is served, and the call carrying the token, resent after that, draws a server error again. `basic/utilities#progress` lets a receiver ignore the token and send no notifications, not fail the request.
 
 ---
 
@@ -821,9 +821,9 @@ Error handling tests validate that the server correctly rejects invalid requests
 - **Category:** errors
 - **Default required:** Yes
 - **Spec reference:** [basic](https://modelcontextprotocol.io/specification/2025-11-25/basic)
-- **Description:** Sends a malformed JSON-RPC message (a JSON object missing required `jsonrpc`, `id`, and `method` fields) and verifies the server rejects it.
-- **Pass criteria:** Server returns a JSON-RPC error response **or** HTTP 4xx status.
-- **Fail criteria:** Server returns neither a JSON-RPC error nor an HTTP 4xx status.
+- **Description:** Sends a malformed JSON-RPC message (a JSON object missing required `jsonrpc`, `id`, and `method` fields), with the headers every request of the session carries, and verifies the server rejects it. A 429 is resent once after `Retry-After`, capped at 2 s, and the second answer decides.
+- **Pass criteria:** Server returns a JSON-RPC error response **or** HTTP 4xx status that is its own rejection of the message. Any other 403 (one without a Bearer challenge) counts only when a well-formed `ping` sent with the same headers was served or drew a different status, whatever its message says (that ping is sent only in this case). A 5xx carrying the server's own `-32600` passes, with a warning that a rejected request should get a 4xx.
+- **Fail criteria:** Server returns neither a JSON-RPC error nor an HTTP 4xx status, or a 5xx without its own `-32600` (a broken server, or a gateway with no backend). A rejection that is not the server's own fails as not evaluable, whatever JSON-RPC error its body carries (a gateway's `-32001`): when the `initialize` handshake was not served and drew the same status (or no answer); when a 401 or an auth-gate 403, or a 429 on the retry as well, answered in the server's place; or when the well-formed `ping` drew the same 403 (quoted when its message names Host/Origin validation) or got no answer. A caller's abort is rethrown.
 
 ---
 
@@ -832,9 +832,9 @@ Error handling tests validate that the server correctly rejects invalid requests
 - **Category:** errors
 - **Default required:** No
 - **Spec reference:** [basic](https://modelcontextprotocol.io/specification/2025-11-25/basic)
-- **Description:** Sends a body that is not valid JSON and verifies the server returns a parse error.
-- **Pass criteria:** Server returns a JSON-RPC error response **or** HTTP 4xx status.
-- **Fail criteria:** Server returns neither a JSON-RPC error nor an HTTP 4xx status.
+- **Description:** Sends a body that is not valid JSON and verifies the server returns a parse error. The answer is read as `error-invalid-jsonrpc` reads its probe.
+- **Pass criteria:** Server returns a JSON-RPC error response **or** HTTP 4xx status that is its own rejection of the body. Any other 403 (one without a Bearer challenge) counts only when a well-formed `ping` sent with the same headers was served or drew a different status. A 5xx carrying the server's own `-32700` passes, with a warning that a rejected request should get a 4xx.
+- **Fail criteria:** Server returns neither a JSON-RPC error nor an HTTP 4xx status, or a 5xx without its own `-32700`. Not evaluable when the `initialize` handshake was not served and drew the same status (or no answer), when a 401 or an auth-gate 403, or a 429 on the retry as well, answered in the server's place, or when the well-formed `ping` drew the same 403 or got no answer.
 
 ---
 
@@ -843,9 +843,9 @@ Error handling tests validate that the server correctly rejects invalid requests
 - **Category:** errors
 - **Default required:** No
 - **Spec reference:** [server/tools#error-handling](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#error-handling)
-- **Description:** Calls `tools/call` with an empty params object (missing the required `name` field) and verifies the server returns an error.
-- **Pass criteria:** Server returns a JSON-RPC error **or** a result with `isError: true`.
-- **Fail criteria:** Server returns no error.
+- **Description:** Calls `tools/call` with an empty params object (missing the required `name` field) and verifies the server returns an error. A 429 is resent once after `Retry-After`, capped at 2 s, and the second answer decides.
+- **Pass criteria:** Server returns a JSON-RPC error that is its own **or** a result with `isError: true`. Any other 403 (one without a Bearer challenge) counts only when the same request for `ping` was served or drew a different status (that ping is sent only in this case). A 5xx carrying the server's own `-32602` passes, with a warning that a rejected request should get a 4xx.
+- **Fail criteria:** Server returns no error, or a 5xx without its own `-32602`. A JSON-RPC error that is not the server's own fails as not evaluable: the `initialize` handshake was not served and drew the same status (or no answer); a 401 or an auth-gate 403, or a 429 on the retry as well, answered in the server's place, whatever JSON-RPC error its body carries; or the `ping` drew the same 403 or got no answer.
 
 ---
 
@@ -888,8 +888,8 @@ Error handling tests validate that the server correctly rejects invalid requests
 - **Default required:** No
 - **Spec reference:** [basic/lifecycle#capability-negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#capability-negotiation)
 - **Description:** Calls list methods (`tools/list`, `resources/list`, `prompts/list`) for capabilities the server did **not** declare in its `initialize` response and verifies each receives an error. Servers that silently handle methods for undeclared capabilities mislead clients about their available surface.
-- **Pass criteria:** For every list method whose capability was not declared, the server returns a JSON-RPC error (preferably `-32601` Method not found). A server that declares all three capabilities leaves nothing to probe; that pass is recorded as a skip.
-- **Fail criteria:** The server returns a successful result for a list method whose capability it did not declare.
+- **Pass criteria:** For every list method whose capability was not declared, the server returns a JSON-RPC error (preferably `-32601` Method not found), each its own rejection; a 429 is resent once after `Retry-After`, capped at 2 s. A 5xx carrying the server's own `-32601` passes, with a warning that a rejected request should get a 4xx. A server that declares all three capabilities leaves nothing to probe; that pass is recorded as a skip.
+- **Fail criteria:** The server returns a successful result for a list method whose capability it did not declare, or a 5xx without its own `-32601`. When the `initialize` handshake was not served, no capability declaration was seen: every list method is still probed and its answer listed, but the test fails as not evaluable whatever the answers (as the 2026-07-28 rule does). Next to a served handshake, a rejection by a 401 or an auth-gate 403, a 429 on the retry as well, or any other 403 when the same request for `ping` (asked at most once for the three methods) drew the same 403 or got no answer fails as not evaluable.
 
 ---
 
@@ -1049,9 +1049,9 @@ All security tests are **optional** by default (severity: warning). They do not 
 
 - **Default required:** No
 - **Spec reference:** [basic/authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
-- **Description:** Fetches the RFC 9728 Protected Resource Metadata document at `/.well-known/oauth-protected-resource` and validates it carries `resource` and a non-empty `authorization_servers` array; a legacy `/.well-known/oauth-authorization-server` document is accepted with a warning. Only the root well-known locations are tried, and a `resource_metadata` URL in a `WWW-Authenticate` challenge is not read (the 2026-07-28 rule does both).
-- **Pass criteria:** Protected Resource Metadata is served with both fields, or legacy OAuth AS metadata exists (with a warning). Skipped without `--auth` (`Skipped: no --auth provided`). When neither document is found, both locations answered HTTP 403, and `security-auth-required` could not attribute the endpoint's bare 403 to authentication, the lookup met the same guard: it is skipped (`Skipped: HTTP 403 without a Bearer challenge on the endpoint and on every well-known metadata location, not attributable to authentication (see security-auth-required)`) instead of failing.
-- **Fail criteria:** Neither document is reachable or valid (missing, non-JSON, or lacking the required fields).
+- **Description:** Looks up RFC 9728 Protected Resource Metadata as a client must, as the 2026-07-28 rule does, and validates it carries `resource` and a non-empty `authorization_servers` array. First the `resource_metadata` URL of the `WWW-Authenticate` challenge on the unauthenticated ping `security-auth-required` sends (shared with it; read when that ping drew a 401, or a 403 carrying a Bearer challenge), and only that URL. Without one, `/.well-known/oauth-protected-resource` followed by the endpoint path, then `/.well-known/oauth-protected-resource`, then a legacy `/.well-known/oauth-authorization-server` document.
+- **Pass criteria:** The advertised URL, or without one the first well-known location with a valid document, returns JSON with both fields. A `resource` that is not the MCP endpoint in canonical form passes with a warning (RFC 9728 section 3.3). With no document (valid or malformed) at any well-known location, legacy OAuth AS metadata passes with a warning. Skipped without `--auth` (`Skipped: no --auth provided`). When the unauthenticated ping drew a bare 403 that `security-auth-required` could not attribute to authentication, and every well-known location and the legacy document drew that same status, the lookup met the same guard: it is skipped (`Skipped: HTTP 403 without a Bearer challenge on the endpoint and on every well-known metadata location, not attributable to authentication (see security-auth-required)`) instead of failing.
+- **Fail criteria:** An advertised `resource_metadata` that is not an absolute http(s) URL, or that is unreachable, non-200, non-JSON or missing either field; clients MUST use it, so a valid well-known document elsewhere is only named in the details. Without a challenge URL: no well-known location answers, the first document found is malformed and none is valid, or no valid document and no legacy document is found. An unauthenticated ping that gets no HTTP answer fails as server unreachable, except a connection closed without an answer next to the served credentialed handshake, which goes on to the well-known locations. A caller's abort is rethrown.
 
 #### `security-token-in-uri` -- Rejects auth tokens in query string
 
@@ -1065,9 +1065,9 @@ All security tests are **optional** by default (severity: warning). They do not 
 
 - **Default required:** No
 - **Spec reference:** [basic/transports#streamable-http](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
-- **Description:** Sends an OPTIONS request with `Origin: https://evil.example.com` and checks the CORS response headers.
-- **Pass criteria:** No CORS headers, or Access-Control-Allow-Origin is a specific origin (not `*` or reflected). An OPTIONS request that gets no HTTP answer (a timeout, a refused or dropped connection) also passes, as no CORS.
-- **Fail criteria:** Access-Control-Allow-Origin is `*` or reflects arbitrary origins.
+- **Description:** Sends two probes carrying `Origin: https://evil.example.com` and checks the CORS response headers on both, as the 2026-07-28 rule does: an OPTIONS preflight (capped at 5 s), and a `ping` sent as the handshake's request, with its headers, as a POST with the run's timeout (MCP does not require a server to handle OPTIONS).
+- **Pass criteria:** No CORS headers on either answer, or Access-Control-Allow-Origin is a specific origin (not `*` or reflected), whatever the status. When neither probe gets an HTTP answer, a connection the server accepted and closed on both passes as cross-origin requests refused, but only next to the served `initialize` handshake.
+- **Fail criteria:** Access-Control-Allow-Origin is `*` or reflects arbitrary origins on either answer (the details note Access-Control-Allow-Credentials). When neither probe gets an HTTP answer and they were not both closed next to the served handshake (a timeout, a connection never established, any other failure), the test fails as server unreachable. A caller's abort is rethrown.
 
 #### `security-origin-validation` -- Validates `Origin` header on requests
 
@@ -1145,7 +1145,7 @@ All security tests are **optional** by default (severity: warning). They do not 
 - **Capability-gated:** tools
 - **Spec reference:** [server/tools#listing-tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#listing-tools)
 - **Description:** Calls `tools/list` twice and compares results. Tool definitions should not change silently within a session.
-- **Pass criteria:** Tool count, names, and descriptions are identical across both calls. The first list is the one cached when the tools tests ran, so on stdio, after the runner restarted a child an earlier check killed, the two lists come from different processes (the 2026-07-28 rule compares two lists from the new process instead).
+- **Pass criteria:** Tool count, names, and descriptions are identical across both calls. The first list is the one cached when the tools tests ran. On stdio, once the runner has restarted a child an earlier check killed after that list was read, both lists come from the new process, as in the 2026-07-28 rule: the one read at the restart, before any `tools/call` reached it, and one read after a `tools/call` with no arguments; the details name the check the restart followed. When the new process leaves nothing to compare (its list before use was not read, or the `tools/call` killed it too and it was restarted again), the test skips with a warning.
 - **Fail criteria:** Any difference in tool count, names, or descriptions (possible rug-pull attack).
 
 #### `security-tool-description-poisoning` -- Tool descriptions free of injection patterns

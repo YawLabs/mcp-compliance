@@ -74,14 +74,15 @@ describe("integration (stdio) — legacy checks with nothing to measure over std
       "tools-list",
       "stdio-unicode",
     ]);
+    // Before: "Unicode string round-tripped through tool call".
     expect(view(report)["stdio-unicode"]).toEqual({
       passed: true,
       skipped: undefined,
-      details: "Unicode string round-tripped through tool call",
+      details: "tools/call echo reproduced the CJK/emoji probe byte-for-byte",
     });
   }, 30_000);
 
-  it("stdio-unicode: with no tool to carry the probe nothing unicode is sent, so it skips", async () => {
+  it("stdio-unicode: with no tool to carry the probe, a ping carrying it in _meta is the round trip measured", async () => {
     const dir = mkdtempSync(join(tmpdir(), "mcp-legacy-unicode-"));
     const script = join(dir, "no-tool-server.mjs");
     writeFileSync(script, NO_TOOL_STDIO_SERVER);
@@ -92,22 +93,26 @@ describe("integration (stdio) — legacy checks with nothing to measure over std
         args: [script],
         env: { TOOLS: tools },
       });
-      // A server that declares no tools. Before: FAIL "tools/list returned
-      // error" -- its -32601 to a list it never offered.
+      // The 2026-07-28 check's reading: with no tool to call, a request
+      // whose envelope carries the probe (there a server/discover's
+      // clientInfo name, here a ping's _meta) is the round trip, which the
+      // server parsing and answering verifies -- a measurement, not a skip.
+      // A server that declares no tools: 0.19.0 skipped it ("Skipped: server
+      // declares no tools, so there is no tool call to carry the unicode
+      // probe"), and before that FAILED "tools/list returned error" -- its
+      // -32601 to a list it never offered. It is still not asked for one.
+      const envelope = {
+        passed: true,
+        skipped: undefined,
+        details:
+          "envelope round-trip verified: ping answered a request whose _meta carries CJK/emoji (no echo path to compare byte-for-byte)",
+      };
       const none = await run(target("none"), ["stdio-unicode"]);
-      expect(view(none)["stdio-unicode"]).toEqual({
-        passed: true,
-        skipped: true,
-        details: "Skipped: server declares no tools, so there is no tool call to carry the unicode probe",
-      });
-      // Declared but empty: tools/list is still asked, and a served list is
-      // a pass that measured nothing about unicode. Before: unflagged.
+      expect(view(none)["stdio-unicode"]).toEqual(envelope);
+      // Declared but empty. 0.19.0: a skip on the served tools/list ("tools/list
+      // returned successfully (no tools to probe with unicode)").
       const empty = await run(target("empty"), ["tools-list", "stdio-unicode"]);
-      expect(view(empty)["stdio-unicode"]).toEqual({
-        passed: true,
-        skipped: true,
-        details: "tools/list returned successfully (no tools to probe with unicode)",
-      });
+      expect(view(empty)["stdio-unicode"]).toEqual(envelope);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -163,6 +163,23 @@ describe("integration — full compliance suite against real server", () => {
     expect(t?.details).toBe("Server accepted request with progressToken (no progress events observed — optional)");
   }, 30000);
 
+  it("security-cors-headers keeps its verdict on the SDK server", async () => {
+    // The SDK server answers the OPTIONS preflight (405, no CORS headers)
+    // and serves the ping carrying the foreign Origin (200, none either):
+    // reading both probes, and one that got no answer, the 2026-07-28 way
+    // changes nothing but the details for a server that answers them.
+    const report = await runComplianceSuite(serverUrl, {
+      timeout: 3000,
+      specVersion: "2025-11-25",
+      only: ["security-cors-headers"],
+    });
+    const t = report.tests.find((x) => x.id === "security-cors-headers");
+    expect({ passed: t?.passed, details: t?.details }).toEqual({
+      passed: true,
+      details: "No CORS headers returned (OPTIONS HTTP 405, POST HTTP 200; server-to-server only, acceptable)",
+    });
+  }, 30000);
+
   it("security-auth-required and security-oversized-input keep their verdicts on the SDK server", async () => {
     // No auth at all: the unauthenticated preflight was served (a JSON-RPC
     // 400, not a 401/403). The 1 MB tools/call is answered over SSE with a
@@ -262,6 +279,35 @@ describe("integration — full compliance suite against real server", () => {
         "PASS: Server rejected unknown version with error: -32600 — Invalid Request: Server already initialized",
       "error-unknown-method": "PASS: Error code: -32601 (correct: Method not found) — Method not found",
     });
+  }, 30000);
+
+  it("the error checks and lifecycle-jsonrpc, which now read a gate's answer as not evaluable, keep their verdicts on the SDK server", async () => {
+    // The SDK answers each probe itself next to a served handshake: a 400
+    // with -32700 for the malformed message and the invalid JSON, a -32603
+    // on 200 for tools/call without a name (its zod error), so attributing
+    // the answer changes nothing. The server declares all three
+    // capabilities, so error-capability-gated has nothing to probe.
+    const report = await runComplianceSuite(serverUrl, {
+      timeout: 3000,
+      only: [
+        "lifecycle-jsonrpc",
+        "error-invalid-jsonrpc",
+        "error-invalid-json",
+        "error-missing-params",
+        "error-capability-gated",
+      ],
+    });
+    const verdicts = Object.fromEntries(report.tests.map((t) => [t.id, `${t.passed ? "PASS" : "FAIL"}: ${t.details}`]));
+    expect(verdicts["error-missing-params"]).toMatch(/^PASS: Error code: -32603 — \[/);
+    delete verdicts["error-missing-params"];
+    expect(verdicts).toEqual({
+      "lifecycle-jsonrpc": "PASS: Valid JSON-RPC 2.0 response",
+      "error-invalid-jsonrpc": "PASS: Error code: -32700 — Parse error: Invalid JSON-RPC message",
+      "error-invalid-json": "PASS: Error code: -32700 — Parse error: Invalid JSON",
+      "error-capability-gated":
+        "PASS: Server declares all capabilities (tools, resources, prompts) — no undeclared methods to test",
+    });
+    expect(report.warnings.filter((w) => /^(lifecycle-jsonrpc|error-)/.test(w))).toEqual([]);
   }, 30000);
 
   it("the passes that measured nothing are the flagged ones, and nothing the server was measured on is flagged", async () => {

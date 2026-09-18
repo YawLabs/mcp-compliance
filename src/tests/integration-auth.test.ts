@@ -761,8 +761,12 @@ describe("integration — legacy auth siblings read the SDK server the way the 2
         headers: authHeaders(),
         only: [OAUTH],
       });
+      // Both well-known locations are named (the endpoint path, then the
+      // root), as the 2026-07-28 lookup names them. Before: "PRM endpoint
+      // returned HTTP 403 and no legacy OAuth metadata found".
       expect(verdicts(report)).toEqual({
-        [OAUTH]: "FAIL: PRM endpoint returned HTTP 403 and no legacy OAuth metadata found",
+        [OAUTH]:
+          "FAIL: No Protected Resource Metadata (/.well-known/oauth-protected-resource/mcp -> HTTP 403; /.well-known/oauth-protected-resource -> HTTP 403) and no legacy OAuth metadata",
       });
     } finally {
       await sdk.stop();
@@ -908,6 +912,98 @@ describe("integration — the legacy negative probes do not credit an auth gate'
         "transport-batch-reject": `FAIL: HTTP 429, then after 0ms HTTP 429 on the batch -- ${limiter} the batch was never looked at`,
         "lifecycle-version-negotiate": `FAIL: HTTP 429, then after 0ms HTTP 429 on the initialize requesting protocol version 2099-01-01 -- ${handshake} the unknown version (see lifecycle-init)`,
         "error-unknown-method": `FAIL: HTTP 429, then after 0ms HTTP 429 on nonexistent/method -- ${handshake} the unknown method (see lifecycle-init)`,
+      });
+    } finally {
+      await sdk.stop();
+    }
+  }, 30000);
+});
+
+describe("integration — the legacy error checks and lifecycle-jsonrpc do not credit an auth gate's envelope as the server's", () => {
+  // error-invalid-jsonrpc, error-invalid-json, error-missing-params and
+  // error-capability-gated pass on a JSON-RPC error; lifecycle-jsonrpc passes
+  // on a valid envelope. A gate in front of the SDK server writes a valid
+  // -32001 envelope on every refusal without the server ever seeing the
+  // request.
+  const CHECKS = [
+    "lifecycle-jsonrpc",
+    "error-invalid-jsonrpc",
+    "error-invalid-json",
+    "error-missing-params",
+    "error-capability-gated",
+  ];
+  const verdicts = (report: Awaited<ReturnType<typeof runComplianceSuite>>) =>
+    Object.fromEntries(report.tests.map((t) => [t.id, `${t.passed ? "PASS" : "FAIL"}: ${t.details}`]));
+  const AUTH_GATE = "not evaluable: an auth gate answered before the server read the request (pass --auth)";
+  const RPC_401 = "HTTP 401, JSON-RPC error -32001";
+
+  it("the auth-requiring server without --auth: its 401 on every request is not five answers of the server's (before: five passes)", async () => {
+    // Before: PASS "Valid JSON-RPC 2.0 response", PASS "Error code: -32001 —
+    // Unauthorized" three times, PASS "Tested 3 undeclared method(s) ... all
+    // returned errors".
+    const report = await runComplianceSuite(serverUrl, { timeout: 3000, specVersion: "2025-11-25", only: CHECKS });
+    const handshake = (what: string) =>
+      `not evaluable: the initialize handshake was not served either (${RPC_401}), so this rejection proves nothing about ${what} (see lifecycle-init)`;
+    expect(verdicts(report)).toEqual({
+      "lifecycle-jsonrpc": `FAIL: ${RPC_401} on the initialize handshake -- ${AUTH_GATE}`,
+      "error-invalid-jsonrpc": `FAIL: ${RPC_401} on the malformed JSON-RPC message -- ${handshake("the malformed JSON-RPC message")}`,
+      "error-invalid-json": `FAIL: ${RPC_401} on the invalid JSON body -- ${handshake("the invalid JSON body")}`,
+      "error-missing-params": `FAIL: ${RPC_401} on tools/call without a name -- ${handshake("the missing tool name")}`,
+      "error-capability-gated": `FAIL: tools/list -> ${RPC_401}, resources/list -> ${RPC_401}, prompts/list -> ${RPC_401} -- not evaluable: the initialize handshake was not served (${RPC_401}), so the suite never saw which capabilities the server declares, and these answers prove nothing about undeclared methods (see lifecycle-init)`,
+    });
+  }, 30000);
+
+  it("the same server with the valid token: the server's own answers keep their PASSes", async () => {
+    const report = await runComplianceSuite(serverUrl, {
+      timeout: 3000,
+      specVersion: "2025-11-25",
+      headers: authHeaders(),
+      only: CHECKS,
+    });
+    const byId = verdicts(report);
+    expect(byId["error-missing-params"]).toMatch(/^PASS: Error code: -32603 — \[/);
+    delete byId["error-missing-params"];
+    expect(byId).toEqual({
+      "lifecycle-jsonrpc": "PASS: Valid JSON-RPC 2.0 response",
+      "error-invalid-jsonrpc": "PASS: Error code: -32700 — Parse error: Invalid JSON-RPC message",
+      "error-invalid-json": "PASS: Error code: -32700 — Parse error",
+      "error-capability-gated":
+        "PASS: Tested 2 undeclared method(s): resources/list, prompts/list — all returned errors",
+    });
+  }, 30000);
+
+  it("a gateway that exempts initialize: the four error checks' 401s are the gateway's (before: four passes)", async () => {
+    const sdk = await startSdkBehind(initializeExemptGateway);
+    try {
+      const report = await runComplianceSuite(sdk.url, { timeout: 3000, specVersion: "2025-11-25", only: CHECKS });
+      expect(report.serverInfo.name).toBe("auth-test-server");
+      expect(verdicts(report)).toEqual({
+        "lifecycle-jsonrpc": "PASS: Valid JSON-RPC 2.0 response",
+        "error-invalid-jsonrpc": `FAIL: ${RPC_401} on the malformed JSON-RPC message -- ${AUTH_GATE}`,
+        "error-invalid-json": `FAIL: ${RPC_401} on the invalid JSON body -- ${AUTH_GATE}`,
+        "error-missing-params": `FAIL: ${RPC_401} on tools/call without a name -- ${AUTH_GATE}`,
+        "error-capability-gated": `FAIL: ${RPC_401} on resources/list -- ${AUTH_GATE}; ${RPC_401} on prompts/list -- ${AUTH_GATE}`,
+      });
+    } finally {
+      await sdk.stop();
+    }
+  }, 30000);
+
+  it("a rate limiter's 429 on every request without the token: not evaluable (before: three passes)", async () => {
+    const sdk = await startSdkBehind(rateLimitingGateway);
+    try {
+      const report = await runComplianceSuite(sdk.url, { timeout: 3000, specVersion: "2025-11-25", only: CHECKS });
+      const handshake = (what: string) =>
+        `not evaluable: the initialize handshake was not served either (HTTP 429), so this rejection proves nothing about ${what} (see lifecycle-init)`;
+      const twice = "HTTP 429, then after 0ms HTTP 429";
+      expect(verdicts(report)).toEqual({
+        "lifecycle-jsonrpc":
+          "FAIL: HTTP 429 on the initialize handshake -- not evaluable: a rate limiter answered before the server read the request, so the initialize request was never looked at",
+        "error-invalid-jsonrpc": `FAIL: ${twice} on the malformed JSON-RPC message -- ${handshake("the malformed JSON-RPC message")}`,
+        "error-invalid-json": `FAIL: ${twice} on the invalid JSON body -- ${handshake("the invalid JSON body")}`,
+        "error-missing-params": `FAIL: ${twice} on tools/call without a name -- ${handshake("the missing tool name")}`,
+        "error-capability-gated":
+          "FAIL: tools/list -> HTTP 429, resources/list -> HTTP 429, prompts/list -> HTTP 429 -- not evaluable: the initialize handshake was not served (HTTP 429), so the suite never saw which capabilities the server declares, and these answers prove nothing about undeclared methods (see lifecycle-init)",
       });
     } finally {
       await sdk.stop();
