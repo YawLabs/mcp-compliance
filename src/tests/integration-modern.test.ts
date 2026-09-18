@@ -192,8 +192,11 @@ for (const ex of EXPECTED) {
         requiredPassed: report.tests.filter((t) => t.required).length,
         skipped: ex.skipped.length,
       });
-      // The passes that measured nothing, and only those; the score math
-      // does not read the flag (the grade and score above are unchanged).
+      // The passes that measured nothing, and only those. The score leaves
+      // them out, which moves nothing on this fixture: every skip is an
+      // optional pass, so over http measured optional is 54/56 (60/62 when
+      // skips scored as passes) and 70 + 28.93 still rounds to 99; over
+      // stdio it is 43/43 (45/45), 100 either way.
       expect(
         report.tests
           .filter((t) => t.skipped)

@@ -3612,8 +3612,9 @@ describe("runComplianceSuite — legacy lifecycle-reinit-reject credits only the
 // answer came back to read -- carry TestResult.skipped, as the checks worded
 // "Skipped ...", "(skipped)" or "not applicable" already did. Before, these
 // were plain passes: the harness infers a skip only from those markers.
-// Score math does not move (a skip is still passed: true); only the flag,
-// and details that claimed an answer that never came, do.
+// A skip is still passed: true; what changes is the flag, details that
+// claimed an answer that never came, and, through the flag, the score,
+// which leaves skips out (pinned in grader.test.ts).
 // ---------------------------------------------------------------------------
 describe("runComplianceSuite — legacy passes that measured nothing are flagged as skips", () => {
   async function runStub(

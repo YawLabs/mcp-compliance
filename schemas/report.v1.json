@@ -53,7 +53,7 @@
       "type": "number",
       "minimum": 0,
       "maximum": 100,
-      "description": "Weighted compliance score: required tests 70%, optional 30%."
+      "description": "Weighted compliance score over the tests that measured something: required tests 70%, optional 30%, and the other bucket alone when one is empty. Skipped tests (TestResult.skipped) are left out of both the numerator and the denominator, and a run in which no test measured anything (none ran, or every one skipped) scores 0. Reports written by mcp-compliance 0.19.0 and earlier scored skips as passes."
     },
     "grade": {
       "type": "string",
@@ -77,7 +77,7 @@
         "skipped": {
           "type": "integer",
           "minimum": 0,
-          "description": "How many of `passed` measured nothing (TestResult.skipped). Optional: reports written before this field existed omit it. Skips are counted in `passed` and in the score denominator."
+          "description": "How many of `passed` measured nothing (TestResult.skipped). Optional: reports written before this field existed omit it. Skips are counted in `passed` but left out of the score."
         }
       },
       "additionalProperties": false
@@ -153,7 +153,7 @@
         "passed": { "type": "boolean" },
         "skipped": {
           "type": "boolean",
-          "description": "True when the check measured nothing: a precondition was absent (no --auth, no tools declared, a check that does not apply on this transport) or an earlier check could not attribute the server's refusal. A skip is still `passed: true` -- it is not a failure, and it counts in summary.passed and the score -- so this flag is the only thing that distinguishes it. Optional: absent means the check produced a verdict, and a result with `passed: false` never carries it."
+          "description": "True when the check measured nothing: a precondition was absent (no --auth, no tools declared, a check that does not apply on this transport) or an earlier check could not attribute the server's refusal. A skip is still `passed: true` -- it is not a failure, and it counts in summary.passed -- so this flag is the only thing that distinguishes it. The score leaves skips out of both its numerator and its denominator. Optional: absent means the check produced a verdict, and a result with `passed: false` never carries it."
         },
         "required": { "type": "boolean" },
         "details": { "type": "string" },

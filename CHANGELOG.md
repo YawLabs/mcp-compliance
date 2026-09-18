@@ -9,10 +9,73 @@ out explicitly here.
 
 ## [Unreleased]
 
+### Changed
+- **A skipped check no longer counts in the score, so grades can move.** A
+  check that measured nothing (`skipped: true`: no `--auth`, no tools
+  declared, a check that does not apply on the transport, a refusal an
+  earlier check could not attribute) used to score as a pass. It is now left
+  out of both the numerator and the denominator: the 70% required / 30%
+  optional weighting applies to the checks that measured something, and when
+  every required or every optional check skipped, the other pool carries the
+  whole score. A run in which every check skipped scores 0 (F), like a run in
+  which none ran, and the terminal, markdown, HTML and GitHub `::notice`
+  reports, the SARIF invocation properties (a `note` key) and the MCP
+  `mcp_compliance_test` tool say so in words: "No test measured anything --
+  all N that ran were skipped, and skips are left out of the score". The JSON
+  report carries no prose; there `summary.skipped` equals `summary.total`.
+  The skip caveats that said skips were "counted as passes in the score" now
+  say they are "left out of the score".
+  - How far a server moves depends on its failures and skips, not on whether
+    it is "clean". On the reference servers no rounded score moved: the SDK
+    v1 server's full 2025-11-25 run stays 96 (A) (95.7 unrounded, was 96.4),
+    and the modern fixture's full 2026-07-28 run stays 99 (A) over HTTP and
+    100 (A) over stdio. A run without skips does not move at all, nor does
+    one without failures that measured anything. Otherwise the drop grows
+    with the number of failures times the number of skips in a pool (in a
+    pool of N checks with F failures and S skips, weight x F x S / (N x
+    (N - S)) points, weight 70 or 30, while both pools have measured
+    checks), so a server whose required checks all pass can still lose a
+    grade: 15 of 50 optional checks failing and 20 skipped takes it from
+    91 (A) to 85 (B).
+  - A run where most checks measured nothing can drop several grades. With
+    `--only security --auth` against an SDK v1 server behind the SDK's Host
+    guard allowing only another hostname (every request draws a bare 403),
+    2025-11-25 goes from 78 (B) to 29 (F), because 16 of its 18 passes
+    measured nothing, and 2026-07-28 from 86 (B) to 40 (D), 16 of 18 as well.
+  - Unchanged: `overall` ("fail" on a required failure or an empty run), so
+    `--strict` exits as before, and a run in which every check skipped is
+    `pass` with grade F; `summary.passed` / `failed` / `total` / `required` /
+    `requiredPassed` / `skipped` and the per-category counts, where a skip
+    still counts as passed (`passed + failed = total`); report schema v1,
+    whose descriptions now say how the score treats skips. `--min-grade`
+    gates, badges and dashboards keyed on grade or score see the move.
+  - The terminal category bars (bar, colour and percentage) and the HTML
+    category cards count what was measured, as the score does: with
+    `--only security`, `Security 18/23` with 16 skips reads 29% under grade
+    F 29%, not 78%. A category in which every check skipped reads `--` over
+    an empty dim bar in the terminal and is grey, not green, in HTML. The
+    `passed/total` ratio next to the bar still counts skips as passes.
+  - `diff` scores both reports from their results as this version does,
+    instead of copying each file's stored score onto the grade line. A
+    report written by 0.19.0 or earlier scored skips as passes, so against
+    such a baseline the grade line used to show a drop
+    (`Grade B (78%) ↓ F (29%)`) above "No changes between baseline and
+    current"; both sides now read the same, and a note under the grade line
+    names the score the file recorded and why it differs. A baseline from before skip tracking
+    (0.18.x) has its skips read from their wording, as for the per-check
+    statuses. The diff JSON adds `recordedScores` (`{ baseline, current }`,
+    each null when the file's score agrees with its results).
+  - The methodology (`COMPLIANCE_RUBRIC.md`, and `specVersion` in
+    `mcp-compliance-rules.json`) goes to 3.0.0: under its own versioning
+    rules a scoring algorithm change is a major bump. 0.19.0 implements
+    2.0.0; this release is the first to implement 3.0.0.
+  - Grades can move, so this is a minor release rather than a patch.
+
 ### Fixed
 - **The 2025-11-25 checks that 0.19.0 left untightened now read their answers
-  honestly, most of them as the 2026-07-28 suite does.** Score math is
-  unchanged; verdicts on the checks below are not.
+  honestly, most of them as the 2026-07-28 suite does.** These fixes leave
+  the score math alone (the skip change is under Changed); verdicts on the
+  checks below move.
   - `error-invalid-jsonrpc`, `error-invalid-json`, `error-missing-params` and
     `error-capability-gated` credited a gateway's JSON-RPC error body (a 401's
     `-32001` "Unauthorized") as the server's rejection, and `lifecycle-jsonrpc`

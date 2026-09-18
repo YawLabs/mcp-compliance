@@ -1,11 +1,11 @@
 # @yawlabs/mcp-compliance Testing Methodology
 
-**Version:** 2.0.0
-**Date:** 2026-09-14
+**Version:** 3.0.0
+**Date:** 2026-09-18
 **MCP Spec Compatibility:** [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) and [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28)
 **License:** [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 **Maintained by:** [Yaw Labs / mcp-compliance](https://github.com/YawLabs/mcp-compliance)
-**Implementation:** `@yawlabs/mcp-compliance` v0.19.0+
+**Implementation:** `@yawlabs/mcp-compliance` v0.20.0+ (v0.19.0 implements methodology 2.0.0, which scored a skip as a pass)
 
 ---
 
@@ -117,7 +117,7 @@ In the 2026-07-28 catalog every rule in the `tools`, `resources` and `prompts` c
 **Rules for capability-driven tests:**
 
 - If a server declares a capability, the corresponding tests become **required** and are expected to pass.
-- If a server does not declare a capability, the corresponding tests either **auto-pass** (for tests that check for the capability before executing) or are **skipped** (for tests gated behind capability checks). An auto-pass is recorded as a pass flagged `skipped: true` (see [section 2.1](#21-weight-distribution)).
+- If a server does not declare a capability, the corresponding tests either **auto-pass** (for tests that check for the capability before executing) or are **skipped** (for tests gated behind capability checks). An auto-pass is recorded as a pass flagged `skipped: true`, which the score leaves out (see [section 2.1](#21-weight-distribution)).
 - Tests for undeclared capabilities that still run are treated as **optional**.
 
 ### 1.3 Retry Behavior
@@ -169,20 +169,25 @@ One run grades exactly one specification revision; the report's `specVersion` na
 
 ### 2.1 Weight Distribution
 
-Tests are divided into two pools: **required** (70% of total score) and **optional** (30% of total score).
+Tests are divided into two pools: **required** (70% of total score) and **optional** (30% of total score). Only tests that **measured something** are scored: a skip (see **Skips** below) is left out of both the numerator and the denominator of its pool.
 
 ```
-Score = (requiredPassed / totalRequired) * 70
-      + (optionalPassed / totalOptional) * 30
+Score = (requiredPassed / requiredMeasured) * 70
+      + (optionalPassed / optionalMeasured) * 30
 ```
+
+`requiredMeasured` and `optionalMeasured` count the pool's tests that were not skipped; `requiredPassed` and `optionalPassed` count the passes among them.
 
 **Edge cases:**
-- If there are **no required tests** in the result set (e.g., all were filtered out), the score is **renormalised** to the optional pool: `Score = (optionalPassed / totalOptional) * 100`.
-- If there are **no optional tests** in the result set, the score is renormalised to the required pool: `Score = (requiredPassed / totalRequired) * 100`.
+- If there are **no measured required tests** in the result set (e.g., all were filtered out, or every one of them skipped), the score is **renormalised** to the optional pool: `Score = (optionalPassed / optionalMeasured) * 100`.
+- If there are **no measured optional tests** in the result set, the score is renormalised to the required pool: `Score = (requiredPassed / requiredMeasured) * 100`.
 - If **no tests ran at all**, the score is **0** and the overall status is `fail` -- there is nothing to attest. (Earlier versions of this document gave an empty pool "full credit"; the implementation has renormalised since 0.13.2 because free credit inflated `--only` runs and capability-gated suites whose remaining tests were all optional.)
+- If tests ran but **every one of them was skipped**, the score is likewise **0** (grade F): nothing was measured, so there is nothing to attest. The reference tool's terminal, markdown, HTML and GitHub reports, its SARIF invocation properties (`note`) and its MCP test tool say so in words ("No test measured anything -- all N that ran were skipped"), as an empty run says "No tests ran", so the F does not read as a server that failed everything; its JSON report shows it in the counts (`summary.skipped` equals `summary.total`). The overall status keeps its meaning ([section 2.3](#23-overall-status)): nothing failed, so it is `pass`.
 - The final score is **rounded to the nearest integer**.
 
-**Skips.** A test that ran but measured nothing -- a precondition was absent (no `--auth`, no tools declared, a check that does not apply on the transport) or an earlier check could not attribute the server's refusal -- is recorded as `passed: true` with `skipped: true`. These are the "auto-pass" results of [section 1.2](#12-capability-driven-execution) and the "skips (as passed)" of the rule sections; the suites flag each one explicitly, and the reference tool also reads their skip wording (details that open with `Skipped`, or carry `(skipped)` or `not applicable`) as a skip, so a pass that measured nothing is flagged whether or not it says so: `No tools to validate`, an injection run in which no payload got an answer, an empty post-hoc scan. A failure is never flagged, whatever its details say. A skip counts as a pass in both the numerator and the denominator of its pool, so the formula above is unchanged; `summary.skipped` and each category's `skipped` count them, so a reader can see how much of a pass total measured nothing. A test the run leaves out (filtered by `--only` / `--skip`, gated off the transport, or absent because a 2026-07-28 capability is undeclared) is not a skip: it is not in the result set at all.
+**Skips.** A test that ran but measured nothing -- a precondition was absent (no `--auth`, no tools declared, a check that does not apply on the transport) or an earlier check could not attribute the server's refusal -- is recorded as `passed: true` with `skipped: true`. These are the "auto-pass" results of [section 1.2](#12-capability-driven-execution) and the "skips (as passed)" of the rule sections; the suites flag each one explicitly, and the reference tool also reads their skip wording (details that open with `Skipped`, or carry `(skipped)` or `not applicable`) as a skip, so a pass that measured nothing is flagged whether or not it says so: `No tools to validate`, an injection run in which no payload got an answer, an empty post-hoc scan. A failure is never flagged, whatever its details say. A skip is left out of the score entirely -- it is neither a pass nor a failure there -- so the score is the verdict of the checks that measured something, and a run in which most checks could not be evaluated does not read as mostly compliant. Leaving a pass out never raises the score: it lowers or keeps its pool's ratio, and a pool it empties was at 100%, so the renormalised score is no higher. A skip still counts in `summary.passed` (so `passed + failed = total`), and `summary.skipped` and each category's `skipped` count them, so a reader can see how much of a pass total measured nothing. A test the run leaves out (filtered by `--only` / `--skip`, gated off the transport, or absent because a 2026-07-28 capability is undeclared) is not a skip: it is not in the result set at all.
+
+Methodology 2.0.0 and earlier (mcp-compliance 0.19.0 and earlier) scored a skip as a pass, in both the numerator and the denominator of its pool. For a run with skips that score is therefore higher than the one this algorithm gives the same results. While both pools have a measured test, a pool of `N` tests of which `F` failed and `S` skipped scores `weight * F * S / (N * (N - S))` points lower (weight 70 or 30): nothing for a pool without failures or without skips, and more the more of both it has. On the reference servers no rounded score moved (the SDK v1 server's full 2025-11-25 run went from 96.4 to 95.7, 96 either way), but a run whose required tests all pass, with 15 of 50 optional tests failing and 20 skipped, drops from 91 (A) to 85 (B), and a run in which most tests measured nothing can drop several grades. Compare scores only when they were computed by the same algorithm: the reference tool's `diff` scores both reports from their results with the current algorithm, and notes the score a report recorded when it differs.
 
 ### 2.2 Grade Thresholds
 
@@ -200,7 +205,7 @@ The overall status is a tri-state summary distinct from the numerical score:
 
 | Status | Condition |
 |--------|-----------|
-| `pass` | All tests passed (required and optional). |
+| `pass` | All tests passed (required and optional). A skip counts as passed here, so a run in which every test skipped is `pass` even though its score is 0 (section 2.1). |
 | `partial` | All **required** tests passed, but one or more **optional** tests failed. |
 | `fail` | One or more **required** tests failed. |
 
@@ -2417,12 +2422,12 @@ Same coverage as 2025-11-25 minus the two session-id rules (there are no session
 
 The file `mcp-compliance-rules.json` provides a machine-readable catalog of all 191 test rules: 88 for MCP 2025-11-25 and 103 for MCP 2026-07-28. It is the canonical source for rule metadata and is intended for tooling integration (IDEs, CI pipelines, dashboards). A test in `src/tests/catalog-parity.test.ts` keeps it in lock-step with the code's catalogs (`TEST_DEFINITIONS`, `MODERN_TEST_DEFINITIONS`) and with the `####` rule headings in sections 3 and 3b.
 
-**Schema (methodology 2.0.0):**
+**Schema (methodology 3.0.0; the schema is unchanged since 2.0.0):**
 
 ```json
 {
-  "specVersion": "2.0.0",
-  "specDate": "2026-09-14",
+  "specVersion": "3.0.0",
+  "specDate": "2026-09-18",
   "mcpSpecCompatibility": ["2025-11-25", "2026-07-28"],
   "categories": [ { "id": "transport", "name": "Transport Validation", "description": "...", "scope": "..." } ],
   "rules": [
@@ -2526,7 +2531,7 @@ Each test result produced by the reference tool contains at minimum:
 | `name` | string | Human-readable name. |
 | `category` | string | Test category. |
 | `passed` | boolean | Whether the test passed. |
-| `skipped` | boolean (optional) | Present and `true` when the test measured nothing (see [section 2.1](#21-weight-distribution)); such a result is always `passed: true`. |
+| `skipped` | boolean (optional) | Present and `true` when the test measured nothing (see [section 2.1](#21-weight-distribution)); such a result is always `passed: true`, and the score leaves it out. |
 | `required` | boolean | Whether the test was required (after capability-driven adjustments). |
 | `details` | string | Human-readable explanation of the result. |
 | `durationMs` | number | Time taken in milliseconds. |

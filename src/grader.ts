@@ -10,17 +10,45 @@ export function computeGrade(score: number): Grade {
 
 /**
  * A check that measured nothing. Skips are `passed: true` (they are not
- * failures) and are counted in `summary.passed` and in the score's
- * denominator exactly as before -- excluding them would move every
- * server's existing grade, which is a product decision, not a reporting
- * one. What `summary.skipped` and the per-category `skipped` counts add
- * is visibility: a reader can now see how much of a pass total was
- * "nothing was measured" instead of "the server did the right thing".
+ * failures), so they stay in `summary.passed`, `summary.total` and the
+ * per-category counts, with `summary.skipped` and each category's
+ * `skipped` saying how many of those passes they are. The score leaves
+ * them out entirely -- see computeScore. A failure is never a skip,
+ * whatever flag it carries.
  */
 function isSkip(t: TestResult): boolean {
   return t.passed && t.skipped === true;
 }
 
+/**
+ * Score, grade, overall verdict and counts for one run.
+ *
+ * The score is computed over MEASURED tests only: a skip (see isSkip) is
+ * left out of both the numerator and the denominator, because a check
+ * that measured nothing is evidence of neither compliance nor its
+ * absence. Counting skips as passes made a run where most checks could
+ * not be evaluated (no `--auth`, no tools, a refusal an earlier check
+ * could not attribute) read as mostly compliant.
+ *
+ * Weighting: measured required tests are 70% of the score, measured
+ * optional tests 30%. When one measured bucket is empty the other is
+ * renormalised to 100% rather than awarding the empty one for free
+ * (`--only` filters that exclude every required test, capability-gated
+ * suites where everything left is optional, or a bucket whose every test
+ * skipped). When nothing was measured at all -- no test ran, or every
+ * test that ran was skipped -- the score is 0 and the grade F: there is
+ * nothing to attest.
+ *
+ * Leaving a pass out never raises the score: it lowers or keeps its
+ * bucket's ratio, and a bucket it empties was at 100%, so the
+ * renormalised score is no higher than the weighted one.
+ *
+ * Everything else keeps its meaning: `overall` is "fail" on any required
+ * failure (or an empty run), "pass" when every test passed, "partial"
+ * otherwise; `summary.passed` / `failed` / `total` / `required` /
+ * `requiredPassed` count skips as passes (so passed + failed = total), and
+ * `summary.skipped` / each category's `skipped` count them.
+ */
 export function computeScore(tests: TestResult[]): {
   score: number;
   grade: Grade;
@@ -42,24 +70,27 @@ export function computeScore(tests: TestResult[]): {
 
   const requiredTests = tests.filter((t) => t.required);
   const requiredPassed = requiredTests.filter((t) => t.passed).length;
-  const optionalTests = tests.filter((t) => !t.required);
-  const optionalPassed = optionalTests.filter((t) => t.passed).length;
 
-  // Weighting: required tests are 70% of the score, optional 30%. When one
-  // bucket is empty we renormalize to the other — giving "free" credit for
-  // an empty bucket (the previous behavior) would inflate the score in
-  // edge cases like `--only` filters that exclude all required tests, or
-  // capability-gated suites where all remaining tests are optional.
+  // The score's buckets: measured tests only.
+  const measured = tests.filter((t) => !isSkip(t));
+  const measuredRequired = measured.filter((t) => t.required);
+  const measuredRequiredPassed = measuredRequired.filter((t) => t.passed).length;
+  const measuredOptional = measured.filter((t) => !t.required);
+  const measuredOptionalPassed = measuredOptional.filter((t) => t.passed).length;
+
   let score: number;
-  if (total === 0) {
-    // No tests ran. Not a pass — there is nothing to attest.
+  if (measured.length === 0) {
+    // No test ran, or every test that ran was skipped. Not a pass --
+    // there is nothing to attest.
     score = 0;
-  } else if (requiredTests.length === 0) {
-    score = Math.round((optionalPassed / optionalTests.length) * 100);
-  } else if (optionalTests.length === 0) {
-    score = Math.round((requiredPassed / requiredTests.length) * 100);
+  } else if (measuredRequired.length === 0) {
+    score = Math.round((measuredOptionalPassed / measuredOptional.length) * 100);
+  } else if (measuredOptional.length === 0) {
+    score = Math.round((measuredRequiredPassed / measuredRequired.length) * 100);
   } else {
-    score = Math.round((requiredPassed / requiredTests.length) * 70 + (optionalPassed / optionalTests.length) * 30);
+    score = Math.round(
+      (measuredRequiredPassed / measuredRequired.length) * 70 + (measuredOptionalPassed / measuredOptional.length) * 30,
+    );
   }
 
   let overall: "pass" | "partial" | "fail";

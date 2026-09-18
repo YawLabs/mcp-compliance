@@ -117,6 +117,19 @@ describe("mcp-compliance-rules.json top level", () => {
     expect(Number.parseInt(catalog.specVersion.split(".")[0], 10)).toBeGreaterThanOrEqual(2);
   });
 
+  it("is at least 3.0.0, the version that leaves skips out of the score (a scoring change is a major bump)", () => {
+    expect(Number.parseInt(catalog.specVersion.split(".")[0], 10)).toBeGreaterThanOrEqual(3);
+  });
+
+  it("the rubric header names the same methodology version and date as the catalog", () => {
+    // Both are written by hand (the catalog's in scripts/gen-catalog-docs.ts),
+    // so a bump to one alone would leave two version labels for one document.
+    expect(rubric).toContain(`\n**Version:** ${catalog.specVersion}\n`);
+    expect(rubric).toContain(`\n**Date:** ${catalog.specDate}\n`);
+    // The section 4 schema example shows the current values too.
+    expect(rubric).toContain(`  "specVersion": "${catalog.specVersion}",\n  "specDate": "${catalog.specDate}",`);
+  });
+
   it("every rule carries a supported specVersion", () => {
     const bad = catalog.rules.filter((r) => !(SUPPORTED_SPEC_VERSIONS as readonly string[]).includes(r.specVersion));
     expect(bad.map((r) => `${r.id}: ${r.specVersion}`)).toEqual([]);

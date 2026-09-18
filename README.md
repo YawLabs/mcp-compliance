@@ -202,7 +202,8 @@ mcp-compliance test --list --transport stdio --skip security --spec-version 2026
 
 # Diff two runs — exit 1 if anything that was passing (or skipped) is now failing;
 # checks that start or stop skipping are listed as "Newly skipped" / "No longer skipped" and never fail the diff.
-# A baseline from an earlier version works too: its skips are read from their wording.
+# A baseline from an earlier version works too: its skips are read from their wording, and both
+# reports are scored from their results as this version scores them (skips left out).
 # Both reports must grade the same spec revision; pin --spec-version on both runs
 # so a server upgrade cannot flip the suite under the baseline.
 mcp-compliance test https://my-server.com/mcp --format json --spec-version 2026-07-28 > current.json
@@ -593,7 +594,7 @@ stdio-only (4):
 | D     | 40-59  |
 | F     | 0-39   |
 
-Required tests are worth 70% of the score, optional tests 30%. A test that measured nothing (a skip) counts as a pass; every report format counts or lists the skips (the terminal lists them under `SKIPPED CHECKS`), `--verbose` prints them as `SKIP`, and `diff` lists checks that start or stop skipping, so a pass total that is partly skips is visible. See the [full scoring algorithm](./COMPLIANCE_RUBRIC.md#2-scoring-algorithm) in the methodology doc.
+Required tests are worth 70% of the score, optional tests 30%, counted over the tests that measured something. A test that measured nothing (a skip) is left out of the score entirely, neither a pass nor a failure; when every required or every optional test skipped, the other pool carries the whole score, and a run in which every test skipped scores 0 (F) like a run in which none ran. The terminal, markdown, HTML and GitHub reports, the SARIF invocation properties (`note`) and the MCP `mcp_compliance_test` tool then say "No test measured anything"; the JSON report shows it in its counts (`summary.skipped` equals `summary.total`). Skips still count toward the pass totals (`summary.passed`, the category counts); every report format counts or lists them (the terminal lists them under `SKIPPED CHECKS`), the terminal category bars and HTML category cards score what was measured, `--verbose` prints skips as `SKIP`, and `diff` lists checks that start or stop skipping. Reports written by 0.19.0 and earlier scored a skip as a pass, so their scores run higher for the same results. By how much depends on the run: on the reference servers no rounded score moved, but the drop grows with a pool's failures times its skips, enough to cost a server whose required checks all pass a whole grade, and a run where most checks measured nothing can drop several. `diff` scores both reports from their results the way this version does, so a baseline written by 0.19.0 or earlier still compares like with like, with a note naming the score that file recorded. See the [full scoring algorithm](./COMPLIANCE_RUBRIC.md#2-scoring-algorithm) in the methodology doc.
 
 ## CI integration
 
@@ -740,7 +741,7 @@ The JSON output of the test suite is a stable, versioned contract. Every report 
 }
 ```
 
-A test that ran but measured nothing (no `--auth`, no tools declared, a check that does not apply on the transport, or a refusal an earlier check could not attribute) is recorded as `passed: true` with `skipped: true`; `summary.skipped` and each `categories[*].skipped` count them. Skips still count as passes in the score, so read `skipped` next to `passed` before treating a pass total as evidence. SARIF output keeps its `results` to failures and names the skips in the run's invocation properties (`testsSkipped`, `skippedTests`), so Code Scanning opens no alert for them.
+A test that ran but measured nothing (no `--auth`, no tools declared, a check that does not apply on the transport, or a refusal an earlier check could not attribute) is recorded as `passed: true` with `skipped: true`; `summary.skipped` and each `categories[*].skipped` count them. Skips count in `passed` but are left out of `score` (reports written by 0.19.0 and earlier scored them as passes), so read `skipped` next to `passed` before treating a pass total as evidence. SARIF output keeps its `results` to failures and names the skips in the run's invocation properties (`testsSkipped`, `skippedTests`), so Code Scanning opens no alert for them.
 
 Consumer guidance:
 

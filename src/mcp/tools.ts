@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { findTestDefinition, getTestDefinitions } from "../definitions/index.js";
-import { SKIP_CAVEAT, skippedTestsOf, statusLabel } from "../reporter.js";
+import { nothingMeasuredNote, SKIP_CAVEAT, skippedTestsOf, statusLabel } from "../reporter.js";
 import { runComplianceSuite } from "../runner.js";
 import { type SpecVersion, SUPPORTED_SPEC_VERSIONS, specBaseFor } from "../spec.js";
 import type { TestDefinition } from "../types.js";
@@ -114,13 +114,17 @@ export function registerTools(server: McpServer) {
         // A skip is `passed: true` and sits inside the pass total, so the
         // count rides on the Tests line and each skip is marked SKIP, the
         // way the terminal report does it. Both appear only when the run
-        // has skips; a run without any reads exactly as before.
+        // has skips; a run without any reads exactly as before. A run in
+        // which every test skipped says so plainly: the score leaves skips
+        // out, so its grade F means nothing was measured.
         const skipped = skippedTestsOf(report).length;
+        const nothingMeasured = nothingMeasuredNote(report);
         const summary = [
           `Grade: ${report.grade} (${report.score}%)`,
           `Overall: ${report.overall}`,
           `Spec: ${report.specVersion}`,
           `Tests: ${report.summary.passed}/${report.summary.total} passed${skipped > 0 ? `, ${skipped} skipped` : ""} (${report.summary.requiredPassed}/${report.summary.required} required)`,
+          ...(nothingMeasured ? [`${nothingMeasured}.`] : []),
           ...(skipped > 0 ? [`Skipped tests ${SKIP_CAVEAT}.`] : []),
           "",
           ...report.tests.map((t) => `${statusLabel(t)} ${t.name}${t.required ? " (required)" : ""} — ${t.details}`),

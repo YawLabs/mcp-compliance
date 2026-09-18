@@ -1,3 +1,4 @@
+import { computeScore } from "./grader.js";
 import { readsAsSkip } from "./harness.js";
 import type { ComplianceReport, TestResult } from "./types.js";
 
@@ -45,6 +46,23 @@ export interface DiffEntry {
   currentStatus?: DiffStatus;
 }
 
+/**
+ * The score and grade a report recorded, kept when they differ from the
+ * ones the diff computed from its results (see DiffSummary.recordedScores).
+ */
+export interface RecordedScore {
+  score: number;
+  grade: string;
+  /**
+   * True when scoring the report's skips as passes reproduces what it
+   * recorded: the report was scored by mcp-compliance 0.19.0 or earlier,
+   * which counted a skip as a pass in both the numerator and the
+   * denominator. False means some other difference (a hand-edited score,
+   * a report from another tool or another algorithm).
+   */
+  skipsAsPasses: boolean;
+}
+
 export interface DiffSummary {
   /**
    * The MCP spec revision both reports were graded against, or null
@@ -53,10 +71,26 @@ export interface DiffSummary {
    * hand-edited or foreign JSON file lacks it.
    */
   specVersion: string | null;
+  /**
+   * Both sides' grade and score are computed here from each report's
+   * results with this version's scoring (skips left out; a report
+   * without skip data has its skips read from their wording, as for the
+   * per-test statuses), not copied from the files. Otherwise a baseline
+   * scored with skips as passes (0.19.0 and earlier) would show a grade
+   * drop next to "No changes". What a report recorded, when it differs,
+   * is in `recordedScores`.
+   */
   baselineGrade: string;
   currentGrade: string;
   baselineScore: number;
   currentScore: number;
+  /**
+   * Each report's recorded score and grade when they differ from the
+   * computed ones above; null when they agree (every report this
+   * version writes agrees with itself). `formatDiff` prints a note for
+   * each one that differs.
+   */
+  recordedScores: { baseline: RecordedScore | null; current: RecordedScore | null };
   regressions: DiffEntry[];
   fixes: DiffEntry[];
   newFailures: DiffEntry[];
@@ -79,6 +113,38 @@ export interface DiffSummary {
 /** Every report this tool writes carries `summary.skipped`; an older one carries no skip data at all. */
 function recordsSkips(report: ComplianceReport): boolean {
   return typeof report.summary?.skipped === "number" || report.tests.some((t) => t.skipped !== undefined);
+}
+
+/**
+ * A report's score and grade under this version's scoring, computed from
+ * its results: each test is a skip exactly when the diff reads it as one
+ * (`statusOf`), so the score and the per-test statuses agree. Plus what
+ * the report itself recorded, when that differs.
+ */
+function scoreOf(
+  report: ComplianceReport,
+  records: boolean,
+): { score: number; grade: string; recorded: RecordedScore | null } {
+  const tests = report.tests.map((t) => {
+    const { skipped: _skipped, ...rest } = t;
+    return statusOf(t, records) === "skip" ? { ...rest, skipped: true } : rest;
+  });
+  const { score, grade } = computeScore(tests);
+  // A file with no score of its own (hand-written or foreign) has nothing to report as recorded.
+  if (typeof report.score !== "number" || (report.score === score && report.grade === grade)) {
+    return { score, grade, recorded: null };
+  }
+  // How 0.19.0 and earlier scored: every skip a pass.
+  const asPasses = computeScore(report.tests.map(({ skipped: _skipped, ...t }) => t));
+  return {
+    score,
+    grade,
+    recorded: {
+      score: report.score,
+      grade: report.grade,
+      skipsAsPasses: asPasses.score === report.score && asPasses.grade === report.grade,
+    },
+  };
 }
 
 /**
@@ -170,12 +236,16 @@ export function diffReports(baseline: ComplianceReport, current: ComplianceRepor
     }
   }
 
+  const baselineScored = scoreOf(baseline, records.baseline);
+  const currentScored = scoreOf(current, records.current);
+
   return {
     specVersion: current.specVersion || baseline.specVersion || null,
-    baselineGrade: baseline.grade,
-    currentGrade: current.grade,
-    baselineScore: baseline.score,
-    currentScore: current.score,
+    baselineGrade: baselineScored.grade,
+    currentGrade: currentScored.grade,
+    baselineScore: baselineScored.score,
+    currentScore: currentScored.score,
+    recordedScores: { baseline: baselineScored.recorded, current: currentScored.recorded },
     regressions,
     fixes,
     newFailures,
@@ -196,6 +266,29 @@ export function formatDiff(summary: DiffSummary): string {
   lines.push(
     `Grade ${summary.baselineGrade} (${summary.baselineScore}%) ${arrow} ${summary.currentGrade} (${summary.currentScore}%)`,
   );
+  // The grade line scores both reports from their results (see
+  // DiffSummary); say so wherever a file recorded something else, so the
+  // grade in the file and the grade here cannot silently disagree.
+  const recordedNotes: string[] = [];
+  for (const side of ["baseline", "current"] as const) {
+    const recorded = summary.recordedScores?.[side];
+    if (!recorded) continue;
+    const records = `The ${side} report records ${recorded.grade} (${recorded.score}%)`;
+    recordedNotes.push(
+      recorded.skipsAsPasses
+        ? `${records}: mcp-compliance 0.19.0 and earlier counted skips as passes.`
+        : `${records}, which its results do not give under this version's scoring.`,
+    );
+    if (!summary.recordsSkips[side]) {
+      recordedNotes.push(`The ${side} report predates skip tracking, so its skips are read from their wording.`);
+    }
+  }
+  if (recordedNotes.length > 0) {
+    lines.push(
+      "Note: both grades are computed here from the reports' results, as this version scores them (skips left out).",
+    );
+    for (const note of recordedNotes) lines.push(`  ${note}`);
+  }
   lines.push("");
 
   /**
@@ -246,7 +339,7 @@ export function formatDiff(summary: DiffSummary): string {
   const baselineUntracked =
     !summary.recordsSkips.baseline && summary.newlySkipped.some((e) => e.baselineStatus === "pass");
   section("Newly skipped", summary.newlySkipped, [
-    "Measured nothing in the current run; counted as passes in its score, but neither regressions nor fixes.",
+    "Measured nothing in the current run; left out of its score, and neither regressions nor fixes.",
     ...(baselineUntracked
       ? [
           "Note: the baseline report predates skip tracking, so its skips are read from their wording; a check it skipped without saying so reads as a pass there, and some of these may have been skipped then too.",

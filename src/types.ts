@@ -25,10 +25,10 @@ export interface TestResult {
    * a result with `passed: false` is a failure whatever its details say,
    * and never carries this flag.
    *
-   * NOTE: skips currently still count toward `summary.passed` and sit in
-   * the score denominator, so the score is optimistic on a run where many
-   * checks measured nothing. Changing that moves every existing grade, so
-   * it is a deliberate, separate decision from surfacing the flag.
+   * NOTE: skips still count toward `summary.passed` (so passed + failed =
+   * total), but the score leaves them out of both its numerator and its
+   * denominator: it is computed over measured checks only, and a run in
+   * which every check skipped scores 0 / F, like a run with no checks.
    */
   skipped?: boolean;
   required: boolean;

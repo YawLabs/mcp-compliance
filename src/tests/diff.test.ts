@@ -191,7 +191,7 @@ describe("diffReports / formatDiff — skipped checks", () => {
     expect(out).toContain(
       [
         "Newly skipped (1):",
-        "  Measured nothing in the current run; counted as passes in its score, but neither regressions nor fixes.",
+        "  Measured nothing in the current run; left out of its score, and neither regressions nor fixes.",
         "  - a [required]: name of a",
         "      was (passed): HTTP 401 (unauthenticated request rejected)",
         `      now (skipped): ${SKIP}`,
@@ -306,7 +306,7 @@ describe("diffReports / formatDiff — skipped checks", () => {
     expect(formatDiff(summary)).toContain(
       [
         "Newly skipped (1):",
-        "  Measured nothing in the current run; counted as passes in its score, but neither regressions nor fixes.",
+        "  Measured nothing in the current run; left out of its score, and neither regressions nor fixes.",
         `  ${BASELINE_NOTE}`,
         "  - a: name of a",
         `      was (passed): ${UNMARKED}`,
@@ -414,7 +414,7 @@ describe("diffReports / formatDiff — skipped checks", () => {
     expect(out).toContain(
       [
         "Newly skipped (1):",
-        "  Measured nothing in the current run; counted as passes in its score, but neither regressions nor fixes.",
+        "  Measured nothing in the current run; left out of its score, and neither regressions nor fixes.",
         `  ${BASELINE_NOTE}`,
         "  - now-skips: name of now-skips",
       ].join("\n"),
@@ -474,6 +474,8 @@ describe("diffReports / formatDiff — skipped checks", () => {
       currentGrade: cur.grade,
       baselineScore: base.score,
       currentScore: cur.score,
+      // Both reports were scored as this version scores: nothing to note.
+      recordedScores: { baseline: null, current: null },
       regressions: [
         {
           id: "lifecycle-init",
@@ -513,7 +515,11 @@ describe("diffReports / formatDiff — skipped checks", () => {
       result("newp", "pass", "fine"),
       result("flip", "fail", "same text"),
     ]);
-    const summary = diffReports({ ...baseline, score: 80, grade: "B" }, { ...current, score: 40, grade: "D" });
+    // Required 1/1 -> 70, optional 2/4 -> 15: 85 (B); required 0/2,
+    // optional 3/4 -> 22.5: 23 (F).
+    expect([baseline.score, baseline.grade, current.score, current.grade]).toEqual([85, "B", 23, "F"]);
+    const summary = diffReports(baseline, current);
+    expect(summary.recordedScores).toEqual({ baseline: null, current: null });
     expect(kindsOf(summary)).toEqual({
       ...NONE,
       regressions: ["reg", "flip"],
@@ -532,7 +538,7 @@ describe("diffReports / formatDiff — skipped checks", () => {
     expect(formatDiff(summary)).toBe(
       [
         "Spec version: 2025-11-25",
-        "Grade B (80%) ↓ D (40%)",
+        "Grade B (85%) ↓ F (23%)",
         "",
         "Regressions (2):",
         "  - reg [required]: name of reg",
@@ -568,5 +574,126 @@ describe("diffReports / formatDiff — skipped checks", () => {
         "No changes between baseline and current.",
       ].join("\n"),
     );
+  });
+
+  /**
+   * The score leaves skips out; 0.19.0 and earlier scored them as passes.
+   * Copying each file's stored score onto the grade line put a baseline
+   * scored the old way next to a current report scored the new way: a
+   * two-grade "drop" above "No changes". Both sides are now scored from
+   * their results, and a file that recorded something else is named.
+   */
+  describe("the grade line scores both reports the same way", () => {
+    const NOTE_HEAD =
+      "Note: both grades are computed here from the reports' results, as this version scores them (skips left out).";
+    /** Scored as 0.19.0 scored: every skip a pass. */
+    const asV0190 = (report: ComplianceReport): ComplianceReport => {
+      const old = computeScore(report.tests.map(({ skipped: _s, ...t }) => t));
+      return { ...report, score: old.score, grade: old.grade, toolVersion: "0.19.0" };
+    };
+    /**
+     * The shape of the Host-guarded --only security run: 23 optional
+     * checks, 16 skips, 2 measured passes, 5 failures.
+     */
+    const hostGuardedTests = (): TestResult[] => [
+      ...Array.from({ length: 16 }, (_, i) => result(`s${i}`, "skip", "Skipped: no --auth provided")),
+      result("p0", "pass", "ok"),
+      result("p1", "pass", "ok"),
+      ...Array.from({ length: 5 }, (_, i) => result(`f${i}`, "fail", "bad")),
+    ];
+
+    it("a baseline scored by 0.19.0 with the same results: no grade move, and a note naming what the file recorded", () => {
+      const current = reportOf(hostGuardedTests());
+      const baseline = asV0190(current);
+      // The two files disagree only in how they scored the skips.
+      expect([current.score, current.grade]).toEqual([29, "F"]);
+      expect([baseline.score, baseline.grade]).toEqual([78, "B"]);
+
+      const summary = diffReports(baseline, current);
+      expect([summary.baselineGrade, summary.baselineScore]).toEqual(["F", 29]);
+      expect([summary.currentGrade, summary.currentScore]).toEqual(["F", 29]);
+      expect(summary.recordedScores).toEqual({
+        baseline: { score: 78, grade: "B", skipsAsPasses: true },
+        current: null,
+      });
+      expect(kindsOf(summary)).toEqual(NONE);
+      expect(hasRegressions(summary)).toBe(false);
+      expect(formatDiff(summary)).toBe(
+        [
+          "Spec version: 2025-11-25",
+          "Grade F (29%) → F (29%)",
+          NOTE_HEAD,
+          "  The baseline report records B (78%): mcp-compliance 0.19.0 and earlier counted skips as passes.",
+          "",
+          "No changes between baseline and current.",
+        ].join("\n"),
+      );
+    });
+
+    it("a real change between two reports scored by 0.19.0 moves the measured score, and both files are named", () => {
+      // One measured pass now fails. Stored: 18/23 = 78 (B) -> 17/23 = 74
+      // (C); measured: 2/7 = 29 -> 1/7 = 14, both F.
+      const baseline = asV0190(reportOf(hostGuardedTests()));
+      const current = asV0190(
+        reportOf(hostGuardedTests().map((t) => (t.id === "p1" ? result("p1", "fail", "bad") : t))),
+      );
+      expect([baseline.score, current.score]).toEqual([78, 74]);
+      const summary = diffReports(baseline, current);
+      expect(kindsOf(summary)).toEqual({ ...NONE, regressions: ["p1"] });
+      const out = formatDiff(summary);
+      expect(out.split("\n").slice(0, 5)).toEqual([
+        "Spec version: 2025-11-25",
+        "Grade F (29%) ↓ F (14%)",
+        NOTE_HEAD,
+        "  The baseline report records B (78%): mcp-compliance 0.19.0 and earlier counted skips as passes.",
+        "  The current report records C (74%): mcp-compliance 0.19.0 and earlier counted skips as passes.",
+      ]);
+    });
+
+    it("a baseline from before skip tracking (0.18.x) is scored from its skip wording, and the note says so", () => {
+      const current = reportOf(hostGuardedTests());
+      const baseline = asV0190(unflagged(current));
+      const summary = diffReports(baseline, current);
+      expect(summary.recordsSkips).toEqual({ baseline: false, current: true });
+      // "Skipped: ..." reads as a skip, so both sides measure the same 7.
+      expect([summary.baselineGrade, summary.baselineScore]).toEqual(["F", 29]);
+      expect(summary.recordedScores.baseline).toEqual({ score: 78, grade: "B", skipsAsPasses: true });
+      expect(kindsOf(summary)).toEqual(NONE);
+      expect(formatDiff(summary)).toContain(
+        [
+          "Grade F (29%) → F (29%)",
+          NOTE_HEAD,
+          "  The baseline report records B (78%): mcp-compliance 0.19.0 and earlier counted skips as passes.",
+          "  The baseline report predates skip tracking, so its skips are read from their wording.",
+          "",
+        ].join("\n"),
+      );
+    });
+
+    it("a stored score its results do not give for another reason (a hand-edited file) is scored from the results and named", () => {
+      const baseline = reportOf([result("a", "pass", "ok", true), result("b", "fail", "bad")]);
+      const summary = diffReports({ ...baseline, score: 95, grade: "A" }, baseline);
+      expect([summary.baselineGrade, summary.baselineScore]).toEqual([baseline.grade, baseline.score]);
+      expect(summary.recordedScores).toEqual({
+        baseline: { score: 95, grade: "A", skipsAsPasses: false },
+        current: null,
+      });
+      expect(formatDiff(summary)).toContain(
+        [
+          `Grade ${baseline.grade} (${baseline.score}%) → ${baseline.grade} (${baseline.score}%)`,
+          NOTE_HEAD,
+          "  The baseline report records A (95%), which its results do not give under this version's scoring.",
+          "",
+        ].join("\n"),
+      );
+    });
+
+    it("a report this version wrote is never noted: its stored score is the one computed from its results", () => {
+      const withSkips = reportOf(hostGuardedTests());
+      const summary = diffReports(withSkips, withSkips);
+      expect(summary.recordedScores).toEqual({ baseline: null, current: null });
+      expect([summary.baselineScore, summary.currentScore]).toEqual([withSkips.score, withSkips.score]);
+      expect(formatDiff(summary)).not.toContain("Note:");
+    });
   });
 });
