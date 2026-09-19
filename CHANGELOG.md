@@ -45,9 +45,10 @@ out explicitly here.
     too. A 5xx without the code now fails as not evaluable and says why, where
     it used to blame the probe ("HTTP 503 for a malformed envelope").
   - A rate limiter's 429 is resent once. `error-unknown-method` and
-    `error-missing-params` no longer fail, and `error-invalid-jsonrpc`,
-    `error-invalid-json` and `error-capability-gated` no longer pass ("HTTP
-    429 without a JSON-RPC body (acceptable)"), on a 429 alone: the probe (and
+    `error-missing-params` no longer fail, and `error-invalid-jsonrpc` and
+    `error-invalid-json` ("HTTP 429 without a JSON-RPC body (acceptable)") and
+    `error-capability-gated` ("Undeclared method(s) rejected: ... (HTTP
+    429)") no longer pass, on a 429 alone: the probe (and
     `lifecycle-jsonrpc`'s `server/discover`) is resent once after
     `Retry-After`, capped at 2 s, and the second answer decides.
   - A caller's abort during one of these probes is rethrown instead of graded
