@@ -9,6 +9,8 @@ out explicitly here.
 
 ## [Unreleased]
 
+## [0.20.1] — 2026-09-18
+
 ### Fixed
 - **2026-07-28: the gaps 0.20.0 listed under "Not yet tightened" are closed.**
   The 2026-07-28 suite now asks whose answer a rejection is, as the
