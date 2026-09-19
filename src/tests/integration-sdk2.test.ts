@@ -131,6 +131,57 @@ const SDK_LEGACY_REQUIRED_DEVIATIONS = ["transport-batch-reject"];
  */
 const CLAIM_LESS_PROBES = ["lifecycle-meta-required", "lifecycle-meta-protocol-version-required"];
 
+/**
+ * The 2026-07-28 checks that credit a JSON-RPC error or rejection only when
+ * it is the server's own answer (src/suites/modern/gate.ts): a gateway's 401
+ * with a -32001 body that echoes the request id used to pass all six.
+ */
+const GATE_READ = [
+  "lifecycle-jsonrpc",
+  "error-unknown-method",
+  "error-invalid-jsonrpc",
+  "error-invalid-json",
+  "error-missing-params",
+  "error-capability-gated",
+];
+
+/** "PASS", "PASS (skipped)" or "FAIL", then the details, for each GATE_READ id the report ran. */
+function gateReadVerdicts(report: ComplianceReport): Record<string, string> {
+  return Object.fromEntries(
+    report.tests
+      .filter((t) => GATE_READ.includes(t.id))
+      .map((t) => [t.id, `${t.passed ? "PASS" : "FAIL"}${t.skipped ? " (skipped)" : ""}: ${t.details}`]),
+  );
+}
+
+/**
+ * The SDK answers each of the six probes itself -- its own envelope, its
+ * own codes on 4xx statuses -- so reading whose answer each is moves no
+ * verdict, no detail and draws no warning, over HTTP and over stdio. (Its
+ * -32602 carries its zod error, a multi-line message; the SDK declares
+ * every capability, so error-capability-gated has nothing to probe.)
+ */
+function expectGateReadUnchanged(report: ComplianceReport, http: boolean) {
+  const verdicts = gateReadVerdicts(report);
+  expect(verdicts["lifecycle-jsonrpc"]).toMatch(/^PASS: Valid JSON-RPC 2\.0 response \(id \d+ echoed, result\)$/);
+  expect(verdicts["error-missing-params"]).toMatch(
+    /^PASS: JSON-RPC error -32602 \(correct: Invalid params\) \(Invalid tools\/call request: \[/,
+  );
+  const { "lifecycle-jsonrpc": _envelope, "error-missing-params": _params, ...rest } = verdicts;
+  expect(rest).toEqual({
+    "error-unknown-method": `PASS: JSON-RPC error -32601${http ? " on HTTP 404" : ""}, id echoed`,
+    ...(http
+      ? {
+          "error-invalid-jsonrpc": "PASS: JSON-RPC error -32600 (correct: Invalid Request) on HTTP 400",
+          "error-invalid-json": "PASS: JSON-RPC error -32700 (correct: Parse error) on HTTP 400",
+        }
+      : {}),
+    "error-capability-gated":
+      "PASS (skipped): Server declares all capabilities (tools, resources, prompts); no undeclared methods to test",
+  });
+  expect(report.warnings.filter((w) => /^(lifecycle-jsonrpc|error-)|spec requires 404/.test(w))).toEqual([]);
+}
+
 /** Same surface as src/tests/fixtures/sdk2-stdio-server.mjs; keep them in sync. */
 function createSdkServer(): McpServer {
   const mcp = new McpServer({ name: "sdk2-http-server", version: "2.0.0" });
@@ -189,6 +240,12 @@ interface MountOptions {
    * this loopback server: the loopback Host guard refuses it.
    */
   tunnelHost?: string;
+  /**
+   * A gateway in front of the SDK that lets server/discover through and
+   * answers every other request itself: HTTP 401 with a Bearer challenge
+   * and a JSON-RPC -32001 "Unauthorized" body that echoes the request id.
+   */
+  gateway401ExceptDiscover?: boolean;
 }
 
 /** Mount exactly as the @modelcontextprotocol/node README shows for plain node:http. */
@@ -203,6 +260,20 @@ async function mount(legacy: "stateless" | "reject", opts: MountOptions = {}): P
     if (opts.bare403Unless !== undefined && req.headers.authorization !== opts.bare403Unless) {
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Forbidden" }, id: null }));
+      return;
+    }
+    if (opts.gateway401ExceptDiscover && req.method === "POST") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      let parsed: { id?: unknown; method?: unknown } | undefined;
+      try {
+        parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      } catch {}
+      if (parsed?.method === "server/discover") return mcpHandler(req, res, parsed);
+      res.writeHead(401, { "Content-Type": "application/json", "WWW-Authenticate": 'Bearer realm="mcp"' });
+      res.end(
+        JSON.stringify({ jsonrpc: "2.0", id: parsed?.id ?? null, error: { code: -32001, message: "Unauthorized" } }),
+      );
       return;
     }
     await mcpHandler(req, res);
@@ -320,6 +391,10 @@ describe("SDK v2 over HTTP, default (dual-era) serving", () => {
 
   it("the claim-less _meta probes draw a clean -32602 over HTTP", () => {
     expectClaimLessProbesClean(report, " (HTTP 400)");
+  });
+
+  it("the six checks that now ask whose answer a rejection is keep their verdicts and draw no warning", () => {
+    expectGateReadUnchanged(report, true);
   });
 
   it("only warns about the auto-detection, the oversized-input observation, the quiet burst and the dual era", () => {
@@ -555,6 +630,86 @@ describe("SDK v2 over HTTP, legacy: 'reject' (modern-only)", () => {
     expectFailingSets(report, SDK_HTTP_REQUIRED_DEVIATIONS, LOCALHOST_INHERENT);
     expect(resultOf(report, "security-auth-required").details).toBe(LOCALHOST_AUTH_REQUIRED);
     expectClaimLessProbesClean(report, " (HTTP 400)");
+    expectGateReadUnchanged(report, true);
+  });
+});
+
+/**
+ * The gateway measured against 0.20.0: it lets server/discover through to
+ * the SDK and answers every other request itself, 401 with a -32001
+ * "Unauthorized" body that echoes the request id. The error checks read
+ * that envelope as the SDK's own rejection of each probe.
+ */
+describe("SDK v2 behind a gateway that answers everything but server/discover 401 / -32001", () => {
+  let mounted: Mounted;
+  let report: ComplianceReport;
+
+  beforeAll(async () => {
+    mounted = await mount("reject", { gateway401ExceptDiscover: true });
+    report = await runComplianceSuite(mounted.url, { timeout: 5000, specVersion: "2026-07-28", only: GATE_READ });
+  }, 60_000);
+
+  afterAll(async () => {
+    await unmount(mounted);
+  });
+
+  it("the error checks fail as not evaluable instead of crediting the gateway (before: four passes)", () => {
+    // Before: PASS "JSON-RPC error -32001 on HTTP 401 (spec requires 404), id
+    // echoed", PASS "JSON-RPC error -32001 on HTTP 401" twice and PASS
+    // "JSON-RPC error -32001 (Unauthorized)", with a "spec requires 404"
+    // warning. The SDK served the discover, so its envelope still passes.
+    const gate = (about: string) =>
+      `not evaluable: an auth gate answered before the server read the request (pass --auth), so it proves nothing about ${about}`;
+    const verdicts = gateReadVerdicts(report);
+    expect(verdicts["lifecycle-jsonrpc"]).toMatch(/^PASS: Valid JSON-RPC 2\.0 response \(id \d+ echoed, result\)$/);
+    const { "lifecycle-jsonrpc": _envelope, ...errors } = verdicts;
+    expect(errors).toEqual({
+      "error-unknown-method": `FAIL: JSON-RPC error -32001 (HTTP 401) for an unknown method; ${gate("the unknown method")}`,
+      "error-invalid-jsonrpc": `FAIL: JSON-RPC error -32001 on HTTP 401 for a malformed envelope; ${gate("the malformed envelope")}`,
+      "error-invalid-json": `FAIL: JSON-RPC error -32001 on HTTP 401 for invalid JSON; ${gate("the invalid JSON")}`,
+      "error-missing-params": `FAIL: JSON-RPC error -32001 (HTTP 401) for a tools/call without a name; ${gate("the missing tool name")}`,
+      // The SDK declares every capability: nothing undeclared to probe.
+      "error-capability-gated":
+        "PASS (skipped): Server declares all capabilities (tools, resources, prompts); no undeclared methods to test",
+    });
+    expect(report.warnings.filter((w) => /^(lifecycle-jsonrpc|error-)|spec requires 404/.test(w))).toEqual([]);
+  });
+});
+
+/**
+ * The SDK's Host guard refusing the setup server/discover itself: its
+ * envelope (`id: null`) is the guard's, not the SDK's JSON-RPC answer.
+ */
+describe("SDK v2 behind its Host guard, pinned 2026-07-28: lifecycle-jsonrpc reads the guard's 403 as not evaluable", () => {
+  let mounted: Mounted;
+  let report: ComplianceReport;
+
+  beforeAll(async () => {
+    mounted = await mount("reject", { allowedHosts: ["mcp.example.com"] });
+    report = await runComplianceSuite(mounted.url, { timeout: 5000, specVersion: "2026-07-28", only: GATE_READ });
+  }, 60_000);
+
+  afterAll(async () => {
+    await unmount(mounted);
+  });
+
+  it("names the guard instead of judging its envelope; the error checks were already not evaluable", () => {
+    // Before: FAIL "Invalid JSON-RPC 2.0 envelope: id=null does not echo
+    // request id 1001" -- a guard's envelope judged as the server's.
+    const rejected = (about: string) =>
+      `not evaluable: the conformant server/discover was itself rejected with -32000 (HTTP 403), so this rejection proves nothing about ${about}`;
+    const lists = ["tools/list", "resources/list", "prompts/list"].map((m) => `${m} -> -32000`).join(", ");
+    expect(gateReadVerdicts(report)).toEqual({
+      // Within the details budget the quoted message outranks the explanation
+      // (review 82a: before, "..., which refuses a request whatever it
+      // carries, ...", 246 characters).
+      "lifecycle-jsonrpc":
+        'FAIL: server/discover answered JSON-RPC error -32000 (HTTP 403); not evaluable: its message ("Invalid Host: 127.0.0.1") names Host/Origin validation, so it proves nothing about the server\'s JSON-RPC envelope',
+      "error-unknown-method": `FAIL: JSON-RPC error -32000 (HTTP 403) for an unknown method; ${rejected("the injected defect")}`,
+      "error-invalid-jsonrpc": `FAIL: JSON-RPC error -32000 on HTTP 403 for a malformed envelope; ${rejected("the injected defect")}`,
+      "error-invalid-json": `FAIL: JSON-RPC error -32000 on HTTP 403 for invalid JSON; ${rejected("the injected defect")}`,
+      "error-capability-gated": `FAIL: ${lists}; ${rejected("whether undeclared methods are rejected")}`,
+    });
   });
 });
 
@@ -845,6 +1000,8 @@ describe("SDK v2 over stdio (serveStdio)", () => {
     // Sent on the already-modern process: -32602, not the -32601 a flipped
     // legacy instance would answer (see CLAIM_LESS_PROBES).
     expectClaimLessProbesClean(report, "");
+    // Nothing stands between the suite and a stdio process.
+    expectGateReadUnchanged(report, false);
     // The initialize probe went to a FRESH child, where a legacy client's
     // opening is served: the suite's own process, pinned modern, would have
     // rejected it with -32022 and mislabelled the server modern-only.

@@ -46,8 +46,9 @@ import { pickTool } from "./features.js";
  * On stdio, a check whose own tools/call kills the server process (an
  * injection payload, the 1 MB argument, unknown arguments) fails as "server
  * died" and has the process replaced before it returns
- * (restartStdioServer) -- on every attempt that kills it, --retries
- * included -- so the checks after it measure the server. After a
+ * (restartStdioServer, which stdio.ts's stdio-unicode uses too) -- on every
+ * attempt that kills it, --retries included -- so the checks after it
+ * measure the server. After a
  * replacement, security-tool-rug-pull compares two lists from the
  * replacement rather than one from each process (rugPullOnReplacement).
  */
@@ -231,7 +232,7 @@ function notApplicable(what: string): TestOutcome {
  * details read "<what> got no response ..."; without it, `what` is the
  * whole clause.
  */
-function unreachable(ctx: ModernSuiteContext, what: string, err?: unknown): TestOutcome {
+export function unreachable(ctx: ModernSuiteContext, what: string, err?: unknown): TestOutcome {
   if (err === undefined) return { passed: false, details: `server unreachable: ${what}` };
   return { passed: false, details: clip(`server unreachable: ${what} got ${noResponse(err, ctx.timeout)}`, 220) };
 }
@@ -2207,12 +2208,14 @@ async function discoverAfterDrop(ctx: ModernSuiteContext): Promise<{ alive: stri
 }
 
 /**
- * Replace a stdio child that exited on a check's own tools/call -- an
+ * Replace a stdio child that exited on a check's own request -- an
  * injection payload, security-oversized-input's 1 MB value,
  * security-extra-params' unknown arguments, the tools/call
- * security-tool-rug-pull sends a replacement -- with a fresh instance: the
- * policy the 2025-11-25 suite applies to the same checks (restartStdioServer
- * in runner.ts). The check already fails as "server died"; left dead, the
+ * security-tool-rug-pull sends a replacement, stdio-unicode's CJK/emoji
+ * tools/call or server/discover (stdio.ts), lifecycle-progress-token's
+ * tools/call with or without its token (lifecycle.ts) -- with a fresh
+ * instance: the policy the 2025-11-25 suite applies to the same checks
+ * (restartStdioServer in runner.ts). The check already fails as "server died"; left dead, the
  * child would fail every later check under a diagnosis of its own ("server
  * unreachable", "Second tools/list call threw"), so one crash would be
  * counted over and over under the wrong names.
@@ -2222,9 +2225,10 @@ async function discoverAfterDrop(ctx: ModernSuiteContext): Promise<{ alive: stri
  * cold process), then, once that is served, one modern request that is not
  * a discover -- the list the server declared, else ping -- which pins a
  * dual-era process (the SDK 2.0 default) to this era before the claim-less
- * probes of the information-disclosure checks reach it, as the feature
- * modules pinned the first process. The cached lists and capabilities stay
- * as they are (they describe the same server); ctx.state.replacement
+ * probes reach it (the late lifecycle block's, after a stdio-unicode or
+ * lifecycle-progress-token restart; the information-disclosure checks'), as
+ * the feature modules pinned the first process. The cached lists and
+ * capabilities stay as they are (they describe the same server); ctx.state.replacement
  * records that the process changed, with the new instance's tools/list
  * from that pin, read before any tools/call reached it, for
  * security-tool-rug-pull (rugPullOnReplacement).
@@ -2242,7 +2246,7 @@ async function discoverAfterDrop(ctx: ModernSuiteContext): Promise<{ alive: stri
  * (ctx.replaceStdioProcess undefined) keeps the dead child. A run the
  * caller aborts is rethrown.
  */
-async function restartStdioServer(ctx: ModernSuiteContext, check: string, cause: string): Promise<void> {
+export async function restartStdioServer(ctx: ModernSuiteContext, check: string, cause: string): Promise<void> {
   const replace = ctx.replaceStdioProcess;
   if (ctx.kind !== "stdio" || !replace) return;
   const exited = `${check}: the server exited on ${cause}`;

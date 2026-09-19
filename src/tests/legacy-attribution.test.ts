@@ -492,7 +492,7 @@ describe("legacy negative probes: the answer to the probe alone, next to a serve
         "FAIL: HTTP 500, JSON-RPC error -32000 on nonexistent/method -- the server failed on the request rather than refusing it (a broken server, or a gateway with no backend), which is no rejection of the unknown method",
     });
     for (const w of [...internal.warnings, ...custom.warnings])
-      expect(w).not.toMatch(/credited, but a rejected request/);
+      expect(w).not.toMatch(/a rejected request is a client error/);
   }, 30_000);
 
   it("a 5xx carrying the server's own rejection of the defect keeps its PASS, with a warning about the status", async () => {
@@ -519,9 +519,9 @@ describe("legacy negative probes: the answer to the probe alone, next to a serve
     expect(
       warnings.filter((w) => /^(transport-batch-reject|lifecycle-version-negotiate|error-unknown-method):/.test(w)),
     ).toEqual([
-      "transport-batch-reject: the server rejected the batch with JSON-RPC error -32600 on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
-      "lifecycle-version-negotiate: the server rejected the unknown version with JSON-RPC error -32602 on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
-      "error-unknown-method: the server rejected the unknown method with JSON-RPC error -32601 on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
+      "transport-batch-reject: the server answered the batch with its own JSON-RPC error -32600 on HTTP 500; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
+      "lifecycle-version-negotiate: the server answered the unknown version with its own JSON-RPC error -32602 on HTTP 500; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
+      "error-unknown-method: the server answered the unknown method with its own JSON-RPC error -32601 on HTTP 500; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
     ]);
   }, 30_000);
 
@@ -618,6 +618,51 @@ describe("legacy negative probes: a 403 whose message names the host or origin i
         'FAIL: HTTP 403, JSON-RPC error -32000 on nonexistent/method ("Invalid Host: mcp.internal.example") -- not evaluable: the message names Host/Origin validation, which refuses a request whatever it carries',
     });
     expect(hits.filter((h) => h === "ping")).toEqual(["ping"]);
+  }, 30_000);
+});
+
+describe("legacy negative probes: a twin that never reached the server credits no 403", () => {
+  // The same 403s as above, next to a ping the server never answered itself:
+  // a rate limiter's 429 still a 429 after one resend, a gateway's 503 with
+  // no backend, or an auth gate's 401. Before: any twin status other than
+  // 403 credited the 403, so all three passed on the guard's refusal.
+  const worded = { textPlain: "host-worded-403", batch: "host-worded-403", unknown: "host-worded-403" } as const;
+  const notReached = (twinName: string, twin: string, defect: string) =>
+    `not evaluable: ${twinName} ${twin} too, so the 403 is not attributable to ${defect} (see security-auth-required)`;
+  const PRE_INIT = "the same ping sent on its own as application/json";
+  const PING = "the same request for ping";
+
+  it("a ping still throttled after its one resend: not attributable (before: three passes)", async () => {
+    const { byId, hits } = await verdicts({ ...worded, ping: 429 }, { only: [CT, BATCH, UNKNOWN] });
+    const twin = "was not served (HTTP 429, then after 0ms HTTP 429)";
+    expect(byId).toEqual({
+      [CT]: `FAIL: HTTP 403, JSON-RPC error -32000 on the text/plain POST -- ${notReached(PRE_INIT, twin, "the Content-Type")}`,
+      [BATCH]: `FAIL: HTTP 403, JSON-RPC error -32600 on the batch -- ${notReached(PRE_INIT, twin, "the batch")}`,
+      [UNKNOWN]: `FAIL: HTTP 403, JSON-RPC error -32601 on nonexistent/method -- ${notReached(PING, twin, "the unknown method")}`,
+    });
+    // The pre-initialization twin (shared by the two transport checks) and
+    // the ping next to the unknown method, each sent and resent once.
+    expect(hits.filter((h) => h === "ping")).toEqual(["ping", "ping", "ping", "ping"]);
+  }, 30_000);
+
+  it("a ping answered 503 (a gateway with no backend) or 401 (an auth gate): not attributable (before: passes)", async () => {
+    const down = await verdicts({ ...worded, ping: 503 }, { only: [CT, UNKNOWN] });
+    expect(down.byId).toEqual({
+      [CT]: `FAIL: HTTP 403, JSON-RPC error -32000 on the text/plain POST -- ${notReached(PRE_INIT, "was not served (HTTP 503)", "the Content-Type")}`,
+      [UNKNOWN]: `FAIL: HTTP 403, JSON-RPC error -32601 on nonexistent/method -- ${notReached(PING, "was not served (HTTP 503)", "the unknown method")}`,
+    });
+    const gated = await verdicts({ ...worded, ping: 401 }, { only: [BATCH] });
+    expect(gated.byId[BATCH]).toBe(
+      `FAIL: HTTP 403, JSON-RPC error -32600 on the batch -- ${notReached(PRE_INIT, "was refused (HTTP 401, JSON-RPC error -32001)", "the batch")}`,
+    );
+  }, 30_000);
+
+  it("a ping served when resent after one 429 credits the 403 as before", async () => {
+    const { byId } = await verdicts({ ...worded, ping: "429-once" }, { only: [CT, BATCH] });
+    expect(byId).toEqual({
+      [CT]: "PASS: HTTP 403 (incorrect Content-Type rejected)",
+      [BATCH]: "PASS: HTTP 403 (batch rejected)",
+    });
   }, 30_000);
 });
 

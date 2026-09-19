@@ -9,6 +9,140 @@ out explicitly here.
 
 ## [Unreleased]
 
+### Fixed
+- **2026-07-28: the gaps 0.20.0 listed under "Not yet tightened" are closed.**
+  The 2026-07-28 suite now asks whose answer a rejection is, as the
+  2025-11-25 suite has since 0.20.0. These fixes leave the score math alone;
+  verdicts on the checks below move.
+  - `lifecycle-jsonrpc` and five error checks no longer credit a gateway's
+    answer as the server's. Against a gateway that answers 401 with a JSON-RPC
+    `-32001` "Unauthorized" body echoing the request id, `lifecycle-jsonrpc`
+    passed on the gateway's envelope ("Valid JSON-RPC 2.0 response (id 1001
+    echoed, error)"), and with `server/discover` let through,
+    `error-unknown-method`, `error-invalid-jsonrpc`, `error-invalid-json`,
+    `error-missing-params` (when tools are declared) and
+    `error-capability-gated` passed on its `-32001`. They now fail as not
+    evaluable on a 401, a 403 carrying a Bearer challenge, a 429 that is still
+    a 429 after one resend, a 5xx without the check's own code (`-32601` for
+    an unknown method and an undeclared capability, `-32600` for a malformed
+    envelope, `-32700` for invalid JSON, `-32602` for a missing tool name), or
+    a 403 without a Bearer challenge that a conformant `server/discover` sent
+    next to the probe could not get past either (see the twin bullet below;
+    the message is quoted when it names Host/Origin validation).
+    `lifecycle-jsonrpc` has no conformant request left to compare with, so any
+    403 on the setup `server/discover` is not evaluable there; its own codes
+    are `-32600`, `-32601`, `-32602`, `-32020`, `-32021` and `-32022`. A 403
+    without a Bearer challenge next to a served twin is still credited: a
+    gateway that lets `server/discover` through and refuses everything else
+    with a bare 403 cannot be told apart from the server refusing the probe.
+  - A 5xx carrying the check's own code is credited, with a warning that a
+    rejected request is a client error and a 4xx is expected.
+    `error-invalid-jsonrpc` and `error-invalid-json` used to fail any 5xx; a
+    `-32600` / `-32700` on a 5xx now passes. `error-unknown-method`'s `-32601`
+    on a 5xx draws that warning, naming the 404 the spec requires, instead of
+    the "spec requires 404" one; `error-missing-params`,
+    `error-capability-gated` (one per method) and `lifecycle-jsonrpc` draw it
+    too. A 5xx without the code now fails as not evaluable and says why, where
+    it used to blame the probe ("HTTP 503 for a malformed envelope").
+  - A rate limiter's 429 is resent once. `error-unknown-method` and
+    `error-missing-params` no longer fail, and `error-invalid-jsonrpc` and
+    `error-invalid-json` ("HTTP 429 without a JSON-RPC body (acceptable)") and
+    `error-capability-gated` ("Undeclared method(s) rejected: ... (HTTP
+    429)") no longer pass, on a 429 alone: the probe (and
+    `lifecycle-jsonrpc`'s `server/discover`) is resent once after
+    `Retry-After`, capped at 2 s, and the second answer decides.
+  - A caller's abort during one of these probes is rethrown instead of graded
+    as "No response to ...".
+- **2026-07-28 `transport-batch-reject` (required) and
+  `transport-content-type-reject` no longer pass on a gateway's answer.** They
+  credited any 4xx, so a gateway's 401 with a `-32001` body passed both. They
+  now read a rejection the way the 2025-11-25 checks do: a 429 is resent once,
+  and a 401, a 403 carrying a Bearer challenge, a 429 again, a 5xx without
+  the batch's own `-32600` (any 5xx for `text/plain`), or a 403 without a
+  Bearer challenge the conformant `server/discover` could not get past either
+  fails as not evaluable. A `-32600` on a 5xx is credited with a warning.
+- **2026-07-28 `error-invalid-cursor` and `lifecycle-subscriptions-listen` no
+  longer credit a gateway's `-32001`.** Both read a rejection through the same
+  reader as the error checks, with one 429 resend and their own codes
+  `-32602` and `-32601` credited on a 5xx with a warning (with a subscription
+  capability advertised, no 5xx is credited). A `-32602` on a 5xx now passes
+  `error-invalid-cursor` with a warning, where it failed for the status.
+- **A 403 without a Bearer challenge is credited only next to a twin that
+  reached the server (both suites).** The conformant request such a 403 is
+  read against -- `server/discover` in 2026-07-28; the credentialed or
+  pre-initialization `ping` in 2025-11-25 -- is resent once after
+  `Retry-After` when it draws a 429, and credits the 403 only when it was
+  served or drew a status the server itself chose: a 2xx, or a 4xx other than
+  401, 403 or 429. In the 2025-11-25 suite any twin status other than 403
+  used to credit it, so behind a WAF whose rate limiter, backend-less 503 or
+  auth gate answered the twin, `transport-content-type-reject`,
+  `transport-batch-reject`, `lifecycle-jsonrpc`, `error-unknown-method`,
+  `error-invalid-jsonrpc`, `error-invalid-json`, `error-missing-params` and
+  `error-capability-gated` passed on the WAF's refusal. They now fail as not
+  evaluable, and the 2026-07-28 checks above read their twin the same way.
+  The 2025-11-25 `security-auth-required`'s credentialed ping is resent once
+  on a 429 too, so a twin throttled once and then served turns a
+  not-evaluable bare 403 into a pass.
+- **2026-07-28 `lifecycle-progress-token` fails a server that fails a request
+  because of its progress token.** Any answer to the `tools/call` carrying
+  `_meta.progressToken` used to pass as "no notifications/progress observed
+  (optional)", a server that fails every request carrying a token included.
+  The call failing on the server's side -- a JSON-RPC error, an HTTP status
+  >= 400 other than a 429 or an auth gate's 401 / Bearer-challenge 403, a
+  connection the server closed, or a stdio child that exits on it -- is now
+  blamed on the token when the same call without it, sent right after, is
+  served and the call carrying the token fails again when resent. A tool whose
+  first call fails whatever it carries (a cold backend) passes on the resent
+  call, whose progress notifications are judged like the first's, and a
+  failure the call without the token shares stays an observation pass.
+  - A 429 on any of its calls is resent once after `Retry-After`. A gate's
+    answer (a 429 still a 429, a 401, a Bearer 403) on any call, a call
+    without the token that gets no response, or a first or resent call
+    nothing answers (a timeout, a connection never established, a stdio child
+    already gone) measured nothing about the token, so it is a skip, left out
+    of the score. Before, a call nothing answered failed ("no response"), a
+    429 passed as "succeeded" and a 401's `-32001` as the server's own error.
+  - On stdio a child that exits on one of its calls is restarted before the
+    next, with a warning naming the call, so the checks after it
+    (`lifecycle-meta-required` and the rest) measure a live process. A child
+    an earlier check had already killed is left alone, with no warning
+    blaming this check's call. A caller's abort is rethrown instead of graded.
+- **2026-07-28 `stdio-unicode` restarts a stdio server that exits on its
+  probe.** A server that crashed on the CJK/emoji `tools/call` or
+  `server/discover` stayed dead, so every later check ran against the dead
+  process and failed under its own name ("unknown method drew no response",
+  "server unreachable", "Second tools/list call threw"). Like the security
+  checks and the 2025-11-25 `stdio-unicode`, the check still fails as the
+  crash, but it now replaces the process -- a new instance, a fresh
+  `server/discover` and an era-pinning request -- on every attempt that kills
+  it (`--retries` included), with a warning naming the check
+  (`stdio-unicode: the server exited on ... and was restarted with a fresh
+  server/discover, so the tests after it ran against the new instance.`).
+  The checks after it measure the new instance, and `security-tool-rug-pull`
+  compares two lists from it: on the official SDK v2 stdio server made to exit
+  on non-ASCII input, `stdio-unicode` is now the run's only failure (grade A).
+  When an earlier check had already killed the child, the check said its
+  probe "got no reply (server exited (code N))"; it now fails as `server
+  unreachable: ...`, as the security checks do, and does not restart it. Tool
+  names in its details are made ASCII and clipped to 60 characters.
+- **`stdio-unicode` (both suites) fails a child that answers the probe and
+  exits right after it.** A plain request sent after each answered probe
+  (`server/discover` in 2026-07-28, `ping` in 2025-11-25) finds the child
+  gone; the check fails ("... was answered, but the server exited right
+  after") and the child is restarted, so the checks after it measure a live
+  server. Before, the check passed on the answer and every later check failed
+  against the dead child. On the official SDK v2 stdio server made to exit
+  right after answering, `stdio-unicode` is now the run's only failure (grade
+  A).
+- Conformant servers keep their results: the 2026-07-28 fixture (HTTP and
+  stdio) and the official SDK v2 server (both HTTP serving modes and stdio)
+  keep every verdict and detail of the checks above and draw no new warning.
+- Not yet tightened: on 2026-07-28, `tools-call-unknown` still credits any
+  JSON-RPC error, a gateway's `-32001` included, and
+  `transport-notification-202`, `transport-get-removed` and
+  `transport-delete-removed` still pass a gateway's 401 as a refusal with a
+  warning.
+
 ## [0.20.0] — 2026-09-18
 
 ### Changed

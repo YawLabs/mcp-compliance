@@ -443,7 +443,7 @@ describe("legacy lifecycle-reinit-reject reads the duplicate as the other negati
       "PASS: Re-initialization rejected with error: -32600 — Invalid Request: Server already initialized",
     );
     expect(warnings.filter((w) => w.startsWith(REINIT))).toEqual([
-      "lifecycle-reinit-reject: the server rejected the duplicate initialize with JSON-RPC error -32600 on HTTP 500; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
+      "lifecycle-reinit-reject: the server answered the duplicate initialize with its own JSON-RPC error -32600 on HTTP 500; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).",
     ]);
   }, 20_000);
 
@@ -1015,17 +1015,49 @@ describe("legacy security-oauth-metadata against the SDK v1's own resource-serve
  * the non-ASCII characters -- "latin1" (UTF-8 bytes decoded as Latin-1),
  * "fffd", "question", "strip", "tokenize" (the words joined by "|") --
  * "parse-error" (every tools/call answered -32700), "exit-on-unicode" (the
- * process exits with code 7 on any line carrying a non-ASCII character), or
- * "ping-meta-reject" (a ping carrying _meta answered -32602).
+ * process exits with code 7 on any line carrying a non-ASCII character),
+ * "exit-after-unicode" (such a line is answered, and the process exits with
+ * code 7 right after writing the answer), "exit-soon-after-unicode" (such a
+ * line is answered, and the process exits with code 7 30 ms later: an async
+ * crash on the input, well after a ping round trip), "plain-ping-silent" (a
+ * ping without _meta is never answered), "ping-meta-reject" (a ping
+ * carrying _meta answered -32602), "slow-after-unicode" (every reply after
+ * such a line is written SLOW_MS, default 2500, later: a live but slow
+ * server), "exit-later-after-unicode" (such a line is answered, then every
+ * later line is ignored and the process exits with code 7 EXIT_MS, default
+ * 3000, later) or "exit-after-meta-ping" (the process exits with code 7
+ * right after answering a ping carrying _meta). TOOLNAME renames the
+ * non-echo tool (default get_time), REJECT_CODE sets the code "strict"
+ * rejects with (default -32602; a non-number is sent as a string).
  */
 const UNICODE_SERVER = `
 import { createInterface } from "node:readline";
 const tool = process.env.TOOL ?? "echo";
 const mode = process.env.MODE ?? "";
-const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+const toolName = process.env.TOOLNAME ?? "get_time";
+const rejectCode = process.env.REJECT_CODE === undefined ? -32602 : Number.isNaN(Number(process.env.REJECT_CODE)) ? process.env.REJECT_CODE : Number(process.env.REJECT_CODE);
+let exitAfterReply = false;
+let exitSoonAfterReply = false;
+let slow = false;
+let deaf = false;
+const send = (o) => {
+  const write = () => process.stdout.write(JSON.stringify(o) + "\\n", () => {
+    if (exitAfterReply) process.exit(7);
+    if (exitSoonAfterReply) setTimeout(() => process.exit(7), 30);
+  });
+  if (slow) setTimeout(write, Number(process.env.SLOW_MS ?? 2500));
+  else write();
+};
 createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY }).on("line", (line) => {
-  if (!line.trim()) return;
+  if (!line.trim() || deaf) return;
+  if (/[^\\x00-\\x7f]/.test(line)) {
+    // Armed once this line's own reply is written.
+    if (mode === "slow-after-unicode") setImmediate(() => { slow = true; });
+    if (mode === "exit-later-after-unicode") setImmediate(() => { deaf = true; setTimeout(() => process.exit(7), Number(process.env.EXIT_MS ?? 3000)); });
+  }
   if (mode === "exit-on-unicode" && /[^\\x00-\\x7f]/.test(line)) process.exit(7);
+  if (mode === "exit-after-unicode" && /[^\\x00-\\x7f]/.test(line)) exitAfterReply = true;
+  if (mode === "exit-soon-after-unicode" && /[^\\x00-\\x7f]/.test(line)) exitSoonAfterReply = true;
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
   if (msg.id === undefined) return;
@@ -1040,6 +1072,8 @@ createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY }).o
       });
     case "ping":
       if (mode === "ping-meta-reject" && msg.params && msg.params._meta) return fail(-32602, "Invalid params: _meta");
+      if (mode === "exit-after-meta-ping" && msg.params && msg.params._meta) exitAfterReply = true;
+      if (mode === "plain-ping-silent" && !(msg.params && msg.params._meta)) return;
       return reply({});
     case "tools/list":
       if (tool === "none") break;
@@ -1047,11 +1081,11 @@ createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY }).o
       if (tool === "echo") {
         return reply({ tools: [{ name: "echo", description: "Echo a message", inputSchema: { type: "object", properties: { message: { type: "string" } } } }] });
       }
-      return reply({ tools: [{ name: "get_time", description: "Returns the time", inputSchema: { type: "object", properties: {}, additionalProperties: tool !== "strict" } }] });
+      return reply({ tools: [{ name: toolName, description: "Returns the time", inputSchema: { type: "object", properties: {}, additionalProperties: tool !== "strict" } }] });
     case "tools/call": {
       if (tool === "none") break;
       if (mode === "parse-error") return fail(-32700, "Parse error");
-      if (tool === "strict") return fail(-32602, "Invalid params: get_time takes no arguments");
+      if (tool === "strict") return fail(rejectCode, "Invalid params: get_time takes no arguments");
       if (tool !== "echo") return reply({ content: [{ type: "text", text: "12:00" }] });
       const m = String((msg.params && msg.params.arguments && msg.params.arguments.message) ?? "");
       let text = m;
@@ -1082,12 +1116,16 @@ describe("legacy stdio-unicode judges the round trip as the 2026-07-28 check doe
     rmSync(dir, { recursive: true, force: true });
   });
 
-  async function overStdio(env: Record<string, string>, only = ["tools-list", UNICODE]) {
+  async function overStdio(env: Record<string, string>, only = ["tools-list", UNICODE], timeout = 5000) {
     const report = await runComplianceSuite(
       { type: "stdio", command: process.execPath, args: [script], env },
-      { timeout: 5000, startupTimeout: 10_000, specVersion: "2025-11-25", only },
+      { timeout, startupTimeout: 10_000, specVersion: "2025-11-25", only },
     );
-    return { byId: verdictsOf(report), warnings: report.warnings };
+    return {
+      byId: verdictsOf(report),
+      warnings: report.warnings,
+      durationMs: Object.fromEntries(report.tests.map((t) => [t.id, t.durationMs])),
+    };
   }
 
   it("a reply that echoes the probe intact passes, byte-for-byte or piece by piece", async () => {
@@ -1179,6 +1217,161 @@ describe("legacy stdio-unicode judges the round trip as the 2026-07-28 check doe
     expect(bare.warnings.filter((w) => w.startsWith(UNICODE))).toEqual([
       "stdio-unicode: the server exited on ping with a CJK/emoji _meta value and was restarted with a fresh initialize handshake, so the tests after it ran against the new instance.",
     ]);
+  }, 60_000);
+
+  it("a child that answers the probe and exits right after it FAILS and is restarted too (before: PASS, left dead)", async () => {
+    // Before: PASS "tools/call echo reproduced the CJK/emoji probe
+    // byte-for-byte", and stdio-unknown-method-recovers failed against the
+    // dead child.
+    const { byId, warnings } = await overStdio({ TOOL: "echo", MODE: "exit-after-unicode" }, [
+      "tools-list",
+      UNICODE,
+      "stdio-unknown-method-recovers",
+    ]);
+    expect(byId[UNICODE]).toBe(
+      "FAIL: tools/call echo with a CJK/emoji argument was answered, but the server exited right after (server exited (code 7))",
+    );
+    expect(byId["stdio-unknown-method-recovers"]).toBe(
+      "PASS: Unknown method returned JSON-RPC error; subsequent ping succeeded",
+    );
+    expect(warnings.filter((w) => w.startsWith(UNICODE))).toEqual([
+      "stdio-unicode: the server exited on tools/call echo with a CJK/emoji argument and was restarted with a fresh initialize handshake, so the tests after it ran against the new instance.",
+    ]);
+    // The same through the ping, when there is no tool to call.
+    const bare = await overStdio({ TOOL: "none", MODE: "exit-after-unicode" }, [
+      UNICODE,
+      "stdio-unknown-method-recovers",
+    ]);
+    expect(bare.byId[UNICODE]).toBe(
+      "FAIL: ping with a CJK/emoji _meta value was answered, but the server exited right after (server exited (code 7))",
+    );
+    expect(bare.byId["stdio-unknown-method-recovers"]).toBe(
+      "PASS: Unknown method returned JSON-RPC error; subsequent ping succeeded",
+    );
+  }, 60_000);
+
+  it("a child that answers the probe and crashes 30 ms later FAILS and is restarted (before: PASS, the next check failed on the crash)", async () => {
+    // Before: PASS "tools/call echo reproduced the CJK/emoji probe
+    // byte-for-byte" -- the plain ping sent after the answer came back
+    // before the child exited -- and stdio-unknown-method-recovers FAILED
+    // "Error: server crashed with exit code 7 before completing the
+    // request", blamed for the crash the probe caused.
+    const recovers = "PASS: Unknown method returned JSON-RPC error; subsequent ping succeeded";
+    const exitedRightAfter = (what: string) =>
+      `FAIL: ${what} was answered, but the server exited right after (server exited (code 7))`;
+    const restarted = (cause: string) =>
+      `stdio-unicode: the server exited on ${cause} and was restarted with a fresh initialize handshake, so the tests after it ran against the new instance.`;
+    const echo = await overStdio({ TOOL: "echo", MODE: "exit-soon-after-unicode" }, [
+      "tools-list",
+      UNICODE,
+      "stdio-unknown-method-recovers",
+    ]);
+    expect(echo.byId[UNICODE]).toBe(exitedRightAfter("tools/call echo with a CJK/emoji argument"));
+    expect(echo.byId["stdio-unknown-method-recovers"]).toBe(recovers);
+    expect(echo.warnings.filter((w) => w.startsWith(UNICODE))).toEqual([
+      restarted("tools/call echo with a CJK/emoji argument"),
+    ]);
+    // With no tool to call, the ping decides alone and is the probe named.
+    const bare = await overStdio({ TOOL: "none", MODE: "exit-soon-after-unicode" }, [
+      UNICODE,
+      "stdio-unknown-method-recovers",
+    ]);
+    expect(bare.byId[UNICODE]).toBe(exitedRightAfter("ping with a CJK/emoji _meta value"));
+    expect(bare.byId["stdio-unknown-method-recovers"]).toBe(recovers);
+    expect(bare.warnings.filter((w) => w.startsWith(UNICODE))).toEqual([
+      restarted("ping with a CJK/emoji _meta value"),
+    ]);
+    // A tool that does not echo: the liveness ping between the two probes
+    // normally comes back before the crash, so the envelope probe is sent
+    // and answered too, and the wait after it finds the child gone
+    // ("tools/call get_time did not echo the probe; ping with a CJK/emoji
+    // _meta value was answered, but ..."). On a loaded machine the crash
+    // can come first, and the ping or the envelope finds it. Either way the
+    // check fails on the exit and the next one measures a live server.
+    const silent = await overStdio({ TOOL: "silent", MODE: "exit-soon-after-unicode" }, [
+      "tools-list",
+      UNICODE,
+      "stdio-unknown-method-recovers",
+    ]);
+    expect(silent.byId[UNICODE]).toMatch(/^FAIL: tools\/call get_time .* \(server exited \(code 7\)\)$/);
+    expect(silent.byId["stdio-unknown-method-recovers"]).toBe(recovers);
+    expect(silent.warnings.filter((w) => w.startsWith(UNICODE))).toHaveLength(1);
+  }, 60_000);
+
+  it("a child that leaves the plain liveness ping unanswered for the whole --timeout FAILS as a hang, as the 2026-07-28 check reads it (review 82a)", async () => {
+    // Before: PASS "tools/call echo reproduced the CJK/emoji probe
+    // byte-for-byte" after one liveness ping capped at 2 s, read as a live
+    // child whatever it was -- while the 2026-07-28 check failed a child
+    // silent after its probe. Each ping now gets the per-request timeout
+    // (a slow server is no hang), and one still unanswered then is.
+    const stopped = (what: string) =>
+      `FAIL: ${what} was answered, but the server stopped answering right after (no reply to ping within 2000ms)`;
+    const warned = (what: string) =>
+      `stdio-unicode: the server stopped answering right after ${what} was answered (no reply to ping within 2000ms); it was not restarted, so the tests after it may fail on the same hang.`;
+    const echo = await overStdio({ TOOL: "echo", MODE: "plain-ping-silent" }, ["tools-list", UNICODE], 2000);
+    expect(echo.byId[UNICODE]).toBe(stopped("tools/call echo with a CJK/emoji argument"));
+    expect(echo.warnings.filter((w) => w.startsWith(UNICODE))).toEqual([
+      warned("tools/call echo with a CJK/emoji argument"),
+    ]);
+    // The bounded exit wait, then one ping that waits the whole --timeout.
+    expect(echo.durationMs[UNICODE]).toBeGreaterThanOrEqual(2000);
+    expect(echo.durationMs[UNICODE]).toBeLessThan(4500);
+    // A tool that does not echo: the ping between the two probes is the one
+    // left unanswered, so the envelope probe is never sent into the hang.
+    const silent = await overStdio({ TOOL: "silent", MODE: "plain-ping-silent" }, ["tools-list", UNICODE], 2000);
+    expect(silent.byId[UNICODE]).toBe(stopped("tools/call get_time with a CJK/emoji argument"));
+    expect(silent.durationMs[UNICODE]).toBeLessThan(4500);
+  }, 90_000);
+
+  it("a live server slower than 2 s but within --timeout keeps its PASS, with no warning (the 2026-07-28 check agrees)", async () => {
+    const slow = await overStdio(
+      { TOOL: "echo", MODE: "slow-after-unicode", SLOW_MS: "2500" },
+      ["tools-list", UNICODE, "stdio-unknown-method-recovers"],
+      8000,
+    );
+    expect(slow.byId[UNICODE]).toBe("PASS: tools/call echo reproduced the CJK/emoji probe byte-for-byte");
+    expect(slow.warnings.filter((w) => w.startsWith(UNICODE))).toEqual([]);
+    expect(slow.byId["stdio-unknown-method-recovers"]).toBe(
+      "PASS: Unknown method returned JSON-RPC error; subsequent ping succeeded",
+    );
+  }, 60_000);
+
+  it("a child that answers, goes silent and exits 3 s later FAILS on the exit and is restarted (before: PASS, the next check failed on it)", async () => {
+    // Before: PASS "tools/call echo reproduced the CJK/emoji probe
+    // byte-for-byte" -- the liveness ping, capped at 2 s, read the silent
+    // child as live -- and stdio-unknown-method-recovers FAILED on the exit.
+    const late = await overStdio(
+      { TOOL: "echo", MODE: "exit-later-after-unicode", EXIT_MS: "3000" },
+      ["tools-list", UNICODE, "stdio-unknown-method-recovers"],
+      8000,
+    );
+    expect(late.byId[UNICODE]).toBe(
+      "FAIL: tools/call echo with a CJK/emoji argument was answered, but the server exited right after (server exited (code 7))",
+    );
+    expect(late.warnings.filter((w) => w.startsWith(UNICODE))).toHaveLength(1);
+    expect(late.byId["stdio-unknown-method-recovers"]).toBe(
+      "PASS: Unknown method returned JSON-RPC error; subsequent ping succeeded",
+    );
+  }, 60_000);
+
+  it("details keep to 220 characters, the tool's name giving way before the conclusion (before: 222 and 250)", async () => {
+    // A 60-character tool name that rejects the probe, then the envelope ping
+    // answered and the process gone right after it. Before: 222 characters,
+    // and 250 with a non-integer error code; the conclusion is kept whole.
+    const name = `a${"b".repeat(59)}`;
+    const tail =
+      "ping with a CJK/emoji _meta value was answered, but the server exited right after (server exited (code 7))";
+    for (const code of ["-32602", "E_BAD_ARGS"]) {
+      const run = await overStdio({ TOOL: "strict", TOOLNAME: name, REJECT_CODE: code, MODE: "exit-after-meta-ping" }, [
+        "tools-list",
+        UNICODE,
+      ]);
+      const details = run.byId[UNICODE].replace(/^FAIL: /, "");
+      expect(details.length, details).toBeLessThanOrEqual(220);
+      expect(details, details).toMatch(/^[\x20-\x7e]+$/);
+      expect(details.endsWith(`; ${tail}`), details).toBe(true);
+      expect(details.startsWith("tools/call abbbbbbbbb"), details).toBe(true);
+    }
   }, 60_000);
 });
 

@@ -45,6 +45,7 @@ import {
   specBaseFor,
 } from "./spec.js";
 import { pickTool } from "./suites/modern/features.js";
+import { twinReachedServer } from "./suites/modern/gate.js";
 import { runModernSuite } from "./suites/modern/index.js";
 import { evaluateProgress } from "./suites/modern/lifecycle.js";
 import {
@@ -276,16 +277,24 @@ interface TwinAnswer {
   statusCode?: number;
 }
 
-/** Read a twin's answer (see TwinAnswer). */
-function twinAnswer(res: { statusCode: number; body: unknown }): TwinAnswer {
+/**
+ * Read a twin's answer (see TwinAnswer). `throttled` is "HTTP 429, then
+ * after Nms " when the twin was resent once after a 429 (credentialedPing,
+ * preInitPing), so its outcome names both answers.
+ */
+function twinAnswer(res: { statusCode: number; body: unknown }, throttled = ""): TwinAnswer {
   const body = res.body as { result?: unknown } | null | undefined;
   if (res.statusCode >= 200 && res.statusCode < 300 && body?.result !== undefined) {
-    return { served: true, outcome: "was served", statusCode: res.statusCode };
+    return {
+      served: true,
+      outcome: throttled ? "was served when resent after HTTP 429" : "was served",
+      statusCode: res.statusCode,
+    };
   }
   const refused = res.statusCode === 401 || res.statusCode === 403;
   return {
     served: false,
-    outcome: `${refused ? "was refused" : "was not served"} (HTTP ${res.statusCode}${rpcErrorSuffix(res.body)})`,
+    outcome: `${refused ? "was refused" : "was not served"} (${throttled}HTTP ${res.statusCode}${rpcErrorSuffix(res.body)})`,
     statusCode: res.statusCode,
   };
 }
@@ -352,12 +361,16 @@ function ownRejectionCode(body: unknown, codes: readonly number[]): number | und
 }
 
 /**
- * The warning for a negative probe the server rejected with its own
- * JSON-RPC error (see ownRejectionCode) on a 5xx: credited, but the status
- * tells clients and gateways that the server failed.
+ * The warning for a negative probe the server answered with its own
+ * JSON-RPC error (see ownRejectionCode) on a 5xx: the status tells clients
+ * and gateways that the server failed. It describes the status only and
+ * says nothing about the verdict, because it is pushed before the check has
+ * decided: the check may still fail on something else (another undeclared
+ * method in error-capability-gated). Worded as the 2026-07-28 suite's
+ * (suites/modern/gate.ts).
  */
 function rejectionOn5xxWarning(check: string, statusCode: number, code: number, defect: string): string {
-  return `${check}: the server rejected ${defect} with JSON-RPC error ${code} on HTTP ${statusCode}; credited, but a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).`;
+  return `${check}: the server answered ${defect} with its own JSON-RPC error ${code} on HTTP ${statusCode}; a rejected request is a client error, so a 4xx status is expected (a 5xx tells clients and gateways the server failed).`;
 }
 
 /**
@@ -416,14 +429,16 @@ function gateRefusal(
  * that may be either: a gate refusing every request, or the server (or a
  * WAF) refusing the defect. `twin` -- the conformant request the probe
  * differs from in nothing but the defect, with the same headers (Host and
- * Origin included) -- tells them apart: when it was served, or drew a
- * different status, the defect is what drew the 403, and the refusal is
- * credited (null here), whatever its message says. When it drew the same
- * 403, or no answer, the 403 is not attributable and the probe fails as not
- * evaluable, security-origin-validation's reading of the same 403: quoting
- * the message when the twin drew the same 403 and the message names Host
- * or Origin validation (a guard that refuses a request whatever it
- * carries), naming the twin's answer otherwise. `twinName` names the twin
+ * Origin included), a 429 on it resent once -- tells them apart: when it
+ * was served, or drew a status the server itself chose (twinReachedServer:
+ * a 2xx, or a 4xx other than 401, 403 or 429), the defect is what drew the
+ * 403, and the refusal is credited (null here), whatever its message says.
+ * When it drew the same 403, a 401, a 429 again, a 5xx or no answer, it
+ * never reached the server either, so the 403 is not attributable and the
+ * probe fails as not evaluable, security-origin-validation's reading of the
+ * same 403: quoting the message when the twin drew the same 403 and the
+ * message names Host or Origin validation (a guard that refuses a request
+ * whatever it carries), naming the twin's answer otherwise. `twinName` names the twin
  * ("the same request for ping"). Only asked for a 403, so a server that
  * answers otherwise is sent nothing more. A caller's abort (while the twin
  * is sent) is rethrown by `twin`.
@@ -438,7 +453,7 @@ async function bare403Verdict(
 ): Promise<LegacyOutcome | null> {
   if (res.statusCode !== 403) return null;
   const answer = await twin();
-  if (answer.served || (answer.statusCode !== undefined && answer.statusCode !== res.statusCode)) return null;
+  if (answer.served || twinReachedServer(answer.statusCode)) return null;
   const message = readAuthRefusal(res, authorizationSent)?.message;
   if (answer.statusCode === res.statusCode && namesHostOrOriginValidation(message)) {
     return {
@@ -706,6 +721,50 @@ const ECHO_ARGUMENT_NAMES = ["message", "text", "input", "query"] as const;
  * any prefixed key).
  */
 const UNICODE_META_KEY = "com.example.compliance/unicode-probe";
+/**
+ * How long stdio-unicode waits, once its last probe is answered, for the
+ * child to exit before the liveness ping after it. A child that answers and
+ * crashes a moment later (an async logger or callback throwing on the
+ * non-ASCII input) is caught here, not by the check after it. Paid once per
+ * run by a healthy stdio server. The 2026-07-28 check waits the same
+ * (EXIT_GRACE_MS, src/suites/modern/liveness.ts).
+ */
+const UNICODE_EXIT_GRACE_MS = 250;
+/** How often that wait looks at the child: the transport reports the exit as a flag. */
+const EXIT_POLL_MS = 10;
+/** The length a check's details keep within (the 2026-07-28 suite's DETAILS_MAX). */
+const DETAILS_MAX = 220;
+
+/**
+ * stdio-unicode's details head within `room`: `note` (what the tools/call
+ * drew, "tools/call x rejected the probe (...); ") then `request` (the probe
+ * whose fate the details report). The note gives way first, keeping its
+ * closing "; " so it still reads as a clause of its own, and is dropped when
+ * too little room is left for it; the request is clipped only after that.
+ * Printable ASCII (the note carries a clipped server-chosen tool name).
+ */
+function fitUnicodeHead(note: string, request: string, room: number): string {
+  if (note.length + request.length <= room) return `${note}${request}`;
+  const noteRoom = room - request.length;
+  if (note === "" || noteRoom < 12) return clipAscii(request, Math.max(room, 3));
+  return `${clipAscii(note.replace(/;\s*$/, ""), noteRoom - 2)}; ${request}`;
+}
+
+/**
+ * Whether a stdio child exits within `ms`: true as soon as it has (at once
+ * when it already had), false when the time runs out first. Polled, since
+ * the transport reports the exit as a flag. A caller's abort rejects at once
+ * with its reason (pause).
+ */
+async function exitsWithin(stdio: StdioTransport, ms: number, signal: AbortSignal | undefined): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (!stdio.exited) {
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    await pause(Math.min(EXIT_POLL_MS, left), signal);
+  }
+  return true;
+}
 
 /** The string-typed properties of a tool's inputSchema whose names suggest an echo path. */
 function echoArguments(inputSchema: unknown): string[] {
@@ -1600,13 +1659,14 @@ export async function runComplianceSuite(
      * transport-post's request. The handshake cannot be the twin of these
      * two: they run before it. Sent at most once per run, and only when one
      * of them drew a 403 without a Bearer challenge -- one whose message
-     * names Host/Origin validation included (see bare403Verdict). A
-     * caller's abort is rethrown.
+     * names Host/Origin validation included (see bare403Verdict). A 429 is
+     * resent once after Retry-After, as the probes' are, and the second
+     * answer is the twin's. A caller's abort is rethrown.
      */
     let preInitPingOnce: Promise<TwinAnswer> | null = null;
     const preInitPing = (): Promise<TwinAnswer> => {
       preInitPingOnce ??= (async () => {
-        try {
+        const send = async () => {
           const res = await request(backendUrl, {
             method: "POST",
             headers: {
@@ -1620,10 +1680,26 @@ export async function runComplianceSuite(
               : AbortSignal.timeout(timeout),
           });
           const text = await res.body.text();
-          return twinAnswer({ statusCode: res.statusCode, body: parseRawBody(text, res.headers["content-type"]) });
+          return {
+            statusCode: res.statusCode,
+            headers: flatHeaders(res.headers),
+            body: parseRawBody(text, res.headers["content-type"]),
+          };
+        };
+        let throttled = "";
+        try {
+          let res = await send();
+          if (res.statusCode === 429) {
+            const wait = retryAfterMs(res.headers);
+            await pause(wait, options.signal);
+            throttled = `HTTP 429, then after ${wait}ms `;
+            res = await send();
+          }
+          return twinAnswer(res, throttled);
         } catch (err: unknown) {
           if (options.signal?.aborted) throw err;
-          return { served: false, outcome: `got ${noResponse(err, timeout)}` };
+          const resent = throttled ? "answered HTTP 429, and its resend " : "";
+          return { served: false, outcome: `${resent}got ${noResponse(err, timeout)}` };
         }
       })();
       return preInitPingOnce;
@@ -2107,15 +2183,21 @@ export async function runComplianceSuite(
      * missing credential, a served twin pins a bare 403 or a dropped
      * connection on that credential; next to error-unknown-method's probe,
      * which differs from it only in the method, it pins a bare 403 on the
-     * method. `statusCode` is the twin's status, when it got one. A caller's
-     * abort is rethrown.
+     * method. `statusCode` is the twin's status, when it got one. A 429 is
+     * resent once after Retry-After (rpcResending429), as the probes' are,
+     * and the second answer is the twin's. A caller's abort is rethrown.
      */
     const credentialedPing = async (): Promise<TwinAnswer> => {
+      let throttledFirst = false;
       try {
-        return twinAnswer(await rpc("ping"));
+        const { res, throttled } = await rpcResending429("ping", undefined, () => {
+          throttledFirst = true;
+        });
+        return twinAnswer(res, throttled);
       } catch (err: unknown) {
         if (options.signal?.aborted) throw err;
-        return { served: false, outcome: `got ${noResponse(err, timeout)}` };
+        const resent = throttledFirst ? "answered HTTP 429, and its resend " : "";
+        return { served: false, outcome: `${resent}got ${noResponse(err, timeout)}` };
       }
     };
 
@@ -2156,12 +2238,15 @@ export async function runComplianceSuite(
      * Retry-After (capped at 2 s, retryAfterMs) when a rate limiter
      * answered 429, as lifecycle-reinit-reject does; the second answer
      * decides. `throttled` is "HTTP 429, then after Nms " once it was
-     * resent. A caller's abort is rethrown.
+     * resent; `onThrottled` is told before the wait, so a caller whose
+     * resend gets no answer can still say the first was a 429. A caller's
+     * abort is rethrown.
      */
-    const rpcResending429 = async (method: string, params?: unknown) => {
+    const rpcResending429 = async (method: string, params?: unknown, onThrottled?: () => void) => {
       let res = await rpc(method, params);
       let throttled = "";
       if (res.statusCode === 429) {
+        onThrottled?.();
         const wait = retryAfterMs(res.headers);
         await pause(wait, options.signal);
         throttled = `HTTP 429, then after ${wait}ms `;
@@ -6296,109 +6381,206 @@ export async function runComplianceSuite(
       // it in its clientInfo name), which the server parsing and answering
       // is the round-trip verified. With no tool to call -- none declared,
       // none listed, or a tools/list that failed -- the envelope decides
-      // alone. A request that gets no reply fails; a child that exited on
-      // it is restarted (restartStdioServer) so the tests after it measure
-      // the server, and one already gone before it is "server unreachable".
-      // A caller's abort is rethrown.
+      // alone. A request that gets no reply fails, and so does one answered
+      // by a child that exits or stops answering right after it, read as
+      // the 2026-07-28 check reads it: a plain ping between the two probes
+      // finds a child the tools/call killed, and after the last answered
+      // probe one bounded wait (UNICODE_EXIT_GRACE_MS) and then a plain ping
+      // find one that crashes a moment after answering. Each ping gets the
+      // per-request timeout, so a child that exits before --timeout runs out
+      // is charged here and a slow server is not read as hung; one still
+      // running and silent for the whole budget fails as a hang on the
+      // probe, with a warning naming it (it is not replaced). A child that
+      // exited on the check's probes is restarted (restartStdioServer) so
+      // the tests after it measure the server, and one already gone before
+      // them is "server unreachable". Every details string keeps to
+      // DETAILS_MAX by clipping its head -- the note on the tools/call
+      // first, then the request -- never the conclusion. A caller's abort is
+      // rethrown.
       const stdio = transport as StdioTransport;
+      /** A probe: `note` (what an earlier probe drew, "tools/call x rejected the probe (...); "), `request`, and `cause` for the restart's warning. */
+      type UnicodeProbe = { note: string; request: string; cause: string };
+      /** The probe the child answered last, until a verdict that needs no liveness reading is reached. */
+      let answered = null as UnicodeProbe | null;
+      /** `note` + `request` + `tail` within DETAILS_MAX: the note gives way first, then the request (fitUnicodeHead). */
+      const fitted = (probe: UnicodeProbe, tail: string): string =>
+        `${fitUnicodeHead(probe.note, probe.request, DETAILS_MAX - tail.length)}${tail}`;
+      /** The verdict for a child gone after answering `probe`, which is restarted. */
+      const exitedAfter = async (probe: UnicodeProbe): Promise<LegacyOutcome> => {
+        answered = null;
+        const verdict = {
+          passed: false,
+          details: fitted(
+            probe,
+            ` was answered, but the server exited right after (server exited (code ${stdio.exitCode ?? "unknown"}))`,
+          ),
+        };
+        await restartStdioServer("stdio-unicode", probe.cause);
+        return verdict;
+      };
       /**
        * Send one request carrying the probe: its answer, or the verdict for
-       * none. `what` opens the details; `cause` names the request in the
-       * restart's warning.
+       * none. An answer from a child that was alive when the request was
+       * sent is `answered`, for settle to read.
        */
       const send = async (
-        what: string,
-        cause: string,
+        probe: UnicodeProbe,
         method: string,
         params: unknown,
       ): Promise<{ body: any } | { verdict: LegacyOutcome }> => {
+        // Gone after answering an earlier probe of this check: that probe killed it.
+        if (stdio.exited && answered) return { verdict: await exitedAfter(answered) };
         const alreadyGone = stdio.exited === true;
+        answered = null;
         try {
-          return { body: (await rpc(method, params)).body };
+          const body = (await rpc(method, params)).body;
+          if (!alreadyGone) answered = probe;
+          return { body };
         } catch (err: unknown) {
           if (options.signal?.aborted) throw err;
-          if (alreadyGone) return { verdict: unreachable(what, err, timeout) };
+          if (alreadyGone) {
+            const overhead = unreachable("x", err, timeout).details.length - 1;
+            return {
+              verdict: unreachable(fitUnicodeHead(probe.note, probe.request, DETAILS_MAX - overhead), err, timeout),
+            };
+          }
           if (!stdio.exited) {
             return {
-              verdict: { passed: false, details: `${what} got no reply (${clipAscii(errorLine(err, 200), 100)})` },
+              verdict: {
+                passed: false,
+                details: fitted(probe, ` got no reply (${clipAscii(errorLine(err, 200), 100)})`),
+              },
             };
           }
           const verdict = {
             passed: false,
-            details: `${what} got no reply (server exited (code ${stdio.exitCode ?? "unknown"}))`,
+            details: fitted(probe, ` got no reply (server exited (code ${stdio.exitCode ?? "unknown"}))`),
           };
-          await restartStdioServer("stdio-unicode", cause);
+          await restartStdioServer("stdio-unicode", probe.cause);
           return { verdict };
         }
       };
-      let tools: unknown[] | null = cachedToolsList;
-      if (tools === null && hasTools) {
-        // tools-list did not run (a filtered run): ask for the list now.
-        try {
-          const listed = (await rpc("tools/list")).body?.result?.tools;
-          if (Array.isArray(listed)) tools = listed;
-        } catch (err: unknown) {
-          if (options.signal?.aborted) throw err;
+      /**
+       * The verdict for a child that stopped serving after answering the
+       * `answered` probe, or null when it still serves (or nothing is left
+       * to read): with `grace` (after the last answered probe) a bounded wait
+       * for its exit first, then one plain ping with the per-request budget
+       * -- the transport fails it the moment the child's exit is reported,
+       * and a ping still unanswered when the budget runs out is a hang. A
+       * child gone is restarted; one still running and silent is named in a
+       * warning.
+       */
+      const settle = async (grace: boolean): Promise<LegacyOutcome | null> => {
+        const probe = answered;
+        if (!probe) return null;
+        let silent: unknown = null;
+        if (!(grace && (await exitsWithin(stdio, UNICODE_EXIT_GRACE_MS, options.signal)))) {
+          try {
+            await mcpRequest(backendUrl, "ping", undefined, nextId, buildHeaders(), timeout);
+          } catch (err: unknown) {
+            if (options.signal?.aborted) throw err;
+            silent = err;
+          }
         }
-      }
-      let note = "";
-      const tool = hasTools && tools ? pickUnicodeTool(tools) : null;
-      if (tool) {
-        const name = clipAscii(tool.name, 60);
-        const what = `tools/call ${name} with a CJK/emoji argument`;
-        const sent = await send(what, what, "tools/call", {
-          name: tool.name,
-          arguments: Object.fromEntries(tool.args.map((arg) => [arg, UNICODE_PROBE])),
+        if (stdio.exited) return exitedAfter(probe);
+        if (silent === null) return null;
+        answered = null;
+        const why =
+          classifyTransportError(silent) === "timeout"
+            ? `no reply to ping within ${timeout}ms`
+            : `ping failed: ${clipAscii(errorLine(silent, 200).replace(/^stdio transport:\s*/, ""), 80)}`;
+        warnings.push(
+          `stdio-unicode: the server stopped answering right after ${probe.cause} was answered (${why}); it was not restarted, so the tests after it may fail on the same hang.`,
+        );
+        return {
+          passed: false,
+          details: fitted(probe, ` was answered, but the server stopped answering right after (${why})`),
+        };
+      };
+      const judge = async (): Promise<LegacyOutcome> => {
+        let tools: unknown[] | null = cachedToolsList;
+        if (tools === null && hasTools) {
+          // tools-list did not run (a filtered run): ask for the list now.
+          try {
+            const listed = (await rpc("tools/list")).body?.result?.tools;
+            if (Array.isArray(listed)) tools = listed;
+          } catch (err: unknown) {
+            if (options.signal?.aborted) throw err;
+          }
+        }
+        let note = "";
+        const tool = hasTools && tools ? pickUnicodeTool(tools) : null;
+        if (tool) {
+          const name = clipAscii(tool.name, 60);
+          const what = `tools/call ${name} with a CJK/emoji argument`;
+          const sent = await send({ note: "", request: what, cause: what }, "tools/call", {
+            name: tool.name,
+            arguments: Object.fromEntries(tool.args.map((arg) => [arg, UNICODE_PROBE])),
+          });
+          if ("verdict" in sent) return sent.verdict;
+          const serialized = JSON.stringify(sent.body) ?? "";
+          if (serialized.includes(UNICODE_PROBE)) {
+            return { passed: true, details: `tools/call ${name} reproduced the CJK/emoji probe byte-for-byte` };
+          }
+          if (reproducesEveryUnicodePiece(serialized)) {
+            return {
+              passed: true,
+              details: `tools/call ${name} reproduced every non-ASCII piece of the CJK/emoji probe (split across the reply, not byte-for-byte)`,
+            };
+          }
+          const error = sent.body?.error;
+          if (error?.code === -32700) {
+            return { passed: false, details: `tools/call ${name} with a CJK/emoji argument -> -32700 parse error` };
+          }
+          const mangled = unicodeManglingEvidence(serialized);
+          if (mangled) {
+            return {
+              passed: false,
+              details: `tools/call ${name} mangled the CJK/emoji probe: ${mangled} (got ${firstTextOf(sent.body)})`,
+            };
+          }
+          // Rejected (unknown arguments, a schema mismatch) or answered
+          // without reflecting its arguments: nothing to compare, so the
+          // envelope probe decides -- sent to a child the tools/call did
+          // not kill.
+          const between = await settle(false);
+          if (between) return between;
+          note = error
+            ? `tools/call ${name} rejected the probe (${errorWithCode(error.code)}); `
+            : `tools/call ${name} did not echo the probe; `;
+        }
+        const envelope = "ping with a CJK/emoji _meta value";
+        const probe = { note, request: envelope, cause: envelope };
+        const sent = await send(probe, "ping", {
+          _meta: { [UNICODE_META_KEY]: UNICODE_PROBE },
         });
         if ("verdict" in sent) return sent.verdict;
-        const serialized = JSON.stringify(sent.body) ?? "";
-        if (serialized.includes(UNICODE_PROBE)) {
-          return { passed: true, details: `tools/call ${name} reproduced the CJK/emoji probe byte-for-byte` };
-        }
-        if (reproducesEveryUnicodePiece(serialized)) {
-          return {
-            passed: true,
-            details: `tools/call ${name} reproduced every non-ASCII piece of the CJK/emoji probe (split across the reply, not byte-for-byte)`,
-          };
-        }
         const error = sent.body?.error;
-        if (error?.code === -32700) {
-          return { passed: false, details: `tools/call ${name} with a CJK/emoji argument -> -32700 parse error` };
+        if (error) return { passed: false, details: fitted(probe, ` -> ${errorWithCode(error.code)}`) };
+        if (sent.body?.result === undefined) {
+          return { passed: false, details: fitted(probe, " -> non-JSON-RPC reply") };
+        }
+        const serialized = JSON.stringify(sent.body) ?? "";
+        const settled = { ...probe, request: "" };
+        if (serialized.includes(UNICODE_PROBE)) {
+          return { passed: true, details: fitted(settled, "ping reproduced the CJK/emoji _meta value byte-for-byte") };
         }
         const mangled = unicodeManglingEvidence(serialized);
-        if (mangled) {
-          return {
-            passed: false,
-            details: `tools/call ${name} mangled the CJK/emoji probe: ${mangled} (got ${firstTextOf(sent.body)})`,
-          };
-        }
-        // Rejected (unknown arguments, a schema mismatch) or answered
-        // without reflecting its arguments: nothing to compare, so the
-        // envelope probe decides.
-        note = error
-          ? `tools/call ${name} rejected the probe (${errorWithCode(error.code)}); `
-          : `tools/call ${name} did not echo the probe; `;
-      }
-      const envelope = "ping with a CJK/emoji _meta value";
-      const sent = await send(`${note}${envelope}`, envelope, "ping", {
-        _meta: { [UNICODE_META_KEY]: UNICODE_PROBE },
-      });
-      if ("verdict" in sent) return sent.verdict;
-      const error = sent.body?.error;
-      if (error) return { passed: false, details: `${note}${envelope} -> ${errorWithCode(error.code)}` };
-      if (sent.body?.result === undefined) {
-        return { passed: false, details: `${note}${envelope} -> non-JSON-RPC reply` };
-      }
-      const serialized = JSON.stringify(sent.body) ?? "";
-      if (serialized.includes(UNICODE_PROBE)) {
-        return { passed: true, details: `${note}ping reproduced the CJK/emoji _meta value byte-for-byte` };
-      }
-      const mangled = unicodeManglingEvidence(serialized);
-      if (mangled) return { passed: false, details: `${note}ping mangled the CJK/emoji _meta value: ${mangled}` };
-      return {
-        passed: true,
-        details: `${note}envelope round-trip verified: ping answered a request whose _meta carries CJK/emoji (no echo path to compare byte-for-byte)`,
+        if (mangled)
+          return { passed: false, details: fitted(settled, `ping mangled the CJK/emoji _meta value: ${mangled}`) };
+        return {
+          passed: true,
+          details: fitted(
+            settled,
+            "envelope round-trip verified: ping answered a request whose _meta carries CJK/emoji (no echo path to compare byte-for-byte)",
+          ),
+        };
       };
+      const verdict = await judge();
+      // The verdict read an answer: a child that answered it and then exited
+      // or stopped answering is the verdict instead, so the check after this
+      // one is not blamed for it.
+      return (await settle(true)) ?? verdict;
     });
 
     await test(

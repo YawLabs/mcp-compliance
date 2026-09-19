@@ -47,13 +47,14 @@ export interface ModernSuiteInput {
  * probe is not the server rejecting the defect; post-hoc checks scan the
  * recorder last.
  *
- * On stdio a security check whose own request kills the server process
- * (an injection payload, the 1 MB argument, unknown tool arguments) has
- * it replaced (ctx.replaceStdioProcess, driven by security.ts's
- * restartStdioServer) every time it does, --retries included, so the
- * checks after it measure the server rather than a dead process. The
- * replacement's messages go to the same recorder, and the suite closes it
- * when the run ends.
+ * On stdio a check whose own request kills the server process (a security
+ * check's injection payload, 1 MB argument or unknown tool arguments;
+ * stdio-unicode's CJK/emoji probe; lifecycle-progress-token's tools/call)
+ * has it replaced (ctx.replaceStdioProcess,
+ * driven by security.ts's restartStdioServer) every time it does, --retries
+ * included, so the checks after it measure the server rather than a dead
+ * process. The replacement's messages go to the same recorder, and the
+ * suite closes it when the run ends.
  */
 export async function runModernSuite(input: ModernSuiteInput): Promise<ComplianceReport> {
   const { transport, options } = input;

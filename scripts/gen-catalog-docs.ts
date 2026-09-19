@@ -48,6 +48,34 @@ const LIST_FAILED_SKIP = (what: string) =>
 const LIST_FAILED_FAIL = (what: string) =>
   `Also fails when ${what}/list failed while ${what}-list was filtered out of the run (the recorded reason is named).`;
 
+/**
+ * The gate reading (src/suites/modern/gate.ts, gateVerdict) of the checks
+ * that credit any rejection: whose answer a rejection is. A 403 is an auth
+ * gate's the way readAuthRefusal (src/detect.ts) reads one: without --auth
+ * any Bearer challenge, with --auth only one carrying an error parameter;
+ * every other 403 is read against the conformant twin. TWIN_CREDITS is that
+ * twin rule (twinReachedServer), `twin` naming the request sent next to the
+ * probe (a server/discover; error-invalid-cursor's list method without the
+ * cursor); GATE_PASS is the pass-side half (the 429 resend, the own code on
+ * a 5xx, the twin); GATE_FAIL lists what fails as not evaluable; GATE_5XX is
+ * what a 5xx without the check's own JSON-RPC code `own` fails as (the server
+ * failing on the probe, not "not evaluable"; with no own code, every 5xx).
+ */
+const DISCOVER_TWIN = "a conformant server/discover sent next to it";
+const TWIN_CREDITS = (twin = DISCOVER_TWIN) =>
+  `any 403 that is not an auth refusal (one without a Bearer challenge, or with --auth one whose challenge carries no error parameter) is read as the server's only when ${twin} (a 429 on it resent once) was served or drew a status the server chose (a 2xx, or a 4xx other than 401, 403 or 429)`;
+const GATE_PASS = (own: string, twin?: string) =>
+  `A 429 is resent once after Retry-After (capped at 2 s)${own ? `, a ${own} on a 5xx passes with a warning that a 4xx is expected` : ""}, and ${TWIN_CREDITS(twin)}.`;
+const GATE_FAIL = (twin = "the conformant server/discover") =>
+  `a 401, a 403 that reads as an auth refusal (without --auth any Bearer challenge, with --auth one carrying an error parameter; a gateway's -32001 body included), a 429 still a 429 after its one resend, or any other 403 ${twin} could not get past either (it drew the same 403, a 401, a 429 again, a 5xx, a redirect or no answer)`;
+const GATE_5XX = (own: string, on: string) =>
+  `${own ? `a 5xx without ${own}` : "any 5xx"} fails as the server failing on ${on} rather than rejecting it (a broken server, or a gateway with no backend)`;
+/** GATE_5XX as a sentence of its own. */
+const GATE_5XX_SENTENCE = (own: string, on: string) => {
+  const clause = GATE_5XX(own, on);
+  return `${clause[0].toUpperCase()}${clause.slice(1)}, not as not evaluable.`;
+};
+
 const C: Record<string, Criteria> = {
   // ── transport ──
   "transport-post": {
@@ -61,13 +89,13 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "transport-content-type-reject": {
-    pass: "HTTP 4xx (415 or 400 expected) for an otherwise valid server/discover sent with Content-Type: text/plain.",
-    fail: "The text/plain body is parsed and answered with a 2xx status.",
+    pass: `HTTP 4xx (415 or 400 expected) for an otherwise valid server/discover sent with Content-Type: text/plain, as the server's own rejection, with the conformant setup server/discover served. ${GATE_PASS("")}`,
+    fail: `The text/plain body is parsed and answered with a 2xx status, or a redirect; or the POST gets no answer, the resend after a 429 included ("server unreachable"). A rejecting status fails as not evaluable when it is ${GATE_FAIL()}, and any rejection (a status >= 400, or a JSON-RPC error on a 2xx) does when the conformant setup server/discover was itself rejected or got no response (when that discover drew the probe's 403, its answer is the twin and no further server/discover is sent). Otherwise ${GATE_5XX("", "the POST")}.`,
     gate: null,
   },
   "transport-batch-reject": {
-    pass: "A JSON array of two valid server/discover requests draws HTTP 4xx or a JSON-RPC error body.",
-    fail: "A 2xx status without a JSON-RPC error, an array response (a JSON array body, or an SSE data frame holding an array), or a text/event-stream carrying no JSON-RPC response (notifications before an error frame are ignored).",
+    pass: `A JSON array of two valid server/discover requests draws HTTP 4xx or a JSON-RPC error body, as the server's own rejection, with the conformant setup server/discover served. ${GATE_PASS("-32600")}`,
+    fail: `A 2xx status without a JSON-RPC error, an array response (a JSON array body, or an SSE data frame holding an array), or a text/event-stream carrying no JSON-RPC response (notifications before an error frame are ignored); or the batch gets no answer, the resend after a 429 included ("server unreachable"). A rejecting status fails as not evaluable when it is ${GATE_FAIL()}, and any rejection (a status >= 400, or a JSON-RPC error on any status) does when the conformant setup server/discover was itself rejected or got no response (a -32600 on a 5xx is then neither credited nor warned about; when that discover drew the probe's 403, its answer is the twin and no further server/discover is sent). Otherwise ${GATE_5XX("-32600", "the batch")}.`,
     gate: null,
   },
   "transport-notification-202": {
@@ -137,7 +165,7 @@ const C: Record<string, Criteria> = {
   },
   "stdio-unicode": {
     pass: `The chosen tool (one named echo, else the first with a string property named message/text/input/query, else the first tool; tools/list fetched on demand) reproduces the CJK/emoji probe byte-for-byte, or reproduces every non-ASCII piece of it somewhere in the reply (a tokenizing tool); or, when the tool merely does not echo its input, a server/discover whose clientInfo name carries the probe is answered with a result.`,
-    fail: `The tool reply or the discover reply shows mangling (U+FFFD, a Latin-1 mis-decode, the non-ASCII characters replaced by '?', or the probe's first word present with neither the CJK word nor the emoji anywhere in the reply), the tool call draws -32700, the discover carrying the probe in clientInfo is rejected or answered with a non-JSON-RPC reply, or a probe that is sent gets no reply because the server crashes or never answers it -- a tool call that gets none ends the check at once, without falling back to the discover (the details give a one-line reason, such as the exit code or the timeout).`,
+    fail: `The tool reply or the discover reply shows mangling (U+FFFD, a Latin-1 mis-decode, the non-ASCII characters replaced by '?', or the probe's first word present with neither the CJK word nor the emoji anywhere in the reply), the tool call draws -32700, the discover carrying the probe in clientInfo is rejected or answered with a non-JSON-RPC reply, or a probe that is sent gets no reply because the server crashes or never answers it -- a tool call that gets none ends the check at once, without falling back to the discover (the details give a one-line reason, such as the exit code or the timeout) -- or a probe is answered by a child that then exits or stops answering (a plain server/discover between the tool call and the envelope probe, and after the last answered probe a wait of up to 250 ms for the exit followed by a plain server/discover, each with the per-request timeout, find it gone or get no reply; a child found gone when the next probe is about to be sent charges the probe it answered last; a child still running but silent for the whole --timeout fails as a hang, is named in a warning and is not restarted). Details keep to 220 characters, the note on the tool call and then the tool's name giving way, never the conclusion. A child that exits on the probe, or right after answering it, is restarted for the checks after this one, with a warning naming it, on every attempt; a child already gone before the probe was sent fails as server unreachable and is not restarted.`,
     gate: null,
   },
   "stdio-unknown-method-recovers": {
@@ -153,7 +181,7 @@ const C: Record<string, Criteria> = {
   // ── lifecycle ──
   "lifecycle-discover": {
     pass: "server/discover with a conformant _meta returns a result carrying a supportedVersions array and a capabilities object.",
-    fail: "A JSON-RPC error, no response, or a result missing either field.",
+    fail: "A JSON-RPC error, no response, or a result missing either field. Over HTTP a 429 is resent once after Retry-After (capped at 2 s) and the second answer decides, for this rule, its lifecycle-discover-* siblings, lifecycle-jsonrpc, the capability gates and the negative probes alike; a resend that gets no response is server unreachable.",
     gate: null,
   },
   "lifecycle-discover-versions": {
@@ -167,8 +195,8 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "lifecycle-jsonrpc": {
-    pass: "The server/discover response has jsonrpc exactly '2.0', the request id echoed, and exactly one of result (an object) or error.",
-    fail: "A missing or wrong jsonrpc field, a missing id, both or neither of result/error, or a non-object result.",
+    pass: "The server/discover response has jsonrpc exactly '2.0', the request id echoed, and exactly one of result (an object) or error. Over HTTP the setup server/discover that every lifecycle rule reads is resent once after Retry-After (capped at 2 s) when it draws a 429, and the answer it settles on is judged (the details add '; resent once after HTTP 429'); a server's own refusal code (-32600, -32601, -32602, -32020, -32021 or -32022) on a 5xx passes with a warning that a 4xx is expected.",
+    fail: "A missing or wrong jsonrpc field, a missing id, both or neither of result/error, or a non-object result. Over HTTP a discover answered without a result fails as not evaluable when something in front of the server wrote the envelope: a 401, any 403 (an auth gate's, or one that refused the conformant request itself, so no twin is sent; a message naming Host/Origin validation is quoted), a 429 still a 429 after its one resend, or a 5xx without one of those codes (this rule's probe is the conformant request, so a 5xx on it is not read as the server failing on a defect). A resend that gets no response is server unreachable.",
     gate: null,
   },
   "lifecycle-id-match": {
@@ -237,8 +265,8 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "lifecycle-subscriptions-listen": {
-    pass: `With a listChanged or subscribe capability declared, the first frame on a subscriptions/listen stream is notifications/subscriptions/acknowledged carrying _meta subscriptionId equal to the request id and a notifications object; an acknowledgment that honours a type or URI the request did not include passes with a warning. With nothing advertised, either that acknowledgment or -32601 passes, the rejection credited only when the conformant server/discover was served.`,
-    fail: `Any other frame first, a subscriptionId that differs from the request id, a missing notifications object, an error other than -32601 when nothing is advertised, a rejection from a server whose conformant server/discover was itself rejected (not evaluable), no acknowledgment within the listen timeout, or a stdio server that exits before acknowledging.`,
+    pass: `With a listChanged or subscribe capability declared, the first frame on a subscriptions/listen stream is notifications/subscriptions/acknowledged carrying _meta subscriptionId equal to the request id and a notifications object; an acknowledgment that honours a type or URI the request did not include passes with a warning. With nothing advertised, either that acknowledgment or a rejection passes (-32601 expected; another error code, or a 4xx with no JSON-RPC body, passes with a warning), the rejection credited only when the conformant server/discover was served and it is the server's own. Over HTTP a 429 on the listen is resent once after Retry-After (capped at 2 s), a -32601 on a 5xx passes with a warning that a 4xx is expected when nothing is advertised, and ${TWIN_CREDITS()}.`,
+    fail: `Any other frame first, a subscriptionId that differs from the request id, a missing notifications object, a rejection when something is advertised, a result before any acknowledgment, a rejection from a server whose conformant server/discover was itself rejected (not evaluable), no acknowledgment within the listen timeout, or a stdio server that exits before acknowledging. Over HTTP a rejection fails as not evaluable, advertised or not, when it is ${GATE_FAIL()}. ${GATE_5XX_SENTENCE("-32601", "the listen")} With something advertised, a -32601 on a 5xx fails as the server's own rejection of a method it advertises ('... rejected with -32601 (HTTP 500) although tools.listChanged advertised'), with no warning.`,
     gate: null,
   },
   "lifecycle-log-level-gating": {
@@ -257,8 +285,8 @@ const C: Record<string, Criteria> = {
     gate: "completions",
   },
   "lifecycle-progress-token": {
-    pass: `tools/call of the first tool without required arguments (tools/list fetched on demand) with _meta.progressToken completes, and every notifications/progress observed for it carries the same token with a strictly increasing progress value (no notifications at all also passes). Skipped when the server declares no tools, and skipped pointing at tools-list when tools/list failed and that rule is in the run.`,
-    fail: `A progress notification carrying a foreign token, a non-numeric or non-increasing progress value, no response to the call, or tools/list failed while tools-list was filtered out of the run (the recorded reason is named).`,
+    pass: `tools/call of the first tool without required arguments (tools/list fetched on demand) with _meta.progressToken completes, and every notifications/progress observed for it carries the same token with a strictly increasing progress value (no notifications at all also passes). A 429 on any of the check's calls is resent once after Retry-After (capped at 2 s). A call that fails on the server's side passes as an observation when the failure is not the token's: the server's own answer to the same call without the token, sent right after, failed the same way (the same JSON-RPC error code whatever the HTTP status; with no JSON-RPC error, the same status), or the call carrying the token, resent after that, was answered without failing again (a cold backend's first call passes on the served resend, whose notifications are judged the same way); or the call without the token failed differently and the call carrying the token, resent, was served or answered as the call without it was. Skipped when the server declares no tools; skipped pointing at tools-list when tools/list failed and that rule is in the run; and skipped as measuring nothing about the token when a gate answered one of the calls (a 429 still a 429, a 401, or a 403 that reads as an auth refusal: without --auth any Bearer challenge, with --auth one carrying an error parameter), the call without the token got no response, the first or resent call got none (a timeout, a connection never established, a stdio child already gone), or, after a call without the token that failed differently, the resent call carrying it reproduced neither failure.`,
+    fail: `A progress notification carrying a foreign token, or a non-numeric or non-increasing progress value (on the call or on its resend); a call carrying _meta.progressToken that fails on the server's side (a JSON-RPC error, an HTTP status >= 400 other than a 429 or an auth gate's 401 / 403, a connection the server closed, or a stdio exit -- before the answer, or right after it, found by a plain server/discover sent after each answered call and, after a call the server failed, a wait of up to 250 ms for the exit -- after which the child is restarted with a warning) while the same call without it, sent right after, is served and the call carrying it fails again when resent; or the call without the token failed differently (a tool whose required arguments the empty call lacks answers -32602 without it) and the call carrying the token, resent, failed the way it first did; or tools/list failed while tools-list was filtered out of the run (the recorded reason is named). Progress notifications on a call the server fails do not make it pass.`,
     gate: null,
   },
   // ── tools ──
@@ -356,8 +384,8 @@ const C: Record<string, Criteria> = {
   },
   // ── errors ──
   "error-unknown-method": {
-    pass: "A JSON-RPC error echoing the request id; on HTTP a 404 status passes cleanly and an error carried on 200 passes with a warning.",
-    fail: "A result, no response, or an error that does not echo the request id. A server that rejects server/discover too fails as not evaluable.",
+    pass: `A JSON-RPC error echoing the request id; on HTTP a 404 status passes cleanly and an error carried on another status (a 200, a 400) passes with a warning. A 429 is resent once after Retry-After (capped at 2 s), a -32601 on a 5xx passes with a warning that the spec requires 404, and ${TWIN_CREDITS()}.`,
+    fail: `A result, no JSON-RPC error, no response, or an error that does not echo the request id. A server that rejects server/discover too fails as not evaluable, and so does an answer something in front of the server gave: ${GATE_FAIL()}. A 429 is not resent while server/discover was rejected. ${GATE_5XX_SENTENCE("-32601", "the probe")}`,
     gate: null,
   },
   "error-method-code": {
@@ -366,28 +394,28 @@ const C: Record<string, Criteria> = {
     gate: null,
   },
   "error-invalid-jsonrpc": {
-    pass: "A JSON object with no method and no id draws a JSON-RPC error or an HTTP 4xx status.",
-    fail: "A result, a 5xx status, or no response. A server that rejects server/discover too fails as not evaluable.",
+    pass: `A JSON object with no method and no id draws a JSON-RPC error or an HTTP 4xx status. ${GATE_PASS("-32600")}`,
+    fail: `A result, a status below 400 without a JSON-RPC error, or no response. A server that rejects server/discover too fails as not evaluable, and so does an answer something in front of the server gave: ${GATE_FAIL()}. A 429 is not resent while server/discover was rejected. ${GATE_5XX_SENTENCE("-32600", "the probe")}`,
     gate: null,
   },
   "error-invalid-json": {
-    pass: "The body '{not json' draws a -32700 error or an HTTP 4xx status.",
-    fail: "A 5xx status, a hang, or an HTML error page. A server that rejects server/discover too fails as not evaluable.",
+    pass: `The body '{not json' draws a JSON-RPC error (-32700 expected) or an HTTP 4xx status. ${GATE_PASS("-32700")}`,
+    fail: `A hang, a result, or a status below 400 without a JSON-RPC error (an HTML page on a 200). A server that rejects server/discover too fails as not evaluable, and so does an answer something in front of the server gave: ${GATE_FAIL()}. A 429 is not resent while server/discover was rejected. ${GATE_5XX_SENTENCE("-32700", "the probe")}`,
     gate: null,
   },
   "error-parse-code": {
-    pass: "The invalid-JSON response carries exactly code -32700; a bare 400 with no JSON-RPC body passes with a warning.",
-    fail: "A JSON-RPC error with a code other than -32700. A server that rejects server/discover too fails as not evaluable.",
+    pass: `The invalid-JSON response carries exactly code -32700; a 4xx with no JSON-RPC body passes with a warning when it is the server's own: a 429 is resent once after Retry-After (capped at 2 s), and ${TWIN_CREDITS()}.`,
+    fail: `A JSON-RPC error with a code other than -32700, a result, or no JSON-RPC error on a status below 400 or a 5xx. A server that rejects server/discover too fails as not evaluable (its probe is then not resent after a 429), and so does a 4xx without a JSON-RPC body that something in front of the server gave (a rate limiter's, an auth gate's or a WAF's bodiless refusal): ${GATE_FAIL()}.`,
     gate: null,
   },
   "error-invalid-request-code": {
-    pass: "The malformed-envelope response carries exactly code -32600; a bare 400 with no JSON-RPC body passes with a warning.",
-    fail: "A JSON-RPC error with a code other than -32600 (for example -32601 or -32602). A server that rejects server/discover too fails as not evaluable.",
+    pass: `The malformed-envelope response carries exactly code -32600; a 4xx with no JSON-RPC body passes with a warning when it is the server's own: a 429 is resent once after Retry-After (capped at 2 s), and ${TWIN_CREDITS()}.`,
+    fail: `A JSON-RPC error with a code other than -32600 (for example -32601 or -32602), a result, or no JSON-RPC error on a status below 400 or a 5xx. A server that rejects server/discover too fails as not evaluable (its probe is then not resent after a 429), and so does a 4xx without a JSON-RPC body that something in front of the server gave (a rate limiter's, an auth gate's or a WAF's bodiless refusal): ${GATE_FAIL()}.`,
     gate: null,
   },
   "error-missing-params": {
-    pass: "tools/call with params carrying only _meta (no name) draws a JSON-RPC error (-32602 expected). Skipped when the server declares no tools.",
-    fail: "A result is returned.",
+    pass: `tools/call with params carrying only _meta (no name) draws a JSON-RPC error (-32602 expected). ${GATE_PASS("-32602")} Skipped when the server declares no tools.`,
+    fail: `A result (isError: true included), no JSON-RPC error, or no response. An error the server did not write fails as not evaluable: ${GATE_FAIL()}. ${GATE_5XX_SENTENCE("-32602", "the probe")}`,
     gate: "tools",
   },
   "tools-call-unknown": {
@@ -396,13 +424,13 @@ const C: Record<string, Criteria> = {
     gate: "tools",
   },
   "error-capability-gated": {
-    pass: "Every list method for a capability the discover result did not declare draws a JSON-RPC error (-32601 expected). Skipped when every capability is declared.",
-    fail: "A list method for an undeclared capability returns a result. Without a served server/discover the test fails as not evaluable (the answers are still recorded).",
+    pass: `Every list method for a capability the discover result did not declare draws a JSON-RPC error (-32601 expected) or a rejecting status, as the server's own rejection. Each method's 429 is resent once after Retry-After (capped at 2 s), a -32601 on a 5xx passes with a warning that a 4xx is expected, and ${TWIN_CREDITS().replace(" sent next to it (a 429 on it resent once)", ", sent at most once for all the methods (a 429 on it resent once),")}. Skipped when every capability is declared.`,
+    fail: `A list method for an undeclared capability returns a result or gets no response. Without a served server/discover the test fails as not evaluable (the answers are still recorded, a 429 not resent); with one, so does an answer something in front of the server gave, the methods grouped by reason and those with the same answer named together: ${GATE_FAIL()}. ${GATE_5XX_SENTENCE("-32601", "the method")} When the details cannot hold every group, a method the server failed on is named first, and is never called not evaluable.`,
     gate: null,
   },
   "error-invalid-cursor": {
-    pass: "A garbage cursor on the first supported list method draws a JSON-RPC error (-32602 expected) or a valid first page.",
-    fail: "A 5xx status, a crash, or a malformed result.",
+    pass: `A garbage cursor on the first supported list method draws a JSON-RPC error (-32602 expected) or a valid first page. ${GATE_PASS("-32602", "the same list method sent without the cursor next to it")}`,
+    fail: `A result on a 5xx status, a crash (no response), a result without the list's array, or neither an error nor a result. An error or rejecting status fails as not evaluable when it is ${GATE_FAIL("the same list method sent without the cursor")}, so a gateway or ACL that lets server/discover through but refuses the list method itself is not credited. ${GATE_5XX_SENTENCE("-32602", "the cursor")}`,
     gate: null,
   },
   "error-id-echo": {
@@ -721,16 +749,16 @@ const CAT_LABEL: Record<string, string> = {
 const CAT_ORDER = ["transport", "lifecycle", "tools", "resources", "prompts", "errors", "schema", "security"];
 const CAT_INTRO: Record<string, string> = {
   transport:
-    'Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard headers plus `_meta`) rather than `ping`, so the only defect in each probe is the one under test. There is no session and no initialization handshake: every request is independent, so nothing here is "pre-init" or "post-init". 15 rules are HTTP-only (`transports: ["http"]`), 4 are stdio-only, and `transport-no-server-requests` is a post-hoc scan of the recording that runs on both transports (the design counts it with the HTTP group, hence "16 HTTP + 4 stdio"). The standard-header rejection rules are **attributable**: a 400 is credited only when the conformant `server/discover` was served, so a server that rejects everything (a legacy-only server pinned to this catalog) fails them as "not evaluable" instead of passing, and so does a transport-level status (401, 403, 413, 415 or 429 from an auth gate, size limit, media-type gate or rate limiter answering before the JSON-RPC layer).',
+    'Transport tests for 2026-07-28 send a **conformant `server/discover`** (standard headers plus `_meta`) rather than `ping`, so the only defect in each probe is the one under test. There is no session and no initialization handshake: every request is independent, so nothing here is "pre-init" or "post-init". 15 rules are HTTP-only (`transports: ["http"]`), 4 are stdio-only, and `transport-no-server-requests` is a post-hoc scan of the recording that runs on both transports (the design counts it with the HTTP group, hence "16 HTTP + 4 stdio"). The standard-header rejection rules are **attributable**: a 400 is credited only when the conformant `server/discover` was served, so a server that rejects everything (a legacy-only server pinned to this catalog) fails them as "not evaluable" instead of passing, and so does a transport-level status (401, 403, 413, 415 or 429 from an auth gate, size limit, media-type gate or rate limiter answering before the JSON-RPC layer). `transport-batch-reject` and `transport-content-type-reject` credit a rejecting status only when it is the server\'s own: a 429 is resent once, and a 401, a 403 that reads as an auth refusal (without `--auth` any Bearer challenge, with `--auth` one carrying an `error` parameter; a gateway\'s `-32001` body included), a 429 still a 429, or any other 403 that a conformant `server/discover` sent next to the probe could not get past either fails as not evaluable, while a 5xx without the batch\'s own `-32600` (any 5xx for `text/plain`) fails as the server failing on the request. Both also fail as not evaluable on any rejection -- a status >= 400, or a JSON-RPC error on a 2xx -- when the conformant setup `server/discover` was itself rejected or got no response, as the standard-header rules do (a `-32600` on a 5xx is then neither credited nor warned about). When that setup `server/discover` already drew the probe\'s 403, its answer is the twin and no further `server/discover` is sent. A probe that gets no answer, the resend after a 429 included, fails as "server unreachable". On stdio, `stdio-unicode` restarts a child that exits on its probe, or right after answering it, as the security checks do, and fails one that answers and then stops answering (named in a warning, not restarted).',
   lifecycle:
-    "Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelope. The suite validates the discover result (versions, capabilities, caching hints, serverInfo), then sends deliberately incomplete envelopes (no `_meta`, no `protocolVersion`, no `clientCapabilities`, no `clientInfo`, an unsupported version) and checks the server rejects exactly the ones the spec says it must; like the header rules, a rejection is credited only when the conformant discover was served and is not a transport-level status. The late block -- `lifecycle-completions`, `lifecycle-progress-token`, the two claim-less probes (`lifecycle-meta-required`, `lifecycle-meta-protocol-version-required`) and `lifecycle-dual-era` -- runs after the feature and stdio tests and before the security tests: a dual-era stdio server that has not yet been pinned modern treats a claim-less message as a legacy opening (a `--only` run on stdio sends a pinning request first), and the security rate-limit burst would otherwise leave an intermediary answering these probes with 429. Three rules are post-hoc scans of the recording (`lifecycle-log-level-gating`) or informational probes (`lifecycle-dual-era`, which on stdio goes to a fresh process and tells a single-instance server apart from one that exits on `initialize`; `lifecycle-removed-methods`).",
+    "Lifecycle in 2026-07-28 is `server/discover` plus the per-request `_meta` envelope. The suite validates the discover result (versions, capabilities, caching hints, serverInfo), then sends deliberately incomplete envelopes (no `_meta`, no `protocolVersion`, no `clientCapabilities`, no `clientInfo`, an unsupported version) and checks the server rejects exactly the ones the spec says it must; like the header rules, a rejection is credited only when the conformant discover was served and is not a transport-level status. The late block -- `lifecycle-completions`, `lifecycle-progress-token`, the two claim-less probes (`lifecycle-meta-required`, `lifecycle-meta-protocol-version-required`) and `lifecycle-dual-era` -- runs after the feature and stdio tests and before the security tests: a dual-era stdio server that has not yet been pinned modern treats a claim-less message as a legacy opening (a `--only` run on stdio sends a pinning request first), and the security rate-limit burst would otherwise leave an intermediary answering these probes with 429. On stdio, `lifecycle-progress-token` restarts a child that exits on one of its calls (before answering it, or right after) before the next, as the security checks do, so the rules after it measure a live process. Over HTTP the setup `server/discover` is resent once after a 429, and every rule that reads it -- the discover-result rules, `lifecycle-jsonrpc`, the capability gates and the negative probes' not-evaluable reading -- judges the answer it settles on. `lifecycle-jsonrpc` and `lifecycle-subscriptions-listen` ask whose answer a rejection is, as the error rules do (see 3b.6), so a gateway's envelope or `-32001` is not read as the server's. Three rules are post-hoc scans of the recording (`lifecycle-log-level-gating`) or informational probes (`lifecycle-dual-era`, which on stdio goes to a fresh process and tells a single-instance server apart from one that exits on `initialize`; `lifecycle-removed-methods`).",
   tools:
     "Only present in the report when the discover result declares the `tools` capability; every rule is then required at runtime except `tools-list-deterministic-order` and `tools-pagination`. `tools/call` may now answer with an MRTR `input_required` result instead of content. The feature tests do not check `resultType: 'complete'` themselves; the post-hoc `schema-result-type` scan does, over every result.",
   resources:
     "Only present when the `resources` capability is declared. New in this revision: caching hints on every cacheable result, and `resources-not-found`, which fails the retired `-32002` code (any code other than `-32602` fails).",
   prompts: "Only present when the `prompts` capability is declared.",
   errors:
-    'Error tests send conformant envelopes so the error under test comes from the server\'s own dispatch, not from `_meta` validation. `error-unknown-method` now expects HTTP 404 on the JSON-RPC error. Two rules are post-hoc scans of every JSON-RPC error recorded during the run; a body that is not a jsonrpc 2.0 error (an auth gate\'s `{"error":"invalid_token"}` on 401, a gateway\'s `{"error":{"code":400,...}}`) is not counted.',
+    'Error tests send conformant envelopes so the error under test comes from the server\'s own dispatch, not from `_meta` validation. `error-unknown-method` now expects HTTP 404 on the JSON-RPC error. Two rules are post-hoc scans of every JSON-RPC error recorded during the run; a body that is not a jsonrpc 2.0 error (an auth gate\'s `{"error":"invalid_token"}` on 401, a gateway\'s `{"error":{"code":400,...}}`) is not counted. The rules that credit any rejection (`error-unknown-method`, `error-invalid-jsonrpc`, `error-invalid-json`, `error-missing-params`, `error-capability-gated`, `error-invalid-cursor`) also ask whose answer it is, so a gateway\'s 401 with a `-32001` body that echoes the id does not pass them: a 401, a 403 that reads as an auth refusal (without `--auth` any Bearer challenge, with `--auth` one carrying an `error` parameter), a 429 still a 429 after one resend, or any other 403 that a conformant twin sent next to the probe (a `server/discover`; for `error-invalid-cursor` its list method without the cursor) could not get past either fails as not evaluable. A 5xx without the rule\'s own code (`-32601`, `-32600`, `-32700`, `-32602`, `-32601`, `-32602`) fails as the server failing on the probe rather than rejecting it, and the rule\'s own code on a 5xx is credited with a warning about the status. No probe is resent after a 429 while the setup `server/discover` was rejected: every rejection is then not evaluable whatever the resend would draw. The exact-code rules (`error-parse-code`, `error-invalid-request-code`) credit only the one right code, which no gate produces, and a 4xx without a JSON-RPC body only when it is the server\'s own, read the same way. `tools-call-unknown` is not read this way yet: a gateway\'s `-32001` on its `tools/call` still passes it.',
   schema:
     "Definition checks (`tools-schema`, `tools-annotations`, `tools-title-field`, `tools-output-schema`, `prompts-schema`, `resources-schema`) validate the list results -- cached by the feature tests, or fetched once on demand when those did not run (`--only schema`) -- and are capability-gated. When a list call failed they skip pointing at the `-list` rule if it is in the run, and fail with the recorded reason when it was filtered out, so `--only schema` cannot grade A over a broken list. The four post-hoc rules scan every server message the Recorder captured: `resultType` on every result (`complete` or `input_required`, or an extension value only when an `extensions` capability is advertised), `input_required` only on MRTR methods, well-formed `InputRequiredResult`s whose methods the client declared support for, and full validation against the vendored 2026-07-28 JSON schema.",
   security:
