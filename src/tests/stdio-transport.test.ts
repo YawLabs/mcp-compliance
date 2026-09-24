@@ -1,4 +1,4 @@
-import { type ChildProcess, type SpawnOptions, spawn as spawnProcess } from "node:child_process";
+import { type ChildProcess, type SpawnOptions, spawn as spawnProcess, spawnSync } from "node:child_process";
 import { getEventListeners } from "node:events";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -37,6 +37,52 @@ function isAlive(pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * The first line of every temp-file server: it ends itself (exit code 124,
+ * as timeout(1) does) two minutes after starting, whatever it is doing. A
+ * worker killed mid-test runs no afterEach, and on Windows the server --
+ * cmd.exe's child -- is outside the kill-on-close job Node puts its own
+ * children in, so one that ignores EOF would otherwise run on forever.
+ * Unref'd, so a server that exits on its own still does; and far past any
+ * test's timeout here, so it never ends a server a test is still watching.
+ */
+const SELF_EXIT_LINE = "setTimeout(() => process.exit(124), 120_000).unref();";
+
+/** SIGKILL the server that wrote its pid to `pidFile`, if it got that far and is still running. */
+function killFromPidFile(pidFile: string): void {
+  let pid: number;
+  try {
+    pid = Number(readFileSync(pidFile, "utf8"));
+  } catch {
+    return;
+  }
+  // An empty or torn write reads as 0 or NaN, and process.kill(0) signals this whole process group on POSIX.
+  if (!Number.isInteger(pid) || pid <= 0 || !isAlive(pid)) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Exited in between.
+  }
+}
+
+/**
+ * Kill `child` together with everything it started, if it is still running.
+ * Windows: the forced tree kill, which reaches through cmd.exe to a server
+ * only while that chain is intact. POSIX: its process group, so `child` must
+ * have been spawned detached to lead one. Nothing once it has exited: its
+ * pid may belong to another process by then.
+ */
+function killTree(child: ChildProcess): void {
+  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    if (process.platform === "win32")
+      spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+    else process.kill(-child.pid, "SIGKILL");
+  } catch {
+    // Exited in between.
   }
 }
 
@@ -83,8 +129,16 @@ function firstLineOf(err: unknown): string {
 describe("StdioTransport", () => {
   let openTransports: StdioTransport[] = [];
   let tempFiles: string[] = [];
+  /**
+   * Kills for processes a test started outside a transport, run first in
+   * afterEach whatever ended the test (a failed expect, the test timeout) --
+   * before the temp files they may read a pid from are removed. None may throw.
+   */
+  let cleanups: (() => void)[] = [];
 
   afterEach(async () => {
+    for (const cleanup of cleanups) cleanup();
+    cleanups = [];
     await Promise.all(openTransports.map((t) => t.close()));
     openTransports = [];
     for (const f of tempFiles) rmSync(f, { force: true });
@@ -397,7 +451,7 @@ describe("StdioTransport", () => {
     tempFiles.push(readyFile, serverPath);
     writeFileSync(
       serverPath,
-      [...body, 'require("node:fs").writeFileSync(process.argv[2], String(process.pid));'].join("\n"),
+      [SELF_EXIT_LINE, ...body, 'require("node:fs").writeFileSync(process.argv[2], String(process.pid));'].join("\n"),
       "utf8",
     );
     const t = createStdioTransport({ command: process.execPath, args: [serverPath, readyFile, ...extraArgs] });
@@ -696,6 +750,7 @@ describe("StdioTransport", () => {
     writeFileSync(
       serverPath,
       [
+        SELF_EXIT_LINE,
         'process.on("SIGTERM", () => {});',
         "setInterval(() => {}, 1000);",
         "process.stdin.resume();",
@@ -728,6 +783,19 @@ describe("StdioTransport", () => {
     const tsx = new URL("../../node_modules/tsx/dist/loader.mjs", import.meta.url).href;
     const caller = spawnProcess(process.execPath, ["--import", tsx, callerPath, serverPath, pidFile], {
       stdio: ["ignore", "pipe", "pipe"],
+      // POSIX: a process group of its own, for afterEach to kill (killTree).
+      detached: process.platform !== "win32",
+    });
+    // If the test ends before the finally below -- a failed expect, or the
+    // test timeout while the caller is still starting or closing on a loaded
+    // machine -- afterEach kills the caller with everything it spawned (the
+    // server too, even before it has written its pid), then a server the
+    // caller left behind by the pid it wrote. Neither is sure to end on its
+    // own: the caller can be torn down with this worker partway through
+    // close(), and the server outlives EOF and SIGTERM.
+    cleanups.push(() => {
+      killTree(caller);
+      killFromPidFile(pidFile);
     });
     let out = "";
     let err = "";
