@@ -1,5 +1,9 @@
 # @yawlabs/mcp-compliance
 
+[![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](https://yaw.sh/mcp/install?name=mcp-compliance&command=npx&args=-y%2C%40yawlabs%2Fmcp-compliance&description=Test%20any%20MCP%20server%20against%20the%20spec%20%282025-11-25%20or%202026-07-28%29%20with%20letter-grade%20scoring&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fmcp-compliance)
+
+One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
+
 [![npm version](https://img.shields.io/npm/v/@yawlabs/mcp-compliance)](https://www.npmjs.com/package/@yawlabs/mcp-compliance)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![GitHub stars](https://img.shields.io/github/stars/YawLabs/mcp-compliance)](https://github.com/YawLabs/mcp-compliance/stargazers)
@@ -7,10 +11,6 @@
 **Test any MCP server for spec compliance.** Two test suites — 88 tests for MCP [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) and 103 tests for MCP [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) — covering transport, lifecycle, tools, resources, prompts, error handling, schema validation, and security. The tool probes the server and grades the newest spec revision it speaks, or you pin one with `--spec-version`. Works against **HTTP endpoints** (`https://my-server.com/mcp`) and **stdio servers** (`npx @modelcontextprotocol/server-filesystem /tmp`) alike. CLI, MCP server, and programmatic API.
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
-
-[![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](https://yaw.sh/mcp/install?name=mcp-compliance&command=npx&args=-y%2C%40yawlabs%2Fmcp-compliance&description=Test%20any%20MCP%20server%20against%20the%20spec%20%282025-11-25%20or%202026-07-28%29%20with%20letter-grade%20scoring&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fmcp-compliance)
-
-One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
 
 ## Why this tool?
 
@@ -802,4 +802,4 @@ npm test
 
 MIT — see [LICENSE](./LICENSE).
 
-[![Follow @TokenLimitNews on X](https://img.shields.io/badge/follow-%40TokenLimitNews-000000?logo=x&logoColor=white)](https://x.com/TokenLimitNews)
+[![Follow @YawLabs on X](https://img.shields.io/badge/follow-%40YawLabs-000000?logo=x&logoColor=white)](https://x.com/YawLabs)
