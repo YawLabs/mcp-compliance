@@ -9,6 +9,8 @@ out explicitly here.
 
 ## [Unreleased]
 
+## [0.20.2] — 2026-09-29
+
 ### Fixed
 - `release.sh` finishes on the first re-run after a later step fails, and retries the MCP Registry publish while the registry cannot see the new version yet. Every "is this version on npm?" read now fetches npm's per-version document with curl (the path the MCP Registry's validator reads, served uncached) instead of `npm view`, whose packument Cloudflare's edge caches for up to five minutes; only a host without curl falls back to `npm view --prefer-online`. When npm refuses a publish with its "cannot publish over the previously published versions" E403, the version is treated as already published rather than reported as a dead token. The MCP Registry publish makes up to four attempts, 30/60/90 s apart, when the registry answers that the version was not found or that npm was transiently unavailable, or answers HTTP 429, 502, 503 or 504 itself (with a fresh registry login before each retry), stops at once on any other error, and treats a duplicate version as already registered.
 
