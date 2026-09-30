@@ -25,8 +25,15 @@ out explicitly here.
   the limit stopped, which used to hang the step, and one whose connection
   failed or dropped (the client's `error sending request` or
   `error reading response`), which used to fail it at once. A login the limit
-  stopped says the registry did not answer, instead of blaming the credentials.
-  Release tooling only; the server itself is unchanged.
+  stopped says the registry did not answer; one that failed any other way says
+  how to read mcp-publisher's output (a 401 is the registry refusing the token
+  exchange; a 429, a 5xx or a connection error is the registry or the network)
+  instead of naming token scopes, which never fail a login: the registry reads
+  the org role at login and refuses only at publish. A publish refused with a
+  403 says what the io.github.YawLabs namespace takes: a YawLabs org Owner whose
+  token can read org roles (after a CI OIDC login: that the release must run in
+  a YawLabs-owned repository). Release tooling only; the server itself is
+  unchanged.
 
 ## [0.20.2] — 2026-09-29
 
