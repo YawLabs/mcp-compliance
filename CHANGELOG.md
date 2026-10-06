@@ -34,6 +34,16 @@ out explicitly here.
   token can read org roles (after a CI OIDC login: that the release must run in
   a YawLabs-owned repository). Release tooling only; the server itself is
   unchanged.
+- `scripts/update-manifests.mjs` escapes every value it writes into a Ruby
+  string in the Homebrew formula (CodeQL js/incomplete-sanitization). The
+  description used to have only `"` escaped, so a `\"` in it came out as `\\"`
+  -- an escaped backslash and then a closing quote -- and a `#{...}` in it
+  would have run as Ruby when brew loaded the formula. Backslashes, quotes,
+  interpolation-starting `#` and line breaks are now escaped in the
+  description, homepage, version, license and command name; a plain `#`
+  ("C# support") is left as is. The generated formula and Scoop manifest for
+  the current package.json are byte-identical to before. Release tooling only;
+  the server itself is unchanged.
 
 ## [0.20.2] — 2026-09-29
 
