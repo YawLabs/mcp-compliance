@@ -25,8 +25,8 @@
  * version, and the NEWEST one at or above the floor wins; a tie keeps search
  * order. Taking the first binary found instead let a stale copy early in the
  * search order hide a current one later: with oam 0.9.0 installed in ~/.oam/bin
- * and 0.15.2 on PATH, the launcher bound to 0.9.0 because installed locations
- * are searched first.
+ * and 0.15.2 on PATH (measured when 0.15.2 was the floor), the launcher bound to
+ * 0.9.0 because installed locations are searched first.
  *
  * Whenever the launcher goes looking for an oam, an OAM_BIN that does not exist,
  * is below the floor, or will not run is named on stderr -- whether or not a
@@ -72,7 +72,7 @@
  * so `--permission` is not offered rather than shipped as security theatre.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.15.2 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.18.0 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over. The
  * floor is not cosmetic, and this tool is the strongest case for it in the
  * whole @yawlabs/*-mcp set. Before 0.9.0, oam's `child_process` diverged from
@@ -112,7 +112,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** The oam release this CLI is verified on. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 15, 2];
+const OAM_MIN = [0, 18, 0];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -187,8 +187,8 @@ function discoverOamPaths() {
  * A pre-release suffix (0.9.0-rc.1) truncates to its base version.
  *
  * Shared by the two places a version is read -- a discovered binary's
- * `oam --version` output ("oam 0.15.2") and the host's own
- * `process.versions.oam` ("0.15.2") -- so they cannot disagree about what a
+ * `oam --version` output ("oam 0.18.0") and the host's own
+ * `process.versions.oam` ("0.18.0") -- so they cannot disagree about what a
  * version string means, or which floor it has to clear.
  */
 function parseVersion(text) {
