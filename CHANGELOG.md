@@ -9,6 +9,8 @@ out explicitly here.
 
 ## [Unreleased]
 
+## [0.20.3] — 2026-10-06
+
 ### Security
 - **The MCP SDK moves from 1.30.0 to 1.32.1** (GHSA-6qxp-vccf-f47h, high: the SDK's OAuth client could send credentials to an authorization server chosen by the MCP server). The SDK is a runtime dependency here -- tsup leaves it external and `dist/` imports it -- so its floor is now `^1.32.1`, and a fresh install can no longer resolve a vulnerable version. Its transitive dependencies, installed alongside it, move too: `proxy-addr` 2.0.7 -> 2.0.8 (GHSA-jqcg-44mw-7w3h, critical), `fast-uri` 3.1.7 -> 3.1.8 (GHSA-hrr3-gc8f-f4qj) and `ip-address` 10.7.0 -> 10.7.3 (GHSA-j6r3-76f7-8jcv, GHSA-h3mg-xc3c-68pw). Development-scope only: `source-map-js` 1.2.1 -> 1.2.2 (GHSA-68fv-2mgg-jv7q), through tsup. `npm audit` reports 0 vulnerabilities.
 
