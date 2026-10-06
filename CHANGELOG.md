@@ -9,6 +9,25 @@ out explicitly here.
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor moves from 0.15.2 to 0.18.0, so the `mcp-compliance`
+  launcher no longer runs the CLI on an older oam.** This tool is verified on
+  one oam release at a time, and the floor keeps the launcher off anything
+  older than that release. 0.18.0 is verified on the published
+  aarch64-pc-windows-msvc binary, checksum matched against the release
+  SHA256SUMS, through the launcher with `OAM_BIN` pointing at it: a full MCP
+  handshake on the `mcp` subcommand listing both tools (the same 2 as on Node),
+  `mcp_compliance_explain` served, the launcher's child process being that
+  binary, and a stdio compliance run against the bundled echo fixture that
+  graded A (98, 43 of 45 passed, 6 skipped) with every verdict identical to the
+  same run on Node. **If the launcher finds only oam 0.17.x or older, it now
+  falls back to Node under the default `MCP_COMPLIANCE_RUNTIME=auto`, and exits
+  with an error under `MCP_COMPLIANCE_RUNTIME=oam`** -- it says so on stderr,
+  naming the version it found and the floor. The CLI behaves the same on Node.
+  A host that runs `oam run dist/index.js` directly bypasses the launcher and
+  keeps the oam it names. Run `oam self-update`, or set
+  `MCP_COMPLIANCE_RUNTIME=node` to make the choice explicit.
+
 ### Fixed
 - `release.sh` waits up to 600 s, not 300, for npm to serve a new version before
   the MCP Registry step, and polls npm up to 120 times 5 s apart in its final
