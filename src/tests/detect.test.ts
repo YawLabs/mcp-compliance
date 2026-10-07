@@ -26,6 +26,7 @@ import type { TransportResponse } from "../transport/index.js";
 import type { StdioTransport } from "../transport/stdio.js";
 import type { ComplianceReport, TransportTarget } from "../types.js";
 import {
+  escapeRegExp,
   type HttpFixture,
   LEGACY_ECHO_FIXTURE,
   LEGACY_SILENT_FIXTURE,
@@ -1325,7 +1326,7 @@ describe("auth-gated server with a rejected --auth credential", () => {
       );
       // Before: the preflight timed out, so the warning fell back to "HTTP 401 ... invalid or expired".
       expect(report.warnings[0]).toMatch(
-        new RegExp(`^Server at ${url.replace(/[.]/g, "\\.")} refused the server/discover probe with HTTP 403, so `),
+        new RegExp(`^Server at ${escapeRegExp(url)} refused the server/discover probe with HTTP 403, so `),
       );
     } finally {
       server.closeAllConnections();

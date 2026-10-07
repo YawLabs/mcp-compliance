@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runComplianceSuite } from "../runner.js";
 import { MODERN_SPEC_VERSION } from "../spec.js";
 import type { ComplianceReport, TransportTarget } from "../types.js";
-import { MODERN_FIXTURE, resultOf, runModern } from "./helpers/modern-fixture.js";
+import { escapeRegExp, MODERN_FIXTURE, resultOf, runModern } from "./helpers/modern-fixture.js";
 
 /**
  * The 2026-07-28 stdio-unicode check against a stdio child that exits on
@@ -172,7 +172,7 @@ describe("2026-07-28 stdio-unicode: a child that exits on the probe is restarted
     expect(resultOf(report, "tools-call-unknown").passed).toBe(false);
     expect(resultOf(report, "stdio-unicode").details).toMatch(
       new RegExp(
-        `^server unreachable: ${TOOL_PROBE.replace(/\//g, "\\/")} got no response \\(connection closed: .*exit code 3`,
+        `^server unreachable: ${escapeRegExp(TOOL_PROBE)} got no response \\(connection closed: .*exit code 3`,
       ),
     );
     expect(resultOf(report, "stdio-unicode").details).toMatch(/^[\x20-\x7e]+$/);

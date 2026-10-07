@@ -16,6 +16,14 @@ export const MODERN_FIXTURE = join(FIXTURES, "modern-server.mjs");
 export const LEGACY_SILENT_FIXTURE = join(FIXTURES, "legacy-silent-server.mjs");
 export const LEGACY_ECHO_FIXTURE = join(FIXTURES, "echo-server.mjs");
 
+/**
+ * `text` with every RegExp metacharacter escaped -- backslash included --
+ * so it matches itself literally inside a `new RegExp(...)` pattern.
+ */
+export function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export interface FixtureOptions {
   /** Comma-joined into MODERN_FIXTURE_BREAK. */
   breaks?: string[];

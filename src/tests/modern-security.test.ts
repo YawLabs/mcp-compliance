@@ -32,6 +32,7 @@ import type { Transport } from "../transport/index.js";
 import { createStdioTransport } from "../transport/stdio.js";
 import type { ComplianceReport, TestResult } from "../types.js";
 import {
+  escapeRegExp,
   type FixtureOptions,
   type HttpFixture,
   passedIds,
@@ -132,10 +133,17 @@ const SIBLING_NOT_EVALUABLE =
 const CREDENTIAL_REFUSED_PREFIX =
   "Skipped: the configured credential was refused too (the credentialed server/discover drew HTTP 401), so ";
 const UNREACHED = "never reached the tool (JSON-RPC or transport error)";
+/**
+ * The foreign Origins the security checks send (CORS_ORIGIN and
+ * REBINDING_ORIGIN in suites/modern/security.ts). The "reflect" inline
+ * server echoes only these, so it reflects every probe exactly as a
+ * reflect-anything server would, without echoing an arbitrary Origin.
+ */
+const FOREIGN_PROBE_ORIGINS = ["https://evil.example.com", "https://evil-rebinding-attack.example.com"] as const;
 
 /** Ids that FAIL on the clean HTTP fixture by design, with the details they must carry. */
 const EXPECTED_FAIL_CLEAN_HTTP: Record<string, RegExp> = {
-  "security-auth-required": new RegExp(`^${NO_AUTH_DETAILS.replace(/[()]/g, "\\$&")}$`),
+  "security-auth-required": new RegExp(`^${escapeRegExp(NO_AUTH_DETAILS)}$`),
   "security-tls-required": /^Server URL uses http: -- production servers should use HTTPS$/,
 };
 
@@ -1512,7 +1520,13 @@ interface InlineOptions {
    * gateway key the server needs next to (not instead of) the bearer token.
    */
   apiKey?: string;
-  /** "fixed": every response carries Access-Control-Allow-Origin https://app.example.com. */
+  /**
+   * "fixed": every response carries Access-Control-Allow-Origin https://app.example.com.
+   * "reflect": a request whose Origin is one of the foreign origins the
+   * security checks probe with (FOREIGN_PROBE_ORIGINS) gets that origin back
+   * with Access-Control-Allow-Credentials -- the misconfiguration the CORS
+   * check must catch, built without echoing an arbitrary request header.
+   */
   cors?: "reflect" | "wildcard" | "none" | "fixed";
   /** "drop": the OPTIONS preflight's socket is destroyed; everything else is served. */
   preflight?: "drop";
@@ -2068,8 +2082,9 @@ function startInlineServer(opts: InlineOptions): Promise<InlineServer> {
       const url = new URL(req.url ?? "/", base);
       const origin = req.headers.origin;
       const cors: Record<string, string> = {};
-      if (opts.cors === "reflect" && typeof origin === "string") {
-        cors["Access-Control-Allow-Origin"] = origin;
+      const reflected = FOREIGN_PROBE_ORIGINS.find((o) => o === origin);
+      if (opts.cors === "reflect" && reflected) {
+        cors["Access-Control-Allow-Origin"] = reflected;
         cors["Access-Control-Allow-Credentials"] = "true";
       }
       if (opts.cors === "wildcard") cors["Access-Control-Allow-Origin"] = "*";
