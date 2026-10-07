@@ -9,6 +9,8 @@ out explicitly here.
 
 ## [Unreleased]
 
+## [0.20.4] — 2026-10-07
+
 ### Fixed
 - The five open CodeQL code-scanning alerts, all in the test suite. Four
   (js/incomplete-sanitization) built a `new RegExp` from an expected string while

@@ -9,12 +9,12 @@
     "id": "1202893495"
   },
   "websiteUrl": "https://yaw.sh/mcp-servers/mcp-compliance/",
-  "version": "0.20.3",
+  "version": "0.20.4",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@yawlabs/mcp-compliance",
-      "version": "0.20.3",
+      "version": "0.20.4",
       "transport": {
         "type": "stdio"
       }
