@@ -20,6 +20,7 @@ import {
 } from "../suites/modern/lifecycle.js";
 import type { ComplianceReport, TestResult, TransportTarget } from "../types.js";
 import {
+  escapeRegExp,
   type HttpFixture,
   LEGACY_ECHO_FIXTURE,
   passedIds,
@@ -202,7 +203,7 @@ for (const kind of KINDS) {
           report,
           id,
           new RegExp(
-            `^server/discover without _meta[a-zA-Z ]*: not evaluable: the conformant server/discover was itself rejected with -32601${status.replace(/[()]/g, "\\$&")}, so this rejection proves nothing about the injected defect$`,
+            `^server/discover without _meta[a-zA-Z ]*: not evaluable: the conformant server/discover was itself rejected with -32601${escapeRegExp(status)}, so this rejection proves nothing about the injected defect$`,
           ),
         );
       }

@@ -9,6 +9,20 @@ out explicitly here.
 
 ## [Unreleased]
 
+### Fixed
+- The five open CodeQL code-scanning alerts, all in the test suite. Four
+  (js/incomplete-sanitization) built a `new RegExp` from an expected string while
+  escaping only `.`, `()` or `/`, so a backslash or any other metacharacter
+  in it would have changed the pattern; they now go through one
+  `escapeRegExp` helper (`src/tests/helpers/modern-fixture.ts`) that escapes
+  every metacharacter, backslash included. The fifth
+  (js/cors-misconfiguration-for-credentials): the inline "reflect" CORS server
+  in `modern-security.test.ts` echoed any request Origin with
+  `Access-Control-Allow-Credentials: true`; it now echoes only the two foreign
+  origins the security checks probe with, so the misconfiguration the CORS
+  check must catch is still served exactly as before. Tests only; the
+  published package is unchanged.
+
 ## [0.20.3] — 2026-10-06
 
 ### Security
