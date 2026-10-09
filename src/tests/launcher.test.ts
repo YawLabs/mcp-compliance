@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, linkSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -137,6 +137,108 @@ describe("launcher pickNewest()", () => {
     expect(pickNewest([at("old", [0, 17, 0]), at("broken", null), at("good", [0, 18, 0])])?.path).toBe("good");
     expect(pickNewest([at("old", [0, 17, 9]), at("broken", null)])).toBeNull();
     expect(pickNewest([])).toBeNull();
+  });
+});
+
+type Found = { passedOver: (number[] | null)[]; overrideMissing: boolean; shim: string | null };
+type RemedyFor = (found: Found, tail: string, platform?: string, arch?: string) => string[];
+
+describe("launcher remedyFor()", () => {
+  const remedyFor = new Function(
+    `${extract([OAM_MIN_DECL, /function remedyFor\([^)]*\) \{[\s\S]*?\n\}/])}\nreturn remedyFor;`,
+  )() as RemedyFor;
+  const TAIL = "Or use MCP_COMPLIANCE_RUNTIME=node to run on Node";
+  const none: Found = { passedOver: [], overrideMissing: false, shim: null };
+
+  it("sends an outdated oam to `oam self-update`, not to the website", () => {
+    const lines = remedyFor({ ...none, passedOver: [[0, 17, 1]] }, TAIL, "win32", "x64");
+    expect(lines[0]).toBe("Run `oam self-update` to get oam 0.18.0 or newer");
+    expect(lines.join("\n")).not.toMatch(/oamjs\.org/);
+    expect(lines.at(-1)).toBe(TAIL);
+  });
+
+  it("asks for a check, not an update, when a binary would not run", () => {
+    const lines = remedyFor({ ...none, passedOver: [null] }, TAIL, "win32", "x64");
+    expect(lines.join("\n")).toMatch(/executable oam for this platform/);
+    expect(lines.join("\n")).not.toMatch(/self-update|oamjs\.org/);
+  });
+
+  it("names a missing OAM_BIN on its own", () => {
+    const lines = remedyFor({ ...none, overrideMissing: true }, TAIL, "darwin", "arm64");
+    expect(lines).toEqual(["Point OAM_BIN at an existing oam binary, or unset it", TAIL]);
+  });
+
+  it("offers the install only when nothing was found, and not on Linux off x64", () => {
+    expect(remedyFor(none, TAIL, "linux", "x64")[0]).toMatch(/^Install oam from https:\/\/oamjs\.org/);
+    const arm = remedyFor(none, TAIL, "linux", "arm64");
+    expect(arm[0]).toMatch(/no build for linux-arm64/);
+    expect(arm.join("\n")).not.toMatch(/oamjs\.org/);
+    // A .cmd/.bat shim is already named with its own fix; no install line on top.
+    expect(remedyFor({ ...none, shim: "C:\\bin\\oam.cmd" }, TAIL, "win32", "x64")).toEqual([TAIL]);
+  });
+});
+
+describe("launcher pipesStdio()", () => {
+  const pipesStdio = new Function(
+    `${extract([
+      /function parseVersion\(text\) \{[\s\S]*?\n\}/,
+      ATLEAST_DECL,
+      /function pipesStdio\(hostOam\) \{[\s\S]*?\n\}/,
+    ])}\nreturn pipesStdio;`,
+  )() as (hostOam: string | undefined) => boolean;
+
+  it("pipes only from an oam below 0.9.0, which treated 'inherit' as 'pipe'", () => {
+    for (const hostOam of ["0.8.2", "0.8.9", "0.1.0"]) expect(pipesStdio(hostOam), hostOam).toBe(true);
+  });
+
+  it("inherits on Node and on any oam from 0.9.0 on, so the terminal keeps its colors", () => {
+    // 0.18.0 is the case this exists for: a supported oam under
+    // MCP_COMPLIANCE_RUNTIME=node used to pipe, and lose the colors, for nothing.
+    for (const hostOam of [undefined, "0.9.0", "0.17.1", "0.18.0", "1.0.0", "dev"]) {
+      expect(pipesStdio(hostOam), String(hostOam)).toBe(false);
+    }
+  });
+});
+
+describe("launcher NODE_OPTIONS handling for a Node handoff", () => {
+  const { withoutPermissionOptions, permissionReachesChildren } = new Function(
+    `${extract([
+      OAM_MIN_DECL,
+      /function parseVersion\(text\) \{[\s\S]*?\n\}/,
+      ATLEAST_DECL,
+      /function stripPermissionOptions\(value\) \{[\s\S]*?\n\}/,
+      /function withoutPermissionOptions\(source\) \{[\s\S]*?\n\}/,
+      /function permissionReachesChildren\(hostOam, execArgv\) \{[\s\S]*?\n\}/,
+    ])}\nreturn { withoutPermissionOptions, permissionReachesChildren };`,
+  )() as {
+    withoutPermissionOptions: (env: Record<string, string>) => Record<string, string>;
+    permissionReachesChildren: (hostOam: string | undefined, execArgv: string[]) => boolean;
+  };
+
+  it("removes --permission and every --allow-* token and keeps the rest as written", () => {
+    // Node exits 9 on `--allow-net=` or `--allow-env` in NODE_OPTIONS before it
+    // runs a line, so a handoff that passed them on could never start.
+    const env = withoutPermissionOptions({
+      NODE_OPTIONS: '--max-old-space-size=512 --permission --allow-net=example.com --allow-env --require "a b.js"',
+      OTHER: "--allow-net=kept",
+    });
+    expect(env.NODE_OPTIONS).toBe('--max-old-space-size=512 --require "a b.js"');
+    expect(env.OTHER).toBe("--allow-net=kept");
+  });
+
+  it("drops NODE_OPTIONS when nothing else is left, under any spelling of the name", () => {
+    const env = withoutPermissionOptions({ Node_Options: "--permission --allow-fs-read=*", PATH: "/bin" });
+    expect(env).toEqual({ PATH: "/bin" });
+  });
+
+  it("refuses only on an oam from 0.18.0 on that itself runs under --permission", () => {
+    // From 0.18.0 oam appends its grants to every child's NODE_OPTIONS AFTER the
+    // env this launcher passes, so stripping cannot help there.
+    expect(permissionReachesChildren("0.18.0", ["--permission", "--allow-env"])).toBe(true);
+    expect(permissionReachesChildren("1.0.0", ["--permission=true"])).toBe(true);
+    expect(permissionReachesChildren("0.18.0", ["--allow-env"])).toBe(false);
+    expect(permissionReachesChildren("0.17.1", ["--permission"])).toBe(false);
+    expect(permissionReachesChildren(undefined, ["--permission"])).toBe(false);
   });
 });
 
@@ -365,6 +467,60 @@ maybeDescribe("launcher with no usable oam", () => {
       // must not claim otherwise.
       expect(run.stderr).not.toMatch(/no newer oam was found/);
       expect(run.stderr).toMatch(/this process is oam 0\.9\.0, older than 0\.18\.0; running on .*node/);
+    },
+    TIMEOUT_MS,
+  );
+  it(
+    "says to fix OAM_BIN, not to install oam, when MCP_COMPLIANCE_RUNTIME=oam and OAM_BIN does not exist",
+    async () => {
+      const run = await runLauncher(
+        undefined,
+        isolated({ MCP_COMPLIANCE_RUNTIME: "oam", OAM_BIN: join(tmpdir(), "no-such-dir", "oam.exe") }),
+      );
+      expect(run.code, JSON.stringify(run)).toBe(1);
+      expect(run.stdout.trim(), "nothing may run").toBe("");
+      expect(run.stderr).toMatch(/^Point OAM_BIN at an existing oam binary, or unset it\.$/m);
+      expect(run.stderr).toMatch(/^Or use MCP_COMPLIANCE_RUNTIME=node to run on Node\.$/m);
+      expect(run.stderr).not.toMatch(/oamjs\.org/);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "finds an oam in OAM_INSTALL_DIR that is not on PATH",
+    async () => {
+      // The pinned Node, linked in as oam, answers `--version` with v2x.y.z and so
+      // clears the floor: found means spawned (and failed, see runLauncher).
+      // Without OAM_INSTALL_DIR the same environment finds nothing and runs
+      // in-process -- the control that makes the first assertion mean something.
+      const installDir = mkdtempSync(join(tmpdir(), "mcp-compliance-launcher-install-"));
+      const fake = join(installDir, process.platform === "win32" ? "oam.exe" : "oam");
+      try {
+        linkSync(process.execPath, fake);
+      } catch {
+        copyFileSync(process.execPath, fake);
+      }
+      const found = await runLauncher(undefined, isolated({ OAM_BIN: "", OAM_INSTALL_DIR: installDir }));
+      expect(spawnedAndFailed(found), JSON.stringify(found)).toBe(true);
+      const control = await runLauncher(undefined, isolated({ OAM_BIN: "" }));
+      expect(servedInProcess(control), JSON.stringify(control)).toBe(true);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "takes oam's permission flags out of NODE_OPTIONS before handing off to Node",
+    async () => {
+      // Set in the preload, so the launcher (itself Node here) starts cleanly and
+      // only its CHILD would see the flag: Node exits 9 on `--allow-env` in
+      // NODE_OPTIONS, so the handoff serves only if the launcher stripped it.
+      const run = await runLauncher(
+        "0.18.0",
+        isolated({ MCP_COMPLIANCE_RUNTIME: "node" }),
+        'process.env.NODE_OPTIONS = "--allow-env --no-deprecation";',
+      );
+      expect(handedOff(run), JSON.stringify(run)).toBe(true);
+      expect(run.stderr).not.toMatch(/not allowed in NODE_OPTIONS/);
     },
     TIMEOUT_MS,
   );

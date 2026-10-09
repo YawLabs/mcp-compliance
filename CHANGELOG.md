@@ -9,6 +9,53 @@ out explicitly here.
 
 ## [Unreleased]
 
+### Changed
+- **Under `MCP_COMPLIANCE_RUNTIME=oam`, the "no usable oam" error now gives a
+  fix that matches what the launcher found.** An outdated oam gets
+  `oam self-update`. A binary that would not run gets "check that it is an
+  executable oam". An `OAM_BIN` that does not exist gets "point OAM_BIN at an
+  existing binary". The install link from https://oamjs.org is given only when
+  no oam was found at all, and not on Linux off x64, where oam publishes no
+  build. It used to print "Install or update from https://oamjs.org" in every
+  case.
+- **The launcher also looks for oam in `OAM_INSTALL_DIR`**, the directory oam's
+  installers write to, before the default install
+  locations and `PATH`. An oam installed to a custom directory that is not on
+  `PATH` is now found.
+- When the launcher hands off from an oam to Node (a supported oam under
+  `MCP_COMPLIANCE_RUNTIME=node`), the child now inherits the terminal again,
+  so the terminal report keeps its colors. Only an oam older than 0.9.0 still
+  gets piped stdio, since those releases treated `'inherit'` as `'pipe'`.
+
+### Fixed
+- A Node handoff no longer dies with exit 9 on oam's permission flags. Node
+  refuses `--allow-*` in `NODE_OPTIONS` ("--allow-env is not allowed in
+  NODE_OPTIONS"). The launcher now removes `--permission` and `--allow-*` from
+  the Node child's `NODE_OPTIONS`. From 0.18.0, oam adds its own grants to a
+  child's `NODE_OPTIONS` itself, after the launcher has set the child's
+  environment, so stripping cannot help when the host oam runs under
+  `--permission`. In that case the launcher now exits 1 and says why, instead
+  of leaving a bare exit 9 from Node.
+
+### Added
+- README: a Runtime section under Requirements. It covers
+  `MCP_COMPLIANCE_RUNTIME`, `OAM_BIN`, `OAM_INSTALL_DIR`, the 0.18.0 floor with
+  its fallback and its error, `oam self-update`, and how `oam run dist/index.js`
+  skips the launcher.
+- `scripts/check-oam-floor.mjs` (`npm run check:oam-floor`), ported from
+  aws-mcp. It checks that every floor claim in the launcher, the README and the
+  launcher tests matches `OAM_MIN`; that part runs offline on every `npm test`
+  via `src/tests/oam-floor.test.ts`. `release.sh` also runs the online part,
+  which stops a release when a newer oam has been published. Set
+  `MCP_COMPLIANCE_ALLOW_STALE_OAM=1` to release on the old floor anyway. With no
+  network, it prints a warning and continues.
+- `src/tests/oam-runtime.integration.test.ts` runs the CLI on a real oam. It
+  runs only when an oam at or above `OAM_MIN` is on `OAM_BIN` or `PATH` and
+  `dist/` is built. It grades the HTTP modern fixture on oam and on Node and
+  requires identical verdicts. It also checks that oam's built-in `undici`
+  rejects refused, dropped and timed-out requests in a form the security checks
+  classify the same way as on Node. On oam 0.18.0 every verdict matched.
+
 ## [0.20.4] — 2026-10-07
 
 ### Fixed

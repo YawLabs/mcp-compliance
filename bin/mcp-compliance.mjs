@@ -54,14 +54,23 @@
  * run. It now hands the CLI off to the newest usable oam, or to Node found on
  * PATH, or exits with an error when there is neither.
  *
- * That handoff PIPES stdio rather than inheriting it. Before 0.9.0 oam treated
- * `stdio: 'inherit'` as `'pipe'`, so an inherited handoff from such a host
- * connected the child to pipes nobody reads: measured with a real oam 0.8.2
- * host, the MCP handshake never answered. Piping the streams explicitly
- * completes it, to both oam and Node. The child's stdout is then a pipe rather
- * than the terminal, so TTY-dependent output (the terminal report's colors) is
- * off on that path. A Node host keeps `inherit`, which hands over the same fds
- * untouched.
+ * From a host oam below 0.9.0 that handoff PIPES stdio rather than
+ * inheriting it. Before 0.9.0 oam treated `stdio: 'inherit'` as `'pipe'`, so an
+ * inherited handoff from such a host connected the child to pipes nobody reads:
+ * measured with a real oam 0.8.2 host, the MCP handshake never answered. Piping
+ * the streams explicitly completes it, to both oam and Node. The child's stdout
+ * is then a pipe rather than the terminal, so TTY-dependent output (the
+ * terminal report's colors) is off on that path. oam 0.9.0 honors `stdio` (its
+ * CHANGELOG), so every other host -- Node, or an oam from 0.9.0 on, such as a
+ * supported oam under MCP_COMPLIANCE_RUNTIME=node -- keeps `inherit`, which
+ * hands over the same fds untouched and keeps the colors.
+ *
+ * A Node handoff gets a copy of the environment with any `--permission` or
+ * `--allow-*` token taken out of NODE_OPTIONS: Node exits 9 on the oam-only
+ * ones there before running a line. An oam host from 0.18.0 on that itself
+ * runs under `--permission` appends its grants to every child's NODE_OPTIONS
+ * after the env this launcher passes, so there the handoff is refused with a
+ * message instead of ending in that exit 9.
  *
  * NO SANDBOX HERE -- DELIBERATELY
  * oam's `--permission` is real hardening, but this tool cannot use it. Its
@@ -102,6 +111,7 @@
  *   MCP_COMPLIANCE_RUNTIME=node   Node: in THIS process on Node, handed off to
  *                                 Node on PATH when THIS process is oam
  *   OAM_BIN=/path/to/oam          use this oam when it is usable, before discovery
+ *   OAM_INSTALL_DIR=/dir          also look for an oam binary in this directory
  * The value is case-insensitive; anything else behaves like `auto`.
  */
 
@@ -151,6 +161,11 @@ function pathKey(p) {
  * to %LOCALAPPDATA%\oam\bin there, but oam's docs name ~/.oam/bin first and
  * OAM_INSTALL_DIR can pick either.
  *
+ * OAM_INSTALL_DIR itself, when set, is checked first: it is the install target
+ * oam's installers write the binary to (oam docs/cli-reference.md),
+ * so an oam installed to a custom directory that is not on PATH is still found.
+ * Like the other installed locations it only breaks a version tie.
+ *
  * PATH is resolved manually rather than by spawning `which`/`where`, which would
  * cost a subprocess on every launch just to find the candidates.
  *
@@ -166,6 +181,7 @@ function discoverOamPaths() {
   if (isWin) {
     installed.unshift(join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "oam", "bin", exe));
   }
+  if (process.env.OAM_INSTALL_DIR) installed.unshift(join(process.env.OAM_INSTALL_DIR, exe));
   const onPath = (process.env.PATH ?? "")
     .split(delimiter)
     .filter(Boolean)
@@ -334,18 +350,27 @@ function unusableReason(path, version, label = path) {
  * Choose the oam to spawn: a usable OAM_BIN, else the newest usable discovered
  * binary. Returns the choice (or null) plus stderr notes: `overrideNote` about
  * an unusable OAM_BIN, and `skipped` describing what was found and rejected
- * when nothing was usable.
+ * when nothing was usable. `passedOver` holds the version of every binary that
+ * was found and rejected (null for one that would not run), and
+ * `overrideMissing` says OAM_BIN named a path that does not exist -- the
+ * inputs remedyFor needs to say which fix applies.
  */
 function chooseOam() {
   const override = process.env.OAM_BIN;
   let overrideNote = null;
+  let overrideMissing = false;
+  const passedOver = [];
   if (override) {
     if (!existsSync(override)) {
       overrideNote = `OAM_BIN=${override} does not exist`;
+      overrideMissing = true;
     } else {
       const version = oamVersion(override);
-      if (atLeast(version, OAM_MIN)) return { chosen: { path: override, version }, overrideNote, skipped: [] };
+      if (atLeast(version, OAM_MIN)) {
+        return { chosen: { path: override, version }, overrideNote, skipped: [], passedOver, overrideMissing };
+      }
       overrideNote = unusableReason(override, version, `OAM_BIN=${override}`);
+      passedOver.push(version);
     }
   }
   const overrideKey = override ? pathKey(override) : null;
@@ -354,7 +379,40 @@ function chooseOam() {
     .map((path) => ({ path, version: oamVersion(path) }));
   const chosen = pickNewest(candidates);
   const skipped = chosen ? [] : candidates.map((c) => unusableReason(c.path, c.version));
-  return { chosen, overrideNote, skipped };
+  if (!chosen) passedOver.push(...candidates.map((c) => c.version));
+  return { chosen, overrideNote, skipped, passedOver, overrideMissing };
+}
+
+/**
+ * The fix for "no usable oam", split by cause, as sentences without their
+ * final period. Ported from ssh-mcp's remedyFor. An oam that is merely too old
+ * needs `oam self-update`, which updates it in place and verifies the signed
+ * release manifest; sending its owner to the website to reinstall is the long
+ * way round, and since 0.18.0 the installers also need ssh-keygen 8.1 or newer.
+ * One that would not run needs checking, not updating. Only when nothing was
+ * found at all is installing the answer -- and not on Linux off x64, where oam
+ * publishes no build to install (aws-mcp's branch). `tail` is the way out that
+ * drops oam.
+ *
+ * Pure on purpose: `platform` and `arch` are passed in so every branch is
+ * testable on one machine.
+ */
+function remedyFor({ passedOver, overrideMissing, shim }, tail, platform = process.platform, arch = process.arch) {
+  const lines = [];
+  if (passedOver.some((v) => v !== null)) lines.push(`Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer`);
+  if (passedOver.some((v) => v === null)) {
+    lines.push("Check that each binary named above is an executable oam for this platform, or point OAM_BIN at one");
+  }
+  if (overrideMissing) lines.push("Point OAM_BIN at an existing oam binary, or unset it");
+  if (lines.length === 0 && !shim) {
+    lines.push(
+      platform === "linux" && arch !== "x64"
+        ? `oam publishes no build for linux-${arch}, so there is nothing to install here: set OAM_BIN=/path/to/oam if you built one yourself`
+        : "Install oam from https://oamjs.org, or set OAM_BIN=/path/to/oam",
+    );
+  }
+  lines.push(tail);
+  return lines;
 }
 
 /** Run the CLI in THIS process. The zero-overhead fallback. */
@@ -377,18 +435,34 @@ const fallbackFailed = (e) => {
 };
 
 /**
+ * Whether a child is spawned with piped stdio rather than `inherit`: only from
+ * a host oam below 0.9.0, the releases that treated `'inherit'` as
+ * `'pipe'` (measured on oam 0.8.2). A Node host keeps `inherit`, and so does an
+ * oam host whose version cannot be read: an unreadable version is not evidence
+ * of the old bug.
+ *
+ * Pure on purpose: `hostOam` is `process.versions.oam`, passed in.
+ */
+function pipesStdio(hostOam) {
+  if (hostOam === undefined) return false;
+  const version = parseVersion(hostOam);
+  return version !== null && !atLeast(version, [0, 9, 0]);
+}
+
+/**
  * Spawn the CLI in a child runtime and mirror its lifetime.
  *
  * `onLaunchFailed(err)` runs when the child could not be started at all; it is
  * never called once the child is running, which would double-start the CLI on
  * the same stdio.
  */
-async function launchChild(cmd, args, onLaunchFailed) {
+async function launchChild(cmd, args, onLaunchFailed, env = process.env) {
   // THIS process being an oam means one below the floor, or any oam under
   // MCP_COMPLIANCE_RUNTIME=node (a supported oam host otherwise runs the CLI
-  // in-process). An old oam's `stdio: 'inherit'` does not hand over the fds, so
-  // pipe explicitly there; see ALREADY RUNNING ON OAM.
-  const piped = process.versions.oam !== undefined;
+  // in-process). Only an oam below 0.9.0 fails to hand over the fds for
+  // `stdio: 'inherit'`, so pipe explicitly there and nowhere else; see ALREADY
+  // RUNNING ON OAM.
+  const piped = pipesStdio(process.versions.oam);
   let child = null;
   try {
     child = spawn(cmd, args, {
@@ -397,7 +471,7 @@ async function launchChild(cmd, args, onLaunchFailed) {
       // reaches the server's shutdown path. Piping preserves both as well:
       // bytes are copied unchanged, and stdin's end propagates to the child.
       stdio: piped ? ["pipe", "pipe", "pipe"] : "inherit",
-      env: process.env,
+      env,
       windowsHide: true,
     });
   } catch (err) {
@@ -504,11 +578,71 @@ async function launchChild(cmd, args, onLaunchFailed) {
 }
 
 /**
+ * A NODE_OPTIONS value with oam's permission flags taken out: `--permission`
+ * and every `--allow-*` token, in either `--flag=value` or bare form. Every
+ * other token is kept as written, quoted ones included. Returns undefined when
+ * nothing is left, so the caller can drop the variable instead of passing an
+ * empty one.
+ *
+ * Why: oam 0.18.0 passes a `--permission` parent's grants to every child in
+ * NODE_OPTIONS, for any program, and oam-only flags such as `--allow-net` or
+ * `--allow-env` there make Node exit 9 before it runs a line ("--allow-net= is
+ * not allowed in NODE_OPTIONS", measured on Node 22.22 under oam 0.18.0). A
+ * NODE_OPTIONS that reached this launcher already carrying them -- from an oam
+ * grandparent -- would kill a Node handoff the same way.
+ */
+function stripPermissionOptions(value) {
+  if (value === undefined) return undefined;
+  const tokens = value.match(/(?:[^\s"]+|"[^"]*")+/g) ?? [];
+  const kept = tokens.filter((t) => !/^--(?:permission|allow-[A-Za-z0-9-]+)(?:=.*)?$/.test(t));
+  return kept.length > 0 ? kept.join(" ") : undefined;
+}
+
+/**
+ * `source` with NODE_OPTIONS passed through stripPermissionOptions, under any
+ * spelling of the name (Windows env names are case-insensitive). Every other
+ * variable is untouched.
+ */
+function withoutPermissionOptions(source) {
+  const out = { ...source };
+  for (const key of Object.keys(out)) {
+    if (key.toUpperCase() !== "NODE_OPTIONS") continue;
+    const stripped = stripPermissionOptions(out[key]);
+    if (stripped === undefined) delete out[key];
+    else out[key] = stripped;
+  }
+  return out;
+}
+
+/**
+ * Whether THIS process is an oam that will push its `--permission` grants onto
+ * a Node child. From oam 0.18.0 every child is handed them in NODE_OPTIONS at
+ * spawn time, after any env this launcher passes -- so stripping them from the
+ * env cannot stop it, and a Node child exits 9 on the oam-only ones. Up to
+ * 0.17.1 a child started with none of them, so an older host is not affected.
+ */
+function permissionReachesChildren(hostOam, execArgv) {
+  if (!atLeast(parseVersion(hostOam ?? ""), [0, 18, 0])) return false;
+  return execArgv.some((a) => a === "--permission" || a.startsWith("--permission="));
+}
+
+/**
  * Hand the CLI to Node on PATH. Only reachable when THIS process is oam -- one
  * below the floor, or any oam under MCP_COMPLIANCE_RUNTIME=node -- so there is
  * no in-process option left.
  */
 async function handOffToNode(reason) {
+  if (permissionReachesChildren(process.versions.oam, process.execArgv)) {
+    // oam would append its grants to Node's NODE_OPTIONS, and Node refuses
+    // the oam-only ones: the handoff could only end in a cryptic exit 9.
+    await errSync(
+      `mcp-compliance: ${reason || "MCP_COMPLIANCE_RUNTIME=node"}, but this oam runs under --permission, and it passes its --permission and --allow-* flags to every child in NODE_OPTIONS, which Node rejects.\n` +
+        (reason
+          ? `Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer, or launch this command with node.\n`
+          : "Unset MCP_COMPLIANCE_RUNTIME to run on this oam, or launch this command with node.\n"),
+    );
+    process.exit(1);
+  }
   const node = findNodeOnPath();
   if (!node) {
     // An empty reason means Node was asked for on an oam host that is itself
@@ -523,10 +657,15 @@ async function handOffToNode(reason) {
     process.exit(1);
   }
   if (reason) await errSync(`mcp-compliance: ${reason}; running on ${node} instead.\n`);
-  await launchChild(node, [SERVER_ENTRY, ...process.argv.slice(2)], async (err) => {
-    await errSync(`mcp-compliance: failed to launch Node at ${node} (${err?.message ?? err})\n`);
-    process.exit(1);
-  });
+  await launchChild(
+    node,
+    [SERVER_ENTRY, ...process.argv.slice(2)],
+    async (err) => {
+      await errSync(`mcp-compliance: failed to launch Node at ${node} (${err?.message ?? err})\n`);
+      process.exit(1);
+    },
+    withoutPermissionOptions(process.env),
+  );
 }
 
 /**
@@ -553,7 +692,7 @@ if (plan === "in-process") {
   const belowFloor = !atLeast(parseVersion(hostOam), OAM_MIN);
   await handOffToNode(belowFloor ? `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}` : "");
 } else {
-  const { chosen, overrideNote, skipped } = chooseOam();
+  const { chosen, overrideNote, skipped, passedOver, overrideMissing } = chooseOam();
 
   if (chosen) {
     if (overrideNote) {
@@ -589,7 +728,9 @@ if (plan === "in-process") {
       await errSync(
         `mcp-compliance: MCP_COMPLIANCE_RUNTIME=oam but no usable oam (${OAM_MIN.join(".")} or newer) was found.\n` +
           notes.map((note) => `  ${note}\n`).join("") +
-          "Install or update from https://oamjs.org, set OAM_BIN=/path/to/oam, or use MCP_COMPLIANCE_RUNTIME=node.\n",
+          remedyFor({ passedOver, overrideMissing, shim }, "Or use MCP_COMPLIANCE_RUNTIME=node to run on Node")
+            .map((line) => `${line}.\n`)
+            .join(""),
       );
       process.exit(1);
     }

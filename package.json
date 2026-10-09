@@ -37,6 +37,7 @@
     "lint": "node scripts/lint.mjs check src/",
     "lint:fix": "node scripts/lint.mjs check --write src/",
     "typecheck": "tsc --noEmit",
+    "check:oam-floor": "node scripts/check-oam-floor.mjs",
     "test:ci": "npm run build && npm test",
     "prepublishOnly": "npm run build",
     "start": "node dist/index.js"
