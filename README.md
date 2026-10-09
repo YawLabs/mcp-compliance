@@ -769,6 +769,22 @@ The methodology is not an authoritative conformance standard — it's one tool's
 
 - Node.js 20+
 
+### Runtime
+
+The `mcp-compliance` command is a small launcher. It prefers the [oam](https://oamjs.org) runtime when a usable one is installed, and otherwise runs the CLI on the Node that npm already started, at no extra cost. The CLI behaves the same on either runtime.
+
+| Variable | Effect |
+| --- | --- |
+| `MCP_COMPLIANCE_RUNTIME=auto` | Default. Uses the newest oam 0.18.0 or newer it finds, and falls back to Node otherwise. If it found an oam it could not use, or `OAM_BIN` is wrong, it says so on stderr (`mcp-compliance: ...; using Node instead.`). |
+| `MCP_COMPLIANCE_RUNTIME=oam` | oam only. If no oam 0.18.0 or newer is found, it exits 1 and gives the fix: `oam self-update` for an outdated oam, a fix for `OAM_BIN`, or the install link when there is no oam at all. |
+| `MCP_COMPLIANCE_RUNTIME=node` | Node only, even when an oam is installed. |
+| `OAM_BIN=/path/to/oam` | Tries this oam before searching. If it is missing, older than 0.18.0 or will not run, the launcher says so and keeps searching. |
+| `OAM_INSTALL_DIR=/dir` | Also checks this directory, where oam's installers put the binary, before `~/.oam/bin`, `%LOCALAPPDATA%\oam\bin` and `PATH`. |
+
+The oam floor is 0.18.0, the latest oam release. It is a hard requirement because the CLI is checked only on that release. Before 0.9.0, oam's `child_process` handled stdio and arguments in ways that would make a compliance run grade the runtime instead of the server. To update an older oam, run `oam self-update`.
+
+`oam run <path-to-package>/dist/index.js -- test <target>` runs the CLI on oam directly and skips the launcher. Nothing above applies then: no floor check, no fallback, no runtime switch.
+
 ## Contributing
 
 ```bash
