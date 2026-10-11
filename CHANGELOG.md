@@ -9,6 +9,8 @@ out explicitly here.
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-10-11
+
 ### Changed
 - **Under `MCP_COMPLIANCE_RUNTIME=oam`, the "no usable oam" error now gives a
   fix that matches what the launcher found.** An outdated oam gets
