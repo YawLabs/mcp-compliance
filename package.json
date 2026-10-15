@@ -60,7 +60,6 @@
     "@modelcontextprotocol/server": "^2.0.0",
     "@types/node": "^25.5.2",
     "esbuild": "^0.28.1",
-    "postject": "^1.0.0-alpha.6",
     "tsup": "^8.5.1",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",

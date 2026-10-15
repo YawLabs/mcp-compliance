@@ -2,11 +2,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Injected by esbuild's `--define:__VERSION__` at single-binary (SEA) build
-// time. Guarded by `typeof` so it stays undefined under tsx/dist (where the
-// filesystem walk below is the real source of truth). esbuild dead-code-
-// eliminates the typeof branch under the define, so this carries no runtime
-// cost in the bundled binary.
+// Injected by esbuild's `--define:__VERSION__` when the CLI is bundled into a
+// standalone binary. Guarded by `typeof` so it stays undefined under tsx/dist
+// (where the filesystem walk below is the real source of truth). esbuild
+// dead-code-eliminates the typeof branch under the define, so this carries no
+// runtime cost in the bundled binary.
 declare const __VERSION__: string | undefined;
 
 /**
@@ -16,8 +16,8 @@ declare const __VERSION__: string | undefined;
  * wherever the code physically lives and the walk finds the owning
  * package.json. Returns "0.0.0" if none is found or it can't be parsed.
  *
- * In the CJS single-binary (Node SEA) bundle, `import.meta.url` is empty
- * (esbuild's cjs output cannot populate it), so `metaUrl` arrives undefined.
+ * In a CJS standalone-binary bundle, `import.meta.url` is empty (esbuild's
+ * cjs output cannot populate it), so `metaUrl` arrives undefined.
  * There we prefer the build-time `__VERSION__` define and never touch the
  * filesystem — the package.json the walk looks for does not exist next to a
  * standalone binary.

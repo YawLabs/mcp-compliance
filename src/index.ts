@@ -30,11 +30,12 @@ const SPEC_VERSION_HELP =
   "auto probes the server with a 2026-07-28 server/discover request and grades the newest revision it speaks; " +
   "pin a date to force one suite. With --list (no connection is made) auto prints every catalog.";
 
-// `__VERSION__` is injected by esbuild's `--define` at single-binary (SEA)
-// build time; esbuild dead-code-eliminates the else branch under the define.
-// Under tsx/dist it's undefined, so we fall back to the package.json read.
-// In the CJS bundle `import.meta.url` is empty, so `createRequire(undefined)`
-// throws — the typeof guard keeps that call out of the bundled binary.
+// `__VERSION__` is injected by esbuild's `--define` when the CLI is bundled
+// into a standalone binary; esbuild dead-code-eliminates the else branch under
+// the define. Under tsx/dist it's undefined, so we fall back to the
+// package.json read. In a CJS bundle `import.meta.url` is empty, so
+// `createRequire(undefined)` throws — the typeof guard keeps that call out of
+// the bundled binary.
 declare const __VERSION__: string | undefined;
 const version =
   typeof __VERSION__ === "string" && __VERSION__
