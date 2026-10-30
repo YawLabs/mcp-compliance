@@ -9,6 +9,8 @@ out explicitly here.
 
 ## [Unreleased]
 
+## [0.21.1] — 2026-10-30
+
 ### Changed
 - **The oam floor moves from 0.18.0 to 0.19.1, so the `mcp-compliance`
   launcher no longer runs the CLI on oam 0.18.x or 0.19.0.** 0.19.1 is the
