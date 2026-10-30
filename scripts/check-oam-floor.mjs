@@ -30,13 +30,13 @@
  *
  * Exit 1 on drift, always -- an inconsistent repo is a bug with no upside.
  * Exit 1 when the floor is behind the latest release, UNLESS
- * MCP_COMPLIANCE_ALLOW_STALE_OAM=1, which is the deliberate, visible way to ship
- * a release anyway. Exit 0 when the network is unavailable, with a WARNING line
+ * MCP_COMPLIANCE_ALLOW_STALE_OAM=1 (or `true`; see allowStale), which is the
+ * deliberate, visible way to ship a release anyway. Exit 0 when the network is unavailable, with a WARNING line
  * saying staleness was not checked: a checker that turns an offline machine into
  * a failed release would just get switched off.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -105,6 +105,15 @@ export function compareVersions(a, b) {
     if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
   }
   return 0;
+}
+
+/**
+ * MCP_COMPLIANCE_ALLOW_STALE_OAM is on for 1 or true, any case, trimmed: cmd.exe's
+ * `set MCP_COMPLIANCE_ALLOW_STALE_OAM=1 && ...` keeps the space before `&&`, and
+ * "1 " used to read as off. Anything else is off, so a typo still fails the check.
+ */
+export function allowStale(value) {
+  return /^(1|true)$/i.test((value ?? "").trim());
 }
 
 /** The source of truth: `const OAM_MIN = [x, y, z];` in the launcher. */
@@ -219,8 +228,8 @@ async function main() {
         console.error("  The policy is one verified release at a time, so bump OAM_MIN, re-verify on it");
         console.error("  (a stdio and an HTTP compliance run on oam, every verdict identical to Node --");
         console.error("  src/tests/oam-runtime.integration.test.ts does the HTTP one), and update the docs.");
-        if (process.env.MCP_COMPLIANCE_ALLOW_STALE_OAM === "1") {
-          console.error("  MCP_COMPLIANCE_ALLOW_STALE_OAM=1 is set -- continuing anyway.");
+        if (allowStale(process.env.MCP_COMPLIANCE_ALLOW_STALE_OAM)) {
+          console.error("  MCP_COMPLIANCE_ALLOW_STALE_OAM is set -- continuing anyway.");
         } else {
           console.error("  Set MCP_COMPLIANCE_ALLOW_STALE_OAM=1 to release on the old floor deliberately.");
           failed = true;
@@ -242,7 +251,27 @@ async function main() {
   process.exit(failed ? 1 : 0);
 }
 
+/**
+ * True when `argv1` (process.argv[1]) names the module at `moduleUrl`. Node
+ * realpaths the main module's URL (unless --preserve-symlinks-main) but leaves
+ * argv[1] as typed, so from a junctioned or symlinked checkout a raw compare
+ * of the two was false: main() never ran, and the check printed nothing and
+ * exited 0, a silence that reads as a pass. Both sides are realpath'd, so the
+ * answer holds with or without --preserve-symlinks-main.
+ */
+export function isMainModule(argv1, moduleUrl) {
+  if (!argv1) return false;
+  const real = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  return real(argv1) === real(fileURLToPath(moduleUrl));
+}
+
 // Only run when invoked directly, so the helpers above stay importable.
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+if (isMainModule(process.argv[1], import.meta.url)) {
   await main();
 }

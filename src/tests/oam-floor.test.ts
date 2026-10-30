@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 // Ported from aws-mcp's src/oam-floor.test.ts. The subject lives in scripts/,
@@ -47,6 +47,31 @@ describe("the oam floor is consistent across this repo", () => {
     const r = runChecker(REPO_ROOT);
     expect(r.code, `check-oam-floor reported drift in this repo:\n${r.out}`).toBe(0);
     expect(r.out).toMatch(/no drift/);
+  });
+});
+
+describe("check-oam-floor entry and env handling", () => {
+  it("still runs when invoked through a junctioned or symlinked directory", () => {
+    // Node realpaths the main module's URL but not argv[1]; a raw compare of the
+    // two skipped main() there, so the check printed nothing and exited 0.
+    const linkRoot = mkdtempSync(join(tmpdir(), "mcp-compliance-floor-link-"));
+    dirs.push(linkRoot);
+    const link = join(linkRoot, "scripts");
+    symlinkSync(join(REPO_ROOT, "scripts"), link, process.platform === "win32" ? "junction" : "dir");
+    const r = spawnSync(process.execPath, [join(link, "check-oam-floor.mjs"), "--offline", "--root", REPO_ROOT], {
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toMatch(/oam floor \(OAM_MIN/);
+  });
+
+  it("reads MCP_COMPLIANCE_ALLOW_STALE_OAM as 1 or true, any case, trimmed", () => {
+    const values = ["1", "1 ", "TRUE", " true", "0", "yes", "", "11"];
+    const script = `import(${JSON.stringify(pathToFileURL(CHECKER).href)}).then((m) => console.log(JSON.stringify(${JSON.stringify(values)}.map(m.allowStale))));`;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 60_000 });
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout)).toEqual([true, true, true, true, false, false, false, false]);
   });
 });
 

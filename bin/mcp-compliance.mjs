@@ -81,7 +81,7 @@
  * so `--permission` is not offered rather than shipped as security theatre.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.18.0 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.19.1 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over. The
  * floor is not cosmetic, and this tool is the strongest case for it in the
  * whole @yawlabs/*-mcp set. Before 0.9.0, oam's `child_process` diverged from
@@ -112,7 +112,8 @@
  *                                 Node on PATH when THIS process is oam
  *   OAM_BIN=/path/to/oam          use this oam when it is usable, before discovery
  *   OAM_INSTALL_DIR=/dir          also look for an oam binary in this directory
- * The value is case-insensitive; anything else behaves like `auto`.
+ * The value is trimmed and case-insensitive; anything else behaves like `auto`,
+ * with a warning on stderr.
  */
 
 import { execFileSync, spawn } from "node:child_process";
@@ -122,7 +123,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** The oam release this CLI is verified on. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 18, 0];
+const OAM_MIN = [0, 19, 1];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -682,7 +683,15 @@ async function fallBackToNode(hostOam, oamFailed = false) {
   await handOffToNode(oamFailed ? tooOld : `${tooOld}, and no newer oam was found`);
 }
 
-const mode = (process.env.MCP_COMPLIANCE_RUNTIME ?? "auto").toLowerCase();
+// Trimmed: cmd.exe's `set MCP_COMPLIANCE_RUNTIME=node && ...` keeps the space
+// before `&&`, and "node " used to fall through to `auto` without a word.
+// Unset or empty is `auto`, silently.
+const mode = (process.env.MCP_COMPLIANCE_RUNTIME ?? "").trim().toLowerCase() || "auto";
+if (!["auto", "oam", "node"].includes(mode)) {
+  await errSync(
+    `mcp-compliance: MCP_COMPLIANCE_RUNTIME=${JSON.stringify(process.env.MCP_COMPLIANCE_RUNTIME)} is not auto, oam or node; using auto.\n`,
+  );
+}
 const hostOam = process.versions.oam;
 const plan = runtimePlan({ mode, hostOam });
 

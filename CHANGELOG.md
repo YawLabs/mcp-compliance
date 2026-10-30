@@ -9,6 +9,36 @@ out explicitly here.
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor moves from 0.18.0 to 0.19.1, so the `mcp-compliance`
+  launcher no longer runs the CLI on oam 0.18.x or 0.19.0.** 0.19.1 is the
+  latest oam release, and it is verified on the installed
+  aarch64-pc-windows-msvc binary through the launcher with
+  `MCP_COMPLIANCE_RUNTIME=oam` and `OAM_BIN` pointing at it: a full MCP
+  handshake on the `mcp` subcommand listing both tools (the same 2 as on Node),
+  `mcp_compliance_explain` served, and a stdio compliance run against the
+  bundled echo fixture that graded A (98, 43 of 45 passed, 6 skipped) with
+  every verdict identical to the same run on Node; the HTTP comparison in
+  `src/tests/oam-runtime.integration.test.ts` passes on it too. An older oam is passed over
+  as before: under the default `MCP_COMPLIANCE_RUNTIME=auto` the launcher
+  falls back to Node and says so on stderr, and under
+  `MCP_COMPLIANCE_RUNTIME=oam` it exits with `oam self-update` as the fix.
+- `MCP_COMPLIANCE_RUNTIME` is trimmed, so cmd.exe's
+  `set MCP_COMPLIANCE_RUNTIME=node && ...` (which keeps the space before
+  `&&`) selects Node instead of silently running as `auto`. A value other than
+  `auto`, `oam` or `node` still runs as `auto`, now with a warning on stderr.
+- `MCP_COMPLIANCE_ALLOW_STALE_OAM` is trimmed and accepts `true` (any case) as
+  well as `1`.
+- A stdio target and the `taskkill` that ends its process tree on Windows are
+  spawned with `windowsHide`, so a GUI host running the suite in-process no
+  longer flashes a console window for each.
+
+### Fixed
+- `scripts/check-oam-floor.mjs` ran nothing and exited 0 when invoked through
+  a junctioned or symlinked checkout: Node realpaths the main module's URL but
+  not `process.argv[1]`, so its "am I the main module" compare was false. Both
+  sides are now realpath'd.
+
 ## [0.21.0] — 2026-10-11
 
 ### Changed

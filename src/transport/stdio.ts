@@ -126,6 +126,8 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
     stdio: ["pipe", "pipe", "pipe"],
     // Windows .cmd/.bat shims (npx, npm) need shell:true to launch.
     shell: isWindows,
+    // No console window flashing up per target when the host is a GUI app.
+    windowsHide: true,
   });
 
   let protocolVersion: string | null = null;
@@ -370,7 +372,7 @@ export function createStdioTransport(opts: StdioTransportOptions): StdioTranspor
         // so not gone on EOF, is left running as an orphan.
         const forcedTreeKill = new Promise<void>((resolve) => {
           try {
-            const killer = spawn("taskkill", ["/pid", pid, "/t", "/f"], { stdio: "ignore" });
+            const killer = spawn("taskkill", ["/pid", pid, "/t", "/f"], { stdio: "ignore", windowsHide: true });
             killer.once("exit", () => resolve());
             killer.once("error", () => resolve());
           } catch {
