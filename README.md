@@ -775,13 +775,13 @@ The `mcp-compliance` command is a small launcher. It prefers the [oam](https://o
 
 | Variable | Effect |
 | --- | --- |
-| `MCP_COMPLIANCE_RUNTIME=auto` | Default. Uses the newest oam 0.19.1 or newer it finds, and falls back to Node otherwise. If it found an oam it could not use, or `OAM_BIN` is wrong, it says so on stderr (`mcp-compliance: ...; using Node instead.`). |
-| `MCP_COMPLIANCE_RUNTIME=oam` | oam only. If no oam 0.19.1 or newer is found, it exits 1 and gives the fix: `oam self-update` for an outdated oam, a fix for `OAM_BIN`, or the install link when there is no oam at all. |
+| `MCP_COMPLIANCE_RUNTIME=auto` | Default. Uses the newest oam 0.19.5 or newer it finds, and falls back to Node otherwise. If it found an oam it could not use, or `OAM_BIN` is wrong, it says so on stderr (`mcp-compliance: ...; using Node instead.`). |
+| `MCP_COMPLIANCE_RUNTIME=oam` | oam only. If no oam 0.19.5 or newer is found, it exits 1 and gives the fix: `oam self-update` for an outdated oam, a fix for `OAM_BIN`, or the install link when there is no oam at all. |
 | `MCP_COMPLIANCE_RUNTIME=node` | Node only, even when an oam is installed. |
-| `OAM_BIN=/path/to/oam` | Tries this oam before searching. If it is missing, older than 0.19.1 or will not run, the launcher says so and keeps searching. |
+| `OAM_BIN=/path/to/oam` | Tries this oam before searching. If it is missing, older than 0.19.5 or will not run, the launcher says so and keeps searching. |
 | `OAM_INSTALL_DIR=/dir` | Also checks this directory, where oam's installers put the binary, before `~/.oam/bin`, `%LOCALAPPDATA%\oam\bin` and `PATH`. |
 
-The oam floor is 0.19.1, the latest oam release. It is a hard requirement because the CLI is checked only on that release. Before 0.9.0, oam's `child_process` handled stdio and arguments in ways that would make a compliance run grade the runtime instead of the server. To update an older oam, run `oam self-update`.
+The oam floor is 0.19.5, the latest oam release. It is a hard requirement because the CLI is checked only on that release. Before 0.9.0, oam's `child_process` handled stdio and arguments in ways that would make a compliance run grade the runtime instead of the server. To update an older oam, run `oam self-update`.
 
 `oam run <path-to-package>/dist/index.js -- test <target>` runs the CLI on oam directly and skips the launcher. Nothing above applies then: no floor check, no fallback, no runtime switch.
 

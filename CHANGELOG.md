@@ -24,6 +24,14 @@ out explicitly here.
   `@modelcontextprotocol/node` ^2.1.2.
 
 ### Changed
+- **The oam floor moves from 0.19.1 to 0.19.5, the latest oam release.**
+  Verified on the installed aarch64-pc-windows-msvc oam 0.19.5 through the
+  launcher with `MCP_COMPLIANCE_RUNTIME=oam`: an MCP handshake on the `mcp`
+  subcommand listing both tools, `mcp_compliance_explain` served, and a stdio
+  compliance run against the bundled echo fixture that graded A (98, 43 of 45
+  passed, 6 skipped) with every verdict identical to the same run on Node; the
+  HTTP comparison in `src/tests/oam-runtime.integration.test.ts` passes on it
+  too. An oam from 0.19.1 to 0.19.4 is now passed over like any older one.
 - `@modelcontextprotocol/server` 2.4.0 rejects a modern request that omits the
   `MCP-Protocol-Version` header with 400/-32020, so an otherwise clean SDK 2.4
   HTTP server no longer fails `transport-header-version-required`. The SDK v2
