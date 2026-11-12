@@ -9,6 +9,27 @@ out explicitly here.
 
 ## [Unreleased]
 
+### Security
+- **Runtime dependencies raised past every open advisory.** `undici` moves to
+  ^8.12.4 (TLS certificate validation bypass when `tls` options were dropped in
+  `Agent`, plus five denial-of-service fixes: TLS 1.2 renegotiation, excessive
+  content-encodings, the decompress interceptor, the EventSource parser and
+  WebSocket PONG buffering), `zod` to ^4.6.7 (memory exhaustion validating
+  oversized constrained collections) and `@modelcontextprotocol/sdk` to ^1.32.2.
+  The lockfile also takes the patched transitive `hono`, `@hono/node-server`,
+  `fast-uri`, `ip-address` and `body-parser`. `npm audit` reports no
+  vulnerabilities.
+- Dev-only: `vitest` ^4.1.12 (with `vite` 8.3.8 and `@vitest/mocker` 4.1.12)
+  and the SDK v2 reference packages `@modelcontextprotocol/server` ^2.4.0 and
+  `@modelcontextprotocol/node` ^2.1.2.
+
+### Changed
+- `@modelcontextprotocol/server` 2.4.0 rejects a modern request that omits the
+  `MCP-Protocol-Version` header with 400/-32020, so an otherwise clean SDK 2.4
+  HTTP server no longer fails `transport-header-version-required`. The SDK v2
+  integration pins and `docs/FIXES.md` now say so; SDK 2.0.0 servers still fail
+  it, as the spec requires.
+
 ## [0.21.1] — 2026-10-30
 
 ### Changed
