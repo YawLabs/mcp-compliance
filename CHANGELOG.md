@@ -9,6 +9,8 @@ out explicitly here.
 
 ## [Unreleased]
 
+## [0.21.2] — 2026-11-11
+
 ### Security
 - **Runtime dependencies raised past every open advisory.** `undici` moves to
   ^8.12.4 (TLS certificate validation bypass when `tls` options were dropped in
