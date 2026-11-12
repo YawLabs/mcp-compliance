@@ -72,11 +72,11 @@ describe("launcher runtimePlan()", () => {
     // asking what it was already running on. `auto` and `oam` both have to take
     // the shortcut -- `oam` demands oam, and the host already is one.
     //
-    // 0.19.1 pins the floor as inclusive (it IS the supported release), and
-    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.19.1 as a string, so a
+    // 0.19.5 pins the floor as inclusive (it IS the supported release), and
+    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.19.5 as a string, so a
     // compare over the raw text would treat a newer oam as too old.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.19.1", "0.19.2", "0.20.0", "0.100.0", "1.0.0", "0.20.0-dev"]) {
+      for (const hostOam of ["0.19.5", "0.19.6", "0.20.0", "0.100.0", "1.0.0", "0.20.0-dev"]) {
         expect(runtimePlan({ mode, hostOam }), `mode=${mode} hostOam=${hostOam}`).toBe("in-process");
       }
     }
@@ -88,8 +88,19 @@ describe("launcher runtimePlan()", () => {
     // depends on (see MINIMUM OAM VERSION in the launcher), and anything older
     // than the latest release is not what the CLI is verified on.
     for (const mode of ["auto", "oam"]) {
-      // 0.19.0, its -dev builds and 0.18.x were supported once and sit below it now.
-      for (const hostOam of ["0.19.0", "0.19.0-dev", "0.18.1", "0.18.0", "0.17.9", "0.15.2", "0.9.0", "0.0.1"]) {
+      // 0.19.1, 0.19.0, its -dev builds and 0.18.x were supported once and sit below it now.
+      for (const hostOam of [
+        "0.19.4",
+        "0.19.1",
+        "0.19.0",
+        "0.19.0-dev",
+        "0.18.1",
+        "0.18.0",
+        "0.17.9",
+        "0.15.2",
+        "0.9.0",
+        "0.0.1",
+      ]) {
         expect(runtimePlan({ mode, hostOam }), `mode=${mode} hostOam=${hostOam}`).toBe("discover");
       }
     }
@@ -118,24 +129,24 @@ describe("launcher pickNewest()", () => {
   const at = (path: string, version: number[] | null): Candidate => ({ path, version });
 
   it("pins the floor to the latest oam release", () => {
-    expect(floor).toEqual([0, 19, 1]);
+    expect(floor).toEqual([0, 19, 5]);
   });
 
   it("takes the newest usable oam, not the first one found", () => {
     // The bug: discovery stopped at the first binary that existed, so an older
     // copy in an earlier location (the installed dir is searched before PATH)
     // hid a newer one later.
-    const chosen = pickNewest([at("installed", [0, 19, 1]), at("path-a", [0, 20, 0]), at("path-b", [0, 19, 9])]);
+    const chosen = pickNewest([at("installed", [0, 19, 5]), at("path-a", [0, 20, 0]), at("path-b", [0, 19, 9])]);
     expect(chosen?.path).toBe("path-a");
   });
 
   it("compares numerically and keeps search order on a tie", () => {
     expect(pickNewest([at("a", [0, 20, 0]), at("b", [0, 100, 0])])?.path).toBe("b");
-    expect(pickNewest([at("first", [0, 19, 1]), at("second", [0, 19, 1])])?.path).toBe("first");
+    expect(pickNewest([at("first", [0, 19, 5]), at("second", [0, 19, 5])])?.path).toBe("first");
   });
 
   it("skips binaries below the floor or with no readable version", () => {
-    expect(pickNewest([at("old", [0, 19, 0]), at("broken", null), at("good", [0, 19, 1])])?.path).toBe("good");
+    expect(pickNewest([at("old", [0, 19, 0]), at("broken", null), at("good", [0, 19, 5])])?.path).toBe("good");
     expect(pickNewest([at("old", [0, 18, 9]), at("broken", null)])).toBeNull();
     expect(pickNewest([])).toBeNull();
   });
@@ -153,7 +164,7 @@ describe("launcher remedyFor()", () => {
 
   it("sends an outdated oam to `oam self-update`, not to the website", () => {
     const lines = remedyFor({ ...none, passedOver: [[0, 17, 1]] }, TAIL, "win32", "x64");
-    expect(lines[0]).toBe("Run `oam self-update` to get oam 0.19.1 or newer");
+    expect(lines[0]).toBe("Run `oam self-update` to get oam 0.19.5 or newer");
     expect(lines.join("\n")).not.toMatch(/oamjs\.org/);
     expect(lines.at(-1)).toBe(TAIL);
   });
@@ -193,9 +204,9 @@ describe("launcher pipesStdio()", () => {
   });
 
   it("inherits on Node and on any oam from 0.9.0 on, so the terminal keeps its colors", () => {
-    // A supported oam (0.19.1) is the case this exists for: under
+    // A supported oam (0.19.5) is the case this exists for: under
     // MCP_COMPLIANCE_RUNTIME=node it used to pipe, and lose the colors, for nothing.
-    for (const hostOam of [undefined, "0.9.0", "0.17.1", "0.18.0", "0.19.1", "1.0.0", "dev"]) {
+    for (const hostOam of [undefined, "0.9.0", "0.17.1", "0.18.0", "0.19.5", "1.0.0", "dev"]) {
       expect(pipesStdio(hostOam), String(hostOam)).toBe(false);
     }
   });
@@ -345,7 +356,7 @@ maybeDescribe("launcher on an oam host", () => {
     it(
       `runs in-process instead of spawning a nested oam (env ${JSON.stringify(extraEnv)})`,
       async () => {
-        const run = await runLauncher("0.19.1", extraEnv);
+        const run = await runLauncher("0.19.5", extraEnv);
         expect(servedInProcess(run), `${JSON.stringify(extraEnv)} -> ${JSON.stringify(run)}`).toBe(true);
       },
       TIMEOUT_MS,
@@ -355,7 +366,7 @@ maybeDescribe("launcher on an oam host", () => {
   it(
     "still discovers when the host oam is below the floor",
     async () => {
-      const run = await runLauncher("0.19.0");
+      const run = await runLauncher("0.19.4");
       expect(servedInProcess(run), `a below-floor host must not shortcut, got ${JSON.stringify(run)}`).toBe(false);
       expect(spawnedAndFailed(run), JSON.stringify(run)).toBe(true);
     },
@@ -397,7 +408,7 @@ maybeDescribe("launcher with no usable oam", () => {
       const run = await runLauncher("0.9.0", isolated({ OAM_BIN: join(tmpdir(), "no-such-dir", "oam.exe") }));
       expect(handedOff(run), JSON.stringify(run)).toBe(true);
       expect(run.stderr).toMatch(
-        /this process is oam 0\.9\.0, older than 0\.19\.1, and no newer oam was found; running on .*node/,
+        /this process is oam 0\.9\.0, older than 0\.19\.5, and no newer oam was found; running on .*node/,
       );
     },
     TIMEOUT_MS,
@@ -410,7 +421,7 @@ maybeDescribe("launcher with no usable oam", () => {
       const run = await runLauncher("0.9.0", isolated({ PATH: noNode, OAM_BIN: join(noNode, "oam.exe") }));
       expect(run.code, JSON.stringify(run)).toBe(1);
       expect(run.stdout.trim(), "nothing may run").toBe("");
-      expect(run.stderr).toMatch(/older than 0\.19\.1, .*no Node was found on PATH/);
+      expect(run.stderr).toMatch(/older than 0\.19\.5, .*no Node was found on PATH/);
       expect(run.stderr).toMatch(/oam self-update/);
     },
     TIMEOUT_MS,
@@ -419,7 +430,7 @@ maybeDescribe("launcher with no usable oam", () => {
   it(
     "hands MCP_COMPLIANCE_RUNTIME=node off to Node even on a supported oam host",
     async () => {
-      const run = await runLauncher("0.19.1", isolated({ MCP_COMPLIANCE_RUNTIME: "node" }));
+      const run = await runLauncher("0.19.5", isolated({ MCP_COMPLIANCE_RUNTIME: "node" }));
       expect(handedOff(run), JSON.stringify(run)).toBe(true);
       // A supported host: the handoff is the asked-for runtime, not a below-floor rescue.
       expect(run.stderr).not.toMatch(/older than/);
@@ -432,7 +443,7 @@ maybeDescribe("launcher with no usable oam", () => {
     async () => {
       // `set MCP_COMPLIANCE_RUNTIME=node && ...` keeps the space before `&&`;
       // untrimmed, "node " fell through to auto and ran on the oam host.
-      const run = await runLauncher("0.19.1", isolated({ MCP_COMPLIANCE_RUNTIME: "node " }));
+      const run = await runLauncher("0.19.5", isolated({ MCP_COMPLIANCE_RUNTIME: "node " }));
       expect(handedOff(run), JSON.stringify(run)).toBe(true);
       expect(run.stderr).not.toMatch(/is not auto, oam or node/);
     },
@@ -455,7 +466,7 @@ maybeDescribe("launcher with no usable oam", () => {
     "names MCP_COMPLIANCE_RUNTIME=node, not an oam update, when that handoff finds no Node",
     async () => {
       const noNode = mkdtempSync(join(tmpdir(), "mcp-compliance-launcher-nopath-"));
-      const run = await runLauncher("0.19.1", isolated({ PATH: noNode, MCP_COMPLIANCE_RUNTIME: "NODE" }));
+      const run = await runLauncher("0.19.5", isolated({ PATH: noNode, MCP_COMPLIANCE_RUNTIME: "NODE" }));
       expect(run.code, JSON.stringify(run)).toBe(1);
       expect(run.stdout.trim(), "nothing may run").toBe("");
       expect(run.stderr).toMatch(/^mcp-compliance: MCP_COMPLIANCE_RUNTIME=node but no Node was found on PATH\.$/m);
@@ -491,7 +502,7 @@ maybeDescribe("launcher with no usable oam", () => {
       // A newer oam WAS found -- it just would not start -- so the handoff note
       // must not claim otherwise.
       expect(run.stderr).not.toMatch(/no newer oam was found/);
-      expect(run.stderr).toMatch(/this process is oam 0\.9\.0, older than 0\.19\.1; running on .*node/);
+      expect(run.stderr).toMatch(/this process is oam 0\.9\.0, older than 0\.19\.5; running on .*node/);
     },
     TIMEOUT_MS,
   );
@@ -540,7 +551,7 @@ maybeDescribe("launcher with no usable oam", () => {
       // only its CHILD would see the flag: Node exits 9 on `--allow-env` in
       // NODE_OPTIONS, so the handoff serves only if the launcher stripped it.
       const run = await runLauncher(
-        "0.19.1",
+        "0.19.5",
         isolated({ MCP_COMPLIANCE_RUNTIME: "node" }),
         'process.env.NODE_OPTIONS = "--allow-env --no-deprecation";',
       );

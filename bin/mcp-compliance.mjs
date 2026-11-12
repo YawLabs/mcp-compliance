@@ -81,7 +81,7 @@
  * so `--permission` is not offered rather than shipped as security theatre.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.19.1 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.19.5 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over. The
  * floor is not cosmetic, and this tool is the strongest case for it in the
  * whole @yawlabs/*-mcp set. Before 0.9.0, oam's `child_process` diverged from
@@ -123,7 +123,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** The oam release this CLI is verified on. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 19, 1];
+const OAM_MIN = [0, 19, 5];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
