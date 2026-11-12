@@ -17,9 +17,9 @@ import type { ComplianceReport, TransportTarget } from "../types.js";
 import { resultOf } from "./helpers/modern-fixture.js";
 
 /**
- * The official SDK v2 (`@modelcontextprotocol/server@2.0.0`) as an
+ * The official SDK v2 (`@modelcontextprotocol/server@2.4.0`) as an
  * independent 2026-07-28 reference server, mounted on node:http through
- * `toNodeHandler` from `@modelcontextprotocol/node@2.0.0` (with the loopback
+ * `toNodeHandler` from `@modelcontextprotocol/node@2.1.2` (with the loopback
  * Host/Origin guards its README prescribes for a hand-wired server) and over
  * stdio through `serveStdio` (src/tests/fixtures/sdk2-stdio-server.mjs).
  *
@@ -83,19 +83,24 @@ const HTTP_TEST_COUNT = 98;
 const STDIO_TEST_COUNT = 74;
 
 /**
- * SDK v2 answers a modern request (full `_meta` envelope) that omits the
- * `MCP-Protocol-Version` header with HTTP 200 and the result, in BOTH
- * serving modes. The spec: "Every POST request to the MCP endpoint MUST
- * include an MCP-Protocol-Version header" (basic/transports/streamable-http
- * #protocol-version-header) and a missing required standard header is a
- * validation failure the server MUST answer with 400 + -32020
- * (#server-validation). The same section lets a server that supports
- * pre-2025-06-18 clients treat a header-less request as 2025-03-26 -- the
- * dual-era default can lean on that MAY (although it serves the request as
- * 2026-07-28, not as 2025-03-26); a `legacy: 'reject'` endpoint "does not
- * support such clients" and "MUST reject a request without the header".
+ * No required deviation on HTTP. `@modelcontextprotocol/server` 2.0.0
+ * answered a modern request (full `_meta` envelope) that omits the
+ * `MCP-Protocol-Version` header with HTTP 200 and the result, in both
+ * serving modes, failing transport-header-version-required ("Every POST
+ * request to the MCP endpoint MUST include an MCP-Protocol-Version header",
+ * basic/transports/streamable-http#protocol-version-header; a missing
+ * standard header is answered 400 + -32020, #server-validation). 2.4.0
+ * rejects it with exactly that in both modes, which HEADER_VERSION_REJECTED
+ * pins so a regression goes red here rather than as an unexplained failure.
  */
-const SDK_HTTP_REQUIRED_DEVIATIONS = ["transport-header-version-required"];
+const SDK_HTTP_REQUIRED_DEVIATIONS: string[] = [];
+const HEADER_VERSION_REJECTED = "HTTP 400, JSON-RPC error -32020 HeaderMismatch";
+
+function expectHeaderVersionRejected(report: ComplianceReport) {
+  const header = resultOf(report, "transport-header-version-required");
+  expect(header.passed, header.details).toBe(true);
+  expect(header.details).toBe(HEADER_VERSION_REJECTED);
+}
 
 /**
  * SDK v2's stateless legacy fallback still speaks 2025-03-26-era batching:
@@ -358,15 +363,16 @@ describe("SDK v2 over HTTP, default (dual-era) serving", () => {
     expect(report.tests.some((t) => t.id === "lifecycle-completions")).toBe(false);
   });
 
-  it("fails exactly the localhost-inherent checks plus the documented SDK deviation", () => {
+  it("fails exactly the localhost-inherent checks; rejects a missing MCP-Protocol-Version header", () => {
     expectFailingSets(report, SDK_HTTP_REQUIRED_DEVIATIONS, LOCALHOST_INHERENT);
     expect(resultOf(report, "security-auth-required").details).toBe(LOCALHOST_AUTH_REQUIRED);
+    expectHeaderVersionRejected(report);
   });
 
-  it("grades A on score; the single required miss keeps overall at fail", () => {
+  it("grades A on score; with only optional misses overall is partial", () => {
     expect(report.grade).toBe("A");
     expect(report.score).toBeGreaterThanOrEqual(90);
-    expect(report.overall).toBe("fail");
+    expect(report.overall).toBe("partial");
     expect(report.summary.required - report.summary.requiredPassed).toBe(SDK_HTTP_REQUIRED_DEVIATIONS.length);
   });
 
@@ -625,10 +631,11 @@ describe("SDK v2 over HTTP, legacy: 'reject' (modern-only)", () => {
     expect(report.warnings.some((w) => w.startsWith("lifecycle-dual-era:"))).toBe(false);
   });
 
-  it("fails exactly the localhost-inherent checks plus the header deviation (a MUST in this mode)", () => {
+  it("fails exactly the localhost-inherent checks; rejects a missing MCP-Protocol-Version header (a MUST in this mode)", () => {
     expect(report.tests).toHaveLength(HTTP_TEST_COUNT);
     expectFailingSets(report, SDK_HTTP_REQUIRED_DEVIATIONS, LOCALHOST_INHERENT);
     expect(resultOf(report, "security-auth-required").details).toBe(LOCALHOST_AUTH_REQUIRED);
+    expectHeaderVersionRejected(report);
     expectClaimLessProbesClean(report, " (HTTP 400)");
     expectGateReadUnchanged(report, true);
   });
