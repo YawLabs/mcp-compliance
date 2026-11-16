@@ -9,6 +9,25 @@ out explicitly here.
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor moves from 0.19.5 to 0.20.2, the latest oam release.**
+  Verified on the installed aarch64-pc-windows-msvc oam 0.20.2 through the
+  launcher with `MCP_COMPLIANCE_RUNTIME=oam`: an MCP handshake on the `mcp`
+  subcommand listing both tools, with the launcher's child confirmed to be that
+  oam.exe, `mcp_compliance_explain` served, a stdio compliance run against the
+  bundled echo fixture that graded A (98, 43 of 45 passed, 6 skipped) and one
+  against the bundled 2026-07-28 fixture that graded A (100, 75 of 75 passed,
+  2 skipped), each with every verdict identical to the same run on Node; the
+  HTTP comparison in `src/tests/oam-runtime.integration.test.ts` passes on it
+  too. An oam from 0.19.5 to 0.20.1 is now passed over like any older one.
+  Nothing in the launcher or the CLI worked around what oam 0.20.0 to 0.20.2
+  fixed, so no code changes with the floor. Per oam's 0.20.2 notes, a child
+  spawned with `windowsHide: true` now opens hidden on Windows as it does on
+  Node, which is how the stdio transport already spawns its target.
+- Dependencies shared with Yaw MCP are already on Yaw MCP 1.1.13's line
+  (`@modelcontextprotocol/sdk` ^1.32.2, `@modelcontextprotocol/server` 2.4.0),
+  so none move in this release.
+
 ## [0.21.2] — 2026-11-11
 
 ### Security
