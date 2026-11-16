@@ -617,17 +617,26 @@ describe("runBenchmark auto on stdio: the era probe and the child it can kill", 
     // A silent legacy server ignores the probe; a 15s --timeout used to be
     // the probe budget, so a modern server with a slower cold start would
     // have been misclassified as 2025-11-25.
+    //
+    // The budgets leave room for a slow spawn: the probe, the initialize
+    // after it and each ping are all timed from the moment they are
+    // written, so a child that takes seconds to boot on a loaded machine
+    // has to fit inside them. 1.5 s / 500 ms did not -- the handshake and
+    // both pings timed out against a process that had not read stdin yet.
+    // The startup budget stays above the per-request one, so the lower
+    // bound still tells the two apart.
     const started = Date.now();
     const result = await runBenchmark(
       { type: "stdio", command: process.execPath, args: [LEGACY_SILENT_FIXTURE] },
-      { requests: 2, timeout: 500, startupTimeout: 1500 },
+      { requests: 2, timeout: 2000, startupTimeout: 5000 },
     );
     const elapsed = Date.now() - started;
     expect(result.specVersion).toBe("2025-11-25");
     expect(result.succeeded).toBe(2);
-    expect(elapsed).toBeGreaterThanOrEqual(1500);
-    expect(elapsed).toBeLessThan(8000);
-  }, 20_000);
+    expect(elapsed).toBeGreaterThanOrEqual(5000);
+    // Well under the 60 s the startup budget defaults to.
+    expect(elapsed).toBeLessThan(20_000);
+  }, 30_000);
 
   it("~2s into an unanswered probe onStatus gets the same status line the test command prints", async () => {
     const status: string[] = [];

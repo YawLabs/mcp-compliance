@@ -19,7 +19,14 @@ import type {
   TransportStream,
 } from "../transport/index.js";
 import { createStdioTransport } from "../transport/stdio.js";
-import { MODERN_FIXTURE, passedIds, runModern, startHttpFixture, stdioFixture } from "./helpers/modern-fixture.js";
+import {
+  awaitStdioReady,
+  MODERN_FIXTURE,
+  passedIds,
+  runModern,
+  startHttpFixture,
+  stdioFixture,
+} from "./helpers/modern-fixture.js";
 
 /**
  * The four stdio-only tests of the 2026-07-28 suite.
@@ -130,6 +137,7 @@ describe("2026-07-28 stdio-unicode: tools/call branch over a real fixture proces
       env: breaks.length ? { MODERN_FIXTURE_BREAK: breaks.join(",") } : undefined,
     });
     try {
+      await awaitStdioReady(transport);
       const ctx = makeContext(transport, TOOLS_STATE);
       await runStdio(ctx);
       return ctx;
@@ -149,6 +157,7 @@ describe("2026-07-28 stdio-unicode: tools/call branch over a real fixture proces
   it("fetches tools/list itself when the capability is declared but no list is cached (--only shape)", async () => {
     const transport = createStdioTransport({ command: process.execPath, args: [MODERN_FIXTURE] });
     try {
+      await awaitStdioReady(transport);
       const ctx = makeContext(transport, { capabilities: { tools: {} } });
       await runStdio(ctx);
       const unicode = outcome(ctx, "stdio-unicode");
@@ -837,6 +846,7 @@ describe("2026-07-28 stdio-unicode: a JSON-RPC error on the tools/call probe, ov
       args: [toolErrorChild(toolsCallCode, toolsCallMessage)],
     });
     try {
+      await awaitStdioReady(transport);
       const ctx = makeContext(transport, GET_TIME_STATE, CHILD_TIMEOUT);
       await runStdio(ctx);
       return ctx;
@@ -937,6 +947,7 @@ describe("2026-07-28 stdio-unicode: a JSON-RPC error on the tools/call probe, ov
   ])("a server that crashes on %s FAILS with a one-line ASCII reason, not a harness Error: carrying the stderr tail", async (_label, state, details) => {
     const transport = createStdioTransport({ command: process.execPath, args: [crashOnNonAsciiChild()] });
     try {
+      await awaitStdioReady(transport);
       const ctx = makeContext(transport, state, CHILD_TIMEOUT);
       await runStdio(ctx);
       const unicode = outcome(ctx, "stdio-unicode");

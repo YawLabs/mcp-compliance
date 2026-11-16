@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type RunOptions, runComplianceSuite } from "../../runner.js";
 import { MODERN_SPEC_VERSION } from "../../spec.js";
+import type { Transport } from "../../transport/index.js";
 import type { ComplianceReport, TransportTarget } from "../../types.js";
 
 /**
@@ -121,6 +122,21 @@ export async function startHttpFixture(opts: FixtureOptions = {}): Promise<HttpF
       });
     },
   };
+}
+
+/**
+ * Wait until a freshly spawned stdio child serves requests: one plain
+ * `server/discover` on a startup-sized budget, the wait the suite's own
+ * setup discover (bounded by `startupTimeout`) gives a cold process. A
+ * test that hands a just-spawned transport straight to one suite module
+ * skips that setup, so the module's first request would race Node's boot
+ * against the per-request timeout -- seconds on a loaded machine. Any
+ * reply counts, a JSON-RPC error included; the request is sent on the bare
+ * transport, before a recorder is attached, so it never shows up in what
+ * a test records.
+ */
+export async function awaitStdioReady(transport: Transport, budgetMs = 25_000): Promise<void> {
+  await transport.request("server/discover", {}, () => "await-stdio-ready", { timeout: budgetMs });
 }
 
 /** Run the 2026-07-28 suite with short, test-friendly timeouts. */

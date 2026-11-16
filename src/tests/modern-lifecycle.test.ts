@@ -2770,7 +2770,10 @@ describe("lifecycle-dual-era: fresh-process initialize on stdio", () => {
       "Server exited after a legacy initialize request on a fresh process (exit code 3: Error: initialize is not supported by this server); an instance spawned with no input stays up, so the request is what it exits on",
     );
     expect(lifecycleWarnings(report)).toEqual([]);
-  }, 20_000);
+    // Three node starts (the suite's process, the fresh one, the idle one)
+    // plus the idle watch: 20 s ran out on a loaded machine with every
+    // assertion still on course.
+  }, 60_000);
 
   it("a single-instance server (second instance exits at startup) passes with the era undetermined and a warning", async () => {
     const report = await runModern(target({ MINI_LOCK: join(mini.dir, "instance.lock") }), {
@@ -2790,10 +2793,11 @@ describe("lifecycle-dual-era: fresh-process initialize on stdio", () => {
   }, 20_000);
 
   it("a server that ignores initialize is given the per-request budget, not the startup budget", async () => {
+    const STARTUP = 30_000;
     const report = await runModern(target({ MINI_INITIALIZE: "silent" }), {
       only: ["lifecycle-dual-era"],
       timeout: 1500,
-      startupTimeout: 10_000,
+      startupTimeout: STARTUP,
     });
     const dual = expectPassed(report, "lifecycle-dual-era");
     const m =
@@ -2803,15 +2807,18 @@ describe("lifecycle-dual-era: fresh-process initialize on stdio", () => {
     expect(m, dual.details).not.toBeNull();
     const budget = Number(m?.[1]);
     // The per-request timeout, stretched at most to 3x the setup discover
-    // latency (a cold node start), never the 10 s startup budget.
+    // latency (a cold node start), never the startup budget. That stretch
+    // is machine-dependent -- a node start that takes 3 s under load makes
+    // the budget 9 s -- so the startup budget sits far above it (30 s, not
+    // 10 s) and the bounds are stated against it, in the same proportions.
     expect(budget).toBeGreaterThanOrEqual(1500);
-    expect(budget).toBeLessThan(10_000);
-    expect(dual.durationMs).toBeLessThan(8000);
+    expect(budget).toBeLessThan(STARTUP);
+    expect(dual.durationMs).toBeLessThan(0.8 * STARTUP);
     // The warning names the budget in full instead of a clipped transport message.
     expect(lifecycleWarnings(report)).toEqual([
       `lifecycle-dual-era: legacy initialize got no response within ${budget}ms on a fresh process; a modern-only server SHOULD reject it with an error naming its supported versions`,
     ]);
-  }, 20_000);
+  }, 60_000);
 
   it("an abort during the fresh-process probe is not recorded as a pass", async () => {
     const controller = new AbortController();
@@ -2920,7 +2927,10 @@ describe("--only <claim-less probe> against an SDK 2.0 stdio server without tool
     it(`${only} only: ${only}/list is sent first, so the probe draws -32602, not the legacy -32601`, async () => {
       const report = await runModern(
         { type: "stdio", command: process.execPath, args: [sdk.script], env: { SDK_ONLY: only } },
-        { only: ["lifecycle-meta-required"] },
+        // The SDK server loads @modelcontextprotocol/server before it reads
+        // stdin: on a loaded machine that outlasts runModern's 10 s startup
+        // budget, and the setup discover then times out with nothing declared.
+        { only: ["lifecycle-meta-required"], startupTimeout: 45_000 },
       );
       expect(report.tests.map((t) => t.id)).toEqual(["lifecycle-meta-required"]);
       expect(Object.keys(report.serverInfo.capabilities ?? {})).toEqual([only]);
