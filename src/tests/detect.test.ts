@@ -8,10 +8,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   classifyDiscoverResponse,
+  detectSpecVersion,
   namesHostOrOriginValidation,
   probeAnswerShowsEra,
   probeExitWarning,
@@ -22,7 +23,7 @@ import {
 } from "../detect.js";
 import { runComplianceSuite } from "../runner.js";
 import { AUTO_DETECT_NOTE_PREFIX, LEGACY_SPEC_VERSION, MODERN_SPEC_VERSION } from "../spec.js";
-import type { TransportResponse } from "../transport/index.js";
+import type { Transport, TransportResponse } from "../transport/index.js";
 import type { StdioTransport } from "../transport/stdio.js";
 import type { ComplianceReport, TransportTarget } from "../types.js";
 import {
@@ -309,18 +310,29 @@ describe("auto-detection: modern fixture", () => {
 
   it("stdio: the first exchange is the probe and resolves 2026-07-28", async () => {
     const status: string[] = [];
+    const started = Date.now();
+    let answeredAfterMs = Number.POSITIVE_INFINITY;
     const report = await runComplianceSuite(stdioFixture().target, {
       timeout: 5000,
       startupTimeout: 10_000,
       only: ["lifecycle-discover"],
       onStatus: (m) => status.push(m),
+      onTestComplete: () => {
+        answeredAfterMs = Math.min(answeredAfterMs, Date.now() - started);
+      },
     });
     expect(report.specVersion).toBe(MODERN_SPEC_VERSION);
     expect(autoNote(report)).toContain("server/discover -> supportedVersions [2026-07-28]");
     expect(resultOf(report, "lifecycle-discover").passed).toBe(true);
     expect(report.url).toMatch(/^stdio:/);
-    // The probe was answered at once: no "still probing" status line.
-    expect(status).toEqual([]);
+    // The probe was answered at once: no "still probing" status line. The
+    // delay counts from spawn, so a node start that takes longer than it on
+    // a loaded machine legitimately draws the line; the guarantee holds
+    // whenever the first test finished (probe answered) inside the delay.
+    // (The exact rule -- nothing at 1999 ms, the line at 2000 ms, nothing
+    // once answered -- is pinned on a fake clock further down.)
+    if (answeredAfterMs < STDIO_PROBE_STATUS_DELAY_MS) expect(status).toEqual([]);
+    expect(status.length).toBeLessThanOrEqual(1);
   });
 
   it("pinned 2025-11-25 against the modern-only fixture: the legacy suite runs, its handshake fails, and the report names the era mismatch", async () => {
@@ -405,10 +417,16 @@ describe("auto-detection: legacy stdio fixtures", () => {
   });
 
   it("silent fixture never answers the probe: legacy on timeout, and the handshake still succeeds", async () => {
+    // The initialize that follows the probe is timed from the moment it is
+    // written, on the same startup budget, so the child has twice the
+    // budget to boot. 1500 ms left it 3 s, which a node start outran on a
+    // loaded machine ("Initialize request failed: ... timed out after
+    // 1500ms") with nothing wrong.
+    const STARTUP = 5000;
     const started = Date.now();
     const report = await runComplianceSuite(legacyStdio(LEGACY_SILENT_FIXTURE), {
       timeout: 5000,
-      startupTimeout: 1500,
+      startupTimeout: STARTUP,
       only: ["lifecycle-init", "lifecycle-ping"],
     });
     const elapsed = Date.now() - started;
@@ -423,18 +441,23 @@ describe("auto-detection: legacy stdio fixtures", () => {
     expect(resultOf(report, "lifecycle-ping").passed).toBe(true);
     expect(report.serverInfo.name).toBe("legacy-silent-fixture");
     // Detection cost is bounded by the startup timeout (plus spawn + suite).
-    expect(elapsed).toBeGreaterThanOrEqual(1500);
-    expect(elapsed).toBeLessThan(10_000);
-  }, 20_000);
+    expect(elapsed).toBeGreaterThanOrEqual(STARTUP);
+    expect(elapsed).toBeLessThan(4 * STARTUP);
+  }, 40_000);
 
   it("silent fixture: ~2s into the outstanding probe onStatus says what the wait is and how to skip it", async () => {
     const status: Array<{ at: number; message: string }> = [];
+    const order: string[] = [];
     const started = Date.now();
     const report = await runComplianceSuite(legacyStdio(LEGACY_SILENT_FIXTURE), {
       timeout: 5000,
       startupTimeout: 3500,
       only: ["lifecycle-init"],
-      onStatus: (message) => status.push({ at: Date.now() - started, message }),
+      onStatus: (message) => {
+        order.push("status");
+        status.push({ at: Date.now() - started, message });
+      },
+      onTestComplete: (r) => order.push(r.id),
     });
     expect(report.specVersion).toBe(LEGACY_SPEC_VERSION);
     expect(resultOf(report, "lifecycle-init").passed).toBe(true);
@@ -442,9 +465,15 @@ describe("auto-detection: legacy stdio fixtures", () => {
     expect(status[0].message).toBe(
       "Probing spec era (server/discover, up to 3.5s). A 2025-11-25 server that ignores unknown methods takes the whole startup timeout; --spec-version 2025-11-25 skips the probe.",
     );
-    // Fired while the probe was still outstanding, not after it resolved.
+    // Fired while the probe was still outstanding, not after it resolved:
+    // no sooner than the delay, and ahead of everything the run does once
+    // the probe has given up (the handshake, then the first test). Stated
+    // as an order, not as "under 3500 ms on the wall clock": `at` counts
+    // from before the spawn and the timer runs when the event loop gets to
+    // it, so on a loaded machine the line can land past 3.5 s having still
+    // fired inside the probe.
     expect(status[0].at).toBeGreaterThanOrEqual(1900);
-    expect(status[0].at).toBeLessThan(3500);
+    expect(order).toEqual(["status", "lifecycle-init"]);
   }, 20_000);
 
   it("pinned 2025-11-25 skips the probe entirely: no wait, no status line, no auto note", async () => {
@@ -1609,6 +1638,112 @@ describe("probeExitWarning: the fresh child's exit can land after its initialize
     );
     expect(elapsed).toBeGreaterThanOrEqual(250);
     expect(elapsed).toBeLessThan(5000);
+  });
+});
+
+describe("detectSpecVersion: the stdio status line, on a fake clock", () => {
+  // The integration tests above watch this timer against a real child, where
+  // the child's boot and the event loop's lag sit inside every measurement.
+  // Here the transport is a stub the test settles by hand and the clock only
+  // moves when told to, so the rule itself is exact: the line fires when the
+  // probe is still outstanding STDIO_PROBE_STATUS_DELAY_MS after it was sent,
+  // and never otherwise.
+  const STATUS =
+    "Probing spec era (server/discover, up to 3.5s). A 2025-11-25 server that ignores unknown methods takes the whole startup timeout; --spec-version 2025-11-25 skips the probe.";
+
+  /** A transport whose one `request` stays pending until the test settles it. */
+  function pendingTransport(kind: "stdio" | "http") {
+    const sent: string[] = [];
+    let settle!: { resolve(res: TransportResponse): void; reject(err: Error): void };
+    const transport = {
+      kind,
+      request: (method: string) => {
+        sent.push(method);
+        return new Promise<TransportResponse>((resolve, reject) => {
+          settle = { resolve, reject };
+        });
+      },
+    } as unknown as Transport;
+    return {
+      transport,
+      sent,
+      answer: (res: TransportResponse) => settle.resolve(res),
+      fail: (e: Error) => settle.reject(e),
+    };
+  }
+
+  const probe = (transport: Transport, status: string[]) =>
+    detectSpecVersion(transport, {
+      nextId: () => 1,
+      timeout: 3500,
+      clientInfo: { name: "detect-test", version: "0" },
+      onStatus: (m) => status.push(m),
+    });
+
+  const discoverResult: TransportResponse = {
+    body: { jsonrpc: "2.0", id: 1, result: { supportedVersions: [MODERN_SPEC_VERSION] } },
+    requestId: 1,
+  };
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("an unanswered probe: nothing 1 ms short of the delay, the line at the delay, and only once", async () => {
+    vi.useFakeTimers();
+    const status: string[] = [];
+    const t = pendingTransport("stdio");
+    const detection = probe(t.transport, status);
+    expect(t.sent).toEqual(["server/discover"]);
+    await vi.advanceTimersByTimeAsync(STDIO_PROBE_STATUS_DELAY_MS - 1);
+    expect(status).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(status).toEqual([STATUS]);
+    // The rest of the startup budget passes with nothing more said.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(status).toEqual([STATUS]);
+    // The transport gives up: no reply reads as legacy.
+    t.fail(new Error("stdio transport: request timed out after 3500ms (method=server/discover)"));
+    await expect(detection).resolves.toMatchObject({ version: LEGACY_SPEC_VERSION, era: "legacy", responded: false });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a probe answered 1 ms short of the delay: no line, then or later, and the timer is gone", async () => {
+    vi.useFakeTimers();
+    const status: string[] = [];
+    const t = pendingTransport("stdio");
+    const detection = probe(t.transport, status);
+    await vi.advanceTimersByTimeAsync(STDIO_PROBE_STATUS_DELAY_MS - 1);
+    t.answer(discoverResult);
+    await expect(detection).resolves.toMatchObject({ version: MODERN_SPEC_VERSION, era: "modern", responded: true });
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(status).toEqual([]);
+  });
+
+  it("a probe that fails 1 ms short of the delay (the child exited): no line either", async () => {
+    vi.useFakeTimers();
+    const status: string[] = [];
+    const t = pendingTransport("stdio");
+    const detection = probe(t.transport, status);
+    await vi.advanceTimersByTimeAsync(STDIO_PROBE_STATUS_DELAY_MS - 1);
+    t.fail(new Error("server crashed with exit code 1"));
+    await expect(detection).resolves.toMatchObject({ era: "legacy", responded: false });
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(status).toEqual([]);
+  });
+
+  it("over HTTP the line never fires, however long the probe is outstanding", async () => {
+    vi.useFakeTimers();
+    const status: string[] = [];
+    const t = pendingTransport("http");
+    const detection = probe(t.transport, status);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(status).toEqual([]);
+    t.answer({ ...discoverResult, statusCode: 200 });
+    await expect(detection).resolves.toMatchObject({ version: MODERN_SPEC_VERSION });
   });
 });
 

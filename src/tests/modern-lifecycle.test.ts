@@ -780,10 +780,13 @@ describe("lifecycle-subscriptions-listen: an acknowledgment that honours more th
 });
 
 describe("lifecycle-subscriptions-listen: a listen whose response never starts", () => {
-  const hangingListen = () =>
+  const hangingListen = (onListen?: () => void) =>
     startModernStub((method, msg) => {
       if (method === "server/discover") return discoverReply(msg.id, { tools: { listChanged: true } });
-      if (method === "subscriptions/listen") return { hang: true };
+      if (method === "subscriptions/listen") {
+        onListen?.();
+        return { hang: true };
+      }
       return notFound(msg.id, method);
     });
 
@@ -801,8 +804,11 @@ describe("lifecycle-subscriptions-listen: a listen whose response never starts",
   });
 
   it("an abort while waiting for the status line is not recorded as no response", async () => {
-    const stub = await hangingListen();
     const controller = new AbortController();
+    // The stub runs in this process, so it says when the listen is in its
+    // hands and being held: the abort is sent on that, a beat later so the
+    // client is back in its wait, instead of a fixed 500 ms after discover.
+    const stub = await hangingListen(() => setTimeout(() => controller.abort(new Error("user abort")), 50));
     const completed: TestResult[] = [];
     try {
       const run = runComplianceSuite(stub.url, {
@@ -810,10 +816,7 @@ describe("lifecycle-subscriptions-listen: a listen whose response never starts",
         only: ["lifecycle-discover", "lifecycle-subscriptions-listen"],
         timeout: 10_000,
         signal: controller.signal,
-        onTestComplete: (r) => {
-          completed.push(r);
-          if (r.id === "lifecycle-discover") setTimeout(() => controller.abort(new Error("user abort")), 500);
-        },
+        onTestComplete: (r) => completed.push(r),
       });
       await expect(run).rejects.toThrow("user abort");
       expect(completed.map((r) => r.id)).toEqual(["lifecycle-discover", "lifecycle-subscriptions-listen"]);
@@ -2778,6 +2781,11 @@ describe("lifecycle-dual-era: fresh-process initialize on stdio", () => {
   it("a single-instance server (second instance exits at startup) passes with the era undetermined and a warning", async () => {
     const report = await runModern(target({ MINI_LOCK: join(mini.dir, "instance.lock") }), {
       only: ["lifecycle-discover", "lifecycle-dual-era"],
+      // The idle instance is watched for three times as long as the fresh
+      // one took to exit, capped at the startup budget: keep the cap clear
+      // of a node start that takes seconds on a loaded machine, or the idle
+      // instance is still booting when the watch ends and reads as "stays up".
+      startupTimeout: 45_000,
     });
     // The suite's own process holds the lock and answered discover.
     expectPassed(report, "lifecycle-discover");
@@ -2790,7 +2798,8 @@ describe("lifecycle-dual-era: fresh-process initialize on stdio", () => {
     expect(lifecycleWarnings(report)).toEqual([
       `lifecycle-dual-era: a fresh instance exited (${exit}) before answering the legacy initialize, and one spawned with no input exited too (${exit}); a server that allows one instance at a time cannot be probed alongside the suite's own process, so its era is undetermined`,
     ]);
-  }, 20_000);
+    // Three node starts and the idle watch, as in the test above.
+  }, 60_000);
 
   it("a server that ignores initialize is given the per-request budget, not the startup budget", async () => {
     const STARTUP = 30_000;
@@ -2821,27 +2830,45 @@ describe("lifecycle-dual-era: fresh-process initialize on stdio", () => {
   }, 60_000);
 
   it("an abort during the fresh-process probe is not recorded as a pass", async () => {
+    // The fresh child writes its pid to `mark` when the legacy initialize
+    // reaches it, then says nothing: from that moment the suite is inside
+    // the initialize wait, whatever the two node starts before it cost. The
+    // abort is sent then -- not a fixed 1500 ms after the start, which a
+    // slow setup discover could outlast (the abort then lands before the
+    // probe and nothing is recorded), and which timed the whole run, both
+    // child shutdowns included, against 5 s (5.9 s seen under load).
+    const mark = join(mini.dir, "probe-abort-initialize");
+    // The wait the abort has to cut short: min(startupTimeout, max(timeout,
+    // 3x the setup discover)), so never less than this.
+    const INITIALIZE_BUDGET = 60_000;
     const controller = new AbortController();
     const completed: TestResult[] = [];
-    const started = Date.now();
-    const run = runComplianceSuite(target({ MINI_INITIALIZE: "silent" }), {
+    const run = runComplianceSuite(target({ MINI_INITIALIZE: "silent", MINI_MARK: mark }), {
       specVersion: MODERN_SPEC_VERSION,
       only: ["lifecycle-dual-era"],
-      timeout: 5000,
-      startupTimeout: 10_000,
+      timeout: INITIALIZE_BUDGET,
+      startupTimeout: 2 * INITIALIZE_BUDGET,
       signal: controller.signal,
       onTestComplete: (r) => completed.push(r),
     });
-    // Past the setup discover (a cold node start), inside the initialize wait.
-    setTimeout(() => controller.abort(new Error("user abort")), 1500);
-    await expect(run).rejects.toThrow("user abort");
-    expect(Date.now() - started).toBeLessThan(5000);
+    const rejected = expect(run).rejects.toThrow("user abort");
+    const deadline = Date.now() + 45_000;
+    while (!existsSync(mark) && Date.now() < deadline) await sleep(20);
+    expect(existsSync(mark), "the legacy initialize never reached a fresh child").toBe(true);
+    const abortedAt = Date.now();
+    controller.abort(new Error("user abort"));
+    await rejected;
+    // Ended by the abort, not by waiting out the initialize budget: the run
+    // was over (both children closed) in under half of it.
+    expect(Date.now() - abortedAt).toBeLessThan(INITIALIZE_BUDGET / 2);
     const dual = completed.filter((r) => r.id === "lifecycle-dual-era");
     for (const r of dual) {
       expect(r.passed, r.details).toBe(false);
       expect(r.details).not.toMatch(/No response to legacy initialize/);
     }
-  }, 20_000);
+    // The harness records the abort itself, once.
+    expect(dual.map((r) => [r.passed, r.details])).toEqual([[false, "Error: user abort"]]);
+  }, 120_000);
 
   it("an abort while the idle instance is watched is not recorded as 'exits on the request'", async () => {
     // The fresh child writes its pid to `mark` on the initialize, then exits

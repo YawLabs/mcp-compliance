@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type BenchmarkResult, describeProbeFailure, formatBenchmark, runBenchmark } from "../benchmark.js";
+import { STDIO_PROBE_STATUS_DELAY_MS } from "../detect.js";
 import type { TransportTarget } from "../types.js";
 import {
   type HttpFixture,
@@ -38,6 +39,33 @@ rl.on("line", (line) => {
       break;
     default:
       throw new Error("unhandled method " + msg.method);
+  }
+});
+rl.on("close", () => process.exit(0));
+`;
+
+/**
+ * A 2026-07-28 stdio server with a boot of KNOWN length: it sleeps
+ * BOOT_DELAY_MS before it reads stdin, so whatever is written to it
+ * meanwhile waits in the pipe for at least that long. It logs every
+ * request's method to SEEN_FILE (synchronously, before answering), so a
+ * test can count what a benchmark sent around its timed loop.
+ */
+const SLOW_BOOT_SERVER = `
+import { appendFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+await new Promise((r) => setTimeout(r, Number(process.env.BOOT_DELAY_MS)));
+const rl = createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY });
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.id === undefined) return;
+  appendFileSync(process.env.SEEN_FILE, msg.method + "\\n");
+  if (msg.method === "server/discover") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", supportedVersions: ["2026-07-28"], capabilities: {}, ttlMs: 0, cacheScope: "public", _meta: { "io.modelcontextprotocol/serverInfo": { name: "slow-boot", version: "1" } } } });
+  } else {
+    send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found: " + msg.method } });
   }
 });
 rl.on("close", () => process.exit(0));
@@ -522,13 +550,40 @@ describe("runBenchmark warm-up (what is sent around the timed loop)", () => {
   });
 
   it("pinned 2026-07-28 on stdio: the first measured sample no longer carries the child's boot", async () => {
-    // Boot (Node + module load) is 150ms and up; a served server/discover
-    // is a few ms. With the warm-up in place the slowest of 8 timed
-    // samples stays well below boot time. (The counting cases above pin
-    // the contract exactly; this one shows the effect it exists for.)
-    const result = await runBenchmark(stdioFixture().target, { ...OPTS, specVersion: "2026-07-28" });
-    expectAllSucceeded(result);
-    expect(result.latencyMs.max, `max ${result.latencyMs.max}ms`).toBeLessThan(100);
+    // The child's boot is made a known quantity: the server sleeps
+    // BOOT_DELAY_MS before it reads stdin, so the first request written to
+    // it cannot be answered sooner than that. Without the warm-up that
+    // request is the first timed sample and max >= BOOT_DELAY_MS, always;
+    // with it the boot is spent on the unmeasured discover and every timed
+    // sample is one served round-trip. So "max is below the boot" is stated
+    // against the delay the test injected -- not against 100 ms on the wall
+    // clock, which a real node start (150 ms and up) usually cleared but one
+    // slow round-trip on a loaded machine did not.
+    const BOOT_DELAY_MS = 2000;
+    const dir = mkdtempSync(join(tmpdir(), "mcp-compliance-bench-boot-"));
+    try {
+      const script = join(dir, "slow-boot.mjs");
+      const seen = join(dir, "seen.txt");
+      writeFileSync(script, SLOW_BOOT_SERVER);
+      writeFileSync(seen, "");
+      const result = await runBenchmark(
+        {
+          type: "stdio",
+          command: process.execPath,
+          args: [script],
+          env: { BOOT_DELAY_MS: String(BOOT_DELAY_MS), SEEN_FILE: seen },
+        },
+        { ...OPTS, specVersion: "2026-07-28" },
+      );
+      expectAllSucceeded(result);
+      // The mechanism, exactly: one unmeasured server/discover ahead of the
+      // 8 measured ones, on stdio as over HTTP above.
+      expect(readFileSync(seen, "utf8").trim().split("\n")).toEqual(Array(REQUESTS + 1).fill("server/discover"));
+      // The effect it exists for: no timed sample waited out the boot.
+      expect(result.latencyMs.max, `max ${result.latencyMs.max}ms`).toBeLessThan(BOOT_DELAY_MS);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("pinned 2026-07-28 against a server that never answers: the warm-up waits out startupTimeout, then the loop measures and says why it failed", async () => {
@@ -588,7 +643,11 @@ describe("runBenchmark auto on stdio: the era probe and the child it can kill", 
     // Before: every sample failed with "server crashed with exit code 1"
     // against the dead child, throughput was reported over 0ms, and
     // nothing said the benchmark's own probe was the cause.
-    const result = await runBenchmark(stdio(crashOnProbe), { ...OPTS, startupTimeout: 10_000 });
+    // The startup budget only bounds a child that says nothing: this one
+    // exits on the probe, which ends the wait at once, so a generous budget
+    // costs nothing and keeps a slow node start from timing the probe out
+    // (no exit seen, no re-spawn, no warning).
+    const result = await runBenchmark(stdio(crashOnProbe), { ...OPTS, startupTimeout: 45_000 });
     expect(result.specVersion).toBe("2025-11-25");
     expect(result.method).toBe("ping");
     expectAllSucceeded(result);
@@ -601,17 +660,22 @@ describe("runBenchmark auto on stdio: the era probe and the child it can kill", 
     expect(warning).toContain("pin --spec-version 2025-11-25 to skip the probe");
     // formatBenchmark prints it next to the counts.
     expect(formatBenchmark(result)).toContain(`  warning: ${warning}`);
-  }, 20_000);
+  }, 60_000);
 
   it("a server that exits at startup regardless is not blamed on the probe", async () => {
-    const result = await runBenchmark(stdio(exitAtStartup), { requests: 2, timeout: 2000, startupTimeout: 5000 });
+    // Both waits here -- the probe on the first child, the initialize on the
+    // fresh one -- end when the child exits, so the startup budget is never
+    // waited out; it only has to outlast a node start. If it does not, the
+    // probe times out on a child that has not got as far as exiting: no
+    // exit is seen and no warning is produced.
+    const result = await runBenchmark(stdio(exitAtStartup), { requests: 2, timeout: 2000, startupTimeout: 45_000 });
     expect(result.failed).toBe(2);
-    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings, JSON.stringify(result)).toHaveLength(1);
     const [warning] = result.warnings ?? [];
     expect(warning).toContain("the server exits at startup regardless of the probe");
     expect(warning).toContain("Error: API_KEY environment variable is required");
     expect(warning).not.toContain("pin --spec-version");
-  }, 20_000);
+  }, 120_000);
 
   it("the probe is bounded by startupTimeout, not the per-request timeout", async () => {
     // A silent legacy server ignores the probe; a 15s --timeout used to be
@@ -650,9 +714,31 @@ describe("runBenchmark auto on stdio: the era probe and the child it can kill", 
   }, 20_000);
 
   it("a probe answered at once produces no status line and no warning", async () => {
-    const status: string[] = [];
-    const result = await runBenchmark(legacyEchoTarget, { ...OPTS, onStatus: (m) => status.push(m) });
-    expect(status).toEqual([]);
+    const order: string[] = [];
+    const started = Date.now();
+    let firstSampleAfterMs = Number.POSITIVE_INFINITY;
+    const result = await runBenchmark(legacyEchoTarget, {
+      ...OPTS,
+      onStatus: () => order.push("status"),
+      onProgress: () => {
+        order.push("sample");
+        firstSampleAfterMs = Math.min(firstSampleAfterMs, Date.now() - started);
+      },
+    });
+    const status = order.filter((e) => e === "status");
+    // The status delay counts from the spawn, and "at once" is the server's
+    // doing, not node's: a start that takes longer than the delay on a
+    // loaded machine legitimately draws the line. The guarantee holds
+    // whenever the first sample -- which follows the probe's answer -- was
+    // in before the delay ran out. (detect.test.ts pins the rule itself on
+    // a fake clock: nothing at 1999 ms, the line at 2000 ms, nothing once
+    // the probe is answered.)
+    if (firstSampleAfterMs < STDIO_PROBE_STATUS_DELAY_MS) expect(status).toEqual([]);
+    // On any machine: at most one line, and never once the probe has been
+    // answered -- the timer is cancelled with the answer, so a line can
+    // only come ahead of every sample.
+    expect(status.length).toBeLessThanOrEqual(1);
+    expect(order.slice(status.length)).toEqual(Array(REQUESTS).fill("sample"));
     expect(result.warnings).toBeUndefined();
   });
 });
