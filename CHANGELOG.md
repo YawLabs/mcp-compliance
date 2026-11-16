@@ -9,6 +9,8 @@ out explicitly here.
 
 ## [Unreleased]
 
+## [0.21.3] — 2026-11-15
+
 ### Changed
 - **The oam floor moves from 0.19.5 to 0.20.2, the latest oam release.**
   Verified on the installed aarch64-pc-windows-msvc oam 0.20.2 through the
